@@ -387,7 +387,12 @@ while [[ $# -gt 0 ]]; do
             SED_PATTERN_LIST+=" -e '/\s*-\s+\"spla@/ ${SUBST}"
             SED_PATTERN_LIST+=" -e '/\s*-\s+\"sirius@/ ${SUBST}"
             ;;
-          cray_pm_accel_energy | cusolver_mp | spla_gemm_offloading | unified_memory)
+          cusolver_mp)
+            CMAKE_FEATURE_FLAGS_GPU+=" -DCP2K_USE_${2^^}=${ON_OFF}"
+            SED_PATTERN_LIST+=" -e '/\s*-\s+\"cusolvermp@/ ${SUBST}"
+            SED_PATTERN_LIST+=" -e '/\s*-\s+\"ucc@/ ${SUBST}"
+            ;;
+          cray_pm_accel_energy | spla_gemm_offloading | unified_memory)
             CMAKE_FEATURE_FLAGS_GPU+=" -DCP2K_USE_${2^^}=${ON_OFF}"
             ;;
           dbm_gpu | elpa_gpu | grid_gpu | pw_gpu)
@@ -834,6 +839,18 @@ case "${MPI_MODE}" in
     ${EXIT_CMD} 1
     ;;
 esac
+
+# cuSOLVERMp requires both CUDA and MPI support.
+if [[ "${CMAKE_FEATURE_FLAGS_GPU}" == *"-DCP2K_USE_CUSOLVER_MP=ON"* ]]; then
+  if [[ "${MPI_MODE}" == "no" ]]; then
+    echo -e "ERROR: The feature CUSOLVER_MP is not available for building serial CP2K binaries (${CP2K_VERSION})\n"
+    ${EXIT_CMD} 1
+  fi
+  if ((CUDA_SM_CODE == 0)); then
+    echo -e "ERROR: The feature CUSOLVER_MP requires CUDA support (specify --gpu_model)\n"
+    ${EXIT_CMD} 1
+  fi
+fi
 
 # Check if CP2K_VERSION and the selected features are compatible
 case "${CP2K_VERSION}" in
