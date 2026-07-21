@@ -70,26 +70,21 @@ if [ "${with_cusolvermp}" != "__DONTUSE__" ]; then
       exit 1
     fi
     CAL_ROOT="$(dirname "$(dirname "${cal_lib}")")"
+    ucc_lib="$(find_in_paths "libucc.*" $LIB_PATHS)"
+    ucx_lib="$(find_in_paths "libucs.*" $LIB_PATHS)"
+    if [ "${ucc_lib}" = "__FALSE__" ] || [ "${ucx_lib}" = "__FALSE__" ]; then
+      report_error ${LINENO} "Could not find UCC/UCX required by cuSOLVERMp ${cusolvermp_major}.${cusolvermp_minor}."
+      exit 1
+    fi
+    UCC_ROOT="$(dirname "$(dirname "${ucc_lib}")")"
+    UCX_ROOT="$(dirname "$(dirname "${ucx_lib}")")"
   fi
-
-  ucc_lib="$(find_in_paths "libucc.*" $LIB_PATHS)"
-  ucx_lib="$(find_in_paths "libucs.*" $LIB_PATHS)"
-  if [ "${ucc_lib}" = "__FALSE__" ] || [ "${ucx_lib}" = "__FALSE__" ]; then
-    report_error ${LINENO} "Could not find UCC/UCX required by cuSOLVERMp."
-    exit 1
-  fi
-  UCC_ROOT="$(dirname "$(dirname "${ucc_lib}")")"
-  UCX_ROOT="$(dirname "$(dirname "${ucx_lib}")")"
 
   cat << EOF > "${BUILDDIR}/setup_cusolvermp"
 export CUSOLVERMP_VER="${cusolvermp_major}.${cusolvermp_minor}"
 export CUSOLVERMP_LIBS="${CUSOLVERMP_LIBS}"
 export CUSOLVER_MP_ROOT="${pkg_install_dir}"
-export UCC_ROOT="${UCC_ROOT}"
-export UCX_ROOT="${UCX_ROOT}"
 prepend_path CMAKE_PREFIX_PATH "${pkg_install_dir}"
-prepend_path CMAKE_PREFIX_PATH "${UCC_ROOT}"
-prepend_path CMAKE_PREFIX_PATH "${UCX_ROOT}"
 EOF
   if [ -n "${NCCL_ROOT}" ]; then
     cat << EOF >> "${BUILDDIR}/setup_cusolvermp"
@@ -101,6 +96,10 @@ EOF
     cat << EOF >> "${BUILDDIR}/setup_cusolvermp"
 export CAL_ROOT="${CAL_ROOT}"
 prepend_path CMAKE_PREFIX_PATH "${CAL_ROOT}"
+export UCC_ROOT="${UCC_ROOT}"
+export UCX_ROOT="${UCX_ROOT}"
+prepend_path CMAKE_PREFIX_PATH "${UCC_ROOT}"
+prepend_path CMAKE_PREFIX_PATH "${UCX_ROOT}"
 EOF
   fi
   filter_setup "${BUILDDIR}/setup_cusolvermp" "${SETUPFILE}"
