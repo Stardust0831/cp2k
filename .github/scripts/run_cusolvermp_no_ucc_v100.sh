@@ -1,0 +1,115 @@
+#!/bin/bash
+set -euo pipefail
+
+: "${WORK_ROOT:?WORK_ROOT is required}"
+
+readonly source_root="${WORK_ROOT}/source"
+readonly build_root="${WORK_ROOT}/build-root"
+readonly install_root="${WORK_ROOT}/install"
+readonly results_root="${WORK_ROOT}/results"
+readonly cuda_root="/opt/devtools/nvidia/cuda-12.4.1"
+readonly nccl_root="/opt/devtools/nvidia/nccl_2.18.5_cuda12.4_sai_v2.18.5-1-sai.1"
+
+mkdir -p "${build_root}/spack" "${results_root}"
+tar -xzf "${WORK_ROOT}/spack.tar.gz" -C "${build_root}/spack"
+mv "${build_root}/spack/spack-1.2.1" "${build_root}/spack/spack"
+mkdir -p "${WORK_ROOT}/spack-packages"
+tar -xzf "${WORK_ROOT}/spack-packages.tar.gz" -C "${WORK_ROOT}/spack-packages"
+
+# The compute nodes cannot reach GitHub. Point the pinned builtin repository at
+# the checkout staged by the Actions driver; package sources still use Spack's
+# public source mirror and NVIDIA's redistribution server.
+perl -0pi -e \
+  's|  repos:\n    builtin:\n      commit: [^\n]+\n|  repos:\n    builtin: '"${WORK_ROOT}"'/spack-packages\n|' \
+  "${source_root}/tools/spack/cp2k_deps_p.yaml"
+
+export BUILD_PATH="${build_root}"
+export CP2K_ROOT="${source_root}"
+export CUDA_HOME="${cuda_root}"
+export INSTALL_PREFIX="${install_root}"
+export LD_LIBRARY_PATH="${nccl_root}/lib:${cuda_root}/lib64:${LD_LIBRARY_PATH:-}"
+
+echo "=== Hardware ==="
+hostname
+nvidia-smi --query-gpu=index,name,compute_cap --format=csv,noheader
+echo "=== CP2K revision ==="
+printf '%s\n' "${SOURCE_SHA:-staged-source}"
+echo "=== Rewritten Spack repository configuration ==="
+sed -n '/^  repos:/,/^  specs:/p' "${source_root}/tools/spack/cp2k_deps_p.yaml"
+
+cd "${source_root}"
+./make_cp2k.sh --cp2k_version psmp --mpi_mode mpich --gpu_model V100 \
+  --disable_feature all --enable_feature cusolver_mp --use_cache no \
+  --install_path "${install_root}" --num_packages 2 -j 16 \
+  2>&1 | tee "${results_root}/build.log"
+
+# shellcheck source=/dev/null
+source "${build_root}/spack/spack/share/spack/setup-env.sh"
+spack -e cp2k_env find -dl | tee "${results_root}/spack-dag.log"
+spack -e cp2k_env find --format '{name}' | sort -u |
+  tee "${results_root}/spack-package-names.log"
+grep -qx cusolvermp "${results_root}/spack-package-names.log"
+grep -qx nccl "${results_root}/spack-package-names.log"
+if grep -Eqx 'ucc|ucx' "${results_root}/spack-package-names.log"; then
+  echo "ERROR: UCC or UCX is present in the concretized Spack environment"
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "${install_root}/cp2k_env"
+readonly cp2k_bin="${install_root}/bin/cp2k.psmp"
+"${cp2k_bin}" --version 2>&1 | tee "${results_root}/cp2k-version.log"
+grep -q 'cusolvermp_nccl' "${results_root}/cp2k-version.log"
+
+ldd "${cp2k_bin}" | tee "${results_root}/cp2k-ldd.log"
+readonly cusolvermp_view="${build_root}/spack/opt/spack/view"
+cusolvermp_lib="$(find "${cusolvermp_view}" -name 'libcusolverMp.so.0' -print -quit)"
+readonly cusolvermp_lib
+: "${cusolvermp_lib:?libcusolverMp.so.0 was not found in the Spack view}"
+ldd "${cusolvermp_lib}" | tee "${results_root}/cusolvermp-ldd.log"
+if grep -Eqi 'libucc|libucs|libucp' \
+  "${results_root}/cp2k-ldd.log" "${results_root}/cusolvermp-ldd.log"; then
+  echo "ERROR: UCC or UCX is present in the runtime dependency graph"
+  exit 1
+fi
+
+cd "${source_root}/tests/QS/regtest-cusolver"
+export CUDA_VISIBLE_DEVICES=0,1
+for input in Si8-generalized.inp Si8-generalized-complex.inp; do
+  sed '/^&GLOBAL$/a\  &TIMINGS\n    THRESHOLD 0.0\n  &END TIMINGS' \
+    "${input}" > "${results_root}/${input}"
+done
+
+export CP2K_GPU_BINDING_DIR="${results_root}/bindings-real"
+mkdir -p "${CP2K_GPU_BINDING_DIR}"
+mpiexec -n 2 "${source_root}/.github/scripts/cp2k_gpu_rank_wrapper.sh" \
+  "${cp2k_bin}" -i "${results_root}/Si8-generalized.inp" \
+  -o "${results_root}/Si8-generalized.out"
+cat "${CP2K_GPU_BINDING_DIR}"/rank-*.log | sort |
+  tee "${results_root}/gpu-bindings-real.log"
+
+export CP2K_GPU_BINDING_DIR="${results_root}/bindings-complex"
+mkdir -p "${CP2K_GPU_BINDING_DIR}"
+mpiexec -n 2 "${source_root}/.github/scripts/cp2k_gpu_rank_wrapper.sh" \
+  "${cp2k_bin}" -i "${results_root}/Si8-generalized-complex.inp" \
+  -o "${results_root}/Si8-generalized-complex.out"
+cat "${CP2K_GPU_BINDING_DIR}"/rank-*.log | sort |
+  tee "${results_root}/gpu-bindings-complex.log"
+
+for binding_log in "${results_root}"/gpu-bindings-*.log; do
+  grep -q 'rank=0 .*physical_device=0 ' "${binding_log}"
+  grep -q 'rank=1 .*physical_device=1 ' "${binding_log}"
+done
+grep -q 'cp_fm_general_cusolver' "${results_root}/Si8-generalized.out"
+grep -q 'cp_cfm_general_cusolver' "${results_root}/Si8-generalized-complex.out"
+
+grep -F 'ENERGY| Total FORCE_EVAL' "${results_root}/Si8-generalized.out" | tail -1 |
+  tee "${results_root}/energies.log"
+grep -F 'ENERGY| Total FORCE_EVAL' "${results_root}/Si8-generalized-complex.out" | tail -1 |
+  tee -a "${results_root}/energies.log"
+
+awk 'NR == 1 {d = $NF + 31.187602969867214; if (d < 0) d = -d; if (d > 1e-11) exit 1}
+     NR == 2 {d = $NF + 31.461089087225638; if (d < 0) d = -d; if (d > 1e-10) exit 1}' \
+  "${results_root}/energies.log"
+
+echo "PASS: cuSOLVERMp 0.7.2 completed real and complex multi-rank tests without UCC."

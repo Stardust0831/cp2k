@@ -1,0 +1,33 @@
+name: cuSOLVERMp without UCC on V100
+
+on:
+  push:
+    branches:
+      - ci-cusolvermp-no-ucc-v100
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cusolvermp-no-ucc-v100
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: [self-hosted, linux, x64, cp2k-v100-driver]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage sources and run on Slurm V100 node
+        env:
+          GPU_SSH_HOST: ${{ secrets.CP2K_GPU_SSH_HOST }}
+        run: .github/scripts/dispatch_cusolvermp_no_ucc_v100.sh
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cusolvermp-no-ucc-v100-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
