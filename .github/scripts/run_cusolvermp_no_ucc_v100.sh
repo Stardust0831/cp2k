@@ -27,7 +27,8 @@ export BUILD_PATH="${build_root}"
 export CP2K_ROOT="${source_root}"
 export CUDA_HOME="${cuda_root}"
 export INSTALL_PREFIX="${install_root}"
-export LD_LIBRARY_PATH="${nccl_root}/lib:${cuda_root}/lib64:${LD_LIBRARY_PATH:-}"
+export PATH="${cuda_root}/bin:${PATH}"
+export LD_LIBRARY_PATH="${nccl_root}/lib:${cuda_root}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
 
 echo "=== Hardware ==="
 hostname
