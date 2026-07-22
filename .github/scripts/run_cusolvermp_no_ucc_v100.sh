@@ -53,7 +53,14 @@ cd "${source_root}"
 source "${build_root}/spack/spack/share/spack/setup-env.sh"
 spack env remove --yes-to-all cp2k_env 2>/dev/null || true
 spack clean --failures
+# Force make_cp2k.sh to regenerate the environment with the CUDA-compatible
+# compiler selection while retaining Spack's installed package store.
+completion_marker="${build_root}/spack/BUILD_DEPENDENCIES_COMPLETED"
+if [[ -e "${completion_marker}" ]]; then
+  unlink "${completion_marker}"
+fi
 ./make_cp2k.sh --cp2k_version psmp --mpi_mode mpich --gpu_model V100 \
+  --gcc_version 13 --rebuild_cp2k \
   --disable_feature all --enable_feature cusolver_mp --use_cache no \
   --install_path "${install_root}" --num_packages 2 -j 16 \
   2>&1 | tee "${results_root}/build.log"
