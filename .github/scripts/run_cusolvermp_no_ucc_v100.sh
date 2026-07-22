@@ -77,8 +77,10 @@ if grep -qx ucc "${results_root}/spack-package-names.log"; then
   exit 1
 fi
 
-# shellcheck source=/dev/null
-source "${install_root}/cp2k_env"
+# Activate the environment created by make_cp2k.sh and add CP2K's installed
+# shared library to the runtime search path.
+eval "$(spack env activate --sh cp2k_env)"
+export LD_LIBRARY_PATH="${install_root}/lib:${LD_LIBRARY_PATH:-}"
 readonly cp2k_bin="${install_root}/bin/cp2k.psmp"
 "${cp2k_bin}" --version 2>&1 | tee "${results_root}/cp2k-version.log"
 grep -q 'cusolvermp_nccl' "${results_root}/cp2k-version.log"
