@@ -1195,8 +1195,10 @@ if [[ ! -f "${SPACK_BUILD_PATH}/BUILD_DEPENDENCIES_COMPLETED" ]]; then
   if ((GCC_VERSION_NEWEST < GCC_VERSION_MINIMUM)); then
     echo "INFO: The newest GCC compiler version ${GCC_VERSION_NEWEST} is too old,"
     echo "      because at least version ${GCC_VERSION_MINIMUM} is required"
-    GCC_VERSION="14"
-    echo "INFO: The lastest stable GCC version ${GCC_VERSION} will be built and used by spack"
+    if [[ "${GCC_VERSION}" == "auto" ]]; then
+      GCC_VERSION="14"
+      echo "INFO: The lastest stable GCC version ${GCC_VERSION} will be built and used by spack"
+    fi
   fi
 
   # Add a specific GCC version to the spack configuration if requested
