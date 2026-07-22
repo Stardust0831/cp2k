@@ -12,7 +12,13 @@ remote_ready=0
 
 collect_results() {
   if ((remote_ready)); then
-    scp -r "${GPU_SSH_HOST}:${remote_root}/results/." artifacts/ || true
+    for attempt in 1 2 3; do
+      if scp -r "${GPU_SSH_HOST}:${remote_root}/results/." artifacts/; then
+        return
+      fi
+      echo "Result collection attempt ${attempt} failed" >&2
+      sleep 5
+    done
   fi
 }
 trap collect_results EXIT

@@ -20,7 +20,7 @@ tar -xzf "${WORK_ROOT}/spack-packages.tar.gz" -C "${WORK_ROOT}/spack-packages"
 # the checkout staged by the Actions driver; package sources still use Spack's
 # public source mirror and NVIDIA's redistribution server.
 perl -0pi -e \
-  's|  repos:\n    builtin:\n      commit: [^\n]+\n|  repos:\n    builtin: '"${WORK_ROOT}"'/spack-packages\n|' \
+  's|  repos:\n    builtin:\n      commit: [^\n]+\n|  repos:\n    builtin: '"${WORK_ROOT}"'/spack-packages/repos/spack_repo/builtin\n|' \
   "${source_root}/tools/spack/cp2k_deps_p.yaml"
 
 export BUILD_PATH="${build_root}"
