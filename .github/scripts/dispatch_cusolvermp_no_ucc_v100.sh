@@ -9,12 +9,30 @@ readonly assets_dir="${RUNNER_TEMP}/cp2k-cusolvermp-assets-${GITHUB_RUN_ID}"
 readonly spack_version="1.2.1"
 readonly spack_commit="131214174051056d434e43d34f7c7645a385a835"
 readonly openblas_patch_sha="723ddc1553b6d27ff89d96985f7732695935c0d4d8df766987702689bdb750ac"
+readonly ssh_control_path="${RUNNER_TEMP}/cp2k-ssh-${GITHUB_RUN_ID}"
 readonly -a ssh_options=(
   -o ConnectTimeout=30
+  -o ControlMaster=auto
+  -o ControlPersist=60
+  -o "ControlPath=${ssh_control_path}"
   -o ServerAliveInterval=30
   -o ServerAliveCountMax=3
 )
 remote_ready=0
+
+retry() {
+  local attempt
+  for attempt in 1 2 3; do
+    if "$@"; then
+      return
+    fi
+    echo "Attempt ${attempt} failed: $*" >&2
+    if ((attempt < 3)); then
+      sleep 10
+    fi
+  done
+  return 1
+}
 
 collect_results() {
   if ((remote_ready)); then
@@ -50,14 +68,14 @@ git -C "${assets_dir}/spack-packages-git" archive --format=tar.gz \
 tar --exclude=.git --exclude=artifacts --format=posix -czf \
   "${assets_dir}/cp2k-source.tar.gz" .
 
-ssh "${ssh_options[@]}" -tt "${GPU_SSH_HOST}" \
+retry ssh "${ssh_options[@]}" -tt "${GPU_SSH_HOST}" \
   "mkdir -p \"\$HOME/${remote_root}/source\""
 remote_ready=1
-scp "${ssh_options[@]}" \
+retry scp "${ssh_options[@]}" \
   "${assets_dir}/spack.tar.gz" "${assets_dir}/spack-packages.tar.gz" \
   "${assets_dir}/cp2k-source.tar.gz" "${assets_dir}/${openblas_patch_sha}" \
   "${GPU_SSH_HOST}:${remote_root}/"
-ssh "${ssh_options[@]}" -tt "${GPU_SSH_HOST}" \
+retry ssh "${ssh_options[@]}" -tt "${GPU_SSH_HOST}" \
   "tar -xzf \"\$HOME/${remote_root}/cp2k-source.tar.gz\" -C \"\$HOME/${remote_root}/source\""
 
 ssh "${ssh_options[@]}" -tt "${GPU_SSH_HOST}" \
