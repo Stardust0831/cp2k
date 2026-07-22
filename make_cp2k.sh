@@ -1130,7 +1130,6 @@ if [[ ! -f "${SPACK_BUILD_PATH}/BUILD_DEPENDENCIES_COMPLETED" ]]; then
       -e "0,/~cuda/s//+cuda cuda_arch=${CUDA_SM_CODE}/" \
       -e 's/"~cuda\s+~gpu_direct"/"\+cuda \+gpu_direct"/' \
       -e '/\s*#\s*-\s+"fabrics=efa,ucx"/ s/#/ /' \
-      -e '/\s*#\s*-\s+"libxstream@/ s/#/ /' \
       -i "${CP2K_CONFIG_FILE}"
     # Building libfabric with CUDA causes problems
     # sed -E -e 's/"~cuda\s+~gdrcopy"/"\+cuda \+gdrcopy"/' -i "${CP2K_CONFIG_FILE}"
