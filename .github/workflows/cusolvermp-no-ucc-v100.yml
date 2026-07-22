@@ -21,6 +21,7 @@ jobs:
 
       - name: Stage sources and run on Slurm V100 node
         env:
+          GPU_REMOTE_ROOT: ${{ secrets.CP2K_GPU_REMOTE_ROOT }}
           GPU_SSH_HOST: ${{ secrets.CP2K_GPU_SSH_HOST }}
         run: .github/scripts/dispatch_cusolvermp_no_ucc_v100.sh
 

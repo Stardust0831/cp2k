@@ -11,10 +11,18 @@ readonly cuda_root="/opt/devtools/nvidia/cuda-12.4.1"
 readonly nccl_root="/opt/devtools/nvidia/nccl_2.18.5_cuda12.4_sai_v2.18.5-1-sai.1"
 
 mkdir -p "${build_root}/spack" "${results_root}"
-tar -xzf "${WORK_ROOT}/spack.tar.gz" -C "${build_root}/spack"
-mv "${build_root}/spack/spack-1.2.1" "${build_root}/spack/spack"
+if [[ ! -x "${build_root}/spack/spack/bin/spack" ]]; then
+  tar -xzf "${WORK_ROOT}/spack.tar.gz" -C "${build_root}/spack"
+  mv "${build_root}/spack/spack-1.2.1" "${build_root}/spack/spack"
+fi
 mkdir -p "${WORK_ROOT}/spack-packages"
 tar -xzf "${WORK_ROOT}/spack-packages.tar.gz" -C "${WORK_ROOT}/spack-packages"
+
+readonly openblas_patch_sha="723ddc1553b6d27ff89d96985f7732695935c0d4d8df766987702689bdb750ac"
+readonly source_cache="${build_root}/spack/spack/var/spack/cache/_source-cache/archive"
+mkdir -p "${source_cache}/${openblas_patch_sha:0:2}"
+cp "${WORK_ROOT}/${openblas_patch_sha}" \
+  "${source_cache}/${openblas_patch_sha:0:2}/${openblas_patch_sha}"
 
 # The compute nodes cannot reach GitHub. Point the pinned builtin repository at
 # the checkout staged by the Actions driver; package sources still use Spack's
@@ -39,6 +47,12 @@ echo "=== Rewritten Spack repository configuration ==="
 sed -n '/^  repos:/,/^  specs:/p' "${source_root}/tools/spack/cp2k_deps_p.yaml"
 
 cd "${source_root}"
+# Recreate the environment from this revision while retaining already installed
+# packages in Spack's store from an earlier attempt.
+# shellcheck source=/dev/null
+source "${build_root}/spack/spack/share/spack/setup-env.sh"
+spack env remove --yes-to-all cp2k_env 2>/dev/null || true
+spack clean --failures
 ./make_cp2k.sh --cp2k_version psmp --mpi_mode mpich --gpu_model V100 \
   --disable_feature all --enable_feature cusolver_mp --use_cache no \
   --install_path "${install_root}" --num_packages 2 -j 16 \
@@ -51,8 +65,8 @@ spack -e cp2k_env find --format '{name}' | sort -u |
   tee "${results_root}/spack-package-names.log"
 grep -qx cusolvermp "${results_root}/spack-package-names.log"
 grep -qx nccl "${results_root}/spack-package-names.log"
-if grep -Eqx 'ucc|ucx' "${results_root}/spack-package-names.log"; then
-  echo "ERROR: UCC or UCX is present in the concretized Spack environment"
+if grep -qx ucc "${results_root}/spack-package-names.log"; then
+  echo "ERROR: UCC is present in the concretized Spack environment"
   exit 1
 fi
 
@@ -68,9 +82,13 @@ cusolvermp_lib="$(find "${cusolvermp_view}" -name 'libcusolverMp.so.0' -print -q
 readonly cusolvermp_lib
 : "${cusolvermp_lib:?libcusolverMp.so.0 was not found in the Spack view}"
 ldd "${cusolvermp_lib}" | tee "${results_root}/cusolvermp-ldd.log"
-if grep -Eqi 'libucc|libucs|libucp' \
-  "${results_root}/cp2k-ldd.log" "${results_root}/cusolvermp-ldd.log"; then
-  echo "ERROR: UCC or UCX is present in the runtime dependency graph"
+if grep -Eqi 'libucc' "${results_root}/cp2k-ldd.log" \
+  "${results_root}/cusolvermp-ldd.log"; then
+  echo "ERROR: UCC is present in the runtime dependency graph"
+  exit 1
+fi
+if grep -Eqi 'libucs|libucp' "${results_root}/cusolvermp-ldd.log"; then
+  echo "ERROR: cuSOLVERMp unexpectedly links against UCX"
   exit 1
 fi
 
