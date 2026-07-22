@@ -86,7 +86,7 @@ readonly cp2k_bin="${install_root}/bin/cp2k.psmp"
 grep -q 'cusolvermp_nccl' "${results_root}/cp2k-version.log"
 
 ldd "${cp2k_bin}" | tee "${results_root}/cp2k-ldd.log"
-readonly cusolvermp_view="${build_root}/spack/opt/spack/view"
+readonly cusolvermp_view="${build_root}/spack/spack/opt/spack/view"
 cusolvermp_lib="$(find "${cusolvermp_view}" -name 'libcusolverMp.so.0' -print -quit)"
 readonly cusolvermp_lib
 : "${cusolvermp_lib:?libcusolverMp.so.0 was not found in the Spack view}"
