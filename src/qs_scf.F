@@ -891,6 +891,17 @@ CONTAINS
             END IF
          ELSE
             ! dont need any dirty trick for the numerically stable irac algorithm.
+         ! OT is not supported with k-points: the current OT method is Gamma-only (real orbitals).
+         ! If the experimental OT_KPOINTS switch is set, require a gapped system (no smearing) and
+         ! abort until the complex OT core is implemented.
+         IF (do_kpoints) THEN
+            IF (scf_control%diagonalization%ot_settings%ot_kpoints) THEN
+               IF (scf_control%smear%do_smear) THEN
+                  CPABORT("OT with k-points requires no smearing (gapped systems only).")
+               END IF
+               CPABORT("OT_KPOINTS dev switch set, but the complex OT core is not implemented in this branch yet.")
+            END IF
+         END IF
          END IF
 
          IF (.NOT. ASSOCIATED(scf_env%qs_ot_env)) THEN

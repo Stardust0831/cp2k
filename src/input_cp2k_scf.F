@@ -567,7 +567,7 @@ CONTAINS
                           "**Disadvantages:** "// &
                           "Sensitive to preconditioning. A good preconditioner can be expensive. "// &
                           "No smearing, or advanced SCF mixing possible: POOR convergence for metallic systems.", &
-                          n_keywords=27, n_subsections=0, repeats=.FALSE., &
+                          n_keywords=28, n_subsections=0, repeats=.FALSE., &
                           citations=[VandeVondele2003, Weber2008])
 
       NULLIFY (keyword)
@@ -577,6 +577,13 @@ CONTAINS
                           usage="&OT T", &
                           default_l_val=.FALSE., &
                           lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="KPOINTS", &
+                          description="Experimental: allow OT to run with k-points (gapped, no smearing). "// &
+                          "Complex OT core is not implemented yet in this branch.", &
+                          usage="KPOINTS T", &
+                          default_l_val=.FALSE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

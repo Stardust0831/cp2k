@@ -95,6 +95,7 @@ MODULE qs_ot_types
       REAL(KIND=dp)     :: broyden_sigma_min = -1.0_dp
       LOGICAL           :: broyden_forget_history = .FALSE., broyden_adaptive_sigma = .FALSE.
       LOGICAL           :: broyden_enable_flip = .FALSE.
+      LOGICAL           :: ot_kpoints = .FALSE.
    END TYPE qs_ot_settings_type
 
 ! **************************************************************************************************
@@ -794,6 +795,8 @@ CONTAINS
       END SELECT
 
       CALL section_vals_val_get(ot_section, "ON_THE_FLY_LOC", l_val=settings%on_the_fly_loc)
+
+      CALL section_vals_val_get(ot_section, "KPOINTS", l_val=settings%ot_kpoints)
 
       CALL section_vals_val_get(ot_section, "MINIMIZER", i_val=ot_method)
       ! overwrite input if ot_state is set
