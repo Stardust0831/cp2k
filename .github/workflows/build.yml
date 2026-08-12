@@ -6,74 +6,96 @@ on:
     branches: [feat-ot-kpoints]
 
 jobs:
-  toolchain:
-    name: Build toolchain (deps)
+  build:
+    name: Toolchain + build (ssmp, psmp) + guard
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+
       - name: Install system build deps
         run: |
           sudo apt-get update
           sudo bash ./tools/toolchain/install_requirements_ubuntu.sh
+
       - name: Restore toolchain cache
         id: tc
         uses: actions/cache@v4
         with:
           path: tools/toolchain/install
-          key: cp2k-toolchain-ubuntu-v1
+          key: cp2k-toolchain-ubuntu-v2
+
       - name: Install CP2K toolchain
         if: steps.tc.outputs.cache-hit != 'true'
         run: |
           cd tools/toolchain
           ./install_cp2k_toolchain.sh
 
-  build:
-    name: Build + guard (${{ matrix.version }})
-    needs: toolchain
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        version: [ssmp, psmp]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Restore toolchain cache
-        uses: actions/cache@v4
-        with:
-          path: tools/toolchain/install
-          key: cp2k-toolchain-ubuntu-v1
-      - name: Configure
+      - name: Show toolchain env
         run: |
           source tools/toolchain/install/setup
-          MPI_FLAG=""
-          if [ "${{ matrix.version }}" = "ssmp" ]; then MPI_FLAG="-DCP2K_USE_MPI=OFF"; fi
-          cmake -S . -B "build-${{ matrix.version }}" -G Ninja \
+          echo "CC=$CC"; echo "MPIFORT=$MPIFORT"
+          command -v gfortran mpif90 mpicc || true
+          ls tools/toolchain/install/lib | head
+
+      - name: Configure + build ssmp
+        run: |
+          source tools/toolchain/install/setup
+          cmake -S . -B build-ssmp -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCP2K_USE_EVERYTHING=ON \
+            -DCP2K_USE_MPI=OFF \
+            -DCP2K_USE_DLAF=OFF \
+            -DCP2K_USE_PEXSI=OFF \
+            -DCP2K_USE_OPENPMD=OFF
+          cmake --build build-ssmp -j 4
+
+      - name: Configure + build psmp
+        run: |
+          source tools/toolchain/install/setup
+          cmake -S . -B build-psmp -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCP2K_USE_EVERYTHING=ON \
             -DCP2K_USE_DLAF=OFF \
             -DCP2K_USE_PEXSI=OFF \
-            -DCP2K_USE_OPENPMD=OFF \
-            ${MPI_FLAG}
-      - name: Build
+            -DCP2K_USE_OPENPMD=OFF
+          cmake --build build-psmp -j 4
+
+      - name: List binaries
         run: |
-          cmake --build "build-${{ matrix.version }}" -j 4
-          echo "--- binaries ---"
-          find "build-${{ matrix.version }}" -maxdepth 3 -type f -name 'cp2k*' -executable
-      - name: Guard - Gamma OT (H2O)
-        run: |
-          export CP2K_DATA_DIR=$PWD/data
-          BIN=$(find "build-${{ matrix.version }}" -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
-          echo "using $BIN"
-          cd tests/QS/regtest-ot-1
-          timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1 || { echo "OT run failed"; tail -80 h2o.out; exit 1; }
-          grep -qiE 'PROGRAM ENDED|SCF run converged' h2o.out || { echo "OT did not converge"; tail -80 h2o.out; exit 1; }
-      - name: Guard - Diamond K-point diag (c_3)
+          echo "-- ssmp --"; find build-ssmp -maxdepth 3 -type f -name 'cp2k*' 2>/dev/null | head
+          echo "-- psmp --"; find build-psmp -maxdepth 3 -type f -name 'cp2k*' 2>/dev/null | head
+
+      - name: Guard Gamma OT (H2O) - ssmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
-          BIN=$(find "build-${{ matrix.version }}" -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
+          BIN=$(find build-ssmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
           echo "using $BIN"
-          cd tests/QS/regtest-kp-1
-          timeout 3000 "$BIN" c_3.inp > c3.out 2>&1 || { echo "KP run failed"; tail -80 c3.out; exit 1; }
-          grep -qiE 'PROGRAM ENDED|SCF run converged' c3.out || { echo "KP did not converge"; tail -80 c3.out; exit 1; }
+          (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
+          cp tests/QS/regtest-ot-1/h2o.out ./h2o.ssmp.out
+          grep -qiE 'PROGRAM ENDED|SCF run converged' ./h2o.ssmp.out || { echo "OT did not converge"; tail -80 ./h2o.ssmp.out; exit 1; }
+
+      - name: Guard Diamond K-point diag (c_3) - ssmp
+        run: |
+          export CP2K_DATA_DIR=$PWD/data
+          BIN=$(find build-ssmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
+          echo "using $BIN"
+          (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
+          cp tests/QS/regtest-kp-1/c3.out ./c3.ssmp.out
+          grep -qiE 'PROGRAM ENDED|SCF run converged' ./c3.ssmp.out || { echo "KP did not converge"; tail -80 ./c3.ssmp.out; exit 1; }
+
+      - name: Guard Gamma OT (H2O) - psmp
+        run: |
+          export CP2K_DATA_DIR=$PWD/data
+          BIN=$(find build-psmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
+          echo "using $BIN"
+          (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
+          grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-ot-1/h2o.out || { echo "OT did not converge"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
+
+      - name: Guard Diamond K-point diag (c_3) - psmp
+        run: |
+          export CP2K_DATA_DIR=$PWD/data
+          BIN=$(find build-psmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
+          echo "using $BIN"
+          (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
+          grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-kp-1/c3.out || { echo "KP did not converge"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
