@@ -23,20 +23,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: tools/toolchain/install
-          key: cp2k-toolchain-ubuntu-v2
+          key: cp2k-toolchain-ubuntu-v3
 
       - name: Install CP2K toolchain
         if: steps.tc.outputs.cache-hit != 'true'
         run: |
           cd tools/toolchain
           ./install_cp2k_toolchain.sh
-
-      - name: Show toolchain env
-        run: |
-          source tools/toolchain/install/setup
-          echo "CC=$CC"; echo "MPIFORT=$MPIFORT"
-          command -v gfortran mpif90 mpicc || true
-          ls tools/toolchain/install/lib | head
 
       - name: Configure + build ssmp
         run: |
@@ -47,7 +40,10 @@ jobs:
             -DCP2K_USE_MPI=OFF \
             -DCP2K_USE_DLAF=OFF \
             -DCP2K_USE_PEXSI=OFF \
-            -DCP2K_USE_OPENPMD=OFF
+            -DCP2K_USE_OPENPMD=OFF \
+            -DCP2K_USE_GAUXC=OFF \
+            -DCP2K_USE_DEEPMD=OFF \
+            -DCP2K_USE_LIBTORCH=OFF
           cmake --build build-ssmp -j 4
 
       - name: Configure + build psmp
@@ -58,10 +54,13 @@ jobs:
             -DCP2K_USE_EVERYTHING=ON \
             -DCP2K_USE_DLAF=OFF \
             -DCP2K_USE_PEXSI=OFF \
-            -DCP2K_USE_OPENPMD=OFF
+            -DCP2K_USE_OPENPMD=OFF \
+            -DCP2K_USE_GAUXC=OFF \
+            -DCP2K_USE_DEEPMD=OFF \
+            -DCP2K_USE_LIBTORCH=OFF
           cmake --build build-psmp -j 4
 
-      - name: List binaries
+      - name: Show binaries
         run: |
           echo "-- ssmp --"; find build-ssmp -maxdepth 3 -type f -name 'cp2k*' 2>/dev/null | head
           echo "-- psmp --"; find build-psmp -maxdepth 3 -type f -name 'cp2k*' 2>/dev/null | head
@@ -70,32 +69,26 @@ jobs:
         run: |
           export CP2K_DATA_DIR=$PWD/data
           BIN=$(find build-ssmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
-          echo "using $BIN"
-          (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
-          cp tests/QS/regtest-ot-1/h2o.out ./h2o.ssmp.out
-          grep -qiE 'PROGRAM ENDED|SCF run converged' ./h2o.ssmp.out || { echo "OT did not converge"; tail -80 ./h2o.ssmp.out; exit 1; }
+          (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { echo "H2O ssmp failed"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
+          grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-ot-1/h2o.out || { echo "H2O ssmp did not converge"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
 
       - name: Guard Diamond K-point diag (c_3) - ssmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
           BIN=$(find build-ssmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
-          echo "using $BIN"
-          (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
-          cp tests/QS/regtest-kp-1/c3.out ./c3.ssmp.out
-          grep -qiE 'PROGRAM ENDED|SCF run converged' ./c3.ssmp.out || { echo "KP did not converge"; tail -80 ./c3.ssmp.out; exit 1; }
+          (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { echo "c3 ssmp failed"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
+          grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-kp-1/c3.out || { echo "c3 ssmp did not converge"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
 
       - name: Guard Gamma OT (H2O) - psmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
           BIN=$(find build-psmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
-          echo "using $BIN"
-          (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
-          grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-ot-1/h2o.out || { echo "OT did not converge"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
+          (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { echo "H2O psmp failed"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
+          grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-ot-1/h2o.out || { echo "H2O psmp did not converge"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
 
       - name: Guard Diamond K-point diag (c_3) - psmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
           BIN=$(find build-psmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
-          echo "using $BIN"
-          (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
-          grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-kp-1/c3.out || { echo "KP did not converge"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
+          (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { echo "c3 psmp failed"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
+          grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-kp-1/c3.out || { echo "c3 psmp did not converge"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
