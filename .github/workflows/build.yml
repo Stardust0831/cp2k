@@ -31,11 +31,13 @@ jobs:
 
       - name: Build ssmp with Spack dependencies and CMake
         run: |
+          mkdir -p "$PWD/.ci/ssmp" "$PWD/.ci/install-ssmp"
           ./make_cp2k.sh -cv ssmp -bp "$PWD/.ci/ssmp" -ip "$PWD/.ci/install-ssmp" \
             -gpu none -mpi no -uc no -j 4 -np 2 -df all -ef fftw3
 
       - name: Build psmp with Spack dependencies and CMake
         run: |
+          mkdir -p "$PWD/.ci/psmp" "$PWD/.ci/install-psmp"
           ./make_cp2k.sh -cv psmp -bp "$PWD/.ci/psmp" -ip "$PWD/.ci/install-psmp" \
             -gpu none -mpi mpich -uc no -j 4 -np 2 -df all -ef fftw3
 
