@@ -45,26 +45,30 @@ jobs:
         run: |
           export CP2K_DATA_DIR=$PWD/data
           BIN=$PWD/.ci/install-ssmp/bin/cp2k.ssmp
-          (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { echo "H2O ssmp failed"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
+          LAUNCH=$PWD/.ci/install-ssmp/bin/launch
+          (cd tests/QS/regtest-ot-1 && timeout 2400 "$LAUNCH" "$BIN" H2O.inp > h2o.out 2>&1) || { echo "H2O ssmp failed"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
           grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-ot-1/h2o.out || { echo "H2O ssmp did not converge"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
 
       - name: Guard Diamond K-point diag (c_3) - ssmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
           BIN=$PWD/.ci/install-ssmp/bin/cp2k.ssmp
-          (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { echo "c3 ssmp failed"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
+          LAUNCH=$PWD/.ci/install-ssmp/bin/launch
+          (cd tests/QS/regtest-kp-1 && timeout 3000 "$LAUNCH" "$BIN" c_3.inp > c3.out 2>&1) || { echo "c3 ssmp failed"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
           grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-kp-1/c3.out || { echo "c3 ssmp did not converge"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
 
       - name: Guard Gamma OT (H2O) - psmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
           BIN=$PWD/.ci/install-psmp/bin/cp2k.psmp
-          (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { echo "H2O psmp failed"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
+          LAUNCH=$PWD/.ci/install-psmp/bin/launch
+          (cd tests/QS/regtest-ot-1 && timeout 2400 "$LAUNCH" "$BIN" H2O.inp > h2o.out 2>&1) || { echo "H2O psmp failed"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
           grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-ot-1/h2o.out || { echo "H2O psmp did not converge"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
 
       - name: Guard Diamond K-point diag (c_3) - psmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
           BIN=$PWD/.ci/install-psmp/bin/cp2k.psmp
-          (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { echo "c3 psmp failed"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
+          LAUNCH=$PWD/.ci/install-psmp/bin/launch
+          (cd tests/QS/regtest-kp-1 && timeout 3000 "$LAUNCH" "$BIN" c_3.inp > c3.out 2>&1) || { echo "c3 psmp failed"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
           grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-kp-1/c3.out || { echo "c3 psmp did not converge"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
