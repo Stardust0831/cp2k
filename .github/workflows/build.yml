@@ -7,90 +7,62 @@ on:
 
 jobs:
   build:
-    name: Toolchain + build (ssmp, psmp) + guard
+    name: Spack dependencies + CMake build (ssmp, psmp) + guard
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system build deps
+      - name: Install Spack bootstrap prerequisites
         run: |
           sudo apt-get update
-          sudo bash ./tools/toolchain/install_requirements_ubuntu.sh
+          sudo apt-get install -y --no-install-recommends \
+            bzip2 ca-certificates cmake g++ gcc gfortran git gnupg libssh-dev \
+            libssl-dev libtool libtool-bin lsb-release make ninja-build patch pkgconf \
+            python3 python3-dev python3-pip python3-venv unzip wget xz-utils zstd
 
-      - name: Restore toolchain cache
-        id: tc
+      - name: Restore Spack dependency stores
         uses: actions/cache@v4
         with:
-          path: tools/toolchain/install
-          key: cp2k-toolchain-ubuntu-v3
+          path: |
+            .ci/ssmp/spack
+            .ci/psmp/spack
+          key: cp2k-spack-minimal-v1-${{ hashFiles('make_cp2k.sh', 'tools/spack/**') }}
 
-      - name: Install CP2K toolchain
-        if: steps.tc.outputs.cache-hit != 'true'
+      - name: Build ssmp with Spack dependencies and CMake
         run: |
-          cd tools/toolchain
-          ./install_cp2k_toolchain.sh
+          ./make_cp2k.sh -cv ssmp -bp "$PWD/.ci/ssmp" -ip "$PWD/.ci/install-ssmp" \
+            -gpu none -mpi no -uc no -j 4 -np 2 -df all -ef fftw3
 
-      - name: Configure + build ssmp
+      - name: Build psmp with Spack dependencies and CMake
         run: |
-          source tools/toolchain/install/setup
-          cmake -S . -B build-ssmp -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCP2K_USE_EVERYTHING=ON \
-            -DCP2K_USE_MPI=OFF \
-            -DCP2K_USE_DLAF=OFF \
-            -DCP2K_USE_PEXSI=OFF \
-            -DCP2K_USE_OPENPMD=OFF \
-            -DCP2K_USE_HDF5=OFF \
-            -DCP2K_USE_GAUXC=OFF \
-            -DCP2K_USE_DEEPMD=OFF \
-            -DCP2K_USE_LIBTORCH=OFF
-          cmake --build build-ssmp -j 4
-
-      - name: Configure + build psmp
-        run: |
-          source tools/toolchain/install/setup
-          cmake -S . -B build-psmp -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCP2K_USE_EVERYTHING=ON \
-            -DCP2K_USE_DLAF=OFF \
-            -DCP2K_USE_PEXSI=OFF \
-            -DCP2K_USE_OPENPMD=OFF \
-            -DCP2K_USE_HDF5=OFF \
-            -DCP2K_USE_GAUXC=OFF \
-            -DCP2K_USE_DEEPMD=OFF \
-            -DCP2K_USE_LIBTORCH=OFF
-          cmake --build build-psmp -j 4
-
-      - name: Show binaries
-        run: |
-          echo "-- ssmp --"; find build-ssmp -maxdepth 3 -type f -name 'cp2k*' 2>/dev/null | head
-          echo "-- psmp --"; find build-psmp -maxdepth 3 -type f -name 'cp2k*' 2>/dev/null | head
+          ./make_cp2k.sh -cv psmp -bp "$PWD/.ci/psmp" -ip "$PWD/.ci/install-psmp" \
+            -gpu none -mpi mpich -uc no -j 4 -np 2 -df all -ef fftw3
 
       - name: Guard Gamma OT (H2O) - ssmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
-          BIN=$(find build-ssmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
+          BIN=$PWD/.ci/install-ssmp/bin/cp2k.ssmp
           (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { echo "H2O ssmp failed"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
           grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-ot-1/h2o.out || { echo "H2O ssmp did not converge"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
 
       - name: Guard Diamond K-point diag (c_3) - ssmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
-          BIN=$(find build-ssmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
+          BIN=$PWD/.ci/install-ssmp/bin/cp2k.ssmp
           (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { echo "c3 ssmp failed"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
           grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-kp-1/c3.out || { echo "c3 ssmp did not converge"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
 
       - name: Guard Gamma OT (H2O) - psmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
-          BIN=$(find build-psmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
+          BIN=$PWD/.ci/install-psmp/bin/cp2k.psmp
           (cd tests/QS/regtest-ot-1 && timeout 2400 "$BIN" H2O.inp > h2o.out 2>&1) || { echo "H2O psmp failed"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
           grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-ot-1/h2o.out || { echo "H2O psmp did not converge"; tail -80 tests/QS/regtest-ot-1/h2o.out; exit 1; }
 
       - name: Guard Diamond K-point diag (c_3) - psmp
         run: |
           export CP2K_DATA_DIR=$PWD/data
-          BIN=$(find build-psmp -maxdepth 3 -type f -name 'cp2k*' -executable | head -n1)
+          BIN=$PWD/.ci/install-psmp/bin/cp2k.psmp
           (cd tests/QS/regtest-kp-1 && timeout 3000 "$BIN" c_3.inp > c3.out 2>&1) || { echo "c3 psmp failed"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
           grep -qiE 'PROGRAM ENDED|SCF run converged' tests/QS/regtest-kp-1/c3.out || { echo "c3 psmp did not converge"; tail -80 tests/QS/regtest-kp-1/c3.out; exit 1; }
