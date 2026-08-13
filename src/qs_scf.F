@@ -899,7 +899,8 @@ CONTAINS
                IF (scf_control%smear%do_smear) THEN
                   CPABORT("OT with k-points requires no smearing (gapped systems only).")
                END IF
-               CPABORT("OT_KPOINTS dev switch set, but the complex OT core is not implemented in this branch yet.")
+               CPABORT("OT_KPOINTS dev switch set, but the complex OT core is not "// &
+                       "implemented in this branch yet.")
             END IF
          END IF
          END IF
