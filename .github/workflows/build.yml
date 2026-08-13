@@ -41,6 +41,7 @@ jobs:
             -DCP2K_USE_DLAF=OFF \
             -DCP2K_USE_PEXSI=OFF \
             -DCP2K_USE_OPENPMD=OFF \
+            -DCP2K_USE_HDF5=OFF \
             -DCP2K_USE_GAUXC=OFF \
             -DCP2K_USE_DEEPMD=OFF \
             -DCP2K_USE_LIBTORCH=OFF
@@ -55,6 +56,7 @@ jobs:
             -DCP2K_USE_DLAF=OFF \
             -DCP2K_USE_PEXSI=OFF \
             -DCP2K_USE_OPENPMD=OFF \
+            -DCP2K_USE_HDF5=OFF \
             -DCP2K_USE_GAUXC=OFF \
             -DCP2K_USE_DEEPMD=OFF \
             -DCP2K_USE_LIBTORCH=OFF
