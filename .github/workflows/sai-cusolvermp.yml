@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: SAI cuSOLVERMp (4 V100)
+
+on:
+  push:
+    branches: [feat/sai-cusolvermp-actions]
+    paths:
+      - .github/workflows/sai-cusolvermp.yml
+      - tools/regtesting/sai/**
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: Published SAI image manifest (empty selects the latest 16V100 daily image)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sai-cusolvermp
+  cancel-in-progress: false
+
+jobs:
+  regression:
+    if: github.repository == 'Stardust0831/cp2k'
+    runs-on: [self-hosted, Linux, X64, sai-cp2k-v100]
+    timeout-minutes: 60
+    env:
+      SAI_SOFTWARE_ROOT: /home/stardust/sai-cp2k-actions
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/regtesting/sai
+      - name: Fetch the pinned SAI tester
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: AI4SAI/sai-hpc-software
+          ref: f6eab22f4580968afa74dc11fe28033af7c59cf6
+          path: tester
+          sparse-checkout: controller
+          persist-credentials: false
+      - name: Run upstream regressions inside the daily SIF
+        id: test
+        env:
+          IMAGE_MANIFEST: ${{ inputs.manifest }}
+        run: python3 -u tools/regtesting/sai/run.py --controller tester/controller --manifest "$IMAGE_MANIFEST"
+      - name: Archive inputs, outputs, and execution evidence
+        if: always() && steps.test.outputs.task != ''
+        env:
+          TASK: ${{ steps.test.outputs.task }}
+        run: |
+          mkdir -p artifacts
+          cp "$TASK/results/report.txt" artifacts/report.txt
+          cp "$TASK/results/summary.md" artifacts/summary.md
+          tar --exclude=./tmp --exclude=./apptainer-runtime --exclude=./apptainer-cache \
+            -czf artifacts/raw-files.tar.gz -C "$TASK" .
+      - name: Upload the CP2K report and raw files
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sai-cusolvermp-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
