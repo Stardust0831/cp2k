@@ -1,19 +1,19 @@
 {
   "accounting": {
     "allocation": "billing=600,cpu=32,gres/gpu=4,mem=60G,node=1",
-    "elapsed": "00:02:30",
+    "elapsed": "00:03:49",
     "exit_code": "0:0",
-    "job": "2154497",
-    "nodes": "16v100n54",
+    "job": "2164000",
+    "nodes": "16v100n64",
     "state": "COMPLETED",
     "user": "stardust"
   },
-  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/41612934249",
-  "completed_at": "2026-11-03T09:43:41.462465+00:00",
+  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/41683380790",
+  "completed_at": "2026-11-03T17:25:50.512452+00:00",
   "error": null,
-  "image_sha256": "e3088619f97ec954a578860573c109f16c21e2209df0fc0724e2d503d05da653",
-  "job": "2154497",
-  "run_id": "github-41612934249-1",
+  "image_sha256": "23400665fcb68d8f0c15398b56228002a2f2595a2a41a9d5dab4f20f8cface13",
+  "job": "2164000",
+  "run_id": "github-41683380790-1",
   "server_version": {
     "controller_sha": "f6eab22f4580968afa74dc11fe28033af7c59cf6",
     "files": {
