@@ -1,0 +1,28 @@
+[Unit]
+Description=SAI CP2K GitHub Actions relay
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+WorkingDirectory=/home/cp2k/ci/runner
+ExecStart=/usr/bin/python3 /home/cp2k/ci/deployment/sandbox.py /home/cp2k/ci /home/cp2k/ci/runner/run.sh
+Environment=HOME=/home/cp2k/ci/work/home
+Environment=TMPDIR=/home/cp2k/ci/tmp
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=SAI_SSH_CONFIG=/home/cp2k/ci/ssh/config
+Environment=DOTNET_EnableDiagnostics=0
+UnsetEnvironment=SSH_AUTH_SOCK SSH_AGENT_PID DBUS_SESSION_BUS_ADDRESS LD_PRELOAD PYTHONPATH
+UMask=0077
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=~@mount @module @reboot @swap @raw-io @obsolete ptrace process_vm_readv process_vm_writev pidfd_getfd keyctl add_key request_key bpf
+SystemCallErrorNumber=EPERM
+RestrictSUIDSGID=yes
+LockPersonality=yes
+Restart=always
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

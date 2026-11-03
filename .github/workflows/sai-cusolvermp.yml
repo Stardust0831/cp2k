@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: SAI cuSOLVERMp (4 V100)
+
+on:
+  schedule:
+    # The existing SAI build starts daily at 02:23 UTC. Poll for a new accepted
+    # image without guessing its finish time; unchanged images use no GPUs.
+    - cron: '47 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Retest the latest accepted image even if already tested
+        type: boolean
+        default: false
+  push:
+    branches: [feat/sai-vps-tester]
+    paths:
+      - .github/workflows/sai-cusolvermp.yml
+      - tools/regtesting/sai/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sai-cusolvermp
+  cancel-in-progress: false
+
+jobs:
+  regression:
+    if: github.repository == 'Stardust0831/cp2k'
+    runs-on: [self-hosted, Linux, X64, sai-cp2k-vps]
+    timeout-minutes: 60
+    outputs:
+      publish: ${{ steps.test.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/regtesting/sai
+      - name: Check gateway recovery and failure reporting
+        run: python3 -m unittest discover -s tools/regtesting/sai/tests -v
+      - name: Submit or resume the fixed SAI four-GPU regression suite
+        id: test
+        env:
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          args=()
+          if [[ "$FORCE" == true ]]; then args+=(--force); fi
+          python3 -u tools/regtesting/sai/relay.py "${args[@]}"
+      - name: Preserve report and raw input/output files
+        if: always() && steps.test.outputs.publish == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sai-cusolvermp-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: regression
+    if: always() && needs.regression.outputs.publish == 'true' && github.repository == 'Stardust0831/cp2k'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: sai-cusolvermp-reports
+          path: reports
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sai-cusolvermp-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts
+      - name: Update the public dashboard report, including failures
+        env:
+          ACTION_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, os, shutil
+          latest = json.loads(Path('artifacts/latest.json').read_text())
+          previous = Path('reports/latest.json')
+          if previous.exists():
+              old = json.loads(previous.read_text())
+              if old.get('completed_at', '') > latest['completed_at']:
+                  raise SystemExit('Refusing to overwrite a newer report')
+          for name in ('report.txt', 'latest.json', 'summary.md'):
+              shutil.copyfile('artifacts/' + name, 'reports/' + name)
+          Path('reports/README.md').write_text(
+              '# SAI cuSOLVERMp tester\n\n'
+              'Four V100 GPUs, four MPI ranks and four OpenMP threads per rank. '
+              'Tests run inside the complete accepted daily CP2K Apptainer image.\n\n'
+              '[Latest report](report.txt) · [Detailed results](summary.md) · '
+              '[Latest Action](' + os.environ['ACTION_URL'] + ')\n\n'
+              'Raw inputs, outputs and provenance are retained in Action artifacts for 90 days '
+              'and on SAI. The source commit in the report identifies the tested image.\n\n'
+              'An isolated self-hosted runner on the relay VPS checks hourly for newly published '
+              'development/16V100 images. Each image is tested once unless manually requested. '
+              'SAI accepts only the fixed tester commands through a dedicated restricted SSH key.\n')
+          PY
+          cd reports
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add report.txt latest.json summary.md README.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Update SAI cuSOLVERMp report for run ${GITHUB_RUN_ID}"
+            git push origin HEAD:sai-cusolvermp-reports
+          fi
