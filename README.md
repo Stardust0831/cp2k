@@ -1,5 +1,7 @@
 # SAI cuSOLVERMp tester
 
+Computing resources are provided by [OPEN-SAI](https://www.open-sai.com/?lang=en-US) (Open Source Supercomputing Center of SAI).
+
 Four V100 GPUs, four MPI ranks and four OpenMP threads per rank. Tests run inside the complete accepted daily CP2K Apptainer image.
 
 [Latest report](report.txt) · [Detailed results](summary.md) · [Latest Action](https://github.com/Stardust0831/cp2k/actions/runs/41612934249)
