@@ -88,6 +88,8 @@ jobs:
               shutil.copyfile('artifacts/' + name, 'reports/' + name)
           Path('reports/README.md').write_text(
               '# SAI cuSOLVERMp tester\n\n'
+              'Computing resources are provided by [OPEN-SAI](https://www.open-sai.com/?lang=en-US) '
+              '(Open Source Supercomputing Center of SAI).\n\n'
               'Four V100 GPUs, four MPI ranks and four OpenMP threads per rank. '
               'Tests run inside the complete accepted daily CP2K Apptainer image.\n\n'
               '[Latest report](report.txt) · [Detailed results](summary.md) · '
