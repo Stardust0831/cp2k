@@ -6,7 +6,8 @@ accepted `development/16V100` image. An unchanged image and controller version
 allocate no GPUs; `workflow_dispatch` with `force=true` requests a retest.
 Scheduled workflows must be present on the fork's default branch.
 
-The relay runs on `DO2-cp2k`. A dedicated SSH key can invoke only `inspect`,
+The relay runs on `DO2-cp2k` and connects as the SAI service account `cp2k-ci`.
+Jobs use the `org-open-sai` Slurm account. A dedicated SSH key can invoke only `inspect`,
 `latest`, `start`, `status`, and `fetch` on SAI. The server selects the image,
 inputs, resources, and job script. The client cannot upload a script or request
 a shell. An Ubuntu Apptainer submission container exposes the Slurm clients and
@@ -53,8 +54,29 @@ Slurm project access, and a writable `~/.ssh/authorized_keys`. The relay require
 Linux Landlock ABI 4 or newer, user systemd with seccomp support, and permission
 to enable user lingering. These are checked on the actual hosts.
 
-SAI root: `/org/org-open-sai/proj-sai-hpc-software/cp2k-cusolvermp-tester`.
+SAI root: `/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester`.
 Relay root: `/home/cp2k/ci`.
+The accepted image catalog and source cache live in `delivery/` under the SAI
+root. The service account needs no access to the build project's directory.
+Historical runs remain in the previous tester directory under that project.
+
+On the existing daily producer, run `deployment/deliver-image.py` every 30
+minutes with `--source /org/org-open-sai/proj-sai-hpc-software`,
+`--destination /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery`, and
+`--controller` pointing to the pinned producer-side controller snapshot.
+Grant that producer traversal of the service home and tester root, and write
+access only to `delivery/`; inherited ACLs must let `cp2k-ci` read its contents.
+The producer receives no access to the service account's SSH keys, code, or
+test state. The helper needs no SSH credential and allocates no GPUs.
+
+The helper selects the latest accepted image, verifies its checksum, and
+delivers its exact Git revision before atomically publishing the local sidecar.
+The sidecar retains the original producer record and its hash. Immutable SIFs
+use hard links on the shared filesystem, avoiding a second copy. Only accepted
+Git revisions are fetched; no symlinks or Git alternates enter the producer tree.
+The mirror keeps earlier delivered revisions for interrupted tests. A failed
+delivery or a heartbeat older than two hours makes the tester report an
+infrastructure error. The existing multi-software build workflow is unchanged.
 
 1. On SAI, create private `code`, `state/runtime-tests`, `scratch`, and `cache`
    directories. Export the pinned repository's `controller/` to
@@ -63,16 +85,17 @@ Relay root: `/home/cp2k/ci`.
    `https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-amd64.tar.gz`.
    `deployment/build-image.py` verifies its SHA-256 and builds `ubuntu-submit.sif`
    using the matching Ubuntu 24.04 host Python/git runtime. Build scratch lives
-   in the project directory. Keep `ubuntu-submit.sif.sha256`.
+   in the tester directory. Keep `ubuntu-submit.sif.sha256`.
 3. Create `code/version.json` with the controller commit, SHA-256 of `entry.py`
    and `server.py`, and submission-image SHA-256. Update it when deploying trusted
    controller changes. The workflow never installs or changes this code.
 4. Generate a dedicated relay SSH key under `ci/ssh/`. On SAI append its public
    key with `from="RELAY_IP",restrict,command="/usr/bin/python3
-   /org/org-open-sai/proj-sai-hpc-software/cp2k-cusolvermp-tester/code/entry.py"`
+   /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/code/entry.py"`
    as one line. Preserve existing keys and a backup. Pin the already-verified
    SAI host key in `ci/ssh/known_hosts`; configure alias `sai-cp2k-tester` in
-   `ci/ssh/config` with that identity, strict host checking, and no forwarding.
+   `ci/ssh/config` with `User cp2k-ci`, that identity, strict host checking, and
+   no forwarding. Update the relay's expected UID to the verified service UID.
 5. Install the GitHub runner under `ci/runner/`, register it to this fork with
    label `sai-cp2k-vps`, and set its work directory to `ci/work/`. Registration
    uses a short-lived token; no credential belongs in the repository.

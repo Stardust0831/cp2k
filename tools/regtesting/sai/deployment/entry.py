@@ -6,8 +6,8 @@ import re
 import shlex
 import sys
 
-ROOT = Path("/org/org-open-sai/proj-sai-hpc-software/cp2k-cusolvermp-tester")
-PROJECT = ROOT.parent
+ROOT = Path("/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester")
+PROJECT = ROOT / "delivery"
 APPTAINER = "/opt/devtools/apptainer/1.4.4/bin/apptainer"
 
 
@@ -31,13 +31,14 @@ def main():
     words = parse_command(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
     # No client command is interpreted by a host shell. No SSH_ORIGINAL_COMMAND
     # or inherited loader/Python/Apptainer settings enter the container.
-    environment = dict(PATH="/usr/bin:/bin", HOME="/home/stardust", USER="stardust",
-                       LOGNAME="stardust", LANG="C.UTF-8",
+    environment = dict(PATH="/usr/bin:/bin", HOME=str(ROOT.parent), USER="cp2k-ci",
+                       LOGNAME="cp2k-ci", LANG="C.UTF-8",
                        APPTAINER_TMPDIR=str(ROOT / "scratch"),
                        APPTAINER_CACHEDIR=str(ROOT / "cache"))
     args = [APPTAINER, "exec", "--cleanenv", "--containall", "--no-home",
             "--no-mount", "bind-paths,home,cwd,tmp,hostfs"]
     paths = [(str(ROOT / "code"), "ro"), (str(ROOT / "state"), "rw"),
+             (str(PROJECT / "sync.json"), "ro"),
              (str(PROJECT / "containers/software/cp2k/development"), "ro"),
              (str(PROJECT / "cache/repositories/cp2k"), "ro"),
              ("/etc/slurm", "ro"), ("/etc/hosts", "ro"), ("/run/munge", "ro"),

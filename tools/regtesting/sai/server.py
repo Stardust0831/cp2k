@@ -13,8 +13,10 @@ import subprocess
 import sys
 import tarfile
 
-ROOT = Path("/org/org-open-sai/proj-sai-hpc-software/cp2k-cusolvermp-tester")
-PROJECT = ROOT.parent
+ROOT = Path("/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester")
+PROJECT = ROOT / "delivery"
+SAI_USER = "cp2k-ci"
+SLURM_ACCOUNT = "org-open-sai"
 STATE = ROOT / "state"
 CONTROL = ROOT / "code/controller"
 ACTIVE = {"PENDING", "RUNNING", "COMPLETING", "CONFIGURING", "SUSPENDED", "REQUEUED"}
@@ -52,6 +54,10 @@ def task_dir(run_id):
 
 
 def latest():
+    sync = json.loads((PROJECT / "sync.json").read_text())
+    age = (datetime.now(timezone.utc) - datetime.fromisoformat(sync["checked_at"])).total_seconds()
+    if sync["status"] != "OK" or not 0 <= age <= 2 * 3600:
+        raise ValueError("daily image delivery failed or is stale: " + str(sync))
     _, path, item = records()[-1]
     return dict(source_sha=item["identity"]["source_sha"], image_sha256=item["sha256"],
                 manifest=str(path), server_version=json.loads((ROOT / "code/version.json").read_text()))
@@ -74,7 +80,7 @@ def describe(task):
             return finalize(task, request, initial_error="Setup interrupted before Slurm submission")
         # sbatch is held until its ID is durable. Recover a lost SSH response
         # by the fixed job name and comment; never guess or submit another job.
-        queued = capture("squeue", "-h", "-u", "stardust", "-o", "%i|%j|%k")
+        queued = capture("squeue", "-h", "-u", SAI_USER, "-o", "%i|%j|%k")
         matches = [row.split("|")[0] for row in queued.splitlines()
                    if row.split("|")[1:] == ["cp2k-cusolvermp-" + task.name, task.name]]
         if len(matches) != 1 or not matches[0].isdigit():
@@ -93,13 +99,13 @@ def describe(task):
             return dict(record, job=job, state="RELEASED", terminal=False)
         return dict(record, job=job, state=queued.split("|", 1)[0], detail=queued, terminal=False)
     rows = capture("sacct", "-X", "-nP", "-j", job, "-o",
-                   "JobIDRaw,State,ExitCode,Elapsed,NodeList,User,AllocTRES")
+                   "JobIDRaw,State,ExitCode,Elapsed,NodeList,User,Account,AllocTRES")
     rows = [line.split("|") for line in rows.splitlines() if line.split("|")[0] == job]
     if not rows or rows[0][1] in ACTIVE:
         return dict(record, job=job, state="ACCOUNTING_PENDING", terminal=False)
     if len(rows) != 1:
         raise ValueError("ambiguous Slurm accounting")
-    accounting = dict(zip(("job", "state", "exit_code", "elapsed", "nodes", "user", "allocation"), rows[0]))
+    accounting = dict(zip(("job", "state", "exit_code", "elapsed", "nodes", "user", "account", "allocation"), rows[0]))
     write(task / "results/accounting.json", accounting)
     return finalize(task, request, accounting)
 
@@ -114,13 +120,15 @@ def finalize(task, request, accounting=None, initial_error=None):
     error, evidence = initial_error, None
     if error is None:
         try:
-            if (accounting["state"], accounting["exit_code"], accounting["user"]) != ("COMPLETED", "0:0", "stardust"):
-                raise ValueError(f"Slurm {accounting['state']}, exit {accounting['exit_code']}")
+            if (accounting["state"], accounting["exit_code"], accounting["user"], accounting["account"]) != (
+                    "COMPLETED", "0:0", SAI_USER, SLURM_ACCOUNT):
+                raise ValueError(f"Slurm {accounting['state']}, exit {accounting['exit_code']}, "
+                                 f"user {accounting['user']}, account {accounting['account']}")
             if "CP2K_CUSOLVERMP_REGTEST_FINISHED" not in (task / f"results/slurm-{accounting['job']}.log").read_text():
                 raise ValueError("container completion marker missing")
             allocation = dict(re.findall(r"(?:^|\s)([A-Za-z][A-Za-z0-9/]*)=([^\s]+)",
                                          (task / "results/allocation.txt").read_text()))
-            expected = dict(JobId=accounting["job"], Partition="16V100", NumNodes="1",
+            expected = dict(JobId=accounting["job"], Account=SLURM_ACCOUNT, Partition="16V100", NumNodes="1",
                             NumTasks="16", TresPerNode="gres/gpu:4")
             if any(allocation.get(k) != v for k, v in expected.items()):
                 raise ValueError("allocation differs from the four-GPU request")
@@ -219,7 +227,7 @@ def start(run_id, image_sha, workflow_sha, mode):
         write(task / "request.json", request)
         (task / "submission.started").write_text(datetime.now(timezone.utc).isoformat() + "\n")
         try:
-            job = capture("sbatch", "--hold", "--parsable", "--account=proj-sai-hpc-software",
+            job = capture("sbatch", "--hold", "--parsable", "--account=" + SLURM_ACCOUNT,
                           "--comment=" + run_id, "--chdir=" + str(task), str(script)).split(";")[0]
         except subprocess.CalledProcessError as exc:
             (task / "results/submission-error.txt").write_text(exc.stderr or str(exc))
@@ -263,7 +271,7 @@ def fetch(run_id):
 def main(argv):
     if argv == ["inspect"]:
         return dict(uid=os.getuid(), container=os.environ.get("APPTAINER_CONTAINER"),
-                    home_ssh_visible=Path("/home/stardust/.ssh").exists(),
+                    home_ssh_visible=Path("/org/org-open-sai/cp2k-ci/.ssh").exists(),
                     code_writable=os.access(ROOT / "code", os.W_OK),
                     slurm=capture("sbatch", "--version"), state_root=str(STATE),
                     server_version=json.loads((ROOT / "code/version.json").read_text()))

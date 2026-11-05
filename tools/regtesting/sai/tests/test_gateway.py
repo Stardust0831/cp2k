@@ -55,8 +55,9 @@ class GatewayTests(unittest.TestCase):
         (self.task / "submission.started").touch()
         replies = ["987|other-job|github-123-1\n456|cp2k-cusolvermp-github-123-1|github-123-1",
                    "PENDING|JobHeldUser"]
-        with patch.object(server, "capture", side_effect=replies), patch.object(server.subprocess, "run") as run:
+        with patch.object(server, "capture", side_effect=replies) as capture, patch.object(server.subprocess, "run") as run:
             result = server.describe(self.task)
+        self.assertEqual(capture.call_args_list[0].args, ("squeue", "-h", "-u", "cp2k-ci", "-o", "%i|%j|%k"))
         self.assertEqual(result["job"], "456")
         self.assertEqual(result["state"], "RELEASED")
         self.assertEqual((self.task / "job.id").read_text(), "456\n")
@@ -82,10 +83,21 @@ class GatewayTests(unittest.TestCase):
         suite = types.SimpleNamespace(write_report=report)
         with patch.dict(sys.modules, cp2k_regtest_suite=suite):
             result = server.finalize(self.task, self.request, dict(job="456", state="FAILED",
-                exit_code="1:0", user="stardust", elapsed="00:01:00", nodes="node"))
+                exit_code="1:0", user="cp2k-ci", account="org-open-sai", elapsed="00:01:00", nodes="node"))
         self.assertEqual(result["status"], "FAILED")
         self.assertEqual(json.loads((self.task / "results/final.json").read_text()), result)
         self.assertEqual(json.loads((self.root / "state/completed" / ("b" * 64 + ".json")).read_text()), result)
+
+    def test_completed_job_from_wrong_user_or_account_is_rejected(self):
+        def report(task, request, error):
+            (task / "results/report.txt").write_text("Status: FAILED\n")
+        suite = types.SimpleNamespace(write_report=report)
+        for user, account in (("stardust", "org-open-sai"), ("cp2k-ci", "private-cp2k-ci")):
+            with self.subTest(user=user, account=account), patch.dict(sys.modules, cp2k_regtest_suite=suite):
+                result = server.finalize(self.task, self.request, dict(job="456", state="COMPLETED",
+                    exit_code="0:0", user=user, account=account, elapsed="00:01:00", nodes="node"))
+                self.assertEqual(result["status"], "FAILED")
+                self.assertIn(f"user {user}, account {account}", result["error"])
 
     def test_same_image_skips_without_allocating(self):
         previous = dict(self.request, status="OK", terminal=True, run_id=self.task.name)
@@ -106,7 +118,7 @@ class GatewayTests(unittest.TestCase):
         os.chdir(self.root)
         environment = dict(GITHUB_RUN_ID="124", GITHUB_RUN_ATTEMPT="1", GITHUB_SHA="a" * 40,
                            GITHUB_SERVER_URL="https://github.com", GITHUB_REPOSITORY="Stardust0831/cp2k")
-        inspect = dict(uid=1478400690, container="ubuntu-submit.sif", home_ssh_visible=False, code_writable=False)
+        inspect = dict(uid=1478400824, container="ubuntu-submit.sif", home_ssh_visible=False, code_writable=False)
         latest = dict(source_sha="d" * 40, image_sha256="b" * 64)
         with patch.dict(os.environ, environment, clear=True), patch.object(sys, "argv", ["relay.py"]), \
                 patch.object(relay, "remote", side_effect=[inspect, latest, RuntimeError("SSH unavailable")]), \
@@ -116,6 +128,21 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(final["status"], "UNKNOWN")
         self.assertEqual(final["source_sha"], latest["source_sha"])
         self.assertIn("Status: UNKNOWN", Path("artifacts/report.txt").read_text())
+
+    def test_relay_rejects_previous_personal_account_before_submission(self):
+        previous_cwd = Path.cwd()
+        self.addCleanup(os.chdir, previous_cwd)
+        os.chdir(self.root)
+        environment = dict(GITHUB_RUN_ID="124", GITHUB_RUN_ATTEMPT="1", GITHUB_SHA="a" * 40,
+                           GITHUB_SERVER_URL="https://github.com", GITHUB_REPOSITORY="Stardust0831/cp2k")
+        inspect = dict(uid=1478400690, container="ubuntu-submit.sif", home_ssh_visible=False, code_writable=False)
+        with patch.dict(os.environ, environment, clear=True), patch.object(sys, "argv", ["relay.py"]), \
+                patch.object(relay, "remote", return_value=inspect) as remote, patch("builtins.print"):
+            self.assertEqual(relay.main(), 1)
+        remote.assert_called_once_with("inspect")
+        final = json.loads(Path("artifacts/latest.json").read_text())
+        self.assertEqual(final["status"], "UNKNOWN")
+        self.assertIn("isolation check failed", final["error"])
 
 
 if __name__ == "__main__":

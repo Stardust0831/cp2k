@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tarfile
 
-ROOT = Path("/org/org-open-sai/proj-sai-hpc-software/cp2k-cusolvermp-tester")
+ROOT = Path("/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester")
 BASE_SHA = "e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86"
 
 
@@ -22,7 +22,7 @@ def main():
         handle.extractall(filesystem, filter="tar")
     for name in ("passwd", "group"):
         with (filesystem / "etc" / name).open("a") as stream:
-            for account in ("stardust", "slurm", "munge"):
+            for account in ("cp2k-ci", "slurm", "munge"):
                 stream.write(subprocess.check_output(["getent", name, account], text=True))
     shutil.copytree("/usr/lib/python3.12", filesystem / "usr/lib/python3.12",
                     ignore=shutil.ignore_patterns("__pycache__"))

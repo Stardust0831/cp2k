@@ -38,7 +38,7 @@ def main():
     latest = None
     try:
         inspect = remote("inspect")
-        if inspect["uid"] != 1478400690 or not inspect["container"] or inspect["home_ssh_visible"] or inspect["code_writable"]:
+        if inspect["uid"] != 1478400824 or not inspect["container"] or inspect["home_ssh_visible"] or inspect["code_writable"]:
             raise ValueError("SAI submission container isolation check failed")
         (destination / "submission-container.json").write_text(json.dumps(inspect, indent=2) + "\n")
         latest = remote("latest")
