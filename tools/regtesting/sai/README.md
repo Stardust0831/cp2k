@@ -60,10 +60,12 @@ The accepted image catalog and source cache live in `delivery/` under the SAI
 root. The service account needs no access to the build project's directory.
 Historical runs remain in the previous tester directory under that project.
 
-On the existing daily producer, run `deployment/deliver-image.py` every 30
-minutes with `--source /org/org-open-sai/proj-sai-hpc-software`,
-`--destination /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery`, and
-`--controller` pointing to the pinned producer-side controller snapshot.
+On the existing daily producer, install `deployment/deliver-image.py` in the
+old tester's `delivery-service/` directory. Install the supplied
+`sai-cp2k-image-delivery.service` and `.timer` in `~/.config/systemd/user/`,
+enable user lingering, then enable the timer with `systemctl --user enable
+--now sai-cp2k-image-delivery.timer`. It runs once at activation and then every
+30 minutes, using the pinned producer-side controller snapshot.
 Grant that producer traversal of the service home and tester root, and write
 access only to `delivery/`; inherited ACLs must let `cp2k-ci` read its contents.
 The producer receives no access to the service account's SSH keys, code, or

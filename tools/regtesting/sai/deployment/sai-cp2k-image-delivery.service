@@ -1,0 +1,11 @@
+[Unit]
+Description=Deliver accepted CP2K images to the SAI tester account
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /org/org-open-sai/proj-sai-hpc-software/cp2k-cusolvermp-tester/delivery-service/deliver-image.py \
+    --source /org/org-open-sai/proj-sai-hpc-software \
+    --destination /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery \
+    --controller /org/org-open-sai/proj-sai-hpc-software/cp2k-cusolvermp-tester/code/controller
+TimeoutStartSec=10min
+UMask=0077
