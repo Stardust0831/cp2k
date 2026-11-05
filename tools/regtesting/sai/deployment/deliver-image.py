@@ -51,7 +51,7 @@ def deliver(source, destination):
         repository.parent.mkdir(parents=True, exist_ok=True)
         # Fetch only accepted revisions. New files inherit the delivery ACL;
         # no producer object permissions or external alternates are retained.
-        subprocess.run(["git", "init", "--bare", "--shared=group", str(repository)], check=True,
+        subprocess.run(["git", "init", "--bare", str(repository)], check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     revision = record["identity"]["source_sha"]
     subprocess.run(["git", "--git-dir=" + str(repository), "fetch", "--depth=1", "--no-tags",

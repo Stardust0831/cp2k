@@ -77,8 +77,9 @@ class DeliveryTests(unittest.TestCase):
     def test_missing_source_does_not_publish_sidecar(self):
         self.record["identity"]["source_sha"] = "0" * 40
         self.image.with_suffix(".json").write_text(json.dumps(self.record))
-        with self.assertRaises(subprocess.CalledProcessError):
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
             delivery.deliver(self.source, self.destination)
+        self.assertIn("fetch", failure.exception.cmd)
         self.assertEqual(list(self.destination.glob("containers/**/*.json")), [])
 
     def test_failed_or_stale_delivery_cannot_reuse_old_success(self):
