@@ -71,9 +71,9 @@ test state. The helper needs no SSH credential and allocates no GPUs.
 
 The helper selects the latest accepted image, verifies its checksum, and
 delivers its exact Git revision before atomically publishing the local sidecar.
-The sidecar retains the original producer record and its hash. Immutable SIFs
-use hard links on the shared filesystem, avoiding a second copy. Only accepted
-Git revisions are fetched; no symlinks or Git alternates enter the producer tree.
+The sidecar retains the original producer record and its hash. SIF bytes are
+copied into the service home with its inherited permissions. Only accepted Git
+revisions are fetched; no symlinks or Git alternates enter the producer tree.
 The mirror keeps earlier delivered revisions for interrupted tests. A failed
 delivery or a heartbeat older than two hours makes the tester report an
 infrastructure error. The existing multi-software build workflow is unchanged.

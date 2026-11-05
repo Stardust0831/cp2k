@@ -3,11 +3,9 @@
 """Run on the daily producer: deliver accepted images into the tester's home."""
 import argparse
 from datetime import datetime, timezone
-import errno
 import fcntl
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -67,13 +65,10 @@ def deliver(source, destination):
     if not delivered_image.exists():
         temporary = delivered_image.with_suffix(".partial")
         temporary.unlink(missing_ok=True)
-        try:
-            os.link(image, temporary)
-        except OSError as exc:
-            if exc.errno != errno.EXDEV:
-                raise
-            shutil.copyfile(image, temporary)
-            temporary.chmod(0o444)
+        # Copy bytes, not the producer's named-user ACLs. The new file inherits
+        # the service-home delivery permissions, independently of the source.
+        shutil.copyfile(image, temporary)
+        temporary.chmod(0o444)
         if checksum(temporary) != record["sha256"]:
             raise ValueError("delivered image checksum differs")
         temporary.replace(delivered_image)
