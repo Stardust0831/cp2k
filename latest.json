@@ -1,28 +1,8 @@
 {
-  "accounting": {
-    "allocation": "billing=600,cpu=32,gres/gpu=4,mem=60G,node=1",
-    "elapsed": "00:02:28",
-    "exit_code": "0:0",
-    "job": "2200483",
-    "nodes": "16v100n35",
-    "state": "COMPLETED",
-    "user": "stardust"
-  },
-  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/41885067398",
-  "completed_at": "2026-11-04T18:17:06.915252+00:00",
-  "error": null,
-  "image_sha256": "5a2da41de00733a120acfd7efe462c34f77914344fd7743ac2c99d9130517fde",
-  "job": "2200483",
-  "run_id": "github-41885067398-1",
-  "server_version": {
-    "controller_sha": "f6eab22f4580968afa74dc11fe28033af7c59cf6",
-    "files": {
-      "entry.py": "3e0440e59b6827486f23640ed2dd66ee0ff15de4d3875b956696554a6f0f015c",
-      "server.py": "067d5f751ed8dad390a63a72a7089071722fa6ff42cc716565baf4228efcc4ce"
-    },
-    "submission_image_sha256": "f96791c34ea341d6306407f55e3e46043c79e4a16c18d00de45961d4af92fa65"
-  },
+  "status": "UNKNOWN",
   "source_sha": "4bb5b030a2c4bdd3d145285b316344db21840987",
-  "status": "OK",
-  "terminal": true
+  "run_id": "github-41951312675-1",
+  "completed_at": "2026-11-05T01:51:52.802315+00:00",
+  "error": "SAI tester: [Errno 13] Permission denied: '/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery/containers/software/cp2k/development/master-2026-11-04-g4bb5b030a2c4-rfb8fb5cab7d4/16V100/41807041729-1-development-16v100-avx2-2026-11-04-4bb5b030a2c4.sif'",
+  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/41951312675"
 }
