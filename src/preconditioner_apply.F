@@ -44,8 +44,8 @@ MODULE preconditioner_apply
         ot_low_rank_base_lattice_fft, ot_low_rank_base_overlap, ot_precond_fermi_low_rank, &
         ot_precond_full_all, ot_precond_full_all_covariant, ot_precond_full_kinetic, &
         ot_precond_full_single, ot_precond_full_single_inverse, ot_precond_s_inverse, &
-        ot_precond_solver_chebyshev, ot_precond_solver_direct, ot_precond_solver_inv_chol, &
-        ot_precond_solver_update
+        ot_precond_solver_chebyshev, ot_precond_solver_cudss, ot_precond_solver_direct, &
+        ot_precond_solver_inv_chol, ot_precond_solver_update
    USE kinds,                           ONLY: dp
    USE lattice_preconditioner_operator, ONLY: apply_lattice_inverse_dense,&
                                               apply_lattice_state_inverse_dense
@@ -55,6 +55,7 @@ MODULE preconditioner_apply
    USE mathconstants,                   ONLY: z_one,&
                                               z_zero
    USE parallel_gemm_api,               ONLY: parallel_gemm
+   USE preconditioner_cudss,            ONLY: cudss_preconditioner_apply
    USE preconditioner_types,            ONLY: lattice_rhs_distribution_type,&
                                               preconditioner_p_type,&
                                               preconditioner_type,&
@@ -298,6 +299,8 @@ CONTAINS
                CALL apply_full_single(preconditioner_env, matrix_in, matrix_out)
             CASE (ot_precond_solver_direct)
                CALL apply_full_direct(preconditioner_env, matrix_in, matrix_out)
+            CASE (ot_precond_solver_cudss)
+               CALL cudss_preconditioner_apply(preconditioner_env%cudss, matrix_in, matrix_out)
             CASE (ot_precond_solver_chebyshev)
                CALL apply_chebyshev_fm(preconditioner_env, matrix_in, matrix_out)
             CASE DEFAULT
@@ -350,6 +353,8 @@ CONTAINS
             CASE (ot_precond_solver_direct)
                CPABORT("Apply_full_direct not supported with ot")
                !CALL apply_full_direct(preconditioner_env, matrix_in, matrix_out)
+            CASE (ot_precond_solver_cudss)
+               CALL cudss_preconditioner_apply(preconditioner_env%cudss, matrix_in, matrix_out)
             CASE (ot_precond_solver_chebyshev)
                CALL apply_chebyshev_dbcsr(preconditioner_env, matrix_in, matrix_out)
             CASE DEFAULT

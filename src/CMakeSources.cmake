@@ -508,6 +508,7 @@ list(
   population_analyses.F
   lattice_preconditioner_operator.F
   low_rank_preconditioner_model.F
+  preconditioner_cudss.F
   preconditioner_apply.F
   preconditioner.F
   preconditioner_makes.F
@@ -1132,7 +1133,7 @@ list(
   fm/cp_fm_struct.F
   fm/cp_linked_list_fm.F)
 
-list(APPEND CP2K_SRCS_C fm/cp_fm_cusolver.c)
+list(APPEND CP2K_SRCS_C fm/cp_fm_cusolver.c preconditioner_cudss.c)
 
 list(APPEND CP2K_SRCS_F fm/cp_dlaf_utils_api.F fm/cp_fm_dlaf_api.F
      fm/cp_cfm_dlaf_api.F)

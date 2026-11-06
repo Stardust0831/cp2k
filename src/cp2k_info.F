@@ -317,6 +317,9 @@ CONTAINS
 #if defined(__SPLA) && defined(__OFFLOAD_GEMM)
       flags = TRIM(flags)//" spla_gemm_offloading"
 #endif
+#if defined(__CUDSS)
+      flags = TRIM(flags)//" cudss"
+#endif
 #if defined(__CUSOLVERMP)
       flags = TRIM(flags)//" cusolvermp"
 #endif

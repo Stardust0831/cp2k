@@ -39,6 +39,7 @@ MODULE preconditioner_solvers
                                               cp_fm_type
    USE input_constants,                 ONLY: ot_precond_full_kinetic,&
                                               ot_precond_solver_chebyshev,&
+                                              ot_precond_solver_cudss,&
                                               ot_precond_solver_default,&
                                               ot_precond_solver_direct,&
                                               ot_precond_solver_inv_chol,&
@@ -46,6 +47,7 @@ MODULE preconditioner_solvers
    USE iterate_matrix,                  ONLY: invert_Hotelling
    USE kinds,                           ONLY: dp
    USE message_passing,                 ONLY: mp_para_env_type
+   USE preconditioner_cudss,            ONLY: cudss_preconditioner_create
    USE preconditioner_types,            ONLY: preconditioner_type
 #include "./base/base_uses.f90"
 
@@ -109,6 +111,13 @@ CONTAINS
             preconditioner_env%solver = ot_precond_solver_update
             CALL make_inverse_update(preconditioner_env, matrix_h)
          END IF
+      CASE (ot_precond_solver_cudss)
+         IF (preconditioner_env%in_use /= ot_precond_full_kinetic) THEN
+            CPABORT("PRECOND_SOLVER CUDSS requires PRECONDITIONER FULL_KINETIC")
+         END IF
+         CALL cudss_preconditioner_create(preconditioner_env%cudss, preconditioner_env%sparse_matrix, &
+                                          preconditioner_env%para_env)
+         preconditioner_env%solver = ot_precond_solver_cudss
       CASE (ot_precond_solver_chebyshev)
          IF (preconditioner_env%in_use /= ot_precond_full_kinetic) THEN
             CPABORT("PRECOND_SOLVER CHEBYSHEV currently requires PRECONDITIONER FULL_KINETIC")

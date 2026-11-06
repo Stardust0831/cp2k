@@ -60,8 +60,8 @@ MODULE preconditioner
         ot_low_rank_base_lattice_fft, ot_low_rank_base_overlap, ot_precond_fermi_low_rank, &
         ot_precond_full_all, ot_precond_full_all_covariant, ot_precond_full_kinetic, &
         ot_precond_full_single, ot_precond_full_single_inverse, ot_precond_none, &
-        ot_precond_s_inverse, ot_precond_solver_default, ot_precond_solver_inv_chol, &
-        ot_precond_solver_update
+        ot_precond_s_inverse, ot_precond_solver_cudss, ot_precond_solver_default, &
+        ot_precond_solver_inv_chol, ot_precond_solver_update
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
@@ -867,6 +867,10 @@ CONTAINS
          CALL cp_fm_release(mo_occ)
       END IF
 
+      IF (my_solver_type == ot_precond_solver_cudss .AND. &
+          preconditioner_env%lattice_fft_mode /= ot_lattice_fft_off) THEN
+         CPABORT("PRECOND_SOLVER CUDSS requires LATTICE_FFT OFF")
+      END IF
       IF (preconditioner_env%lattice_fft_mode /= ot_lattice_fft_off) THEN
          SELECT CASE (precon_type)
          CASE (ot_precond_full_kinetic)
@@ -932,7 +936,8 @@ CONTAINS
       ! Here comes more matrix mess, make sure to output the correct matrix format,
       ! A bit pointless to convert the cholesky factorized version as it doesn't work in
       ! dbcsr form and will crash later,...
-      IF (.NOT. preconditioner_env%lattice_fft_active) THEN
+      IF (.NOT. preconditioner_env%lattice_fft_active .AND. &
+          preconditioner_env%solver /= ot_precond_solver_cudss) THEN
          IF (my_convert_precond_to_dbcsr) THEN
             CALL transfer_fm_to_dbcsr(preconditioner_env%fm, preconditioner_env%dbcsr_matrix, matrix_h)
             IF (precon_type == ot_precond_fermi_low_rank .AND. &

@@ -118,6 +118,9 @@ if(CP2K_USE_CUDA)
         $<$<BOOL:${CP2K_USE_CUSOLVER_MP}>:cp2k::CUSOLVER_MP::cusolver_mp>
         CUDA::cufft CUDA::cufftw CUDA::cublas CUDA::cudart CUDA::cuda_driver)
   endif()
+  if(CP2K_USE_CUDSS)
+    target_link_libraries(cp2k_cuda_libs INTERFACE cp2k::CuDSS)
+  endif()
   if(CP2K_WITH_GPU_PROFILING)
     target_link_libraries(cp2k_cuda_libs INTERFACE CUDA::nvtx3)
   endif()
@@ -387,6 +390,7 @@ target_compile_definitions(
     $<$<BOOL:${CP2K_USE_MIMIC}>:__MIMIC>
     $<$<STREQUAL:"${CP2K_BLAS_VENDOR}","MKL">:__MKL>
     $<$<STREQUAL:"${CP2K_BLAS_VENDOR}","Apple">:__ACCELERATE>
+    $<$<BOOL:${CP2K_USE_CUDSS}>:__CUDSS>
     $<$<BOOL:${CP2K_USE_CUSOLVER_MP}>:__CUSOLVERMP>
     $<$<BOOL:${CP2K_CUSOLVERMP_USE_NCCL}>:__CUSOLVERMP_NCCL>
     $<$<AND:$<STREQUAL:"${CP2K_BLAS_VENDOR}","OpenBLAS">,$<STREQUAL:"${CP2K_BLAS_INTERFACE}","32bits">>:__OPENBLAS>

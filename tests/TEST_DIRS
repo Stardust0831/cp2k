@@ -9,6 +9,7 @@ QS/regtest-libgint                                          libGint libint offlo
 MIMIC/regtest-qmmm                                          mimic mpiranks==4
 TMC/regtest_ana_on_the_fly                                  parallel mpiranks>2
 QS/regtest-cusolver                                         cusolvermp
+QS/regtest-cudss                                            cudss
 QS/regtest-dlaf                                             dlaf spglib
 QS/regtest-dlaf-2                                           dlaf libint !ifx
 QS/regtest-openpmd                                          openpmd

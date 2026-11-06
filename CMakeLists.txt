@@ -215,6 +215,10 @@ cmake_dependent_option(
   CP2K_USE_CUSOLVER_MP "Enable cuSOLVERMp. Only active when CUDA is ON" OFF
   "CP2K_USE_ACCEL MATCHES \"CUDA\"" OFF)
 
+cmake_dependent_option(
+  CP2K_USE_CUDSS "Enable the experimental cuDSS OT preconditioner" OFF
+  "CP2K_USE_ACCEL MATCHES \"CUDA\";CP2K_USE_MPI" OFF)
+
 cmake_dependent_option(CP2K_USE_NVHPC "Enable Nvidia NVHPC kit" OFF
                        "CP2K_USE_ACCEL MATCHES \"CUDA\"" OFF)
 
@@ -581,6 +585,10 @@ if(CP2K_USE_ACCEL MATCHES "CUDA")
 
   if(CP2K_USE_CUSOLVER_MP)
     find_package(CuSolverMP REQUIRED)
+  endif()
+
+  if(CP2K_USE_CUDSS)
+    find_package(CuDSS REQUIRED)
   endif()
 
   message(STATUS "CUDA compiler and libraries found")

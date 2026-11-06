@@ -43,8 +43,8 @@ MODULE qs_ot_types
         ot_precond_fermi_low_rank, ot_precond_full_all, ot_precond_full_all_covariant, &
         ot_precond_full_kinetic, ot_precond_full_single, ot_precond_full_single_inverse, &
         ot_precond_none, ot_precond_s_inverse, ot_precond_solver_chebyshev, &
-        ot_precond_solver_default, ot_precond_solver_direct, ot_precond_solver_inv_chol, &
-        ot_precond_solver_update
+        ot_precond_solver_cudss, ot_precond_solver_default, ot_precond_solver_direct, &
+        ot_precond_solver_inv_chol, ot_precond_solver_update
    USE input_section_types,             ONLY: section_vals_type,&
                                               section_vals_val_get
    USE kinds,                           ONLY: dp
@@ -1756,6 +1756,8 @@ CONTAINS
          settings%precond_solver_name = "INVERSE_UPDATE"
       CASE (ot_precond_solver_chebyshev)
          settings%precond_solver_name = "CHEBYSHEV"
+      CASE (ot_precond_solver_cudss)
+         settings%precond_solver_name = "CUDSS"
       CASE DEFAULT
          CPABORT("READ OTSCF SOLVER: Value unknown")
       END SELECT

@@ -450,3 +450,15 @@ libGint - A library for the calculation of the Hartree Fock exchange on GPUs
 - &FORCE_EVAL &DFT &XC &HF HFX_LIBRARY libGint
 - &FORCE_EVAL &DFT &XC &HF &MEMORY MAX_MEMORY X
 - pass `-DCP2K_USE_LIBGINT=ON` to CMake.
+
+## cuDSS (optional, experimental OT preconditioner)
+
+Build with `-DCP2K_USE_CUDSS=ON -DCP2K_CUDSS_ROOT=<prefix>` to enable `PRECOND_SOLVER CUDSS` for
+real `PRECONDITIONER FULL_KINETIC` calculations. This experimental backend requires CUDA, MPI and
+cuDSS 1.0 or newer. It retains a sparse Cholesky factorization and applies it to batches of orbital
+gradients without forming an inverse. The current prototype gathers the sparse operator on rank zero
+and redistributes right-hand-side batches; cuDSS performs the factorization and solves across the
+MPI communicator. Multi-rank runs require one GPU per rank and a matching CUDA-aware MPI
+communication layer; the default is `libcudss_commlayer_openmpi.so.1`, overridable with
+`CUDSS_COMM_LIB` (both communicators must accept `MPI_Comm`). Use `LATTICE_FFT OFF`. Complex k-point
+preconditioners are not supported by this backend.

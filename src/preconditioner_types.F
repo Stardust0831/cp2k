@@ -29,6 +29,8 @@ MODULE preconditioner_types
    USE kinds,                           ONLY: dp
    USE message_passing,                 ONLY: mp_para_env_release,&
                                               mp_para_env_type
+   USE preconditioner_cudss,            ONLY: cudss_preconditioner_release,&
+                                              cudss_preconditioner_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -58,6 +60,7 @@ MODULE preconditioner_types
 
 ! **************************************************************************************************
    TYPE preconditioner_type
+      TYPE(cudss_preconditioner_type) :: cudss
 !    PRIVATE
       TYPE(dbcsr_type), POINTER :: sparse_matrix => NULL()
       TYPE(cp_fm_type), POINTER :: fm => NULL()
@@ -198,6 +201,7 @@ CONTAINS
       INTEGER                                            :: handle, i
 
       CALL timeset(routineN, handle)
+      CALL cudss_preconditioner_release(preconditioner_env%cudss)
 
       IF (ASSOCIATED(preconditioner_env%sparse_matrix)) THEN
          CALL dbcsr_deallocate_matrix(preconditioner_env%sparse_matrix)
