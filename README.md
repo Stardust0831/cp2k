@@ -52,5 +52,3 @@ Acceptance limits: lifecycle delta E <= 1e-8 Ha and maximum force-component delt
 ## Additional full-spectrum fixture selection
 
 Initial baseline-only attempts exposed two harness startup issues (MPI thread level and a parent directory), followed by orthogonality sensitivity in the additional full-spectrum DZVP-GTH Si8 fixture. The records were retained. A separate baseline diagnostic measured the Gamma overlap condition number as 4.894e6 for DZVP-GTH and 7.651e2 for DZVP-MOLOPT-SR-GTH; the latter keeps the same 104 basis functions and passed real and complex full-spectrum solves without warnings. Only the two added full-spectrum fixtures use MOLOPT-SR. The final 1e-12/no-warning criterion was retained; original upstream regressions and the two large benchmark inputs were not changed.
-
-AI-assisted implementation, review and validation; these fork drafts are prepared for human review.
