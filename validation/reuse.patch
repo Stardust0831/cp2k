@@ -1,0 +1,523 @@
+diff --git a/src/fm/cp_blacs_env.F b/src/fm/cp_blacs_env.F
+index 780f909..d71b9fb 100644
+--- a/src/fm/cp_blacs_env.F
++++ b/src/fm/cp_blacs_env.F
+@@ -13,6 +13,8 @@
+ !> \author Fawzi Mohamed
+ ! **************************************************************************************************
+ MODULE cp_blacs_env
++   USE ISO_C_BINDING,                   ONLY: C_NULL_PTR,&
++                                              C_PTR
+    USE cp_array_utils,                  ONLY: cp_2d_i_write
+    USE cp_blacs_types,                  ONLY: cp_blacs_type
+    USE kinds,                           ONLY: dp
+@@ -56,6 +58,7 @@ MODULE cp_blacs_env
+       INTEGER, DIMENSION(:, :), POINTER :: blacs2mpi => NULL()
+       INTEGER, DIMENSION(:, :), POINTER :: mpi2blacs => NULL()
+       LOGICAL :: repeatable = .FALSE.
++      TYPE(C_PTR) :: cusolver_context = C_NULL_PTR
+    CONTAINS
+       PROCEDURE, PUBLIC, PASS, NON_OVERRIDABLE :: create => cp_blacs_env_create_low
+       PROCEDURE, PUBLIC, PASS, NON_OVERRIDABLE :: retain => cp_blacs_env_retain
+@@ -64,6 +67,15 @@ MODULE cp_blacs_env
+       PROCEDURE, PUBLIC, PASS, NON_OVERRIDABLE :: write => cp_blacs_env_write
+    END TYPE cp_blacs_env_type
+ 
++#if defined(__CUSOLVERMP)
++   INTERFACE
++      SUBROUTINE cp_fm_cusolver_context_destroy(context) BIND(C)
++         IMPORT :: C_PTR
++         TYPE(C_PTR), INTENT(INOUT) :: context
++      END SUBROUTINE cp_fm_cusolver_context_destroy
++   END INTERFACE
++#endif
++
+ !***
+ CONTAINS
+ 
+@@ -294,6 +306,10 @@ CONTAINS
+    SUBROUTINE cp_blacs_env_release_low(blacs_env)
+       CLASS(cp_blacs_env_type), INTENT(INOUT)                   :: blacs_env
+ 
++#if defined(__CUSOLVERMP)
++      CALL cp_fm_cusolver_context_destroy(blacs_env%cusolver_context)
++#endif
++
+       CALL blacs_env%gridexit()
+       CALL mp_para_env_release(blacs_env%para_env)
+       DEALLOCATE (blacs_env%mpi2blacs)
+diff --git a/src/fm/cp_fm_cusolver.c b/src/fm/cp_fm_cusolver.c
+index 159b76a..1e77dd4 100644
+--- a/src/fm/cp_fm_cusolver.c
++++ b/src/fm/cp_fm_cusolver.c
+@@ -237,67 +237,131 @@ static char *cusolverGetErrorString(cusolverStatus_t status) {
+   } while (0)
+ 
+ /*******************************************************************************
+- * \brief Driver routine to diagonalize a matrix with the cuSOLVERMp library.
+- * \author Ole Schuett
++ * \brief cuSOLVERMp execution resources owned by a BLACS environment.
+  ******************************************************************************/
+-void cp_fm_diag_cusolver(const int fortran_comm, const int matrix_desc[9],
+-                         const int nprow, const int npcol, const int myprow,
+-                         const int mypcol, const int n, const double *matrix,
+-                         double *eigenvectors, double *eigenvalues) {
+-
+-  const int local_device = offload_get_chosen_device();
++typedef struct {
++  MPI_Comm comm;
++  int device, nprow, npcol;
++  cudaStream_t stream;
++  cusolverMpHandle_t handle;
++  cusolverMpGrid_t grid;
++#if defined(__CUSOLVERMP_NCCL)
++  ncclComm_t nccl_comm;
++#else
++  cal_comm_t cal_comm;
++#endif
++} cp_fm_cusolver_context;
+ 
++/*******************************************************************************
++ * \brief Lazily initialize the execution resources for a BLACS environment.
++ ******************************************************************************/
++static cp_fm_cusolver_context *get_context(void **context,
++                                           const int fortran_comm,
++                                           const int nprow, const int npcol) {
++  const int device = offload_get_chosen_device();
+   MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
+-  int rank, nranks;
+-  MPI_Comm_rank(comm, &rank);
+-  MPI_Comm_size(comm, &nranks);
+-
++  cp_fm_cusolver_context *ctx = *context;
+ #if defined(__CUSOLVERMP_NCCL)
+-  check_nccl_device_visibility(comm, local_device);
++  if (!ctx) {
++    check_nccl_device_visibility(comm, device);
++  }
+ #endif
+   offload_activate_chosen_device();
++  if (ctx) {
++    int comparison;
++    MPI_Comm_compare(comm, ctx->comm, &comparison);
++    assert(comparison == MPI_IDENT || comparison == MPI_CONGRUENT);
++    assert(ctx->device == device && ctx->nprow == nprow && ctx->npcol == npcol);
++    return ctx;
++  }
++
++  ctx = calloc(1, sizeof(*ctx));
++  assert(ctx);
++  MPI_Comm_dup(comm, &ctx->comm);
++  ctx->device = device;
++  ctx->nprow = nprow;
++  ctx->npcol = npcol;
++  int rank, nranks;
++  MPI_Comm_rank(ctx->comm, &rank);
++  MPI_Comm_size(ctx->comm, &nranks);
+ 
+ #if defined(__CUSOLVERMP_NCCL)
+-  // Create NCCL communicator.
+   ncclUniqueId nccl_id;
+   if (rank == 0) {
+     NCCL_CHECK(ncclGetUniqueId(&nccl_id));
+   }
+-  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, comm);
+-
+-  ncclComm_t nccl_comm;
+-  NCCL_CHECK(ncclCommInitRank(&nccl_comm, nranks, nccl_id, rank));
++  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, ctx->comm);
++  NCCL_CHECK(ncclCommInitRank(&ctx->nccl_comm, nranks, nccl_id, rank));
+ #else
+-  // Create CAL communicator.
+-  cal_comm_t cal_comm = NULL;
+   cal_comm_create_params_t params;
+   params.allgather = &allgather;
+   params.req_test = &req_test;
+   params.req_free = &req_free;
+-  params.data = &comm;
++  params.data = &ctx->comm;
+   params.rank = rank;
+   params.nranks = nranks;
+-  params.local_device = local_device;
+-  CAL_CHECK(cal_comm_create(params, &cal_comm));
++  params.local_device = device;
++  CAL_CHECK(cal_comm_create(params, &ctx->cal_comm));
+ #endif
+ 
+-  // Create various handles.
+-  cudaStream_t stream = NULL;
+-  CUDA_CHECK(cudaStreamCreate(&stream));
+-
+-  cusolverMpHandle_t cusolvermp_handle = NULL;
+-  CUSOLVER_CHECK(cusolverMpCreate(&cusolvermp_handle, local_device, stream));
+-
+-  cusolverMpGrid_t grid = NULL;
++  CUDA_CHECK(cudaStreamCreate(&ctx->stream));
++  CUSOLVER_CHECK(cusolverMpCreate(&ctx->handle, device, ctx->stream));
+ #if defined(__CUSOLVERMP_NCCL)
+-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, nccl_comm,
+-                                            nprow, npcol,
++  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(ctx->handle, &ctx->grid,
++                                            ctx->nccl_comm, nprow, npcol,
+                                             CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
+ #else
+-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, cal_comm,
+-                                            nprow, npcol,
++  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(ctx->handle, &ctx->grid,
++                                            ctx->cal_comm, nprow, npcol,
+                                             CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
+ #endif
++  *context = ctx;
++  return ctx;
++}
++
++/*******************************************************************************
++ * \brief Release execution resources before their BLACS environment is freed.
++ ******************************************************************************/
++void cp_fm_cusolver_context_destroy(void **context) {
++  cp_fm_cusolver_context *ctx = *context;
++  if (!ctx) {
++    return;
++  }
++
++  int device;
++  CUDA_CHECK(cudaGetDevice(&device));
++  CUDA_CHECK(cudaSetDevice(ctx->device));
++  CUSOLVER_CHECK(cusolverMpDestroyGrid(ctx->grid));
++  CUSOLVER_CHECK(cusolverMpDestroy(ctx->handle));
++  CUDA_CHECK(cudaStreamDestroy(ctx->stream));
++#if defined(__CUSOLVERMP_NCCL)
++  NCCL_CHECK(ncclCommDestroy(ctx->nccl_comm));
++#else
++  CAL_CHECK(cal_comm_destroy(ctx->cal_comm));
++#endif
++  MPI_Comm_free(&ctx->comm);
++  free(ctx);
++  *context = NULL;
++  CUDA_CHECK(cudaSetDevice(device));
++}
++
++/*******************************************************************************
++ * \brief Driver routine to diagonalize a matrix with the cuSOLVERMp library.
++ * \author Ole Schuett
++ ******************************************************************************/
++void cp_fm_diag_cusolver(void **context, const int fortran_comm,
++                         const int matrix_desc[9], const int nprow,
++                         const int npcol, const int myprow, const int mypcol,
++                         const int n, const double *matrix,
++                         double *eigenvectors, double *eigenvalues) {
++
++  cp_fm_cusolver_context *ctx =
++      get_context(context, fortran_comm, nprow, npcol);
++  const MPI_Comm comm = ctx->comm;
++  const cudaStream_t stream = ctx->stream;
++  const cusolverMpHandle_t cusolvermp_handle = ctx->handle;
++  const cusolverMpGrid_t grid = ctx->grid;
++
+   const int mb = matrix_desc[4];
+   const int nb = matrix_desc[5];
+   const int rsrc = matrix_desc[6];
+@@ -358,7 +422,7 @@ void cp_fm_diag_cusolver(const int fortran_comm, const int matrix_desc[9],
+   // Wait for solver to finish.
+   CUDA_CHECK(cudaStreamSynchronize(stream));
+ #if !defined(__CUSOLVERMP_NCCL)
+-  CAL_CHECK(cal_stream_sync(cal_comm, stream));
++  CAL_CHECK(cal_stream_sync(ctx->cal_comm, stream));
+ #endif
+ 
+   // Check info.
+@@ -383,16 +447,8 @@ void cp_fm_diag_cusolver(const int fortran_comm, const int matrix_desc[9],
+   CUDA_CHECK(cudaFree(work_dev));
+   CUDA_CHECK(cudaFreeHost(work_host));
+ 
+-  // Destroy handles.
++  // Destroy matrix descriptor.
+   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(cusolvermp_matrix_desc));
+-  CUSOLVER_CHECK(cusolverMpDestroyGrid(grid));
+-  CUSOLVER_CHECK(cusolverMpDestroy(cusolvermp_handle));
+-  CUDA_CHECK(cudaStreamDestroy(stream));
+-#if defined(__CUSOLVERMP_NCCL)
+-  NCCL_CHECK(ncclCommDestroy(nccl_comm));
+-#else
+-  CAL_CHECK(cal_comm_destroy(cal_comm));
+-#endif
+ 
+   // Sync MPI ranks to include load imbalance in total timings.
+   MPI_Barrier(comm);
+@@ -402,7 +458,7 @@ void cp_fm_diag_cusolver(const int fortran_comm, const int matrix_desc[9],
+  * \brief Driver routine to solve A*x = lambda*B*x with cuSOLVERMp sygvd.
+  * \author Jiri Vyskocil
+  ******************************************************************************/
+-void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
++void cp_fm_diag_cusolver_sygvd(void **context, const int fortran_comm,
+                                const int a_matrix_desc[9],
+                                const int b_matrix_desc[9], const int nprow,
+                                const int npcol, const int myprow,
+@@ -410,60 +466,12 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
+                                const double *aMatrix, const double *bMatrix,
+                                double *eigenvectors, double *eigenvalues) {
+ 
+-  const int local_device = offload_get_chosen_device();
+-
+-  MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
+-  int rank, nranks;
+-  MPI_Comm_rank(comm, &rank);
+-  MPI_Comm_size(comm, &nranks);
+-
+-#if defined(__CUSOLVERMP_NCCL)
+-  check_nccl_device_visibility(comm, local_device);
+-#endif
+-  offload_activate_chosen_device();
+-
+-#if defined(__CUSOLVERMP_NCCL)
+-  // Create NCCL communicator.
+-  ncclUniqueId nccl_id;
+-  if (rank == 0) {
+-    NCCL_CHECK(ncclGetUniqueId(&nccl_id));
+-  }
+-  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, comm);
+-
+-  ncclComm_t nccl_comm;
+-  NCCL_CHECK(ncclCommInitRank(&nccl_comm, nranks, nccl_id, rank));
+-#else
+-  // Create CAL communicator
+-  cal_comm_t cal_comm = NULL;
+-  cal_comm_create_params_t params;
+-  params.allgather = &allgather;
+-  params.req_test = &req_test;
+-  params.req_free = &req_free;
+-  params.data = &comm;
+-  params.rank = rank;
+-  params.nranks = nranks;
+-  params.local_device = local_device;
+-  CAL_CHECK(cal_comm_create(params, &cal_comm));
+-#endif
+-
+-  // Create CUDA stream and cuSOLVER handle
+-  cudaStream_t stream = NULL;
+-  CUDA_CHECK(cudaStreamCreate(&stream));
+-
+-  cusolverMpHandle_t cusolvermp_handle = NULL;
+-  CUSOLVER_CHECK(cusolverMpCreate(&cusolvermp_handle, local_device, stream));
+-
+-  // Define grid for device computation
+-  cusolverMpGrid_t grid = NULL;
+-#if defined(__CUSOLVERMP_NCCL)
+-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, nccl_comm,
+-                                            nprow, npcol,
+-                                            CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
+-#else
+-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, cal_comm,
+-                                            nprow, npcol,
+-                                            CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
+-#endif
++  cp_fm_cusolver_context *ctx =
++      get_context(context, fortran_comm, nprow, npcol);
++  const MPI_Comm comm = ctx->comm;
++  const cudaStream_t stream = ctx->stream;
++  const cusolverMpHandle_t cusolvermp_handle = ctx->handle;
++  const cusolverMpGrid_t grid = ctx->grid;
+ 
+   // Matrix descriptors for A, B, and Z
+   const int mb_a = a_matrix_desc[4];
+@@ -559,7 +567,7 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
+   // Wait for computation to finish
+   CUDA_CHECK(cudaStreamSynchronize(stream));
+ #if !defined(__CUSOLVERMP_NCCL)
+-  CAL_CHECK(cal_stream_sync(cal_comm, stream));
++  CAL_CHECK(cal_stream_sync(ctx->cal_comm, stream));
+ #endif
+ 
+   // Check info
+@@ -590,14 +598,6 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
+   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrA));
+   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrB));
+   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrZ));
+-  CUSOLVER_CHECK(cusolverMpDestroyGrid(grid));
+-  CUSOLVER_CHECK(cusolverMpDestroy(cusolvermp_handle));
+-  CUDA_CHECK(cudaStreamDestroy(stream));
+-#if defined(__CUSOLVERMP_NCCL)
+-  NCCL_CHECK(ncclCommDestroy(nccl_comm));
+-#else
+-  CAL_CHECK(cal_comm_destroy(cal_comm));
+-#endif
+ 
+   MPI_Barrier(comm); // Synchronize MPI ranks
+ }
+@@ -606,62 +606,18 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
+  * \brief Driver routine to solve A*x = lambda*B*x with cuSOLVERMp hegvd.
+  ******************************************************************************/
+ void cp_cfm_diag_cusolver_hegvd(
+-    const int fortran_comm, const int a_matrix_desc[9],
++    void **context, const int fortran_comm, const int a_matrix_desc[9],
+     const int b_matrix_desc[9], const int nprow, const int npcol,
+     const int myprow, const int mypcol, const int n,
+     const cuDoubleComplex *aMatrix, const cuDoubleComplex *bMatrix,
+     cuDoubleComplex *eigenvectors, double *eigenvalues) {
+ 
+-  const int local_device = offload_get_chosen_device();
+-
+-  MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
+-  int rank, nranks;
+-  MPI_Comm_rank(comm, &rank);
+-  MPI_Comm_size(comm, &nranks);
+-
+-#if defined(__CUSOLVERMP_NCCL)
+-  check_nccl_device_visibility(comm, local_device);
+-#endif
+-  offload_activate_chosen_device();
+-
+-#if defined(__CUSOLVERMP_NCCL)
+-  ncclUniqueId nccl_id;
+-  if (rank == 0) {
+-    NCCL_CHECK(ncclGetUniqueId(&nccl_id));
+-  }
+-  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, comm);
+-
+-  ncclComm_t nccl_comm;
+-  NCCL_CHECK(ncclCommInitRank(&nccl_comm, nranks, nccl_id, rank));
+-#else
+-  cal_comm_t cal_comm = NULL;
+-  cal_comm_create_params_t params;
+-  params.allgather = &allgather;
+-  params.req_test = &req_test;
+-  params.req_free = &req_free;
+-  params.data = &comm;
+-  params.rank = rank;
+-  params.nranks = nranks;
+-  params.local_device = local_device;
+-  CAL_CHECK(cal_comm_create(params, &cal_comm));
+-#endif
+-
+-  cudaStream_t stream = NULL;
+-  CUDA_CHECK(cudaStreamCreate(&stream));
+-
+-  cusolverMpHandle_t cusolvermp_handle = NULL;
+-  CUSOLVER_CHECK(cusolverMpCreate(&cusolvermp_handle, local_device, stream));
+-
+-  cusolverMpGrid_t grid = NULL;
+-#if defined(__CUSOLVERMP_NCCL)
+-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, nccl_comm,
+-                                            nprow, npcol,
+-                                            CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
+-#else
+-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, cal_comm,
+-                                            nprow, npcol,
+-                                            CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
+-#endif
++  cp_fm_cusolver_context *ctx =
++      get_context(context, fortran_comm, nprow, npcol);
++  const MPI_Comm comm = ctx->comm;
++  const cudaStream_t stream = ctx->stream;
++  const cusolverMpHandle_t cusolvermp_handle = ctx->handle;
++  const cusolverMpGrid_t grid = ctx->grid;
+ 
+   const int mb_a = a_matrix_desc[4];
+   const int nb_a = a_matrix_desc[5];
+@@ -747,7 +703,7 @@ void cp_cfm_diag_cusolver_hegvd(
+ 
+   CUDA_CHECK(cudaStreamSynchronize(stream));
+ #if !defined(__CUSOLVERMP_NCCL)
+-  CAL_CHECK(cal_stream_sync(cal_comm, stream));
++  CAL_CHECK(cal_stream_sync(ctx->cal_comm, stream));
+ #endif
+ 
+   int info;
+@@ -774,14 +730,6 @@ void cp_cfm_diag_cusolver_hegvd(
+   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrA));
+   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrB));
+   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrZ));
+-  CUSOLVER_CHECK(cusolverMpDestroyGrid(grid));
+-  CUSOLVER_CHECK(cusolverMpDestroy(cusolvermp_handle));
+-  CUDA_CHECK(cudaStreamDestroy(stream));
+-#if defined(__CUSOLVERMP_NCCL)
+-  NCCL_CHECK(ncclCommDestroy(nccl_comm));
+-#else
+-  CAL_CHECK(cal_comm_destroy(cal_comm));
+-#endif
+ 
+   MPI_Barrier(comm);
+ }
+diff --git a/src/fm/cp_fm_cusolver_api.F b/src/fm/cp_fm_cusolver_api.F
+index 79a2acc..121b424 100644
+--- a/src/fm/cp_fm_cusolver_api.F
++++ b/src/fm/cp_fm_cusolver_api.F
+@@ -12,7 +12,8 @@
+ MODULE cp_fm_cusolver_api
+    USE ISO_C_BINDING,                   ONLY: C_DOUBLE,&
+                                               C_DOUBLE_COMPLEX,&
+-                                              C_INT
++                                              C_INT,&
++                                              C_PTR
+    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
+    USE cp_cfm_types,                    ONLY: cp_cfm_type
+    USE cp_fm_types,                     ONLY: cp_fm_type
+@@ -46,11 +47,12 @@ CONTAINS
+       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues_buffer
+       TYPE(cp_blacs_env_type), POINTER                   :: context
+       INTERFACE
+-         SUBROUTINE cp_fm_diag_cusolver_c(fortran_comm, matrix_desc, &
++         SUBROUTINE cp_fm_diag_cusolver_c(cusolver_context, fortran_comm, matrix_desc, &
+                                           nprow, npcol, myprow, mypcol, &
+                                           n, matrix, eigenvectors, eigenvalues) &
+             BIND(C, name="cp_fm_diag_cusolver")
+-            IMPORT :: C_INT, C_DOUBLE
++            IMPORT :: C_INT, C_DOUBLE, C_PTR
++            TYPE(C_PTR), INTENT(INOUT)                 :: cusolver_context
+             INTEGER(kind=C_INT), VALUE                :: fortran_comm
+             INTEGER(kind=C_INT), DIMENSION(*)         :: matrix_desc
+             INTEGER(kind=C_INT), VALUE                :: nprow
+@@ -74,6 +76,7 @@ CONTAINS
+       ALLOCATE (eigenvalues_buffer(n))
+ 
+       CALL cp_fm_diag_cusolver_c( &
++         cusolver_context=context%cusolver_context, &
+          fortran_comm=matrix%matrix_struct%para_env%get_handle(), &
+          matrix_desc=matrix%matrix_struct%descriptor, &
+          nprow=context%num_pe(1), &
+@@ -120,11 +123,12 @@ CONTAINS
+       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues_buffer
+       TYPE(cp_blacs_env_type), POINTER                   :: context
+       INTERFACE
+-         SUBROUTINE cp_fm_general_cusolver_c(fortran_comm, a_matrix_desc, b_matrix_desc, &
++         SUBROUTINE cp_fm_general_cusolver_c(cusolver_context, fortran_comm, a_matrix_desc, b_matrix_desc, &
+                                              nprow, npcol, myprow, mypcol, &
+                                              n, aMatrix, bMatrix, eigenvectors, eigenvalues) &
+             BIND(C, name="cp_fm_diag_cusolver_sygvd")
+-            IMPORT :: C_INT, C_DOUBLE
++            IMPORT :: C_INT, C_DOUBLE, C_PTR
++            TYPE(C_PTR), INTENT(INOUT)                 :: cusolver_context
+             INTEGER(kind=C_INT), VALUE                :: fortran_comm
+             INTEGER(kind=C_INT), DIMENSION(*)         :: a_matrix_desc, b_matrix_desc
+             INTEGER(kind=C_INT), VALUE                :: nprow
+@@ -149,6 +153,7 @@ CONTAINS
+       ALLOCATE (eigenvalues_buffer(n))
+ 
+       CALL cp_fm_general_cusolver_c( &
++         cusolver_context=context%cusolver_context, &
+          fortran_comm=INT(aMatrix%matrix_struct%para_env%get_handle(), C_INT), &
+          a_matrix_desc=INT(aMatrix%matrix_struct%descriptor, C_INT), &
+          b_matrix_desc=INT(bMatrix%matrix_struct%descriptor, C_INT), &
+@@ -200,11 +205,12 @@ CONTAINS
+       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues_buffer
+       TYPE(cp_blacs_env_type), POINTER                   :: context
+       INTERFACE
+-         SUBROUTINE cp_cfm_general_cusolver_c(fortran_comm, a_matrix_desc, b_matrix_desc, &
++         SUBROUTINE cp_cfm_general_cusolver_c(cusolver_context, fortran_comm, a_matrix_desc, b_matrix_desc, &
+                                               nprow, npcol, myprow, mypcol, &
+                                               n, aMatrix, bMatrix, eigenvectors, eigenvalues) &
+             BIND(C, name="cp_cfm_diag_cusolver_hegvd")
+-            IMPORT :: C_DOUBLE, C_DOUBLE_COMPLEX, C_INT
++            IMPORT :: C_DOUBLE, C_DOUBLE_COMPLEX, C_INT, C_PTR
++            TYPE(C_PTR), INTENT(INOUT)                 :: cusolver_context
+             INTEGER(kind=C_INT), VALUE                :: fortran_comm
+             INTEGER(kind=C_INT), DIMENSION(*)         :: a_matrix_desc, b_matrix_desc
+             INTEGER(kind=C_INT), VALUE                :: nprow
+@@ -228,6 +234,7 @@ CONTAINS
+       ALLOCATE (eigenvalues_buffer(n))
+ 
+       CALL cp_cfm_general_cusolver_c( &
++         cusolver_context=context%cusolver_context, &
+          fortran_comm=INT(aMatrix%matrix_struct%para_env%get_handle(), C_INT), &
+          a_matrix_desc=INT(aMatrix%matrix_struct%descriptor, C_INT), &
+          b_matrix_desc=INT(bMatrix%matrix_struct%descriptor, C_INT), &

@@ -1,0 +1,30 @@
+{
+  "archive": "evidence.tar.gz",
+  "archive_sha256": "ea73d3ed73540bf51418ebc2a0f5e8e202bd360f32dff09c6353d14e865558ee",
+  "archive_bytes": 1913689,
+  "verified_files": 326,
+  "remote_campaign": "/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/development/cusolver-opt-20261106",
+  "jobs": [
+    {
+      "JobIDRaw": "2234980",
+      "User": "cp2k-ci",
+      "Account": "org-open-sai",
+      "Partition": "16V100",
+      "State": "COMPLETED",
+      "ExitCode": "0:0",
+      "ElapsedRaw": "2773",
+      "AllocCPUS": "32",
+      "AllocTRES": "billing=600,cpu=32,gres/gpu=4,mem=60G,node=1",
+      "NodeList": "16v100n66",
+      "Start": "2026-11-06T10:37:31",
+      "End": "2026-11-06T11:23:44",
+      "gpus": 4,
+      "gpu_hours": 3.081111111111111
+    }
+  ],
+  "queue": "",
+  "all_jobs_successful": true,
+  "gpu_hours": 3.081111111111111,
+  "completed_marker": true,
+  "collected_at": "2026-11-06T03:25:52.902298+00:00"
+}

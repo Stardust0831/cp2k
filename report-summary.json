@@ -1,0 +1,74 @@
+{
+  "job": "2234980",
+  "comparisons": {
+    "ag-gamma": {
+      "wall_seconds": {
+        "baseline": 281.56554074119776,
+        "reuse": 268.54910761280917,
+        "transfers": 261.282324206084
+      },
+      "scf_steps": 10,
+      "matrix_size": 12500,
+      "requested_vectors": 3250,
+      "eigenvector_d2h_reduction": 0.74
+    },
+    "diamond-gamma": {
+      "wall_seconds": {
+        "baseline": 167.43659650790505,
+        "reuse": 153.20537394681014,
+        "transfers": 158.14416387397796
+      },
+      "scf_steps": 8,
+      "matrix_size": 13000,
+      "requested_vectors": 2000,
+      "eigenvector_d2h_reduction": 0.8461538461538461
+    }
+  },
+  "context_counts": {
+    "baseline": [
+      81,
+      81,
+      81,
+      81
+    ],
+    "reuse": [
+      8,
+      8,
+      8,
+      8
+    ],
+    "transfers": [
+      81,
+      81,
+      81,
+      81
+    ]
+  },
+  "source": {
+    "baseline": "5d4c07bd2d03f4106c5e72172c7a20d5e697dcdd",
+    "reuse": "d774c4b95ffe603ba2e883521cf8e2789799bc44",
+    "transfers": "00ccf6dba2862c45b315676ef1da2dd550d2d58a"
+  },
+  "max_deltas": {
+    "reuse": {
+      "lifecycle": {
+        "energy": 2.4868995751603507e-14,
+        "force": 1.0305115322271213e-13
+      },
+      "solids": {
+        "energy": 1.8189894035458565e-12,
+        "force": 1.0000000502143058e-13
+      }
+    },
+    "transfers": {
+      "lifecycle": {
+        "energy": 2.4868995751603507e-14,
+        "force": 1.20540447266196e-13
+      },
+      "solids": {
+        "energy": 3.637978807091713e-12,
+        "force": 1.0000000502143058e-13
+      }
+    }
+  }
+}

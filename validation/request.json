@@ -1,0 +1,28 @@
+{
+  "source_base": "5d4c07bd2d03f4106c5e72172c7a20d5e697dcdd",
+  "image": "/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery/containers/software/cp2k/development/master-2026-11-04-g37370f362787-r6825aebe61e9/16V100/42003384294-1-development-16v100-avx2-2026-11-05-37370f362787.sif",
+  "image_sha256": "790326ae501f7db678a6cb5d41f4aa72cbaf02fdbe1aa3110369b68eea320c88",
+  "dependency_prefix": "/opt/apps/cp2k/cp2k-development-master-2026-10-30-gd077e66fe06a-re943569fcfff/16V100",
+  "dependency_directory": "/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery/direct-dbcsr-build-deps-20261105/16V100",
+  "campaign": "/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/development/cusolver-opt-20261106",
+  "purpose": "independent minimal cuSOLVER execution-resource reuse and generalized output transfer optimizations",
+  "source_archive_sha256": "3b03e1e42632af00ad99b9acd5bfab6c432408a8c1376ff05e169c7ecf0854ee",
+  "variants": [
+    {
+      "name": "baseline",
+      "source_sha": "5d4c07bd2d03f4106c5e72172c7a20d5e697dcdd"
+    },
+    {
+      "name": "reuse",
+      "source_sha": "d774c4b95ffe603ba2e883521cf8e2789799bc44",
+      "patch": "reuse.patch",
+      "patch_sha256": "a4837ada3372f35b985ee47123a6c6138afeb568db48f8c33826a2a70f13c1f3"
+    },
+    {
+      "name": "transfers",
+      "source_sha": "00ccf6dba2862c45b315676ef1da2dd550d2d58a",
+      "patch": "transfers.patch",
+      "patch_sha256": "b5dd6c60e24b0e55d452e76a3df5b5a50b0a8d2dd027f480404ccb5bcc3a83c8"
+    }
+  ]
+}

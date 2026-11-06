@@ -1,0 +1,7 @@
+
+ OVERLAP MATRIX CONDITION NUMBER
+ 1-Norm Condition Number (Estimate)
+   CN : |A|*|A^-1|:  1.146E+001 *  2.706E+002   = 3.102E+003  Log(1-CN):  3.4917
+ 1-Norm and 2-Norm Condition Numbers using Diagonalization
+   CN : |A|*|A^-1|:  1.146E+001 *  2.712E+002   = 3.109E+003  Log(1-CN):  3.4926
+   CN : max/min ev:  5.233E+000 /  6.839E-003   = 7.651E+002  Log(2-CN):  2.8837

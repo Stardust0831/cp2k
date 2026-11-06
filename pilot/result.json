@@ -1,0 +1,32 @@
+{
+  "job": "2234785",
+  "host": "16v100n43.mr-sai.ai",
+  "source": "5d4c07bd2d03f4106c5e72172c7a20d5e697dcdd",
+  "artifacts": {
+    "build/bin/cp2k.psmp": "0a8edd181209234e5667c29b8a176a8ab4abfd4ea9bd287943216fb0ec553b22",
+    "build/src/libcp2k.so.2026.2": "cf6b9cec17c9ca3d76bc159f9e38a0d6d78cf1de97da4e3897b1232980efed18",
+    "build/CMakeCache.txt": "b25a22383ef2a580188cc5e0d3f02825a509b62fe54903037974d6647b8d82f3",
+    "source/src/fm/cp_blacs_env.F": "74041700af71ba3fd2c83fe13459d5cb207748549020bd16cf753a8148d6d80c",
+    "source/src/fm/cp_fm_cusolver.c": "379cda72ac8c18e18f30ffd019b37ae0e8216572c40f5e6ad2fbceb6decd4ad8",
+    "source/src/fm/cp_fm_cusolver_api.F": "7ab7561f0cede64d3a2a458323d7b1bfadaaaf7ace5c03623326095b56714517",
+    "source/src/fm/cp_cfm_diag.F": "9eec1a9261fe1534d1d7ca53e778ff5ea7d49c13751aee57c1b30cceda29b51d"
+  },
+  "cases": {
+    "real-gth": {
+      "exit_code": 0,
+      "seconds": 23.20617664400197,
+      "input_sha256": "e8d1f4f0212256174ed028cf6b6e523d35f45f9c27855865cffd5a417a33fd77"
+    },
+    "real-sr": {
+      "exit_code": 0,
+      "seconds": 23.105891995990532,
+      "input_sha256": "76bb058fef71a306a3bb102d2b42f4b4f408e7cdd131d9e8229503dfbfb1068b"
+    },
+    "complex-sr": {
+      "exit_code": 0,
+      "seconds": 22.205066718990565,
+      "input_sha256": "8c60d6433f893689f7da7a6101b3d875051f21a4bcdd6aa5068682f9dfaa4c51"
+    }
+  },
+  "finished_at": "2026-11-06T02:34:42.339028+00:00"
+}

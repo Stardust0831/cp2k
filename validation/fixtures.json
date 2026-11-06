@@ -1,0 +1,81 @@
+{
+  "fixtures": [
+    {
+      "name": "real-standard",
+      "backend": "cp_fm_diag_cusolver",
+      "atoms": 8,
+      "nmo": 36,
+      "matrix_size": 104,
+      "block_size": 64,
+      "basis": "DZVP-GTH"
+    },
+    {
+      "name": "real-subset",
+      "backend": "cp_fm_general_cusolver",
+      "atoms": 8,
+      "nmo": 36,
+      "matrix_size": 104,
+      "block_size": 64,
+      "basis": "DZVP-GTH"
+    },
+    {
+      "name": "real-partial",
+      "backend": "cp_fm_general_cusolver",
+      "atoms": 8,
+      "nmo": 17,
+      "matrix_size": 104,
+      "block_size": 8,
+      "basis": "DZVP-GTH"
+    },
+    {
+      "name": "real-full",
+      "backend": "cp_fm_general_cusolver",
+      "atoms": 8,
+      "nmo": 104,
+      "matrix_size": 104,
+      "block_size": 64,
+      "basis": "DZVP-MOLOPT-SR-GTH"
+    },
+    {
+      "name": "complex-subset",
+      "backend": "cp_cfm_general_cusolver",
+      "atoms": 8,
+      "nmo": 36,
+      "matrix_size": 104,
+      "block_size": 64,
+      "basis": "DZVP-GTH"
+    },
+    {
+      "name": "complex-full",
+      "backend": "cp_cfm_general_cusolver",
+      "atoms": 8,
+      "nmo": 104,
+      "matrix_size": 104,
+      "block_size": 64,
+      "basis": "DZVP-MOLOPT-SR-GTH"
+    }
+  ],
+  "files": {
+    "inputs/SI_8.xyz": "30043a28e0c6cac623bf3a35afd9a51f19f57aff09ff9a1fc190df3ec40f2e8e",
+    "inputs/ag-gamma/BASIS_MOLOPT": "686dd72e7601ee41d4a173e4c7c3946f1e750f03095090f44d3821c180a81a61",
+    "inputs/ag-gamma/POTENTIAL": "b0e5adf52fc7b7dcf3f2d156ae3f1327780f6f4d11973db329545e5c73bdc361",
+    "inputs/ag-gamma/input.inp": "70725874208d0422be23052cf5d5ad3fb8a4e39dc0e629c383eda3771b263a1e",
+    "inputs/ag-gamma/provenance.json": "9953acf5581ff6b440da7ad3de8088529ec135755aeff870826624b3af45df5a",
+    "inputs/complex-full.inp": "f7c1537aa869766c89956758c3dc4108227c13ec8627226cba530667680943b1",
+    "inputs/complex-subset.inp": "581ce4ed008c29c0f9e90e8ae628ce78df099d219e992e24b102ed2edb9eaf75",
+    "inputs/diamond-gamma/BASIS_MOLOPT": "686dd72e7601ee41d4a173e4c7c3946f1e750f03095090f44d3821c180a81a61",
+    "inputs/diamond-gamma/POTENTIAL": "b0e5adf52fc7b7dcf3f2d156ae3f1327780f6f4d11973db329545e5c73bdc361",
+    "inputs/diamond-gamma/input.inp": "eebd0e7ef0a02a7e98d83c796f077336948bc8c60854d01a7df78374458d63e9",
+    "inputs/diamond-gamma/provenance.json": "c8b650a96ba6dc470cd550ac4645a459eb499ac9937ecef8cde578f6c5b07e95",
+    "inputs/real-full.inp": "0fb1c65a842d81a2ebdea58479c17671f4e795399e74f7b6862916115af71377",
+    "inputs/real-partial.inp": "ccc7f09c55ab00366e4ede19396336ce3df0c19d98b5ef815979359bd631d8d5",
+    "inputs/real-standard.inp": "5f5d55d8950c4514d07e4e20b0d5059e1644debf57074eac63c95b87f04f95f0",
+    "inputs/real-subset.inp": "52daad174e09612fb7d5c984fad2fd0445e42100e9be6d2b40ac11a7f20d47c8"
+  },
+  "provenance": {
+    "small_fixture_source": "/tmp/cp2k-cusolver-opt-main-20261106/tests/QS/regtest-cusolver",
+    "small_fixture_changes": "RUN_TYPE ENERGY_FORCE, explicit square FM blocks, requested MO counts, EPS_CHECK_DIAG 1e-12, full-spectrum cases use DZVP-MOLOPT-SR-GTH (same 104 functions); same Si8 geometry and five SCF steps",
+    "solid_inputs": "/mnt/g/work/agent/sai-hpc-software/.work/cp2k-elpa-dbcsr-retest-20261105/raw/inputs",
+    "solid_input_changes": "none; exact original Multiwfn-derived direct-generalized input, basis and potential"
+  }
+}

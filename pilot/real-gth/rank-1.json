@@ -1,0 +1,29 @@
+{
+  "rank": 1,
+  "local_rank": 1,
+  "host": "16v100n43.mr-sai.ai",
+  "gpu": "GPU-e47330ab-b8a6-958a-b52f-d8cd7dc43a5d",
+  "cores": [
+    [
+      0,
+      52
+    ],
+    [
+      0,
+      53
+    ],
+    [
+      0,
+      54
+    ],
+    [
+      0,
+      55
+    ]
+  ],
+  "job": "2234785",
+  "arguments": [
+    "-i",
+    "input.inp"
+  ]
+}

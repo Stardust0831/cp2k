@@ -1,0 +1,6 @@
+START real-gth
+END real-gth {'exit_code': 0, 'seconds': 23.20617664400197, 'input_sha256': 'e8d1f4f0212256174ed028cf6b6e523d35f45f9c27855865cffd5a417a33fd77'}
+START real-sr
+END real-sr {'exit_code': 0, 'seconds': 23.105891995990532, 'input_sha256': '76bb058fef71a306a3bb102d2b42f4b4f408e7cdd131d9e8229503dfbfb1068b'}
+START complex-sr
+END complex-sr {'exit_code': 0, 'seconds': 22.205066718990565, 'input_sha256': '8c60d6433f893689f7da7a6101b3d875051f21a4bcdd6aa5068682f9dfaa4c51'}

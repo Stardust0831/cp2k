@@ -1,0 +1,481 @@
+[16v100n43.mr-sai.ai:1170015] Rank 0 bound to package[0][core:L0-3]
+[16v100n43.mr-sai.ai:1170015] Rank 1 bound to package[0][core:L4-7]
+[16v100n43.mr-sai.ai:1170015] Rank 2 bound to package[0][core:L8-11]
+[16v100n43.mr-sai.ai:1170015] Rank 3 bound to package[0][core:L12-15]
+WARNING: Skipping mount /usr/bin/nvidia-persistenced [files]: /usr/bin/nvidia-persistenced doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-cuda-mps-control [files]: /usr/bin/nvidia-cuda-mps-control doesn't exist in container
+WARNING: Skipping mount /usr/share/glvnd/egl_vendor.d/10_nvidia.json [files]: /usr/share/glvnd/egl_vendor.d/10_nvidia.json doesn't exist in container
+WARNING: Skipping mount /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json [files]: /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json doesn't exist in container
+WARNING: Skipping mount /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json [files]: /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json doesn't exist in container
+WARNING: Skipping mount /usr/share/nvidia/nvoptix.bin [files]: /usr/share/nvidia/nvoptix.bin doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-cuda-mps-server [files]: /usr/bin/nvidia-cuda-mps-server doesn't exist in container
+WARNING: Skipping mount /usr/share/vulkan/icd.d/nvidia_icd.json [files]: /usr/share/vulkan/icd.d/nvidia_icd.json doesn't exist in container
+WARNING: Skipping mount /usr/share/vulkan/implicit_layer.d/nvidia_layers.json [files]: /usr/share/vulkan/implicit_layer.d/nvidia_layers.json doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-smi [files]: /usr/bin/nvidia-smi doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-debugdump [files]: /usr/bin/nvidia-debugdump doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-debugdump [files]: /usr/bin/nvidia-debugdump doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-persistenced [files]: /usr/bin/nvidia-persistenced doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-cuda-mps-server [files]: /usr/bin/nvidia-cuda-mps-server doesn't exist in container
+WARNING: Skipping mount /usr/share/glvnd/egl_vendor.d/10_nvidia.json [files]: /usr/share/glvnd/egl_vendor.d/10_nvidia.json doesn't exist in container
+WARNING: Skipping mount /usr/share/vulkan/icd.d/nvidia_icd.json [files]: /usr/share/vulkan/icd.d/nvidia_icd.json doesn't exist in container
+WARNING: Skipping mount /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json [files]: /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-smi [files]: /usr/bin/nvidia-smi doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-cuda-mps-control [files]: /usr/bin/nvidia-cuda-mps-control doesn't exist in container
+WARNING: Skipping mount /usr/share/vulkan/implicit_layer.d/nvidia_layers.json [files]: /usr/share/vulkan/implicit_layer.d/nvidia_layers.json doesn't exist in container
+WARNING: Skipping mount /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json [files]: /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json doesn't exist in container
+WARNING: Skipping mount /usr/share/nvidia/nvoptix.bin [files]: /usr/share/nvidia/nvoptix.bin doesn't exist in container
+WARNING: Skipping mount /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json [files]: /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json doesn't exist in container
+WARNING: Skipping mount /usr/share/nvidia/nvoptix.bin [files]: /usr/share/nvidia/nvoptix.bin doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-debugdump [files]: /usr/bin/nvidia-debugdump doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-persistenced [files]: /usr/bin/nvidia-persistenced doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-cuda-mps-server [files]: /usr/bin/nvidia-cuda-mps-server doesn't exist in container
+WARNING: Skipping mount /usr/share/vulkan/icd.d/nvidia_icd.json [files]: /usr/share/vulkan/icd.d/nvidia_icd.json doesn't exist in container
+WARNING: Skipping mount /usr/share/vulkan/implicit_layer.d/nvidia_layers.json [files]: /usr/share/vulkan/implicit_layer.d/nvidia_layers.json doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-smi [files]: /usr/bin/nvidia-smi doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-cuda-mps-control [files]: /usr/bin/nvidia-cuda-mps-control doesn't exist in container
+WARNING: Skipping mount /usr/share/glvnd/egl_vendor.d/10_nvidia.json [files]: /usr/share/glvnd/egl_vendor.d/10_nvidia.json doesn't exist in container
+WARNING: Skipping mount /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json [files]: /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json doesn't exist in container
+WARNING: Skipping mount /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json [files]: /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json doesn't exist in container
+WARNING: Skipping mount /usr/share/nvidia/nvoptix.bin [files]: /usr/share/nvidia/nvoptix.bin doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-smi [files]: /usr/bin/nvidia-smi doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-cuda-mps-control [files]: /usr/bin/nvidia-cuda-mps-control doesn't exist in container
+WARNING: Skipping mount /usr/share/glvnd/egl_vendor.d/10_nvidia.json [files]: /usr/share/glvnd/egl_vendor.d/10_nvidia.json doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-debugdump [files]: /usr/bin/nvidia-debugdump doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-persistenced [files]: /usr/bin/nvidia-persistenced doesn't exist in container
+WARNING: Skipping mount /usr/bin/nvidia-cuda-mps-server [files]: /usr/bin/nvidia-cuda-mps-server doesn't exist in container
+WARNING: Skipping mount /usr/share/vulkan/icd.d/nvidia_icd.json [files]: /usr/share/vulkan/icd.d/nvidia_icd.json doesn't exist in container
+WARNING: Skipping mount /usr/share/vulkan/implicit_layer.d/nvidia_layers.json [files]: /usr/share/vulkan/implicit_layer.d/nvidia_layers.json doesn't exist in container
+WARNING: Skipping mount /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json [files]: /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json doesn't exist in container
+[1793932461.902810] [16v100n43:1170195:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170138/fd/60 flags=0x0) failed: Permission denied
+[1793932461.902820] [16v100n43:1170138:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170207/fd/60 flags=0x0) failed: Permission denied
+[1793932461.902834] [16v100n43:1170207:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170151/fd/60 flags=0x0) failed: Permission denied
+[1793932461.902848] [16v100n43:1170151:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170195/fd/60 flags=0x0) failed: Permission denied
+[1793932461.903188] [16v100n43:1170195:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170138/fd/60 flags=0x0) failed: Permission denied
+[1793932461.903187] [16v100n43:1170138:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170207/fd/60 flags=0x0) failed: Permission denied
+[1793932461.903217] [16v100n43:1170207:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170151/fd/60 flags=0x0) failed: Permission denied
+[1793932461.903221] [16v100n43:1170151:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170195/fd/60 flags=0x0) failed: Permission denied
+[1793932461.903946] [16v100n43:1170195:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170207/fd/60 flags=0x0) failed: Permission denied
+[1793932461.903952] [16v100n43:1170138:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170151/fd/60 flags=0x0) failed: Permission denied
+[1793932461.903977] [16v100n43:1170151:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170138/fd/60 flags=0x0) failed: Permission denied
+[1793932461.903979] [16v100n43:1170207:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170195/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904303] [16v100n43:1170195:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170207/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904308] [16v100n43:1170138:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170151/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904338] [16v100n43:1170151:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170138/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904339] [16v100n43:1170207:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170195/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904574] [16v100n43:1170195:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170151/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904583] [16v100n43:1170138:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170195/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904602] [16v100n43:1170207:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170138/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904605] [16v100n43:1170151:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170207/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904931] [16v100n43:1170195:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170151/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904935] [16v100n43:1170138:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170195/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904959] [16v100n43:1170207:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170138/fd/60 flags=0x0) failed: Permission denied
+[1793932461.904960] [16v100n43:1170151:0]        mm_posix.c:238  UCX  ERROR   open(file_name=/proc/1170207/fd/60 flags=0x0) failed: Permission denied
+ DBCSR| CPU Multiplication driver                                           XSMM (U)
+ DBCSR| Multrec recursion limit                                              512 (U)
+ DBCSR| Multiplication stack size                                          30000 (D)
+ DBCSR| Maximum elements for images                                    UNLIMITED (U)
+ DBCSR| Multiplicative factor virtual images                                   1 (U)
+ DBCSR| Use multiplication densification                                       F (D)
+ DBCSR| Multiplication size stacks                                             3 (U)
+ DBCSR| Use memory pool for CPU allocation                                     F (U)
+ DBCSR| Number of 3D layers                                               SINGLE (U)
+ DBCSR| Use MPI memory allocation                                              F (U)
+ DBCSR| Use RMA algorithm                                                      F (U)
+ DBCSR| Use Communication thread                                               T (U)
+ DBCSR| Communication thread load                                             75 (D)
+ DBCSR| MPI: My process id                                                     0
+ DBCSR| MPI: Number of processes                                               4
+ DBCSR| OMP: Current number of threads                                         4
+ DBCSR| OMP: Max number of threads                                             4
+ DBCSR| ACC: Number of devices/node                                            1
+ DBCSR| ACC: Number of stack-buffers per thread                                8 (U)
+ DBCSR| ACC: Avoid driver after busy                                           F (U)
+ DBCSR| ACC: Process inhomogeneous stacks                                      T (U)
+ DBCSR| ACC: Min. flop for processing                                          0 (U)
+ DBCSR| ACC: Use G2G algorithm                                                 F (D)
+ DBCSR| ACC: Min. flop for sorting                                          4000 (U)
+ DBCSR| ACC: Number of binning bins                                         4096 (U)
+ DBCSR| ACC: Size of binning bins                                             16 (U)
+ DBCSR| ACC: GPU backend is enabled                                            T (D)
+ DBCSR| Split modifier for TAS multiplication algorithm                  1.0E+00 (U)
+
+
+  **** **** ******  **  PROGRAM STARTED AT               2026-11-06 10:34:21.237
+ ***** ** ***  *** **   PROGRAM STARTED ON                   16v100n43.mr-sai.ai
+ **    ****   ******    PROGRAM STARTED BY                             <unknown>
+ ***** **    ** ** **   PROGRAM PROCESS ID                               1170195
+  **** **  *******  **  PROGRAM STARTED IN /org/org-open-sai/cp2k-ci/cp2k-cusolv
+                                           ermp-tester/state/development/cusolve
+                                           r-opt-20261106/diagnostics-full-spect
+                                           rum/complex-sr
+
+ CP2K| version string:                 CP2K version 2026.2 (Development Version)
+ CP2K| source code revision number:     5d4c07bd2d03f4106c5e72172c7a20d5e697dcdd
+ CP2K| cp2kflags: omp libint fftw3 libxc libxc_gpu elpa parallel scalapack mpi_f
+ CP2K|            08 cosma libxs libxsmm dbcsr_acc plumed2 spglib openblas libdf
+ CP2K|            ftd4 s_dftd3 mctc-lib tblite libvori libbqb offload_cuda spla_
+ CP2K|            _gemm_offloading cusolvermp cusolvermp_nccl hdf5 libwignernj
+ CP2K| is freely available from                            https://www.cp2k.org/
+ CP2K| Program compiled at                                   2026-11-06 10:20:20
+ CP2K| Program compiled on                                                      
+ CP2K| Program compiled with                                  GCC version 14.3.0
+ CP2K| Program compiled for                                               x86_64
+ CP2K| Program compiled in    /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/s
+ CP2K|                        tate/development/cusolver-opt-20261106/build
+ CP2K| Program executable     /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/s
+ CP2K|                        tate/development/cusolver-opt-20261106/build/bin/c
+ CP2K|                        p2k.psmp
+ CP2K| Data directory path    /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/s
+ CP2K|                        tate/development/cusolver-opt-20261106/source/data
+ CP2K| Input file name                                                 input.inp
+
+ GLOBAL| Force Environment number                                              1
+ GLOBAL| Basis set file name                                        BASIS_MOLOPT
+ GLOBAL| Potential file name                                      GTH_POTENTIALS
+ GLOBAL| MM Potential file name                                     MM_POTENTIAL
+ GLOBAL| Coordinate file name                                           SI_8.xyz
+ GLOBAL| Method name                                                        CP2K
+ GLOBAL| Project name                                               complex-full
+ GLOBAL| Run type                                                   ENERGY_FORCE
+ GLOBAL| FFT library                                                       FFTW3
+ GLOBAL| Diagonalization library                                        cuSOLVER
+ GLOBAL| Cholesky decomposition library                                ScaLAPACK
+ GLOBAL| DGEMM library                                                      SPLA
+ GLOBAL| Direct generalized diagonalization requested                          T
+ GLOBAL| Minimum matrix size for cuSOLVER diagonalization                     64
+ GLOBAL| Orthonormality check for eigenvectors enabled                 1.000E-12
+ GLOBAL| Matrix multiplication library                                     COSMA
+ GLOBAL| All-to-all communication in single precision                          F
+ GLOBAL| Grid backend                                                       AUTO
+ GLOBAL| Global print level                                                  LOW
+ GLOBAL| MPI I/O enabled                                                       T
+ GLOBAL| Total number of message passing processes                             4
+ GLOBAL| Number of distributed systems (nodes)                                 1
+ GLOBAL| Number of threads for this process                                    4
+ GLOBAL| This output is from process                                           0
+ GLOBAL| OpenMP stack size per thread (OMP_STACKSIZE)                    default
+ GLOBAL| CPU model name               AMD Ryzen Threadripper PRO 5995WX 64-Cores
+ GLOBAL| CPUID                                                              1002
+
+ MEMORY| system memory details [Kb]
+ MEMORY|                        rank 0           min           max       average
+ MEMORY| MemTotal            263883800     263883800     263883800     263883800
+ MEMORY| MemFree             209733092     209733092     209733092     209733092
+ MEMORY| Buffers                123620        123620        123620        123620
+ MEMORY| Cached                3754184       3754184       3754184       3754184
+ MEMORY| Slab                  1968696       1968696       1968696       1968696
+ MEMORY| SReclaimable           353160        353160        353160        353160
+ MEMORY| MemLikelyFree       213964056     213964056     213964056     213964056
+
+
+ *******************************************************************************
+ *******************************************************************************
+ **                                                                           **
+ **     #####                         ##              ##                      **
+ **    ##   ##            ##          ##              ##                      **
+ **   ##     ##                       ##            ######                    **
+ **   ##     ##  ##   ##  ##   #####  ##  ##   ####   ##    #####    #####    **
+ **   ##     ##  ##   ##  ##  ##      ## ##   ##      ##   ##   ##  ##   ##   **
+ **   ##  ## ##  ##   ##  ##  ##      ####     ###    ##   ######   ######    **
+ **    ##  ###   ##   ##  ##  ##      ## ##      ##   ##   ##       ##        **
+ **     #######   #####   ##   #####  ##  ##  ####    ##    #####   ##        **
+ **           ##                                                    ##        **
+ **                                                                           **
+ **                                                ... make the atoms dance   **
+ **                                                                           **
+ **            Copyright (C) by CP2K developers group (2000-2026)             **
+ **                      J. Chem. Phys. 152, 194103 (2020)                    **
+ **                                                                           **
+ *******************************************************************************
+
+
+ TOTAL NUMBERS AND MAXIMUM NUMBERS
+
+  Total number of            - Atomic kinds:                                   1
+                             - Atoms:                                          8
+                             - Shell sets:                                     8
+                             - Shells:                                        40
+                             - Primitive Cartesian functions:                 32
+                             - Cartesian basis functions:                    112
+                             - Spherical basis functions:                    104
+
+  Maximum angular momentum of- Orbital basis functions:                        2
+                             - Local part of the GTH pseudopotential:          0
+                             - Non-local part of the GTH pseudopotential:      2
+
+
+ SCF PARAMETERS         Density guess:                                     MOPAC
+                        --------------------------------------------------------
+                        max_scf:                                               5
+                        max_scf_history:                                       0
+                        max_diis:                                              4
+                        --------------------------------------------------------
+                        eps_scf:                                        1.00E-05
+                        eps_scf_history:                                0.00E+00
+                        eps_diis:                                       1.00E-07
+                        eps_eigval:                                     1.00E-05
+                        --------------------------------------------------------
+                        level_shift [a.u.]:                             0.000000
+                        SCF update method:                                MIXING
+                        added MOs                                        88   -1
+                        --------------------------------------------------------
+                        Mixing method:                           DIRECT_P_MIXING
+                        --------------------------------------------------------
+                        Smear method:                                   GAUSSIAN
+                        Smearing width (sigma) [a.u.]:                  1.84E-03
+                        Accuracy threshold:                             1.00E-10
+                        --------------------------------------------------------
+                        No outer SCF
+
+ *** WARNING in qs_scf_initialization.F:832 :: the DIIS scheme is ***
+ *** disabled, since EPS_DIIS < EPS_SCF                           ***
+
+
+ Extrapolation method: initial_guess
+
+ Number of electrons:                                                         32
+ Number of occupied orbitals:                                                 16
+ Number of molecular orbitals:                                               104
+
+ Number of orbital functions:                                                104
+ Number of independent orbital functions:                                    104
+
+
+ SCF WAVEFUNCTION OPTIMIZATION
+
+  Step     Update method      Time    Convergence         Total energy    Change
+  ------------------------------------------------------------------------------
+     1 P_Mix/Diag. 0.40E+00    2.7     1.12225791       -31.2012617624 -3.12E+01
+     2 P_Mix/Diag. 0.40E+00    2.6     0.67033329       -31.2797111461 -7.84E-02
+     3 P_Mix/Diag. 0.40E+00    3.3     0.40083826       -31.3271396344 -4.74E-02
+     4 P_Mix/Diag. 0.40E+00    2.7     0.24002145       -31.3557522561 -2.86E-02
+     5 P_Mix/Diag. 0.40E+00    2.9     0.14390476       -31.3729909893 -1.72E-02
+
+  Leaving inner SCF loop after reaching     5 steps.
+
+
+  Electronic density on regular grids:        -32.0000000002       -0.0000000002
+  Core density on regular grids:               32.0000001532        0.0000001532
+  Total charge density on r-space grids:        0.0000001529
+  Total charge density g-space grids:           0.0000001529
+
+  Overlap energy of the core charge distribution:               0.00000000005430
+  Self energy of the core charge distribution:                -82.06393942512820
+  Core Hamiltonian energy:                                     17.66471934206714
+  Hartree energy:                                              42.69603904126633
+  Exchange-correlation energy:                                 -9.66980994751764
+  Smearing free energy correction:                             -0.00000000000000
+  Fermi energy:                                                 0.17569688439535
+
+  Total energy:                                               -31.37299098925806
+  Total energy (extrapolated to sigma->0):                    -31.37299098925806
+
+ *** WARNING in qs_scf.F:1002 :: SCF run NOT converged ***
+
+
+ ENERGY| Total FORCE_EVAL ( QS ) energy [hartree]            -31.398976825409854
+
+ -------------------------------------------------------------------------------
+ -                                                                             -
+ -                                DBCSR STATISTICS                             -
+ -                                                                             -
+ -------------------------------------------------------------------------------
+ COUNTER                                    TOTAL       BLAS       SMM       ACC
+ flops inhomo. stacks                           0       0.0%      0.0%      0.0%
+ flops total                         0.000000E+00       0.0%      0.0%      0.0%
+ flops max/rank                      0.000000E+00       0.0%      0.0%      0.0%
+ matmuls inhomo. stacks                         0       0.0%      0.0%      0.0%
+ matmuls total                                  0       0.0%      0.0%      0.0%
+ number of processed stacks                     0       0.0%      0.0%      0.0%
+ average stack size                                     0.0       0.0       0.0
+ marketing flops                     0.000000E+00
+ -------------------------------------------------------------------------------
+ -                                                                             -
+ -                      DBCSR MESSAGE PASSING PERFORMANCE                      -
+ -                                                                             -
+ -------------------------------------------------------------------------------
+ ROUTINE             CALLS      AVE VOLUME [Bytes]
+ MP_Bcast                1                     12.
+ MP_Allreduce           19                     21.
+ MP_Alltoall            12                  13903.
+ -------------------------------------------------------------------------------
+
+ -------------------------------------------------------------------------------
+ -                                                                             -
+ -                                GRID STATISTICS                              -
+ -                                                                             -
+ -------------------------------------------------------------------------------
+ LP    KERNEL             BACKEND                              COUNT     PERCENT
+ 4     collocate ortho    GPU                                  12642      49.99%
+ 4     integrate ortho    GPU                                  10535      41.66%
+ 5     integrate ortho    GPU                                   2107       8.33%
+ 0     collocate general  CPU                                      2       0.01%
+ 1     integrate general  CPU                                      2       0.01%
+ -------------------------------------------------------------------------------
+
+ -------------------------------------------------------------------------------
+ -                                                                             -
+ -                          OFFLOAD MEMPOOL STATISTICS                         -
+ -                                                                             -
+ -------------------------------------------------------------------------------
+ Memory consumption                Number of allocations  Used [MiB]  Size [MiB]
+ Device                                                6           1           1
+ Host                                                  6           1           1
+ -------------------------------------------------------------------------------
+
+ MEMORY| Estimated peak process memory [MiB]                                2370
+
+ -------------------------------------------------------------------------------
+ -                                                                             -
+ -                         MESSAGE PASSING PERFORMANCE                         -
+ -                                                                             -
+ -------------------------------------------------------------------------------
+
+ ROUTINE             CALLS      AVE VOLUME [Bytes]
+ MP_Group                5
+ MP_Bcast              585                  30308.
+ MP_Allreduce         3065                   5486.
+ MP_Sync                 4
+ MP_Alltoall           134                 382571.
+ MP_SendRecv            75                   8847.
+ MP_ISendRecv           75                   8847.
+ MP_Wait                75
+ MP_comm_split           2
+ -------------------------------------------------------------------------------
+
+
+ -------------------------------------------------------------------------------
+ -                                                                             -
+ -                           R E F E R E N C E S                               -
+ -                                                                             -
+ -------------------------------------------------------------------------------
+ 
+ CP2K version 2026.2 (Development Version), the CP2K developers group (2026).
+ CP2K is freely available from https://www.cp2k.org/ .
+ 
+ M. Iannuzzi, J. Wilhelm, F. Stein, A. Bussy, H. Elgabarty, D. Golze, A. Hehn, 
+ M. Graml, S. Marek, B. Sertcan Gökmen, C. Schran, H. Forbert, R. Z. 
+ Khaliullin, A. Kozhevnikov, M. Taillefumier, R. Meli, V. V. Rybkin, M. Brehm, 
+ R. Schade, O. Schütt, J. V. Pototschnig, H. Mirhosseini, A. Knüpfer, D. Marx, 
+ M. Krack, J. Hutter, T. D. Kühne.
+ J. Phys. Chem. B 130, 1237-1310 (2026).
+ The CP2K Program Package Made Simple.
+ https://doi.org/10.1021/acs.jpcb.5c05851
+
+ T. D. Kühne, M. Iannuzzi, M. Del Ben, V. V. Rybkin, P. Seewald, F. Stein, T. 
+ Laino, R. Z. Khaliullin, O. Schütt, F. Schiffmann, D. Golze, J. Wilhelm, S. 
+ Chulkov, M. H. Bani-Hashemian, V. Weber, U. Borstnik, M. Taillefumier, A. S. 
+ Jakobovits, A. Lazzaro, H. Pabst, T. Müller, R. Schade, M. Guidon, S. 
+ Andermatt, N. Holmberg, G. K. Schenter, A. Hehn, A. Bussy, F. Belleflamme, G. 
+ Tabacchi, A. Glöß, M. Lass, I. Bethune, C. J. Mundy, C. Plessl, M. Watkins, 
+ J. VandeVondele, M. Krack, J. Hutter.
+ J. Chem. Phys. 152, 194103 (2020).
+ CP2K: An electronic structure and molecular dynamics software package - 
+ Quickstep: Efficient and accurate electronic structure calculations.
+ https://doi.org/10.1063/5.0007045
+
+ A. Togo, I. Tanaka.
+ arXiv, 1808.01590 (2018).
+ Spglib : a software library for crystal symmetry search.
+
+ O. Schuett, P. Messmer, J. Hutter, J. VandeVondele.
+ Electronic Structure Calculations on Graphics Processing Units, 173-190 (2016).
+ GPU-Accelerated Sparse Matrix-Matrix Multiplication for Linear Scaling Density 
+ Functional Theory.
+ https://doi.org/10.1002/9781118670712.ch8
+
+ A. Heinecke, G. Henry, M. Hutchinson, H. Pabst.
+ Proceedings of Intl. Supercomputing Conference, 981-991 (2016).
+ LIBXSMM: Accelerating Small Matrix Multiplications by Runtime Code Generation.
+ https://doi.org/10.1109/SC.2016.83
+
+ U. Borstnik, J. VandeVondele, V. Weber, J. Hutter.
+ Parallel Comput. 40, 47-58 (2014).
+ Sparse matrix multiplication: The distributed block-compressed sparse row 
+ library.
+ https://doi.org/10.1016/j.parco.2014.03.012
+
+ J. VandeVondele, J. Hutter.
+ J. Chem. Phys. 127, 114105 (2007).
+ Gaussian basis sets for accurate calculations on molecular systems in gas and 
+ condensed phases.
+ https://doi.org/10.1063/1.2770708
+
+ J. VandeVondele, M. Krack, F. Mohamed, M. Parrinello, T. Chassaing, J. Hutter.
+ Comput. Phys. Commun. 167, 103-128 (2005).
+ QUICKSTEP: Fast and accurate density functional calculations using a mixed 
+ Gaussian and plane waves approach.
+ https://doi.org/10.1016/j.cpc.2004.12.014
+
+ M. Krack.
+ Theor. Chem. Acc. 114, 145-152 (2005).
+ Pseudopotentials for H to Kr optimized for gradient-corrected 
+ exchange-correlation functionals.
+ https://doi.org/10.1007/s00214-005-0655-y
+
+ M. Frigo, S. G. Johnson.
+ Proc. IEEE 93, 216-231 (2005).
+ The design and implementation of FFTW3.
+ https://doi.org/10.1109/JPROC.2004.840301
+
+ C. Hartwigsen, S. Goedecker, J. Hutter.
+ Phys. Rev. B 58, 3641-3662 (1998).
+ Relativistic separable dual-space Gaussian pseudopotentials from H to Rn.
+ https://doi.org/10.1103/PhysRevB.58.3641
+
+ G. Lippert, J. Hutter, M. Parrinello.
+ Mol. Phys. 92, 477-487 (1997).
+ A hybrid Gaussian and plane wave density functional scheme.
+ https://doi.org/10.1080/002689797170220
+
+ S. Goedecker, M. Teter, J. Hutter.
+ Phys. Rev. B 54, 1703-1710 (1996).
+ Separable dual-space Gaussian pseudopotentials.
+ https://doi.org/10.1103/PhysRevB.54.1703
+
+ J. P. Perdew, K. Burke, M. Ernzerhof.
+ Phys. Rev. Lett. 77, 3865-3868 (1996).
+ Generalized gradient approximation made simple.
+ https://doi.org/10.1103/PhysRevLett.77.3865
+
+ C.-L. Fu, K.-M. Ho.
+ Phys. Rev. B 28, 5480-5486 (1983).
+ First-principles calculation of the equilibrium ground-state properties of 
+ transition metals: Applications to Nb and Mo.
+ https://doi.org/10.1103/PhysRevB.28.5480
+
+
+ -------------------------------------------------------------------------------
+ -                                                                             -
+ -                                T I M I N G                                  -
+ -                                                                             -
+ -------------------------------------------------------------------------------
+ SUBROUTINE                       CALLS  ASD         SELF TIME        TOTAL TIME
+                                MAXIMUM       AVERAGE  MAXIMUM  AVERAGE  MAXIMUM
+ CP2K                                 1  1.0    0.009    0.026   18.269   18.269
+ qs_forces                            1  2.0    0.000    0.000   18.208   18.208
+ qs_energies                          1  3.0    0.000    0.000   18.158   18.159
+ scf_env_do_scf                       1  4.0    0.000    0.000   14.220   14.220
+ scf_env_do_scf_inner_loop            5  5.0    0.001    0.001   14.220   14.220
+ qs_scf_new_mos_kp                    5  6.0    0.000    0.000   14.062   14.063
+ do_general_diag_kp                   5  7.0    0.002    0.002   14.062   14.063
+ cp_cfm_geeig                         5  8.0    0.001    0.001   13.955   13.957
+ cp_cfm_general_cusolver              5  9.0   13.950   13.952   13.950   13.952
+ qs_energies_init_hamiltonians        1  4.0    0.000    0.000    3.799    3.799
+ build_core_hamiltonian_matrix        1  5.0    0.000    0.001    3.769    3.769
+ overlap_condnum                      1  6.0    0.000    0.000    3.752    3.753
+ cp_fm_power                          1  7.0    0.000    0.000    3.684    3.684
+ cp_fm_diag_cusolver                  1  8.0    3.683    3.683    3.683    3.683
+ -------------------------------------------------------------------------------
+
+ The number of warnings for this run is : 2
+ 
+ -------------------------------------------------------------------------------
+  **** **** ******  **  PROGRAM ENDED AT                 2026-11-06 10:34:40.741
+ ***** ** ***  *** **   PROGRAM RAN ON                       16v100n43.mr-sai.ai
+ **    ****   ******    PROGRAM RAN BY                                 <unknown>
+ ***** **    ** ** **   PROGRAM PROCESS ID                               1170195
+  **** **  *******  **  PROGRAM STOPPED IN /org/org-open-sai/cp2k-ci/cp2k-cusolv
+                                           ermp-tester/state/development/cusolve
+                                           r-opt-20261106/diagnostics-full-spect
+                                           rum/complex-sr

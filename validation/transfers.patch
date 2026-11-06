@@ -1,0 +1,217 @@
+diff --git a/src/fm/cp_cfm_diag.F b/src/fm/cp_cfm_diag.F
+index 9e48fe1..25eafa7 100644
+--- a/src/fm/cp_cfm_diag.F
++++ b/src/fm/cp_cfm_diag.F
+@@ -484,7 +484,7 @@ CONTAINS
+             CALL cp_cfm_create(scratch_check, bmatrix%matrix_struct)
+             CALL cp_cfm_to_cfm(bmatrix, overlap_check)
+          END IF
+-         CALL cp_cfm_general_cusolver(amatrix, bmatrix, work, evals)
++         CALL cp_cfm_general_cusolver(amatrix, bmatrix, work, evals(1:nmo))
+          IF (check_eigenvectors) THEN
+             CALL check_generalized_diag(overlap_check, work, scratch_check, nmo)
+             CALL cp_cfm_release(scratch_check)
+diff --git a/src/fm/cp_fm_cusolver.c b/src/fm/cp_fm_cusolver.c
+index 159b76a..65e45b3 100644
+--- a/src/fm/cp_fm_cusolver.c
++++ b/src/fm/cp_fm_cusolver.c
+@@ -406,10 +406,11 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
+                                const int a_matrix_desc[9],
+                                const int b_matrix_desc[9], const int nprow,
+                                const int npcol, const int myprow,
+-                               const int mypcol, const int n,
++                               const int mypcol, const int n, const int nmo,
+                                const double *aMatrix, const double *bMatrix,
+                                double *eigenvectors, double *eigenvalues) {
+ 
++  assert(nmo >= 0 && nmo <= n);
+   const int local_device = offload_get_chosen_device();
+ 
+   MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
+@@ -570,11 +571,20 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
+     abort();
+   }
+ 
+-  // Copy results back to host
+-  CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, matrix_local_size,
+-                             cudaMemcpyDeviceToHost, stream));
+-  CUDA_CHECK(cudaMemcpyAsync(eigenvalues, eigenvalues_dev, n * sizeof(double),
+-                             cudaMemcpyDeviceToHost, stream));
++  // The requested eigenvectors occupy a contiguous prefix of the local columns.
++  const int nq_eigenvectors =
++      cusolverMpNUMROC(nmo, nb_a, mypcol, csrc_a, npcol);
++  const size_t eigenvectors_local_size =
++      (size_t)ldA * nq_eigenvectors * sizeof(double);
++  if (eigenvectors_local_size > 0) {
++    CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, eigenvectors_local_size,
++                               cudaMemcpyDeviceToHost, stream));
++  }
++  if (nmo > 0) {
++    CUDA_CHECK(cudaMemcpyAsync(eigenvalues, eigenvalues_dev,
++                               nmo * sizeof(double), cudaMemcpyDeviceToHost,
++                               stream));
++  }
+ 
+   // Wait for copy to finish
+   CUDA_CHECK(cudaStreamSynchronize(stream));
+@@ -608,10 +618,11 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
+ void cp_cfm_diag_cusolver_hegvd(
+     const int fortran_comm, const int a_matrix_desc[9],
+     const int b_matrix_desc[9], const int nprow, const int npcol,
+-    const int myprow, const int mypcol, const int n,
++    const int myprow, const int mypcol, const int n, const int nmo,
+     const cuDoubleComplex *aMatrix, const cuDoubleComplex *bMatrix,
+     cuDoubleComplex *eigenvectors, double *eigenvalues) {
+ 
++  assert(nmo >= 0 && nmo <= n);
+   const int local_device = offload_get_chosen_device();
+ 
+   MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
+@@ -757,10 +768,20 @@ void cp_cfm_diag_cusolver_hegvd(
+     abort();
+   }
+ 
+-  CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, matrix_local_size,
+-                             cudaMemcpyDeviceToHost, stream));
+-  CUDA_CHECK(cudaMemcpyAsync(eigenvalues, eigenvalues_dev, n * sizeof(double),
+-                             cudaMemcpyDeviceToHost, stream));
++  // The requested eigenvectors occupy a contiguous prefix of the local columns.
++  const int nq_eigenvectors =
++      cusolverMpNUMROC(nmo, nb_a, mypcol, csrc_a, npcol);
++  const size_t eigenvectors_local_size =
++      (size_t)ldA * nq_eigenvectors * sizeof(cuDoubleComplex);
++  if (eigenvectors_local_size > 0) {
++    CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, eigenvectors_local_size,
++                               cudaMemcpyDeviceToHost, stream));
++  }
++  if (nmo > 0) {
++    CUDA_CHECK(cudaMemcpyAsync(eigenvalues, eigenvalues_dev,
++                               nmo * sizeof(double), cudaMemcpyDeviceToHost,
++                               stream));
++  }
+ 
+   CUDA_CHECK(cudaStreamSynchronize(stream));
+ 
+diff --git a/src/fm/cp_fm_cusolver_api.F b/src/fm/cp_fm_cusolver_api.F
+index 79a2acc..79a7050 100644
+--- a/src/fm/cp_fm_cusolver_api.F
++++ b/src/fm/cp_fm_cusolver_api.F
+@@ -116,13 +116,12 @@ CONTAINS
+ 
+       CHARACTER(len=*), PARAMETER :: routineN = 'cp_fm_general_cusolver'
+ 
+-      INTEGER(kind=C_INT)                                :: handle, n, nmo
+-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues_buffer
++      INTEGER(kind=C_INT)                                :: handle, n
+       TYPE(cp_blacs_env_type), POINTER                   :: context
+       INTERFACE
+          SUBROUTINE cp_fm_general_cusolver_c(fortran_comm, a_matrix_desc, b_matrix_desc, &
+                                              nprow, npcol, myprow, mypcol, &
+-                                             n, aMatrix, bMatrix, eigenvectors, eigenvalues) &
++                                             n, nmo, aMatrix, bMatrix, eigenvectors, eigenvalues) &
+             BIND(C, name="cp_fm_diag_cusolver_sygvd")
+             IMPORT :: C_INT, C_DOUBLE
+             INTEGER(kind=C_INT), VALUE                :: fortran_comm
+@@ -132,6 +131,7 @@ CONTAINS
+             INTEGER(kind=C_INT), VALUE                :: myprow
+             INTEGER(kind=C_INT), VALUE                :: mypcol
+             INTEGER(kind=C_INT), VALUE                :: n
++            INTEGER(kind=C_INT), VALUE                :: nmo
+             REAL(kind=C_DOUBLE), DIMENSION(*)         :: aMatrix
+             REAL(kind=C_DOUBLE), DIMENSION(*)         :: bMatrix
+             REAL(kind=C_DOUBLE), DIMENSION(*)         :: eigenvectors
+@@ -145,9 +145,6 @@ CONTAINS
+       n = INT(aMatrix%matrix_struct%nrow_global, C_INT)
+       context => aMatrix%matrix_struct%context
+ 
+-      ! Allocate eigenvalues_buffer
+-      ALLOCATE (eigenvalues_buffer(n))
+-
+       CALL cp_fm_general_cusolver_c( &
+          fortran_comm=INT(aMatrix%matrix_struct%para_env%get_handle(), C_INT), &
+          a_matrix_desc=INT(aMatrix%matrix_struct%descriptor, C_INT), &
+@@ -157,23 +154,17 @@ CONTAINS
+          myprow=INT(context%mepos(1), C_INT), &
+          mypcol=INT(context%mepos(2), C_INT), &
+          n=n, &
++         nmo=INT(SIZE(eigenvalues), C_INT), &
+          aMatrix=aMatrix%local_data, &
+          bMatrix=bMatrix%local_data, &
+          eigenvectors=eigenvectors%local_data, &
+-         eigenvalues=eigenvalues_buffer)
+-
+-      nmo = SIZE(eigenvalues)
+-      eigenvalues(1:nmo) = eigenvalues_buffer(1:nmo)
+-
+-      DEALLOCATE (eigenvalues_buffer)
++         eigenvalues=eigenvalues)
+ #else
+       MARK_USED(aMatrix)
+       MARK_USED(bMatrix)
+       MARK_USED(eigenvectors)
+       eigenvalues = 0.0_dp
+       MARK_USED(n)
+-      MARK_USED(nmo)
+-      MARK_USED(eigenvalues_buffer)
+       MARK_USED(context)
+       CPABORT("CP2K compiled without the cuSOLVERMp library.")
+ #endif
+@@ -196,13 +187,12 @@ CONTAINS
+ 
+       CHARACTER(len=*), PARAMETER :: routineN = 'cp_cfm_general_cusolver'
+ 
+-      INTEGER(kind=C_INT)                                :: handle, n, nmo
+-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues_buffer
++      INTEGER(kind=C_INT)                                :: handle, n
+       TYPE(cp_blacs_env_type), POINTER                   :: context
+       INTERFACE
+          SUBROUTINE cp_cfm_general_cusolver_c(fortran_comm, a_matrix_desc, b_matrix_desc, &
+                                               nprow, npcol, myprow, mypcol, &
+-                                              n, aMatrix, bMatrix, eigenvectors, eigenvalues) &
++                                              n, nmo, aMatrix, bMatrix, eigenvectors, eigenvalues) &
+             BIND(C, name="cp_cfm_diag_cusolver_hegvd")
+             IMPORT :: C_DOUBLE, C_DOUBLE_COMPLEX, C_INT
+             INTEGER(kind=C_INT), VALUE                :: fortran_comm
+@@ -212,6 +202,7 @@ CONTAINS
+             INTEGER(kind=C_INT), VALUE                :: myprow
+             INTEGER(kind=C_INT), VALUE                :: mypcol
+             INTEGER(kind=C_INT), VALUE                :: n
++            INTEGER(kind=C_INT), VALUE                :: nmo
+             COMPLEX(kind=C_DOUBLE_COMPLEX), DIMENSION(*) :: aMatrix
+             COMPLEX(kind=C_DOUBLE_COMPLEX), DIMENSION(*) :: bMatrix
+             COMPLEX(kind=C_DOUBLE_COMPLEX), DIMENSION(*) :: eigenvectors
+@@ -225,8 +216,6 @@ CONTAINS
+       n = INT(aMatrix%matrix_struct%nrow_global, C_INT)
+       context => aMatrix%matrix_struct%context
+ 
+-      ALLOCATE (eigenvalues_buffer(n))
+-
+       CALL cp_cfm_general_cusolver_c( &
+          fortran_comm=INT(aMatrix%matrix_struct%para_env%get_handle(), C_INT), &
+          a_matrix_desc=INT(aMatrix%matrix_struct%descriptor, C_INT), &
+@@ -236,23 +225,17 @@ CONTAINS
+          myprow=INT(context%mepos(1), C_INT), &
+          mypcol=INT(context%mepos(2), C_INT), &
+          n=n, &
++         nmo=INT(SIZE(eigenvalues), C_INT), &
+          aMatrix=aMatrix%local_data, &
+          bMatrix=bMatrix%local_data, &
+          eigenvectors=eigenvectors%local_data, &
+-         eigenvalues=eigenvalues_buffer)
+-
+-      nmo = SIZE(eigenvalues)
+-      eigenvalues(1:nmo) = eigenvalues_buffer(1:nmo)
+-
+-      DEALLOCATE (eigenvalues_buffer)
++         eigenvalues=eigenvalues)
+ #else
+       MARK_USED(aMatrix)
+       MARK_USED(bMatrix)
+       MARK_USED(eigenvectors)
+       eigenvalues = 0.0_dp
+       MARK_USED(n)
+-      MARK_USED(nmo)
+-      MARK_USED(eigenvalues_buffer)
+       MARK_USED(context)
+       CPABORT("CP2K compiled without the cuSOLVERMp library.")
+ #endif

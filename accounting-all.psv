@@ -1,0 +1,7 @@
+JobIDRaw|User|Account|Partition|State|ExitCode|ElapsedRaw|AllocTRES|NodeList|Start|End
+2233720|cp2k-ci|org-open-sai|16V100|FAILED|1:0|664|billing=600,cpu=32,gres/gpu=4,mem=60G,node=1|16v100n58|2026-11-06T09:39:19|2026-11-06T09:50:23
+2234133|cp2k-ci|org-open-sai|16V100|FAILED|1:0|131|billing=600,cpu=32,gres/gpu=4,mem=60G,node=1|16v100n09|2026-11-06T10:02:53|2026-11-06T10:05:04
+2234297|cp2k-ci|org-open-sai|16V100|FAILED|1:0|95|billing=600,cpu=32,gres/gpu=4,mem=60G,node=1|16v100n09|2026-11-06T10:12:22|2026-11-06T10:13:57
+2234539|cp2k-ci|org-open-sai|16V100|FAILED|1:0|203|billing=600,cpu=32,gres/gpu=4,mem=60G,node=1|16v100n32|2026-11-06T10:19:57|2026-11-06T10:23:20
+2234785|cp2k-ci|org-open-sai|16V100|COMPLETED|0:0|72|billing=600,cpu=32,gres/gpu=4,mem=60G,node=1|16v100n43|2026-11-06T10:33:30|2026-11-06T10:34:42
+2234980|cp2k-ci|org-open-sai|16V100|COMPLETED|0:0|2773|billing=600,cpu=32,gres/gpu=4,mem=60G,node=1|16v100n66|2026-11-06T10:37:31|2026-11-06T11:23:44

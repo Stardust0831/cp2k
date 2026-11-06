@@ -1,0 +1,10 @@
+{
+  "original_archive": "/mnt/g/work/agent/sai-hpc-software/.work/cp2k-issue-6371-draft/cp2k-elpa-cusolvermp-20261025",
+  "original_source_sha": "cfe5e5d87aaf302953f14eb43587bef2411a8fb2",
+  "original_elpa_input_sha256": "f283e6a506ab0830d58b88857c31b5c6fed4a8895f90c915bd6fb19c06f77890",
+  "files": {
+    "input.inp": "70725874208d0422be23052cf5d5ad3fb8a4e39dc0e629c383eda3771b263a1e",
+    "BASIS_MOLOPT": "686dd72e7601ee41d4a173e4c7c3946f1e750f03095090f44d3821c180a81a61",
+    "POTENTIAL": "b0e5adf52fc7b7dcf3f2d156ae3f1327780f6f4d11973db329545e5c73bdc361"
+  }
+}
