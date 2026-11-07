@@ -455,6 +455,43 @@ void cp_fm_diag_cusolver(void **context, const int fortran_comm,
 }
 
 /*******************************************************************************
+ * \brief Release only the host registrations owned by this solve.
+ ******************************************************************************/
+static void unregister_host_matrices(const void *matrices[],
+                                     const size_t sizes[], const int count) {
+  for (int i = 0; i < count; ++i) {
+    if (sizes[i] > 0) {
+      CUDA_CHECK(cudaHostUnregister((void *)matrices[i]));
+    }
+  }
+}
+
+/*******************************************************************************
+ * \brief Pin host matrices together, or retain the original pageable path.
+ ******************************************************************************/
+static int register_host_matrices(const void *matrices[], const size_t sizes[],
+                                  const int count) {
+  CUDA_CHECK(cudaPeekAtLastError());
+  for (int i = 0; i < count; ++i) {
+    if (sizes[i] == 0) {
+      continue;
+    }
+    const cudaError_t error = cudaHostRegister((void *)matrices[i], sizes[i],
+                                               cudaHostRegisterDefault);
+    if (error == cudaErrorHostMemoryAlreadyRegistered ||
+        error == cudaErrorMemoryAllocation || error == cudaErrorNotSupported) {
+      (void)cudaGetLastError();
+      // Overlapping registrations can leave a transfer range only partly
+      // registered, which CUDA rejects. Undo this solve's registrations first.
+      unregister_host_matrices(matrices, sizes, i);
+      return 0;
+    }
+    CUDA_CHECK(error);
+  }
+  return 1;
+}
+
+/*******************************************************************************
  * \brief Driver routine to solve A*x = lambda*B*x with cuSOLVERMp sygvd.
  * \author Jiri Vyskocil
  ******************************************************************************/
@@ -517,6 +554,16 @@ void cp_fm_diag_cusolver_sygvd(void **context, const int fortran_comm,
   // Allocate device memory for matrices
   double *dev_A = NULL, *dev_B = NULL;
   size_t matrix_local_size = ldA * nq_a * sizeof(double);
+  // The requested eigenvectors occupy a contiguous prefix of the local columns.
+  const int nq_eigenvectors =
+      cusolverMpNUMROC(nmo, nb_a, mypcol, csrc_a, npcol);
+  const size_t eigenvectors_local_size =
+      (size_t)ldA * nq_eigenvectors * sizeof(double);
+  const void *host_matrices[] = {aMatrix, bMatrix, eigenvectors};
+  const size_t host_sizes[] = {matrix_local_size, matrix_local_size,
+                               eigenvectors_local_size};
+  const int host_registered =
+      register_host_matrices(host_matrices, host_sizes, 3);
   CUDA_CHECK(cudaMalloc((void **)&dev_A, matrix_local_size));
   CUDA_CHECK(cudaMalloc((void **)&dev_B, matrix_local_size));
 
@@ -579,11 +626,6 @@ void cp_fm_diag_cusolver_sygvd(void **context, const int fortran_comm,
     abort();
   }
 
-  // The requested eigenvectors occupy a contiguous prefix of the local columns.
-  const int nq_eigenvectors =
-      cusolverMpNUMROC(nmo, nb_a, mypcol, csrc_a, npcol);
-  const size_t eigenvectors_local_size =
-      (size_t)ldA * nq_eigenvectors * sizeof(double);
   if (eigenvectors_local_size > 0) {
     CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, eigenvectors_local_size,
                                cudaMemcpyDeviceToHost, stream));
@@ -598,6 +640,9 @@ void cp_fm_diag_cusolver_sygvd(void **context, const int fortran_comm,
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   // Clean up resources
+  if (host_registered) {
+    unregister_host_matrices(host_matrices, host_sizes, 3);
+  }
   CUDA_CHECK(cudaFree(dev_A));
   CUDA_CHECK(cudaFree(dev_B));
   CUDA_CHECK(cudaFree(dev_Z));
@@ -668,6 +713,16 @@ void cp_cfm_diag_cusolver_hegvd(
 
   cuDoubleComplex *dev_A = NULL, *dev_B = NULL;
   size_t matrix_local_size = ldA * nq_a * sizeof(cuDoubleComplex);
+  // The requested eigenvectors occupy a contiguous prefix of the local columns.
+  const int nq_eigenvectors =
+      cusolverMpNUMROC(nmo, nb_a, mypcol, csrc_a, npcol);
+  const size_t eigenvectors_local_size =
+      (size_t)ldA * nq_eigenvectors * sizeof(cuDoubleComplex);
+  const void *host_matrices[] = {aMatrix, bMatrix, eigenvectors};
+  const size_t host_sizes[] = {matrix_local_size, matrix_local_size,
+                               eigenvectors_local_size};
+  const int host_registered =
+      register_host_matrices(host_matrices, host_sizes, 3);
   CUDA_CHECK(cudaMalloc((void **)&dev_A, matrix_local_size));
   CUDA_CHECK(cudaMalloc((void **)&dev_B, matrix_local_size));
 
@@ -724,11 +779,6 @@ void cp_cfm_diag_cusolver_hegvd(
     abort();
   }
 
-  // The requested eigenvectors occupy a contiguous prefix of the local columns.
-  const int nq_eigenvectors =
-      cusolverMpNUMROC(nmo, nb_a, mypcol, csrc_a, npcol);
-  const size_t eigenvectors_local_size =
-      (size_t)ldA * nq_eigenvectors * sizeof(cuDoubleComplex);
   if (eigenvectors_local_size > 0) {
     CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, eigenvectors_local_size,
                                cudaMemcpyDeviceToHost, stream));
@@ -741,6 +791,9 @@ void cp_cfm_diag_cusolver_hegvd(
 
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
+  if (host_registered) {
+    unregister_host_matrices(host_matrices, host_sizes, 3);
+  }
   CUDA_CHECK(cudaFree(dev_A));
   CUDA_CHECK(cudaFree(dev_B));
   CUDA_CHECK(cudaFree(dev_Z));
