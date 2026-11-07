@@ -12,7 +12,8 @@
 MODULE cp_fm_cusolver_api
    USE ISO_C_BINDING,                   ONLY: C_DOUBLE,&
                                               C_DOUBLE_COMPLEX,&
-                                              C_INT
+                                              C_INT,&
+                                              C_PTR
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_cfm_types,                    ONLY: cp_cfm_type
    USE cp_fm_types,                     ONLY: cp_fm_type
@@ -46,11 +47,12 @@ CONTAINS
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues_buffer
       TYPE(cp_blacs_env_type), POINTER                   :: context
       INTERFACE
-         SUBROUTINE cp_fm_diag_cusolver_c(fortran_comm, matrix_desc, &
+         SUBROUTINE cp_fm_diag_cusolver_c(cusolver_context, fortran_comm, matrix_desc, &
                                           nprow, npcol, myprow, mypcol, &
                                           n, matrix, eigenvectors, eigenvalues) &
             BIND(C, name="cp_fm_diag_cusolver")
-            IMPORT :: C_INT, C_DOUBLE
+            IMPORT :: C_INT, C_DOUBLE, C_PTR
+            TYPE(C_PTR), INTENT(INOUT)                 :: cusolver_context
             INTEGER(kind=C_INT), VALUE                :: fortran_comm
             INTEGER(kind=C_INT), DIMENSION(*)         :: matrix_desc
             INTEGER(kind=C_INT), VALUE                :: nprow
@@ -74,6 +76,7 @@ CONTAINS
       ALLOCATE (eigenvalues_buffer(n))
 
       CALL cp_fm_diag_cusolver_c( &
+         cusolver_context=context%cusolver_context, &
          fortran_comm=matrix%matrix_struct%para_env%get_handle(), &
          matrix_desc=matrix%matrix_struct%descriptor, &
          nprow=context%num_pe(1), &
@@ -116,15 +119,15 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'cp_fm_general_cusolver'
 
-      INTEGER(kind=C_INT)                                :: handle, n, nmo
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues_buffer
+      INTEGER(kind=C_INT)                                :: handle, n
       TYPE(cp_blacs_env_type), POINTER                   :: context
       INTERFACE
-         SUBROUTINE cp_fm_general_cusolver_c(fortran_comm, a_matrix_desc, b_matrix_desc, &
+         SUBROUTINE cp_fm_general_cusolver_c(cusolver_context, fortran_comm, a_matrix_desc, b_matrix_desc, &
                                              nprow, npcol, myprow, mypcol, &
-                                             n, aMatrix, bMatrix, eigenvectors, eigenvalues) &
+                                             n, nmo, aMatrix, bMatrix, eigenvectors, eigenvalues) &
             BIND(C, name="cp_fm_diag_cusolver_sygvd")
-            IMPORT :: C_INT, C_DOUBLE
+            IMPORT :: C_INT, C_DOUBLE, C_PTR
+            TYPE(C_PTR), INTENT(INOUT)                 :: cusolver_context
             INTEGER(kind=C_INT), VALUE                :: fortran_comm
             INTEGER(kind=C_INT), DIMENSION(*)         :: a_matrix_desc, b_matrix_desc
             INTEGER(kind=C_INT), VALUE                :: nprow
@@ -132,6 +135,7 @@ CONTAINS
             INTEGER(kind=C_INT), VALUE                :: myprow
             INTEGER(kind=C_INT), VALUE                :: mypcol
             INTEGER(kind=C_INT), VALUE                :: n
+            INTEGER(kind=C_INT), VALUE                :: nmo
             REAL(kind=C_DOUBLE), DIMENSION(*)         :: aMatrix
             REAL(kind=C_DOUBLE), DIMENSION(*)         :: bMatrix
             REAL(kind=C_DOUBLE), DIMENSION(*)         :: eigenvectors
@@ -145,10 +149,8 @@ CONTAINS
       n = INT(aMatrix%matrix_struct%nrow_global, C_INT)
       context => aMatrix%matrix_struct%context
 
-      ! Allocate eigenvalues_buffer
-      ALLOCATE (eigenvalues_buffer(n))
-
       CALL cp_fm_general_cusolver_c( &
+         cusolver_context=context%cusolver_context, &
          fortran_comm=INT(aMatrix%matrix_struct%para_env%get_handle(), C_INT), &
          a_matrix_desc=INT(aMatrix%matrix_struct%descriptor, C_INT), &
          b_matrix_desc=INT(bMatrix%matrix_struct%descriptor, C_INT), &
@@ -157,23 +159,17 @@ CONTAINS
          myprow=INT(context%mepos(1), C_INT), &
          mypcol=INT(context%mepos(2), C_INT), &
          n=n, &
+         nmo=INT(SIZE(eigenvalues), C_INT), &
          aMatrix=aMatrix%local_data, &
          bMatrix=bMatrix%local_data, &
          eigenvectors=eigenvectors%local_data, &
-         eigenvalues=eigenvalues_buffer)
-
-      nmo = SIZE(eigenvalues)
-      eigenvalues(1:nmo) = eigenvalues_buffer(1:nmo)
-
-      DEALLOCATE (eigenvalues_buffer)
+         eigenvalues=eigenvalues)
 #else
       MARK_USED(aMatrix)
       MARK_USED(bMatrix)
       MARK_USED(eigenvectors)
       eigenvalues = 0.0_dp
       MARK_USED(n)
-      MARK_USED(nmo)
-      MARK_USED(eigenvalues_buffer)
       MARK_USED(context)
       CPABORT("CP2K compiled without the cuSOLVERMp library.")
 #endif
@@ -196,15 +192,15 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'cp_cfm_general_cusolver'
 
-      INTEGER(kind=C_INT)                                :: handle, n, nmo
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigenvalues_buffer
+      INTEGER(kind=C_INT)                                :: handle, n
       TYPE(cp_blacs_env_type), POINTER                   :: context
       INTERFACE
-         SUBROUTINE cp_cfm_general_cusolver_c(fortran_comm, a_matrix_desc, b_matrix_desc, &
+         SUBROUTINE cp_cfm_general_cusolver_c(cusolver_context, fortran_comm, a_matrix_desc, b_matrix_desc, &
                                               nprow, npcol, myprow, mypcol, &
-                                              n, aMatrix, bMatrix, eigenvectors, eigenvalues) &
+                                              n, nmo, aMatrix, bMatrix, eigenvectors, eigenvalues) &
             BIND(C, name="cp_cfm_diag_cusolver_hegvd")
-            IMPORT :: C_DOUBLE, C_DOUBLE_COMPLEX, C_INT
+            IMPORT :: C_DOUBLE, C_DOUBLE_COMPLEX, C_INT, C_PTR
+            TYPE(C_PTR), INTENT(INOUT)                 :: cusolver_context
             INTEGER(kind=C_INT), VALUE                :: fortran_comm
             INTEGER(kind=C_INT), DIMENSION(*)         :: a_matrix_desc, b_matrix_desc
             INTEGER(kind=C_INT), VALUE                :: nprow
@@ -212,6 +208,7 @@ CONTAINS
             INTEGER(kind=C_INT), VALUE                :: myprow
             INTEGER(kind=C_INT), VALUE                :: mypcol
             INTEGER(kind=C_INT), VALUE                :: n
+            INTEGER(kind=C_INT), VALUE                :: nmo
             COMPLEX(kind=C_DOUBLE_COMPLEX), DIMENSION(*) :: aMatrix
             COMPLEX(kind=C_DOUBLE_COMPLEX), DIMENSION(*) :: bMatrix
             COMPLEX(kind=C_DOUBLE_COMPLEX), DIMENSION(*) :: eigenvectors
@@ -225,9 +222,8 @@ CONTAINS
       n = INT(aMatrix%matrix_struct%nrow_global, C_INT)
       context => aMatrix%matrix_struct%context
 
-      ALLOCATE (eigenvalues_buffer(n))
-
       CALL cp_cfm_general_cusolver_c( &
+         cusolver_context=context%cusolver_context, &
          fortran_comm=INT(aMatrix%matrix_struct%para_env%get_handle(), C_INT), &
          a_matrix_desc=INT(aMatrix%matrix_struct%descriptor, C_INT), &
          b_matrix_desc=INT(bMatrix%matrix_struct%descriptor, C_INT), &
@@ -236,23 +232,17 @@ CONTAINS
          myprow=INT(context%mepos(1), C_INT), &
          mypcol=INT(context%mepos(2), C_INT), &
          n=n, &
+         nmo=INT(SIZE(eigenvalues), C_INT), &
          aMatrix=aMatrix%local_data, &
          bMatrix=bMatrix%local_data, &
          eigenvectors=eigenvectors%local_data, &
-         eigenvalues=eigenvalues_buffer)
-
-      nmo = SIZE(eigenvalues)
-      eigenvalues(1:nmo) = eigenvalues_buffer(1:nmo)
-
-      DEALLOCATE (eigenvalues_buffer)
+         eigenvalues=eigenvalues)
 #else
       MARK_USED(aMatrix)
       MARK_USED(bMatrix)
       MARK_USED(eigenvectors)
       eigenvalues = 0.0_dp
       MARK_USED(n)
-      MARK_USED(nmo)
-      MARK_USED(eigenvalues_buffer)
       MARK_USED(context)
       CPABORT("CP2K compiled without the cuSOLVERMp library.")
 #endif
