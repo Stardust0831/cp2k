@@ -541,7 +541,8 @@ CONTAINS
       INTEGER(KIND=int_8)                                :: count, offset
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: local_pos
       INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:, :)  :: thread_pos
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: nblocks
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: local_col, local_row, nblocks, &
+                                                            process_col, process_row
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: send_index
       LOGICAL                                            :: transposed
       TYPE(cp_fm_struct_type), POINTER                   :: fms
@@ -554,6 +555,17 @@ CONTAINS
       plan%matrix_type = dbcsr_get_matrix_type(matrix)
       para_env => fms%context%para_env
       nproc = para_env%num_pe
+      ! The block-cyclic mapping is fixed for every element in this plan.
+      ALLOCATE (process_row(fms%nrow_global), local_row(fms%nrow_global), &
+                process_col(fms%ncol_global), local_col(fms%ncol_global))
+      DO i = 1, fms%nrow_global
+         process_row(i) = fms%g2p_row(i)
+         local_row(i) = fms%g2l_row(i)
+      END DO
+      DO i = 1, fms%ncol_global
+         process_col(i) = fms%g2p_col(i)
+         local_col(i) = fms%g2l_col(i)
+      END DO
       nthreads = 1
 !$    nthreads = omp_get_max_threads()
       ALLOCATE (thread_pos(0:nproc - 1, 0:nthreads - 1), nblocks(0:nthreads - 1))
@@ -564,7 +576,7 @@ CONTAINS
 
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(matrix, fms, nproc, nthreads, &
-!$OMP thread_pos, nblocks, send_index, plan) &
+!$OMP thread_pos, nblocks, send_index, plan, process_row, process_col, local_row, local_col) &
 !$OMP PRIVATE(iter, row, col, row_offset, col_offset, nrow, ncol, &
 !$OMP thread, iblock, pos, pass, mirror, i, j, x, y, dest, k, offset, count, local_pos, transposed)
       thread = 0
@@ -618,11 +630,11 @@ CONTAINS
                         x = col_offset + j - 1
                         y = row_offset + i - 1
                      END IF
-                     dest = fms%context%blacs2mpi(fms%g2p_row(x), fms%g2p_col(y))
+                     dest = fms%context%blacs2mpi(process_row(x), process_col(y))
                      local_pos(dest) = local_pos(dest) + 1
                      IF (pass == 1) CYCLE
                      k = INT(local_pos(dest))
-                     send_index(:, k) = [fms%g2l_row(x), fms%g2l_col(y)]
+                     send_index(:, k) = [local_row(x), local_col(y)]
                      pos = pos + 1
                      plan%thread(thread)%slots(pos) = k
                   END DO
