@@ -458,7 +458,7 @@ void cp_fm_diag_cusolver(void **context, const int fortran_comm,
  * \brief Release only the host registrations owned by this solve.
  ******************************************************************************/
 static void unregister_host_matrices(const void *matrices[],
-                                    const size_t sizes[], const int count) {
+                                     const size_t sizes[], const int count) {
   for (int i = 0; i < count; ++i) {
     if (sizes[i] > 0) {
       CUDA_CHECK(cudaHostUnregister((void *)matrices[i]));
@@ -470,14 +470,14 @@ static void unregister_host_matrices(const void *matrices[],
  * \brief Pin host matrices together, or retain the original pageable path.
  ******************************************************************************/
 static int register_host_matrices(const void *matrices[], const size_t sizes[],
-                                 const int count) {
+                                  const int count) {
   CUDA_CHECK(cudaPeekAtLastError());
   for (int i = 0; i < count; ++i) {
     if (sizes[i] == 0) {
       continue;
     }
-    const cudaError_t error =
-        cudaHostRegister((void *)matrices[i], sizes[i], cudaHostRegisterDefault);
+    const cudaError_t error = cudaHostRegister((void *)matrices[i], sizes[i],
+                                               cudaHostRegisterDefault);
     if (error == cudaErrorHostMemoryAlreadyRegistered ||
         error == cudaErrorMemoryAllocation || error == cudaErrorNotSupported) {
       (void)cudaGetLastError();
@@ -562,7 +562,8 @@ void cp_fm_diag_cusolver_sygvd(void **context, const int fortran_comm,
   const void *host_matrices[] = {aMatrix, bMatrix, eigenvectors};
   const size_t host_sizes[] = {matrix_local_size, matrix_local_size,
                                eigenvectors_local_size};
-  const int host_registered = register_host_matrices(host_matrices, host_sizes, 3);
+  const int host_registered =
+      register_host_matrices(host_matrices, host_sizes, 3);
   CUDA_CHECK(cudaMalloc((void **)&dev_A, matrix_local_size));
   CUDA_CHECK(cudaMalloc((void **)&dev_B, matrix_local_size));
 
@@ -720,7 +721,8 @@ void cp_cfm_diag_cusolver_hegvd(
   const void *host_matrices[] = {aMatrix, bMatrix, eigenvectors};
   const size_t host_sizes[] = {matrix_local_size, matrix_local_size,
                                eigenvectors_local_size};
-  const int host_registered = register_host_matrices(host_matrices, host_sizes, 3);
+  const int host_registered =
+      register_host_matrices(host_matrices, host_sizes, 3);
   CUDA_CHECK(cudaMalloc((void **)&dev_A, matrix_local_size));
   CUDA_CHECK(cudaMalloc((void **)&dev_B, matrix_local_size));
 
