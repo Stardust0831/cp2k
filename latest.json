@@ -2,19 +2,19 @@
   "accounting": {
     "account": "org-open-sai",
     "allocation": "billing=600,cpu=32,gres/gpu=4,mem=60G,node=1",
-    "elapsed": "00:01:06",
+    "elapsed": "00:01:05",
     "exit_code": "0:0",
-    "job": "2281353",
-    "nodes": "16v100n37",
+    "job": "2299556",
+    "nodes": "16v100n29",
     "state": "COMPLETED",
     "user": "cp2k-ci"
   },
-  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/42364953244",
-  "completed_at": "2026-11-07T10:42:29.468428+00:00",
+  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/42455830204",
+  "completed_at": "2026-11-08T06:44:02.566710+00:00",
   "error": null,
-  "image_sha256": "ed90e01cbd11c0a2a9c402da148e00dc0bd94484adde0fd3b5a03c850bd58988",
-  "job": "2281353",
-  "run_id": "github-42364953244-1",
+  "image_sha256": "51c739b22c2512c58f9e31bc0e1413a557c87bbfe055b23e84485937c9e55b7d",
+  "job": "2299556",
+  "run_id": "github-42455830204-1",
   "server_version": {
     "controller_sha": "f6eab22f4580968afa74dc11fe28033af7c59cf6",
     "files": {
@@ -23,7 +23,7 @@
     },
     "submission_image_sha256": "c29837d34a7efea0aa7ab479878cb10cdfdd75b2a35858e5ab12dbe114682417"
   },
-  "source_sha": "0761fd1b052d62503997faf4d66c0f8b9cec03b7",
+  "source_sha": "b0248242982381cac583edcb3d8c7e9cb8bf6af6",
   "status": "OK",
   "terminal": true
 }
