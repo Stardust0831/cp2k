@@ -1,8 +1,29 @@
 {
-  "status": "UNKNOWN",
-  "source_sha": null,
-  "run_id": "github-42553794596-1",
-  "completed_at": "2026-11-09T02:58:42.899427+00:00",
-  "error": "SAI tester: daily image delivery failed or is stale: {'checked_at': '2026-11-08T20:56:13.738103+00:00', 'image_sha256': '51c739b22c2512c58f9e31bc0e1413a557c87bbfe055b23e84485937c9e55b7d', 'manifest': '/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery/containers/software/cp2k/development/master-2026-11-07-gb02482429823-r072a856f73b7/16V100/42437624596-1-development-16v100-avx2-2026-11-08-b02482429823.json', 'source_sha': 'b0248242982381cac583edcb3d8c7e9cb8bf6af6', 'status': 'OK'}",
-  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/42553794596"
+  "accounting": {
+    "account": "org-open-sai",
+    "allocation": "billing=600,cpu=32,gres/gpu=4,mem=60G,node=1",
+    "elapsed": "00:01:12",
+    "exit_code": "0:0",
+    "job": "2312375",
+    "nodes": "16v100n32",
+    "state": "COMPLETED",
+    "user": "cp2k-ci"
+  },
+  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/42555942513",
+  "completed_at": "2026-11-09T03:23:17.927717+00:00",
+  "error": null,
+  "image_sha256": "6c003153099e32aa3d58cc5f75d840a02b4f0900fbc709b09040fae80c7e1a45",
+  "job": "2312375",
+  "run_id": "github-42555942513-1",
+  "server_version": {
+    "controller_sha": "f6eab22f4580968afa74dc11fe28033af7c59cf6",
+    "files": {
+      "entry.py": "ff192dbc970b09cef3e6a88cb6b6126d71a966db834910ceb4adfee8ce7891a1",
+      "server.py": "6c5edc36a4729491b5fbc763c967393c43b81a4cfb81281ed33533128c91fee5"
+    },
+    "submission_image_sha256": "c29837d34a7efea0aa7ab479878cb10cdfdd75b2a35858e5ab12dbe114682417"
+  },
+  "source_sha": "f7b901573b9717fff1c9237a024fb064b6bad373",
+  "status": "OK",
+  "terminal": true
 }
