@@ -1,8 +1,8 @@
 {
   "status": "UNKNOWN",
   "source_sha": null,
-  "run_id": "github-42533677172-1",
-  "completed_at": "2026-11-08T23:08:25.900324+00:00",
+  "run_id": "github-42553794596-1",
+  "completed_at": "2026-11-09T02:58:42.899427+00:00",
   "error": "SAI tester: daily image delivery failed or is stale: {'checked_at': '2026-11-08T20:56:13.738103+00:00', 'image_sha256': '51c739b22c2512c58f9e31bc0e1413a557c87bbfe055b23e84485937c9e55b7d', 'manifest': '/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery/containers/software/cp2k/development/master-2026-11-07-gb02482429823-r072a856f73b7/16V100/42437624596-1-development-16v100-avx2-2026-11-08-b02482429823.json', 'source_sha': 'b0248242982381cac583edcb3d8c7e9cb8bf6af6', 'status': 'OK'}",
-  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/42533677172"
+  "action_url": "https://github.com/Stardust0831/cp2k/actions/runs/42553794596"
 }
