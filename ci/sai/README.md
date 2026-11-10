@@ -1,8 +1,9 @@
 # SAI multi-GPU CI target
 
-SAI provides a free four-V100 testing environment. The `sai-cusolvermp` target uses cp2k-ci's
-existing SSH remote runner for daily and pull-request testing. An organization member can request a
-run with `/cp2kci sai-cusolvermp`. The target also runs automatically for changes matching its
+[SAI](https://www.open-sai.com/?lang=en-US) (Open Source Supercomputing Center of SAI) provides a
+free four-V100 testing environment. The `sai-cusolvermp` target uses cp2k-ci's existing SSH remote
+runner for daily and pull-request testing. An organization member can request a run with
+`/cp2kci sai-cusolvermp`. The target also runs automatically for changes matching its
 `trigger_path`.
 
 The relay fetches the exact commit SHA supplied by cp2k-ci, including a PR's merge commit. SAI uses
