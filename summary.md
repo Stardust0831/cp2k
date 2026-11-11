@@ -2,11 +2,11 @@
 
 Status: **OK**
 
-CP2K: `c6417739960d602b4710ac5e6b229be39f59cb58`
+CP2K: `b672eecf6c8afe7653818280e0f2c472be67b559`
 
 Full daily SIF; 4 MPI ranks × 4 OpenMP threads; no explicit memory request.
 
-Slurm `2362821`: COMPLETED, 00:01:04, `16v100n42`.
+Slurm `2384268`: COMPLETED, 00:01:28, `16v100n20`.
 
 9/9 cases passed; 8 numerical checks; 6 cuSOLVERMp execution paths verified.
 
@@ -22,6 +22,6 @@ Slurm `2362821`: COMPLETED, 00:01:04, `16v100n42`.
 | `QS/regtest-elpa-qr/si128-elpa.inp` | `cp_fm_diag_cusolver` |
 | `QS/regtest-elpa-qr/si128-elpa-qr.inp` | `cp_fm_diag_cusolver` |
 
-[Action](https://github.com/Stardust0831/cp2k/actions/runs/42934957449)
+[Action](https://github.com/Stardust0831/cp2k/actions/runs/43116760694)
 
 Raw artifacts include original/adapted inputs, outputs, backend timers, GPU/rank mapping, image and source identity, and final Slurm accounting.
