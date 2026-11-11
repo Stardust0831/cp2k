@@ -1,2 +1,71 @@
-Summary: Tester infrastructure: SAI tester: daily image delivery failed or is stale: {'checked_at': '2026-11-10T03:52:25.255996+00:00', 'image_sha256': 'c62183d4076866ebb6cf45ea7cb079f5fa14d82acf26ef6597f7b30da10f2c0e', 'manifest': '/org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/delivery/containers/software/cp2k/development/master-2026-11-09-gdb0abe27bef8-r8e956177900f/16V100/42729730793-1-development-16v100-avx2-2026-11-10-db0abe27bef8.json', 'source_sha': 'db0abe27bef8b49a2af1137b2fe2989040907e64', 'status': 'OK'}
-Status: UNKNOWN
+CommitSHA: c6417739960d602b4710ac5e6b229be39f59cb58
+Tester: SAI cuSOLVERMp (4 V100)
+ImageSHA256: 9a07e3ab1ca235deea0995fa3e88d18b6834510e91a3c674431933c9f618f2a9
+RecipeSHA256: df33871fa6c2486d4308b917149b12e6ed3a0f2fa970542878b57f8749897245
+*************************** Testing started ****************************
+
+----------------------------- Settings ---------------------------------
+MPI ranks:      4
+OpenMP threads: 4
+GPU devices:    4
+Workers:        1
+Timeout [s]:    150
+Work base dir:  /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21
+MPI exec:       /opt/devtools/openmpi/openmpi-5.0.10-nvhpc263-gnu-cuda12-avx2/bin/mpirun -np {N} --mca plm isolated --mca ras ^slurm --host localhost:16 --map-by ppr:4:node:pe=4 --bind-to core --report-bindings
+Smoke test:     False
+Valgrind:       False
+Keepalive:      False
+Flag slow:      False
+Debug:          False
+Binary dir:     /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/bin
+CP2K data dir:  /opt/apps/cp2k/cp2k-development-master-2026-11-10-gc6417739960d-rdf33871fa6c2/16V100/share/cp2k/data
+VERSION:        psmp
+Flags:          omp,libint,fftw3,libxc,libxc_gpu,elpa,parallel,scalapack,mpi_f08,cosma,libxs,libxsmm,dbcsr_acc,plumed2,spglib,openblas,libdftd4,s_dftd3,mctc-lib,tblite,libvori,libbqb,offload_cuda,spla_gemm_offloading,cusolvermp,cusolvermp_nccl,hdf5,libwignernj
+------------------------------------------------------------------------
+Copying test files ... done
+Launched 4 test directories and 1 worker...
+
+>>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21/QS/regtest-cusolver
+    H2O-6.inp                                                                             -17.14603642           OK (   3.23 sec)
+    Si8-generalized.inp                                                                   -31.18760297           OK (   6.72 sec)
+    Si8-generalized-complex.inp                                                           -31.46108909           OK (   6.48 sec)
+<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21/QS/regtest-cusolver (1 of 4) done in 16.44 sec
+>>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21/QS/regtest-elpa
+    cplx_kp.inp                                                                           -41.89708036           OK (   3.08 sec)
+    tailblock_hang.inp                                                                               -           OK (  12.47 sec)
+    H13-tailblock.inp                                                                     -4.603864759           OK (   6.42 sec)
+<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21/QS/regtest-elpa (2 of 4) done in 21.97 sec
+>>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21/QS/regtest-elpa-2
+    H2O-elpa-redistribute.inp                                                             -16.97332797           OK (   3.41 sec)
+<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21/QS/regtest-elpa-2 (3 of 4) done in 3.41 sec
+>>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21/QS/regtest-elpa-qr
+    si128-elpa.inp                                                                        0.2748485038           OK (   6.01 sec)
+    si128-elpa-qr.inp                                                                     0.2748485038           OK (   6.22 sec)
+<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-42934957449-2/results/regtesting/TEST-2026-11-11_02-15-21/QS/regtest-elpa-qr (4 of 4) done in 12.22 sec
+------------------------------- Errors ---------------------------------
+
+
+------------------------------- Timings --------------------------------
+Plot: name="timings", title="Timing Distribution", ylabel="time [s]"
+PlotPoint: name="100th_percentile", plot="timings", label="100th %ile", y=12.47, yerr=0.0
+PlotPoint: name="99th_percentile", plot="timings", label="99th %ile", y=12.01, yerr=0.0
+PlotPoint: name="98th_percentile", plot="timings", label="98th %ile", y=11.55, yerr=0.0
+PlotPoint: name="95th_percentile", plot="timings", label="95th %ile", y=10.17, yerr=0.0
+PlotPoint: name="90th_percentile", plot="timings", label="90th %ile", y=7.87, yerr=0.0
+PlotPoint: name="80th_percentile", plot="timings", label="80th %ile", y=6.58, yerr=0.0
+
+------------------------------- Summary --------------------------------
+Number of FAILED  tests 0
+Number of WRONG   tests 0
+Number of CORRECT tests 9
+Total number of   tests 9
+
+Summary: correct: 9 / 9; 1min
+Status: OK
+
+*************************** Testing ended ******************************
+
+Summary: 9 cases passed; 6 cuSOLVERMp paths verified
+Status: OK
+ReportTime: 2026-11-11T02:16:31.873842+00:00
+ActionURL: https://github.com/Stardust0831/cp2k/actions/runs/42934957449
