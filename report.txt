@@ -1,6 +1,6 @@
-CommitSHA: edc37958a646f2d89312a5b9ba1dfda35fd33222
+CommitSHA: e1220d9e70af89d545eebd44ec4288cf8b7955b6
 Tester: SAI cuSOLVERMp (4 V100)
-ImageSHA256: 17552cd7c93269e2811aba8a1a98bbac64cdcf1de73067e0ff1a277aca25a0d8
+ImageSHA256: 7a7565a07ebfafcbe2b8b84c021ef8281e4c891e0b1f4772cb6145d81e7de113
 RecipeSHA256: 44c1ecf58c82bd9fea8b8c7bc85675e86575822e08e2a6bf85469922bed45817
 *************************** Testing started ****************************
 
@@ -10,49 +10,49 @@ OpenMP threads: 4
 GPU devices:    4
 Workers:        1
 Timeout [s]:    150
-Work base dir:  /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40
+Work base dir:  /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48
 MPI exec:       /opt/devtools/openmpi/openmpi-5.0.10-nvhpc263-gnu-cuda12-avx2/bin/mpirun -np {N} --mca plm isolated --mca ras ^slurm --host localhost:16 --map-by ppr:4:node:pe=4 --bind-to core --report-bindings
 Smoke test:     False
 Valgrind:       False
 Keepalive:      False
 Flag slow:      False
 Debug:          False
-Binary dir:     /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/bin
-CP2K data dir:  /opt/apps/cp2k/cp2k-development-master-2026-11-14-gedc37958a646-r44c1ecf58c82/16V100/share/cp2k/data
+Binary dir:     /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/bin
+CP2K data dir:  /opt/apps/cp2k/cp2k-development-master-2026-11-15-ge1220d9e70af-r44c1ecf58c82/16V100/share/cp2k/data
 VERSION:        psmp
 Flags:          omp,libint,fftw3,libxc,libxc_gpu,elpa,parallel,scalapack,mpi_f08,cosma,libxs,libxsmm,dbcsr_acc,plumed2,spglib,openblas,libdftd4,s_dftd3,mctc-lib,tblite,libvori,libbqb,offload_cuda,spla_gemm_offloading,cusolvermp,cusolvermp_nccl,hdf5,libwignernj
 ------------------------------------------------------------------------
 Copying test files ... done
 Launched 4 test directories and 1 worker...
 
->>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40/QS/regtest-cusolver
-    H2O-6.inp                                                                             -17.14603642           OK (   3.34 sec)
-    Si8-generalized.inp                                                                   -31.18760297           OK (   7.22 sec)
-    Si8-generalized-complex.inp                                                           -31.46108909           OK (   6.72 sec)
-<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40/QS/regtest-cusolver (1 of 4) done in 17.27 sec
->>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40/QS/regtest-elpa
-    cplx_kp.inp                                                                           -41.89708036           OK (   3.31 sec)
-    tailblock_hang.inp                                                                               -           OK (  13.38 sec)
-    H13-tailblock.inp                                                                     -4.603864759           OK (   7.34 sec)
-<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40/QS/regtest-elpa (2 of 4) done in 24.03 sec
->>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40/QS/regtest-elpa-2
-    H2O-elpa-redistribute.inp                                                             -16.97332797           OK (   3.28 sec)
-<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40/QS/regtest-elpa-2 (3 of 4) done in 3.28 sec
->>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40/QS/regtest-elpa-qr
-    si128-elpa.inp                                                                        0.2748485038           OK (   6.68 sec)
-    si128-elpa-qr.inp                                                                     0.2748485038           OK (   6.70 sec)
-<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43652973593-1/results/regtesting/TEST-2026-11-14_23-23-40/QS/regtest-elpa-qr (4 of 4) done in 13.37 sec
+>>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48/QS/regtest-cusolver
+    H2O-6.inp                                                                             -17.14603642           OK (   3.38 sec)
+    Si8-generalized.inp                                                                   -31.18760297           OK (   6.38 sec)
+    Si8-generalized-complex.inp                                                           -31.46108909           OK (   6.64 sec)
+<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48/QS/regtest-cusolver (1 of 4) done in 16.40 sec
+>>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48/QS/regtest-elpa
+    cplx_kp.inp                                                                           -41.89708036           OK (   3.34 sec)
+    tailblock_hang.inp                                                                               -           OK (  12.71 sec)
+    H13-tailblock.inp                                                                     -4.603864759           OK (   6.31 sec)
+<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48/QS/regtest-elpa (2 of 4) done in 22.36 sec
+>>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48/QS/regtest-elpa-2
+    H2O-elpa-redistribute.inp                                                             -16.97332797           OK (   3.31 sec)
+<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48/QS/regtest-elpa-2 (3 of 4) done in 3.31 sec
+>>> /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48/QS/regtest-elpa-qr
+    si128-elpa.inp                                                                        0.2748485038           OK (   6.42 sec)
+    si128-elpa-qr.inp                                                                     0.2748485038           OK (   6.04 sec)
+<<< /org/org-open-sai/cp2k-ci/cp2k-cusolvermp-tester/state/runtime-tests/github-43773321299-1/results/regtesting/TEST-2026-11-15_23-10-48/QS/regtest-elpa-qr (4 of 4) done in 12.46 sec
 ------------------------------- Errors ---------------------------------
 
 
 ------------------------------- Timings --------------------------------
 Plot: name="timings", title="Timing Distribution", ylabel="time [s]"
-PlotPoint: name="100th_percentile", plot="timings", label="100th %ile", y=13.38, yerr=0.0
-PlotPoint: name="99th_percentile", plot="timings", label="99th %ile", y=12.90, yerr=0.0
-PlotPoint: name="98th_percentile", plot="timings", label="98th %ile", y=12.42, yerr=0.0
-PlotPoint: name="95th_percentile", plot="timings", label="95th %ile", y=10.97, yerr=0.0
-PlotPoint: name="90th_percentile", plot="timings", label="90th %ile", y=8.55, yerr=0.0
-PlotPoint: name="80th_percentile", plot="timings", label="80th %ile", y=7.27, yerr=0.0
+PlotPoint: name="100th_percentile", plot="timings", label="100th %ile", y=12.71, yerr=0.0
+PlotPoint: name="99th_percentile", plot="timings", label="99th %ile", y=12.22, yerr=0.0
+PlotPoint: name="98th_percentile", plot="timings", label="98th %ile", y=11.74, yerr=0.0
+PlotPoint: name="95th_percentile", plot="timings", label="95th %ile", y=10.28, yerr=0.0
+PlotPoint: name="90th_percentile", plot="timings", label="90th %ile", y=7.85, yerr=0.0
+PlotPoint: name="80th_percentile", plot="timings", label="80th %ile", y=6.51, yerr=0.0
 
 ------------------------------- Summary --------------------------------
 Number of FAILED  tests 0
@@ -67,5 +67,5 @@ Status: OK
 
 Summary: 9 cases passed; 6 cuSOLVERMp paths verified
 Status: OK
-ReportTime: 2026-11-14T23:24:48.514418+00:00
-ActionURL: https://github.com/Stardust0831/cp2k/actions/runs/43652973593
+ReportTime: 2026-11-15T23:11:53.101790+00:00
+ActionURL: https://github.com/Stardust0831/cp2k/actions/runs/43773321299
