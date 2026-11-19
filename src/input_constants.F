@@ -58,7 +58,8 @@ MODULE input_constants
                                                do_embed = 7, &
                                                do_sirius = 8, &
                                                do_nnp = 9, &
-                                               do_ipi = 10
+                                               do_ipi = 10, &
+                                               do_gxtb = 11
 
    ! NNP USE_GPU keyword values. AUTO resolves to ON or OFF once at init, so the
    ! force evaluation only ever tests use_gpu == nnp_use_gpu_on.

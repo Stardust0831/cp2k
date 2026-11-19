@@ -46,6 +46,7 @@ MODULE force_env_types
                                               ipi_env_release,&
                                               ipi_environment_type
    USE ipi_server,                      ONLY: shutdown_server
+   USE gxtb_types,                      ONLY: gxtb_env_type, gxtb_release
    USE kinds,                           ONLY: dp
    USE message_passing,                 ONLY: mp_para_env_release,&
                                               mp_para_env_type
@@ -89,9 +90,9 @@ MODULE force_env_types
                                  use_embed = 507, &
                                  use_pwdft_force = 508, &
                                  use_nnp_force = 509, &
-                                 use_ipi = 510
+                                 use_ipi = 510, use_gxtb = 511
 
-   CHARACTER(LEN=10), DIMENSION(501:510), PARAMETER, PUBLIC :: &
+   CHARACTER(LEN=10), DIMENSION(501:511), PARAMETER, PUBLIC :: &
       use_prog_name = [ &
       "FIST  ", &
       "QS    ", &
@@ -102,7 +103,7 @@ MODULE force_env_types
       "EMBED ", &
       "SIRIUS", &
       "NNP   ", &
-      "IPI   "]
+      "IPI   ", "GXTB  "]
 
    PUBLIC :: force_env_type, &
              force_env_p_type
@@ -160,6 +161,7 @@ MODULE force_env_types
       TYPE(nnp_type), POINTER                          :: nnp_env => NULL()
       TYPE(embed_env_type), POINTER                    :: embed_env => NULL()
       TYPE(ipi_environment_type), POINTER              :: ipi_env => NULL()
+      TYPE(gxtb_env_type), POINTER                     :: gxtb_env => NULL()
       TYPE(section_vals_type), POINTER                 :: force_env_section => NULL()
       TYPE(section_vals_type), POINTER                 :: root_section => NULL()
    END TYPE force_env_type
@@ -262,6 +264,9 @@ CONTAINS
             CASE (use_embed)
                CALL embed_env_release(force_env%embed_env)
                DEALLOCATE (force_env%embed_env)
+            CASE (use_gxtb)
+               CALL gxtb_release(force_env%gxtb_env)
+               DEALLOCATE (force_env%gxtb_env)
             CASE (use_ipi)
                CALL shutdown_server(force_env%ipi_env)
                CALL ipi_env_release(force_env%ipi_env)
@@ -457,6 +462,11 @@ CONTAINS
                           nnp_potential_energy=potential_energy, &
                           subsys=subsys)
          CPASSERT(.NOT. PRESENT(kinetic_energy))
+      CASE (use_gxtb)
+         CPASSERT(ASSOCIATED(force_env%gxtb_env))
+         CPASSERT(.NOT. PRESENT(kinetic_energy))
+         IF (PRESENT(subsys)) subsys => force_env%gxtb_env%subsys
+         IF (PRESENT(potential_energy)) potential_energy = force_env%gxtb_env%energy
       CASE (use_ipi)
          CALL ipi_env_get(force_env%ipi_env, &
                           ipi_energy=potential_energy, &

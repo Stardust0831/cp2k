@@ -76,7 +76,7 @@ MODULE f77_interface
    USE grid_api,                        ONLY: grid_library_finalize,&
                                               grid_library_init
    USE input_constants,                 ONLY: &
-        do_eip, do_embed, do_fist, do_ipi, do_mixed, do_nnp, do_qmmm, do_qmmmx, do_qs, do_sirius
+        do_eip, do_embed, do_fist, do_gxtb, do_ipi, do_mixed, do_nnp, do_qmmm, do_qmmmx, do_qs, do_sirius
    USE input_cp2k_check,                ONLY: check_cp2k_input
    USE input_cp2k_force_eval,           ONLY: create_force_eval_section
    USE input_cp2k_read,                 ONLY: empty_initial_variables,&
@@ -91,6 +91,7 @@ MODULE f77_interface
         section_vals_remove_values, section_vals_retain, section_vals_type, section_vals_val_get, &
         section_vals_write
    USE ipi_environment,                 ONLY: ipi_init
+   USE gxtb_environment,                ONLY: gxtb_env_type, gxtb_init
    USE ipi_environment_types,           ONLY: ipi_environment_type
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
@@ -666,6 +667,7 @@ CONTAINS
       TYPE(fp_type), POINTER                             :: fp_env
       TYPE(global_environment_type), POINTER             :: globenv
       TYPE(ipi_environment_type), POINTER                :: ipi_env
+      TYPE(gxtb_env_type), POINTER                       :: gxtb_env
       TYPE(keyword_type), POINTER                        :: keyword
       TYPE(meta_env_type), POINTER                       :: meta_env
       TYPE(mixed_environment_type), POINTER              :: mixed_env
@@ -937,6 +939,11 @@ CONTAINS
             CALL force_env_create(my_force_env, root_section, nnp_env=nnp_env, para_env=my_para_env, &
                                   globenv=globenv, force_env_section=force_env_section)
 
+         CASE (do_gxtb)
+            ALLOCATE (gxtb_env)
+            CALL gxtb_init(gxtb_env, root_section, force_env_section, subsys_section, my_para_env, use_motion_section)
+            CALL force_env_create(my_force_env, root_section, gxtb_env=gxtb_env, para_env=my_para_env, &
+                                  globenv=globenv, force_env_section=force_env_section)
          CASE (do_ipi)
             ALLOCATE (ipi_env)
             CALL ipi_init(ipi_env, root_section, my_para_env, force_env_section=force_env_section, &

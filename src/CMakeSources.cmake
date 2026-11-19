@@ -346,6 +346,8 @@ list(
   ipi_environment.F
   ipi_environment_types.F
   ipi_server.F
+  gxtb_environment.F
+  gxtb_types.F
   iterate_matrix.F
   kg_correction.F
   kg_environment.F
@@ -1529,6 +1531,7 @@ list(
   CP2K_SRCS_C
   libint_c_api.c
   sockets.c
+  gxtb_bridge.c
   base/machine_cpuid.c
   base/openmp_trace.c
   base/openmp_trace.c

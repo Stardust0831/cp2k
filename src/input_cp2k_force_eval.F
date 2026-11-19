@@ -21,7 +21,7 @@ MODULE input_cp2k_force_eval
    USE cp_units,                        ONLY: cp_unit_to_cp2k
    USE generic_function_input,          ONLY: create_function_section
    USE input_constants,                 ONLY: &
-        do_eip, do_embed, do_fist, do_ipi, do_mixed, do_nnp, do_qmmm, do_qs, do_sirius, &
+        do_eip, do_embed, do_fist, do_gxtb, do_ipi, do_mixed, do_nnp, do_qmmm, do_qs, do_sirius, &
         do_stress_analytical, do_stress_diagonal_anal, do_stress_diagonal_numer, do_stress_none, &
         do_stress_numerical, numerical
    USE input_cp2k_dft,                  ONLY: create_bsse_section,&
@@ -90,7 +90,7 @@ CONTAINS
                                           "NNP", &
                                           "MIXED", &
                                           "EMBED", &
-                                          "IPI"), &
+                                          "IPI", "GXTB"), &
                           enum_desc=s2a("Alias for QUICKSTEP", &
                                         "PW DFT using the SIRIUS library", &
                                         "Molecular Mechanics", &
@@ -100,11 +100,35 @@ CONTAINS
                                         "Neural Network Potentials", &
                                         "Use a combination of two of the above", &
                                         "Perform an embedded calculation", &
-                                        "Receive forces from an i-PI client"), &
-                          enum_i_vals=[do_qs, do_sirius, do_fist, do_qmmm, do_eip, do_qs, do_nnp, do_mixed, do_embed, do_ipi], &
+                                        "Receive forces from an i-PI client", &
+                                        "Periodic g-xTB with an explicit Born-von Karman supercell"), &
+                          enum_i_vals=[do_qs, do_sirius, do_fist, do_qmmm, do_eip, do_qs, do_nnp, do_mixed, &
+                                       do_embed, do_ipi, do_gxtb], &
                           default_i_val=do_qs)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
+
+      NULLIFY (subsection)
+      CALL section_create(subsection, __LOCATION__, name="GXTB", &
+                          description="Periodic g-xTB energy, forces and stress in a neutral three-dimensional cell.")
+      CALL keyword_create(keyword, __LOCATION__, name="LIBRARY", &
+                          description="Shared library providing the periodic g-xTB energy and derivatives.", &
+                          usage="LIBRARY /path/to/libgxtb_backend.so", default_lc_val="")
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="REPEATS", &
+                          description="Numbers of copies of each cell vector in the Gamma-point electronic calculation.", &
+                          usage="REPEATS 2 2 2", n_var=3, default_i_vals=[1, 1, 1])
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="EXCHANGE_RADII", &
+                          description="Fixed exchange damping and cutoff radii for providers requiring them.", &
+                          usage="EXCHANGE_RADII [angstrom] 4 6", unit_str="angstrom", n_var=2, &
+                          default_r_vals=[0.0_dp, 0.0_dp])
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
 
       CALL keyword_create(keyword, __LOCATION__, name="STRESS_TENSOR", &
                           description="Controls the calculation of the stress tensor. The combinations defined below"// &

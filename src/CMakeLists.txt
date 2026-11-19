@@ -207,6 +207,7 @@ else()
 endif()
 
 target_compile_features(cp2k PUBLIC cuda_std_11)
+target_link_libraries(cp2k PRIVATE ${CMAKE_DL_LIBS})
 target_include_directories(cp2k PUBLIC $<INSTALL_INTERFACE:include/cp2k>)
 
 if(CP2K_DBM_OPENCL)

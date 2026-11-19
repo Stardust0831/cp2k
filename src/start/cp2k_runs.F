@@ -76,7 +76,7 @@ MODULE cp2k_runs
                                               grid_library_set_config
    USE input_constants,                 ONLY: &
         bsse_run, cell_opt_run, debug_run, do_atom, do_band, do_cp2k, do_embed, do_farming, &
-        do_fist, do_ipi, do_mixed, do_nnp, do_opt_basis, do_optimize_input, do_qmmm, do_qs, &
+        do_fist, do_gxtb, do_ipi, do_mixed, do_nnp, do_opt_basis, do_optimize_input, do_qmmm, do_qs, &
         do_sirius, do_swarm, do_tamc, do_test, do_tree_mc, do_tree_mc_ana, driver_run, ehrenfest, &
         energy_force_run, energy_run, geo_opt_run, history_guess, linear_response_run, mimic_run, &
         mol_dyn_run, mon_car_run, mtlr_run, negf_run, none_run, pint_run, real_time_propagation, &
@@ -310,7 +310,7 @@ CONTAINS
              method_name_id /= do_nnp .AND. &
              method_name_id /= do_embed .AND. &
              method_name_id /= do_fist .AND. &
-             method_name_id /= do_ipi) THEN
+             method_name_id /= do_gxtb .AND. method_name_id /= do_ipi) THEN
             CPABORT("Energy/Force run not available for all methods ")
          END IF
 
