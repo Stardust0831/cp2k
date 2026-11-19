@@ -129,19 +129,16 @@ CONTAINS
          CALL listen_socket(socket, 1_c_int)
          CALL accept_socket(socket, comm_socket)
          CALL close_socket(socket)
-         CALL remove_socket_file(c_hostname)
+         IF (drv_unix) CALL remove_socket_file(c_hostname)
          CALL ipi_env_set(ipi_env=ipi_env, sockfd=comm_socket)
-      END IF
 
-      ! Check if the client needs initialization
-      ! We only send a meaningless message since we have no general way of
-      ! knowing what the client is expecting
-      CALL ask_status(comm_socket, msgbuffer)
-      IF (TRIM(msgbuffer) == "NEEDINIT") THEN
-         CALL writebuffer(comm_socket, initmsg, msglength)
-         CALL writebuffer(comm_socket, 1) ! Bead index - just send 1
-         CALL writebuffer(comm_socket, 12) ! Bits in the following message
-         CALL writebuffer(comm_socket, "Initializing", 12)
+         CALL ask_status(comm_socket, msgbuffer)
+         IF (TRIM(msgbuffer) == "NEEDINIT") THEN
+            CALL writebuffer(comm_socket, initmsg, msglength)
+            CALL writebuffer(comm_socket, 1)
+            CALL writebuffer(comm_socket, 12)
+            CALL writebuffer(comm_socket, "Initializing", 12)
+         END IF
       END IF
 
 #endif
@@ -162,6 +159,7 @@ CONTAINS
 
       INTEGER                                            :: output_unit
 
+      IF (.NOT. ipi_env%subsys%para_env%is_source()) RETURN
       output_unit = cp_logger_get_default_io_unit()
       WRITE (output_unit, *) "@ i–PI: Shutting down server."
       CALL writebuffer(ipi_env%sockfd, msg, msglength)
@@ -177,45 +175,39 @@ CONTAINS
       TYPE(ipi_environment_type), POINTER                :: ipi_env
 
       CHARACTER(len=msglength)                           :: msgbuffer
-      INTEGER                                            :: comm_socket, i, nAtom, p, xyz
+      INTEGER                                            :: comm_socket, p
       REAL(kind=dp)                                      :: energy
-      REAL(kind=dp), DIMENSION(:, :), POINTER            :: forces
+      REAL(kind=dp), DIMENSION(3, 3)                     :: virial
+      TYPE(mp_para_env_type), POINTER                    :: para_env
 
-      i = 0
-      nAtom = ipi_env%subsys%particles%n_els
-      comm_socket = ipi_env%sockfd
+      para_env => ipi_env%subsys%para_env
+      IF (para_env%is_source()) THEN
+         comm_socket = ipi_env%sockfd
 
-      ! Step 1: See if the client is ready
-      CALL ask_status(comm_socket, msgbuffer)
-      IF (TRIM(msgbuffer) /= "READY") THEN
-         CPABORT("i–PI: Expected READY header but recieved "//TRIM(msgbuffer))
+         CALL ask_status(comm_socket, msgbuffer)
+         IF (TRIM(msgbuffer) /= "READY") THEN
+            CPABORT("i-PI: Expected READY header but received "//TRIM(msgbuffer))
+         END IF
+
+         CALL send_posdata(comm_socket, subsys=ipi_env%subsys)
+
+         CALL ask_status(comm_socket, msgbuffer)
+         IF (TRIM(msgbuffer) /= "HAVEDATA") THEN
+            CPABORT("i-PI: Expected HAVEDATA header but received "//TRIM(msgbuffer))
+         END IF
+         CALL ask_getforce(comm_socket, energy, ipi_env%ipi_forces, virial)
       END IF
 
-      ! Step 2: Send cell and position data to client
-      CALL send_posdata(comm_socket, subsys=ipi_env%subsys)
-
-      ! Step 3: Ask for status, should be done now
-      CALL ask_status(comm_socket, msgbuffer)
-      IF (TRIM(msgbuffer) /= "HAVEDATA") THEN
-         CPABORT("i–PI: Expected HAVEDATA header but recieved "//TRIM(msgbuffer))
-      END IF
-
-      ! Step 4: Ask for data
-      ALLOCATE (forces(3, nAtom))
-      CALL ask_getforce(comm_socket, energy=energy, forces=forces)
-
-      ! Step 4.5: Check for sanity
-      IF (SIZE(forces) /= (nAtom*3)) THEN
-         CPABORT("i–PI: Mismatch in particle number between CP2K and i–PI client")
-      END IF
-
-      ! Step 5: Return data
-      DO p = 1, nAtom
-         DO xyz = 1, 3
-            ipi_env%subsys%particles%els(p)%f(xyz) = forces(xyz, p)
-         END DO
+      CALL para_env%bcast(energy)
+      CALL para_env%bcast(ipi_env%ipi_forces)
+      CALL para_env%bcast(virial)
+      DO p = 1, SIZE(ipi_env%ipi_forces, 2)
+         ipi_env%subsys%particles%els(p)%f = ipi_env%ipi_forces(:, p)
       END DO
-      CALL ipi_env_set(ipi_env=ipi_env, ipi_energy=energy, ipi_forces=forces)
+      IF (ipi_env%subsys%virial%pv_availability .AND. .NOT. ipi_env%subsys%virial%pv_numer) THEN
+         ipi_env%subsys%virial%pv_virial = virial
+      END IF
+      CALL ipi_env_set(ipi_env=ipi_env, ipi_energy=energy)
    END SUBROUTINE request_forces
 
 ! **************************************************************************************************
@@ -284,6 +276,9 @@ CONTAINS
       ! Recieve data
       CALL readbuffer(sockfd, energy)
       CALL readbuffer(sockfd, nAtom)
+      IF (PRESENT(forces)) THEN
+         IF (nAtom /= SIZE(forces, 2)) CPABORT("i-PI: client returned a different atom count")
+      END IF
       ALLOCATE (forces_buffer(3*nAtom))
       CALL readbuffer(sockfd, forces_buffer, nAtom*3)
       CALL readbuffer(sockfd, virial_buffer, 9)
