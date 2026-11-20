@@ -123,6 +123,8 @@ option(CP2K_USE_ACE "Enable ACE support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_DEEPMD "Enable DeePMD support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_DFTD4 "Enable DFTD4 support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_TBLITE "Enable TBLITE support" ${CP2K_USE_EVERYTHING})
+set(CP2K_GXTB_PROVIDER_LIBRARY "" CACHE FILEPATH
+    "Electronic provider for METHOD GXTB with native CP2K D4Srev")
 option(CP2K_USE_GREENX "Enable GreenX support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_HDF5 "Enable HDF5 support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_LIBFCI "Enable LibFCI active-space solver support"

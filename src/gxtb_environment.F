@@ -59,7 +59,6 @@ CONTAINS
       CALL section_vals_val_get(opts, "LIBRARY", c_val=library)
       CALL section_vals_val_get(opts, "REPEATS", i_vals=repeats)
       CALL section_vals_val_get(opts, "EXCHANGE_RADII", r_vals=radii)
-      IF (LEN_TRIM(library) == 0) CPABORT("METHOD GXTB requires &GXTB/LIBRARY")
       IF (ANY(repeats < 1)) CPABORT("GXTB REPEATS must be positive")
       env%repeats = repeats
       env%radii = radii

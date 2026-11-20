@@ -7,13 +7,10 @@ index 96f0871..3969d70 100644
 -  find_package("dftd" REQUIRED)
 +if(NOT TARGET "dftd4::dftd4")
 +  find_package("dftd4" CONFIG REQUIRED)
-@@ -93,0 +94 @@ endif()
-+find_library(REVD4_LIBRARY NAMES cp2k_gxtb_revd4 REQUIRED)
-@@ -109 +110,3 @@ set(
+@@ -109 +109,2 @@ set(
 -  "dftd::dftd"
 +  "dftd4::dftd4"
 +  "multicharge::multicharge"
-+  "${REVD4_LIBRARY}"
 diff --git a/src/tblite/disp.f90 b/src/tblite/disp.f90
 index 69f263d..195e6fb 100644
 --- a/src/tblite/disp.f90

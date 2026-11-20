@@ -26,7 +26,7 @@ module tblite_disp_revd4
       final :: release
    end type
    interface
-      function prepare(n,z,xyz,cell,pbc,msg,len) bind(C,name="cp2k_revd4_new") result(p)
+      function prepare(n,z,xyz,cell,pbc,msg,len) bind(C,name="cp2k_save_d4_new") result(p)
          import :: c_int, c_double, c_ptr, c_char, c_size_t
          integer(c_int), value :: n
          integer(c_int), intent(in) :: z(*), pbc(3)
@@ -35,23 +35,23 @@ module tblite_disp_revd4
          integer(c_size_t), value :: len
          type(c_ptr) :: p
       end function
-      subroutine free(p) bind(C,name="cp2k_revd4_free")
+      subroutine free(p) bind(C,name="cp2k_save_d4_free")
          import :: c_ptr
          type(c_ptr), value :: p
       end subroutine
-      subroutine scf(p,q,e,v) bind(C,name="cp2k_revd4_scf")
+      subroutine scf(p,q,e,v) bind(C,name="cp2k_save_d4_scf")
          import :: c_ptr, c_double
          type(c_ptr), value :: p
          real(c_double), intent(in) :: q(*)
          real(c_double), intent(out) :: e(*), v(*)
       end subroutine
-      subroutine grad2(p,q,g,s) bind(C,name="cp2k_revd4_derivatives")
+      subroutine grad2(p,q,g,s) bind(C,name="cp2k_save_d4_derivatives")
          import :: c_ptr, c_double
          type(c_ptr), value :: p
          real(c_double), intent(in) :: q(*)
          real(c_double), intent(out) :: g(3,*), s(3,3)
       end subroutine
-      subroutine atm(p,e,g,s) bind(C,name="cp2k_revd4_atm")
+      subroutine atm(p,e,g,s) bind(C,name="cp2k_save_d4_atm")
          import :: c_ptr, c_double
          type(c_ptr), value :: p
          real(c_double), intent(out) :: e(*), g(3,*), s(3,3)
@@ -62,7 +62,7 @@ contains
       type(revd4_dispersion), intent(out) :: self
       type(structure_type), intent(in) :: mol
       type(error_type), allocatable, intent(out) :: error
-      self%label = "self-consistent g-xTB 2.0.1 D4Srev (axtb)"
+      self%label = "self-consistent g-xTB 2.0.1 D4Srev (CP2K)"
       if (any(mol%num < 1) .or. any(mol%num > 103)) call fatal_error(error, "D4Srev requires Z=1..103")
    end subroutine
    subroutine release(g)

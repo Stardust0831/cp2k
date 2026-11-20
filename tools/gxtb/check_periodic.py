@@ -25,7 +25,7 @@ from periodic_client import PeriodicGXTB
 HERE = Path(__file__).resolve().parent
 
 
-def run_cp2k(directory, atoms, command, engine, repeat, radii, library):
+def run_cp2k(directory, atoms, command, engine, repeat, radii, library, linked_provider=False):
     directory.mkdir()
     socket = "gxtb-" + uuid.uuid4().hex
     address = Path("/tmp", "ipi_" + socket)
@@ -36,10 +36,11 @@ def run_cp2k(directory, atoms, command, engine, repeat, radii, library):
     )
     deck = re.sub(r"      A [^\n]+\n      B [^\n]+\n      C [^\n]+", cell, template)
     deck = deck.replace("water.xyz", "structure.xyz")
-    if library:
+    if library or linked_provider:
         deck = re.sub(r"&MOTION\n.*?&END MOTION\n", "", deck, flags=re.DOTALL)
-        options = ["  METHOD GXTB", "  &GXTB", f"    LIBRARY {library}",
-                   "    REPEATS " + " ".join(map(str, repeat))]
+        options = ["  METHOD GXTB", "  &GXTB", "    REPEATS " + " ".join(map(str, repeat))]
+        if library:
+            options.append(f"    LIBRARY {library}")
         if radii:
             options.append("    EXCHANGE_RADII [angstrom] " + " ".join(map(str, radii)))
         deck = deck.replace("  METHOD IPI", "\n".join([*options, "  &END GXTB"]))
@@ -50,7 +51,7 @@ def run_cp2k(directory, atoms, command, engine, repeat, radii, library):
     with (directory / "cp2k.log").open("w") as log:
         process = subprocess.Popen([*command, "-i", "run.inp"], cwd=directory, stdout=log, stderr=log)
         try:
-            if library is None:
+            if library is None and not linked_provider:
                 deadline = time.monotonic() + 30
                 while not address.is_socket():
                     if process.poll() is not None or time.monotonic() > deadline:
@@ -88,7 +89,9 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("output", type=Path, help="New directory for full inputs and logs")
     parser.add_argument("--engine", required=True, choices=("save-tblite", "atomli"))
-    parser.add_argument("--library", type=Path, help="Run METHOD GXTB with this shared library (default: i-PI)")
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument("--library", type=Path, help="Run METHOD GXTB with this shared library (default: i-PI)")
+    backend.add_argument("--linked-provider", action="store_true", help="Use the electronic provider linked with CP2K")
     parser.add_argument("--reference-cli", type=Path,
                         help="Compare save-tblite against its standalone executable")
     parser.add_argument("--check-loader-failure", action="store_true",
@@ -103,6 +106,8 @@ def main():
     args = parser.parse_args()
     if args.reference_cli and args.engine != "save-tblite":
         parser.error("--reference-cli requires the save-tblite engine")
+    if args.linked_provider and args.engine != "save-tblite":
+        parser.error("--linked-provider requires the save-tblite engine")
     binary = args.binary.resolve()
     out = args.output.resolve()
     out.mkdir(parents=True)
@@ -134,7 +139,7 @@ def main():
     report = {}
 
     def evaluate(label, structure, repeat=(1, 1, 1)):
-        return run_cp2k(out / label, structure, command, args.engine, repeat, radii, library)
+        return run_cp2k(out / label, structure, command, args.engine, repeat, radii, library, args.linked_provider)
 
     def check(name, error, tolerance):
         report[name] = {"max_abs_error": float(error), "tolerance": tolerance}

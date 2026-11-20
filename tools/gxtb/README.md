@@ -1,13 +1,12 @@
 # Periodic g-xTB in CP2K
 
 `FORCE_EVAL / METHOD GXTB` evaluates a neutral, three-dimensionally periodic
-cell through a shared library in the CP2K process. CP2K constructs the
+cell in the CP2K process. CP2K constructs the
 Born-von Karman supercell from `REPEATS na nb nc`, passes its lattice and
 atoms to a Gamma-point electronic solver, and returns the energy per input
 cell, the mean force on equivalent images and the pressure-positive virial.
 One MPI rank calls the provider and broadcasts the results. The CP2K changes
-and adapters were written against public interfaces. Electronic structure and
-parameters come from the separately installed provider.
+and adapters were written against public interfaces.
 
 ## Open-source CPU provider
 
@@ -15,25 +14,29 @@ The build uses Paderborn's public `save_tblite` snapshot
 `35e7942b60edd89bb407ab3da5768d3410af83f5` for the periodic electronic
 solver. Its original g-xTB dispersion dependency was
 `grimme-lab/dftd@99d64ee83832fda03df2c7dd7b7fd9f4c9ebb098`. The source for
-that revision could not be verified. The molecular g-xTB 2.0.1 D4Srev
-implementation used here is published under LGPL-3.0-or-later by
-Atoms for Humanity in the `axtb-gxtb`, `axtb-base` and `axtb-d4` crates,
-version 0.2.0. [Electronic solver archive](https://github.com/DCM-Uni-Paderborn/Periodic-g-xTB-Benchmarks/tree/866691a93b36ee582e49d896dfda5b91524dce12/validation/accelerated_exchange/root_a_partial_bridge/final_35e7942_20260717/provider/source)
-[Molecular D4Srev source and equations](https://github.com/atomsforhumanity/axtb/tree/65d0f64a9a8211f73b0738ff908b7a414975f50b/crates/gxtb/src/revd4)
+that revision could not be verified. The electronic basis, integrals,
+Hamiltonian, exchange, diagonalization and SCF iteration come from this
+electronic solver. [Electronic solver archive](https://github.com/DCM-Uni-Paderborn/Periodic-g-xTB-Benchmarks/tree/866691a93b36ee582e49d896dfda5b91524dce12/validation/accelerated_exchange/root_a_partial_bridge/final_35e7942_20260717/provider/source)
 
-The fork adds the periodic image sums, coordination numbers, self-image
-pairs, per-cell three-body counting, and analytic coordinate and strain
-derivatives. It calls the public molecular routines for the model data, C6
-coefficients, damping and Axilrod-Teller-Muto (ATM) kernel. Every SCF cycle
+CP2K implements g-xTB 2.0.1 D4Srev in `src/gxtb_revd4.cpp` as part of
+`libcp2k`. It computes coordination numbers, pair-specific C6 interpolation
+on the imaginary frequency grid, screened damping, periodic pair and
+Axilrod-Teller-Muto (ATM) sums, and analytic charge, coordinate and strain
+derivatives. The electronic solver receives CP2K's dispersion functions
+when it enters an energy/force evaluation. Every SCF cycle
 uses the current Mulliken charges for the two-body energy and its charge
 potential. The three-body term uses neutral reference C6 at the current
 geometry. The dispersion uses the 2.0.1 program's hard cutoffs of 30, 50 and
 25 bohr for coordination, two-body and three-body terms, respectively.
 Energy derivatives at cutoff crossings can depend on the displacement step.
+Parameter tables have a reproducible numerical import from the public
+g-xTB and D4 data distributed with axtb 0.2.0. The earlier Rust
+implementation is available as an optional numerical reference.
+[Parameter provenance and regeneration](revd4/PARAMETERS.md)
 
 Build CP2K from this branch with its usual CMake configuration. The plugin
-requires Linux, Rust/Cargo (tested with 1.91.1), CMake 3.22 or newer, a C and
-a Fortran compiler with OpenMP, BLAS/LAPACK, curl, GNU tar, patch, flock and
+requires Linux, CMake 3.22 or newer, C, C++17 and Fortran compilers with
+OpenMP, BLAS/LAPACK, curl, GNU tar, patch, flock and
 coreutils. Run from `tools/gxtb` with your CP2K executable on PATH.
 
 ```sh
@@ -47,13 +50,18 @@ and `REPEATS 1 1 1`. Its expected distorted NaCl energy is
 -622.7008860203 Ha. The provider sets the SCF accuracy to 0.01, uses zero
 electronic temperature and starts from EEQBC charges. It takes its exchange
 settings from the electronic solver. For runs elsewhere, set `LIBRARY` to
-the absolute path and keep the two installed shared libraries together.
-The standalone executable is `build-gxtb/install/bin/tblite`. The build
-verifies the source downloads by SHA-256 and builds the Rust dependencies
-from `Cargo.lock`.
+the absolute path. To make this the linked electronic solver, configure
+CP2K with `-DCP2K_GXTB_PROVIDER_LIBRARY=/absolute/path/to/libgxtb_save.so`
+and rebuild. This enables `METHOD GXTB` without a `LIBRARY` keyword. The
+provider library and its compiler and BLAS runtimes must be accessible at
+run time. The separately built CLI `build-gxtb/install/bin/tblite` compiles
+the same CP2K dispersion source directly. Neither build requires Rust.
+The build script verifies its source downloads by SHA-256.
 
-The provider constructs dense pair-coefficient matrices with quadratic
-storage in the number of supercell atoms. For `M` orbitals per input cell
+The dispersion currently searches basis atom pairs in quadratic time and
+stores interactions within a fixed real-space cutoff. Once the geometry
+is prepared, each SCF charge update visits the unique interacting atom
+pairs. For `M` orbitals per input cell
 and `m` replicated cells the dense electronic eigensolve costs O((mM)^3)
 time and O((mM)^2) memory per SCF iteration. These are algorithmic estimates.
 
@@ -65,10 +73,18 @@ the same provider. Finite differences use independent CP2K energy runs.
 
 ```sh
 prefix="$PWD/build-gxtb/install"
-python3 revd4/check.py "$prefix/lib/libcp2k_gxtb_revd4.so"
-cargo test --release --locked --manifest-path revd4/Cargo.toml --target-dir "$PWD/build-gxtb/cargo-target"
+python3 revd4/check.py /path/to/libcp2k.so
 python3 check_periodic.py "$(command -v cp2k.ssmp)" checks-open-nacl --engine save-tblite --library "$prefix/lib/libgxtb_save.so" --reference-cli "$prefix/bin/tblite" --all-derivatives --force-step 0.0001 --strain-step 0.00002
 python3 check_periodic.py "$(command -v cp2k.ssmp)" checks-open-si --engine save-tblite --library "$prefix/lib/libgxtb_save.so" --reference-cli "$prefix/bin/tblite" --all-derivatives --structure silicon
+```
+
+Use `--linked-provider` in place of `--library PATH` to exercise the linked
+provider. To compare both implementations term by term, build the Rust
+oracle separately (tested with Rust 1.91.1).
+
+```sh
+cargo build --release --locked --manifest-path revd4/Cargo.toml --target-dir "$PWD/build-gxtb/oracle"
+python3 revd4/check.py /path/to/libcp2k.so --reference "$PWD/build-gxtb/oracle/release/libcp2k_gxtb_revd4.so"
 ```
 
 | Structure | Displacement (angstrom) | Strain step | Maximum force error (eV/angstrom) | Maximum stress error (eV/angstrom^3) |
@@ -79,8 +95,8 @@ python3 check_periodic.py "$(command -v cp2k.ssmp)" checks-open-si --engine save
 The table covers all 3N forces and six strains. For both cells CP2K and
 the standalone program agree within 1.2e-7 eV in energy, 1.6e-8 eV/angstrom
 in force and 3.4e-9 eV/angstrom^3 in stress. `REPEATS 2 1 1` and a
-separately supplied doubled structure give the same energy per cell to
-printed precision. The NaCl force difference at the coarser 1e-3 angstrom
+separately supplied doubled structure agree in energy per cell to
+1.5e-11 eV. The NaCl force difference at the coarser 1e-3 angstrom
 step is 0.030234 eV/angstrom, exceeding the 2e-4 threshold. A separate run
 with the dispersion energy, potential and derivatives all set to zero
 still gives 0.030134 eV/angstrom at that step. Its cause remains open.
@@ -88,10 +104,18 @@ still gives 0.030134 eV/angstrom at that step. Its cause remains open.
 At the archived molecular water density the two-body and ATM terms give
 -4.42494068950e-5 and +3.03371243557e-7 Ha, respectively, within
 6.36e-17 Ha of the individual reference terms. On a skew periodic cell,
-finite differences of the dispersion give maximum errors of 5.39e-14 Ha/e
-in the charge potential, 5.38e-15 Ha/bohr in the gradient and 1.28e-13 Ha
-in the strain derivative. A simple-cubic Ar test compares self-image
-interactions against molecular dimers and the two allowed trimer shapes.
+finite differences of the native dispersion give maximum errors of 5.43e-14
+Ha/e in the charge potential, 4.03e-15 Ha/bohr in the gradient and 1.28e-13
+Ha in the strain derivative. Against the Rust oracle, 206 three-atom
+geometries covering Z=1..103 and two skew periodic cells (including Ar
+self images) agree to 6.0e-19 Ha in per-atom two-body energies, 3.9e-21 Ha
+in per-atom ATM energies, 8.7e-19 Ha/bohr in gradient components and
+3.1e-18 Ha in strain components. These compare implementations of the
+same model. Finite differences test the consistency of its derivatives.
+With `--archive /path/to/axtb/crates/gxtb/tests/reference_v2/reference`, the
+runner compares 19 molecular cases to archived Grimme program results.
+Using the printed charges (six decimal places), the largest differences
+are 1.64e-8 Ha for the two-body term and 1.57e-14 Ha for ATM.
 [Molecular reference coordinates, SCF density and energies](https://github.com/atomsforhumanity/axtb/tree/65d0f64a9a8211f73b0738ff908b7a414975f50b/crates/gxtb/tests/reference_v2/reference/water)
 
 For the separate distorted `water.xyz` in this directory the **full**
@@ -105,6 +129,9 @@ sampling and GPU execution are outside this provider's tested path.
 A CP2K build linked with its stock tblite held a Quickstep/GFN2 and a GXTB
 force environment in the same process. Running water/GFN2, NaCl/GXTB and
 water/GFN2 in succession reproduced both reference energies within 2e-15 Ha.
+Counting host calls for a NaCl single point gave 16 two-body energy/potential
+evaluations, one ATM evaluation, one two-body gradient evaluation and one
+geometry creation/destruction pair.
 The two-rank MPI NaCl run passed direct energy, force, stress, displacement,
 shear and explicit-supercell comparisons.
 

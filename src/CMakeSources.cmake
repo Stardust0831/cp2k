@@ -1579,7 +1579,7 @@ list(
 
 list(APPEND CP2K_SRCS_F grpp/libgrpp.F)
 
-set(CP2K_SRCS_CPP torch_c_api.cpp ace_c_api.cpp)
+set(CP2K_SRCS_CPP torch_c_api.cpp ace_c_api.cpp gxtb_revd4.cpp)
 
 list(APPEND CP2K_SRCS_F openpmd_api.F input/cp_output_handling_openpmd.F
      cp_realspace_grid_openpmd.F pw/realspace_grid_openpmd.F)

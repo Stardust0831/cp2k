@@ -1,0 +1,4 @@
+{
+  global: cp2k_gxtb_name_v1; cp2k_gxtb_eval_v2;
+  local: *;
+};

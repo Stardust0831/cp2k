@@ -52,10 +52,9 @@ if [[ ! -d "$src" ]]; then
 fi
 cmake -E copy_if_different "$here/tblite_revd4.f90" "$src/provider/src/tblite/disp/revd4.f90"
 
-cargo build --release --locked --manifest-path "$here/Cargo.toml" --target-dir "$work/cargo-target"
 build="$work/cmake-$key"
 cmake -S "$here" -B "$build" -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="$work/install" -DREVD4_LIBRARY="$work/cargo-target/release/libcp2k_gxtb_revd4.so" \
+    -DCMAKE_INSTALL_PREFIX="$work/install" \
     -DPROVIDER_SOURCE="$src/provider" -DSTOCK_SOURCE="$src/stock" -DMULTICHARGE_SOURCE="$src/multicharge"
 cmake --build "$build" --target gxtb_save tblite-exe --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-4}"
 cmake --install "$build" --component gxtb_runtime

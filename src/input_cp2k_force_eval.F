@@ -112,7 +112,7 @@ CONTAINS
       CALL section_create(subsection, __LOCATION__, name="GXTB", &
                           description="Periodic g-xTB energy, forces and stress in a neutral three-dimensional cell.")
       CALL keyword_create(keyword, __LOCATION__, name="LIBRARY", &
-                          description="Shared library providing the periodic g-xTB energy and derivatives.", &
+                          description="Electronic provider library. The default uses the provider linked with CP2K.", &
                           usage="LIBRARY /path/to/libgxtb_backend.so", default_lc_val="")
       CALL section_add_keyword(subsection, keyword)
       CALL keyword_release(keyword)

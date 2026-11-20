@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(cp2k_open_gxtb LANGUAGES C Fortran)
+project(cp2k_open_gxtb LANGUAGES C CXX Fortran)
 
 # Link one set of Fortran modules privately into the adapter. CP2K can
 # already have its own tblite and multicharge with a different Fortran ABI.
@@ -33,12 +33,16 @@ add_subdirectory("${PROVIDER_SOURCE}" save_tblite)
 target_compile_options(tblite-lib PRIVATE
   $<$<COMPILE_LANG_AND_ID:Fortran,GNU>:-ffree-line-length-none>)
 
-add_library(gxtb_save SHARED ../save_tblite.c)
+target_sources(tblite-exe PRIVATE host_d4.c ../../../src/gxtb_revd4.cpp)
+target_compile_features(tblite-exe PRIVATE cxx_std_17)
+target_compile_definitions(tblite-exe PRIVATE GXTB_STANDALONE)
+add_library(gxtb_save SHARED ../save_tblite.c host_d4.c)
 target_link_libraries(gxtb_save PRIVATE tblite-lib)
-target_link_options(gxtb_save PRIVATE "LINKER:--exclude-libs,ALL")
+target_link_options(gxtb_save PRIVATE "LINKER:--exclude-libs,ALL"
+  "LINKER:--version-script,${CMAKE_CURRENT_SOURCE_DIR}/provider.exports")
+set_property(TARGET gxtb_save APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/provider.exports")
 set_target_properties(gxtb_save PROPERTIES INSTALL_RPATH "$ORIGIN")
 set_target_properties(tblite-exe PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
 install(TARGETS gxtb_save tblite-exe
   LIBRARY DESTINATION lib COMPONENT gxtb_runtime
   RUNTIME DESTINATION bin COMPONENT gxtb_runtime)
-install(FILES "${REVD4_LIBRARY}" DESTINATION lib COMPONENT gxtb_runtime)
