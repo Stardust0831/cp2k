@@ -93,6 +93,51 @@ difference. At 250 angstrom and radii 70/105 angstrom the maximum force
 component difference from the official result is 9.41e-4 Ha/bohr. CP2K and
 direct periodic Atomli agree within 6e-10 Ha for every cell and radius tested.
 
+In a separate release comparison, the 250 angstrom periodic-minus-molecular
+water energy was -1.34e-8 Ha with Atomli 0.1.9 and +0.024784575 Ha with
+0.1.11, 0.1.12 and 0.1.18. Atomli 0.1.11 documents setting the periodic
+bond-order correction to zero. Zeroing only the corresponding model
+coefficients in a temporary copy of Grimme's molecular executable reproduced
+the water periodic version jump to 4.9e-10 Ha. [Release notes](https://github.com/atomag/atomli-assets/releases/tag/v0.1.11)
+
+## Quickstep bond-order experiment
+
+`bond_order_gamma.f90` independently evaluates the closed-shell Mayer
+bond-order contribution in a real explicit supercell. It takes the
+spin-summed AO density, overlap, AO-to-atom map and symmetric atom-pair
+weights. It returns the energy and its derivatives with respect to both
+AO matrices at fixed pair weights. For a bond between atoms A and B the
+energy is the pair weight times the sum of (PS)_ij (PS)_ji over i on A
+and j on B.
+
+`check_bond_order.py` runs Quickstep with `METHOD XTB`, `GFN_TYPE TBLITE`,
+and `METHOD GFN2` and reads its converged `P_CSR_WRITE` and `S_CSR_WRITE`
+matrices. It compiles the Fortran operator separately and applies it to those
+fixed densities. The H-H fixtures use the g-xTB bond-correlation parameters
+and minimum-image distances. This is an operator test. A full self-consistent
+g-xTB calculation also needs the g-xTB basis, one-electron Hamiltonian,
+the other exchange and response terms, and screened dispersion.
+
+```sh
+FC=gfortran python check_bond_order.py /path/to/cp2k.ssmp checks-bond-order
+```
+
+The executable must include tblite. The runner uses NumPy, ASE and a
+Fortran compiler and runs seven single-rank calculations in fresh directories.
+The isolated H2, 250 angstrom periodic H2, boundary-crossing H2 and a doubled
+cell all gave -0.0098632492 Ha per molecule. Disabling the term in the
+independent molecular reference raised the H2 energy by +0.0098632492 Ha.
+On the distorted four-H chain, finite differences of all independent
+entries of P and S agreed with the analytic matrix responses within
+3e-14 Ha. On the full 3x1x1 mesh the runner transforms the complex matrices
+into a three-cell supercell with the phase for each AO's lattice image.
+The bond-order energy per primitive cell agreed with an independently
+converged explicit Gamma supercell to 1.3e-13 Ha. The k-space density
+and overlap response contractions agreed with central differences within
+1e-12 Ha. The supercell transform here is a dense numerical reference.
+Nuclear forces, stress and self-consistent changes in the electronic
+density require additional model terms and integration.
+
 ## Other implementations
 
 `save_tblite.c` is an optional C adapter to the periodic save_tblite API.
