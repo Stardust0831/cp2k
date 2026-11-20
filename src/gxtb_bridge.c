@@ -11,7 +11,22 @@ struct gxtb_handle {
   void *library;
   cp2k_gxtb_fn *evaluate;
   cp2k_gxtb_fn_v2 *evaluate_native;
+  cp2k_gxtb_fn_v3 *evaluate_scf;
 };
+#ifdef __TBLITE
+int cp2k_gxtb_internal(int n, const int *z, const double *pos,
+                       const double *cell, const double *radii, int forces,
+                       int virial, double *energy, double *grad, double *strain,
+                       char *message, size_t capacity);
+static const char *internal_name(void) {
+  return "CP2K Gamma g-xTB (stock tblite Gaussian integrals, internal EEQBC, "
+         "semi-analytic derivatives)";
+}
+#endif
+
+#if defined(CP2K_GXTB_PROVIDER_LINKED) && defined(__ELF__)
+#pragma weak cp2k_gxtb_eval_v3
+#endif
 
 void *cp_gxtb_open(const char *path, char *message, size_t capacity) {
 #ifdef _WIN32
@@ -23,6 +38,7 @@ void *cp_gxtb_open(const char *path, char *message, size_t capacity) {
   const char *(*name)(void) = NULL;
   cp2k_gxtb_fn *evaluate = NULL;
   cp2k_gxtb_fn_v2 *evaluate_native = NULL;
+  cp2k_gxtb_fn_v3 *evaluate_scf = NULL;
   if (path[0]) {
     library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!library) {
@@ -31,8 +47,9 @@ void *cp_gxtb_open(const char *path, char *message, size_t capacity) {
     }
     name = dlsym(library, "cp2k_gxtb_name_v1");
     evaluate_native = dlsym(library, "cp2k_gxtb_eval_v2");
+    evaluate_scf = dlsym(library, "cp2k_gxtb_eval_v3");
     evaluate = dlsym(library, "cp2k_gxtb_eval_v1");
-    if (!name || (!evaluate && !evaluate_native)) {
+    if (!name || (!evaluate && !evaluate_native && !evaluate_scf)) {
       snprintf(message, capacity, "Library is missing its g-xTB entry points");
       dlclose(library);
       return NULL;
@@ -41,9 +58,15 @@ void *cp_gxtb_open(const char *path, char *message, size_t capacity) {
 #ifdef CP2K_GXTB_PROVIDER_LINKED
     name = cp2k_gxtb_name_v1;
     evaluate_native = cp2k_gxtb_eval_v2;
+#ifdef __ELF__
+    evaluate_scf = cp2k_gxtb_eval_v3;
+#endif
+#elif defined(__TBLITE)
+    name = internal_name;
 #else
     snprintf(message, capacity,
-             "Set &GXTB/LIBRARY or build CP2K with CP2K_GXTB_PROVIDER_LIBRARY");
+             "Build CP2K with CP2K_USE_TBLITE=ON or supply a g-xTB provider "
+             "via &GXTB/LIBRARY");
     return NULL;
 #endif
   }
@@ -57,15 +80,19 @@ void *cp_gxtb_open(const char *path, char *message, size_t capacity) {
   handle->library = library;
   handle->evaluate = evaluate;
   handle->evaluate_native = evaluate_native;
-  snprintf(message, capacity, "%s", name());
+  handle->evaluate_scf = evaluate_scf;
+  snprintf(message, capacity, "%s",
+           evaluate_scf ? "CP2K Gamma SCF, exchange, repulsion and D4Srev "
+                          "(external geometry integrals)"
+                        : name());
   return handle;
 #endif
 }
 
 int cp_gxtb_eval(const struct gxtb_handle *handle, int n, const int *z,
                  const double *pos, const double *cell, const double *radii,
-                 double *energy, double *grad, double *strain, char *message,
-                 size_t capacity) {
+                 int forces, int virial, double *energy, double *grad,
+                 double *strain, char *message, size_t capacity) {
   /* A successful call must set all outputs, including zero derivatives. */
   *energy = NAN;
   for (size_t i = 0; i < 3 * (size_t)n; i++)
@@ -74,7 +101,15 @@ int cp_gxtb_eval(const struct gxtb_handle *handle, int n, const int *z,
     strain[i] = NAN;
   message[0] = '\0';
   int status;
-  if (handle->evaluate_native)
+#ifdef __TBLITE
+  if (!handle->evaluate_scf && !handle->evaluate_native && !handle->evaluate)
+    return cp2k_gxtb_internal(n, z, pos, cell, radii, forces, virial, energy,
+                              grad, strain, message, capacity);
+#endif
+  if (handle->evaluate_scf)
+    status = handle->evaluate_scf(cp2k_gxtb_scf, n, z, pos, cell, radii, energy,
+                                  grad, strain, message, capacity);
+  else if (handle->evaluate_native)
     status =
         handle->evaluate_native(cp2k_gxtb_native_d4(), n, z, pos, cell, radii,
                                 energy, grad, strain, message, capacity);

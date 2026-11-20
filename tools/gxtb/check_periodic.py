@@ -25,7 +25,8 @@ from periodic_client import PeriodicGXTB
 HERE = Path(__file__).resolve().parent
 
 
-def run_cp2k(directory, atoms, command, engine, repeat, radii, library, linked_provider=False):
+def run_cp2k(directory, atoms, command, engine, repeat, radii, library, linked_provider=False,
+             internal=False, energy_only=False):
     directory.mkdir()
     socket = "gxtb-" + uuid.uuid4().hex
     address = Path("/tmp", "ipi_" + socket)
@@ -36,7 +37,7 @@ def run_cp2k(directory, atoms, command, engine, repeat, radii, library, linked_p
     )
     deck = re.sub(r"      A [^\n]+\n      B [^\n]+\n      C [^\n]+", cell, template)
     deck = deck.replace("water.xyz", "structure.xyz")
-    if library or linked_provider:
+    if library or linked_provider or internal:
         deck = re.sub(r"&MOTION\n.*?&END MOTION\n", "", deck, flags=re.DOTALL)
         options = ["  METHOD GXTB", "  &GXTB", "    REPEATS " + " ".join(map(str, repeat))]
         if library:
@@ -46,12 +47,15 @@ def run_cp2k(directory, atoms, command, engine, repeat, radii, library, linked_p
         deck = deck.replace("  METHOD IPI", "\n".join([*options, "  &END GXTB"]))
     else:
         deck = deck.replace("HOST gxtb", "HOST " + socket)
+    if energy_only:
+        deck = deck.replace("RUN_TYPE ENERGY_FORCE", "RUN_TYPE ENERGY")
+        deck = deck.replace("STRESS_TENSOR ANALYTICAL", "STRESS_TENSOR NONE")
     (directory / "run.inp").write_text(deck)
     write(directory / "structure.xyz", atoms, format="xyz")
     with (directory / "cp2k.log").open("w") as log:
         process = subprocess.Popen([*command, "-i", "run.inp"], cwd=directory, stdout=log, stderr=log)
         try:
-            if library is None and not linked_provider:
+            if library is None and not linked_provider and not internal:
                 deadline = time.monotonic() + 30
                 while not address.is_socket():
                     if process.poll() is not None or time.monotonic() > deadline:
@@ -74,7 +78,11 @@ def run_cp2k(directory, atoms, command, engine, repeat, radii, library, linked_p
     output = (directory / "cp2k.log").read_text()
     if "PROGRAM ENDED AT" not in output:
         raise RuntimeError(f"Missing CP2K completion marker in {directory}")
+    if internal and "GXTB| CP2K Gamma g-xTB (stock tblite" not in output:
+        raise RuntimeError(f"CP2K did not use the internal g-xTB implementation in {directory}")
     energy = float(re.search(r"ENERGY\| Total FORCE_EVAL .*?\[hartree\]\s+(\S+)", output)[1])
+    if energy_only:
+        return energy * Hartree, None, None
     forces = np.array(re.findall(r"FORCES\|\s+\d+\s+(\S+)\s+(\S+)\s+(\S+) ", output), float)
     lines = output.split("Analytical stress tensor [bar]", 1)[1]
     stress = np.array(re.findall(r"STRESS\| +[xyz] +([-+\d.][\d.E+-]*) +(\S+) +(\S+)", lines)[:3], float)
@@ -92,22 +100,29 @@ def main():
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--library", type=Path, help="Run METHOD GXTB with this shared library (default: i-PI)")
     backend.add_argument("--linked-provider", action="store_true", help="Use the electronic provider linked with CP2K")
+    backend.add_argument("--internal", action="store_true", help="Require the CP2K implementation with stock tblite")
     parser.add_argument("--reference-cli", type=Path,
                         help="Compare save-tblite against its standalone executable")
+    parser.add_argument("--reference-accuracy", type=float, default=0.01,
+                        help="Accuracy passed to the standalone tblite reference (default 0.01)")
     parser.add_argument("--check-loader-failure", action="store_true",
                         help="Simulate a missing dependency in the Atomli CFFI adapter")
     parser.add_argument("--ranks", type=int, default=1)
     parser.add_argument("--mpiexec", default="mpiexec")
-    parser.add_argument("--structure", choices=("nacl", "silicon"), default="nacl")
+    parser.add_argument("--structure", choices=("nacl", "silicon", "h3", "caf2"), default="nacl")
     parser.add_argument("--all-derivatives", action="store_true",
                         help="Check every force component and six independent strain derivatives")
     parser.add_argument("--force-step", type=float, help="Displacement in angstrom")
     parser.add_argument("--strain-step", type=float, help="Dimensionless homogeneous strain")
     args = parser.parse_args()
+    if args.reference_accuracy <= 0 or not np.isfinite(args.reference_accuracy):
+        parser.error("--reference-accuracy must be positive and finite")
     if args.reference_cli and args.engine != "save-tblite":
         parser.error("--reference-cli requires the save-tblite engine")
     if args.linked_provider and args.engine != "save-tblite":
         parser.error("--linked-provider requires the save-tblite engine")
+    if args.internal and (args.engine != "save-tblite" or not args.reference_cli):
+        parser.error("--internal compares to --engine save-tblite with --reference-cli")
     binary = args.binary.resolve()
     out = args.output.resolve()
     out.mkdir(parents=True)
@@ -129,17 +144,27 @@ def main():
         atoms = Atoms("NaCl", scaled_positions=[[0.05, 0.04, 0.03], [0.47, 0.51, 0.49]],
                       cell=[[7.2, 0, 0], [0.36, 7.4, 0], [0.45, 0.18, 7.0]], pbc=True)
         radii = (2.0, 3.3)
-    else:
+    elif args.structure == "silicon":
         atoms = bulk("Si", "diamond", a=5.43, cubic=True)
         atoms.cell[1, 0] += 0.04
         atoms.positions[1] += [0.016, -0.023, 0.011]
         radii = (2.1, 2.6)
+    elif args.structure == "h3":
+        atoms = Atoms("H3", positions=[[1.4, 1.3, 1.1], [2.17, 1.34, 1.12], [2.98, 2.61, 1.77]],
+                      cell=[[8.6, 0., 0.], [0.2, 8.9, 0.], [0.1, -0.1, 9.1]], pbc=True)
+        radii = (2.0, 3.3)
+    else:
+        atoms = bulk("CaF2", "fluorite", a=5.46)
+        atoms.positions[1] += [0.021, -0.034, 0.016]
+        atoms.cell[0, 1] += 0.05
+        radii = (1.2, 1.8)
     if args.engine != "atomli":
         radii = None
     report = {}
 
-    def evaluate(label, structure, repeat=(1, 1, 1)):
-        return run_cp2k(out / label, structure, command, args.engine, repeat, radii, library, args.linked_provider)
+    def evaluate(label, structure, repeat=(1, 1, 1), energy_only=False):
+        return run_cp2k(out / label, structure, command, args.engine, repeat, radii,
+                        library, args.linked_provider, args.internal, energy_only)
 
     def check(name, error, tolerance):
         report[name] = {"max_abs_error": float(error), "tolerance": tolerance}
@@ -166,7 +191,7 @@ def main():
         case.mkdir()
         write(case / "cell.gen", atoms, format="gen")
         with (case / "tblite.log").open("w") as log:
-            subprocess.run([args.reference_cli.resolve(), "run", "--method", "gxtb", "--acc", "0.01",
+            subprocess.run([args.reference_cli.resolve(), "run", "--method", "gxtb", "--acc", str(args.reference_accuracy),
                             "--etemp", "0", "--guess", "eeqbc",
                             "--grad", "grad.tag", "--json", "results.json", "cell.gen"],
                            cwd=case, stdout=log, stderr=subprocess.STDOUT, timeout=180, check=True)
@@ -188,7 +213,8 @@ def main():
         plus, minus = atoms.copy(), atoms.copy()
         perturb(plus, step)
         perturb(minus, -step)
-        return (evaluate(label + "_plus", plus)[0] - evaluate(label + "_minus", minus)[0]) / (2 * step)
+        return (evaluate(label + "_plus", plus, energy_only=args.internal)[0]
+                - evaluate(label + "_minus", minus, energy_only=args.internal)[0]) / (2 * step)
 
     force_errors = []
     for atom, axis in (np.ndindex(len(atoms), 3) if args.all_derivatives else [(1, 0)]):

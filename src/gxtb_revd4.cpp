@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "gxtb_revd4.h"
+#include "gxtb_pairs.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -11,10 +12,12 @@
 #include <vector>
 
 namespace {
-using Vec = std::array<double, 3>;
-using Tensor = std::array<double, 9>;
+using gxtb::difference;
+using gxtb::dot;
+using gxtb::Gradient;
+using gxtb::pi;
+using gxtb::Vec;
 using Spectrum = std::array<double, 23>;
-constexpr double pi = 3.14159265358979323846;
 constexpr double cn_radius = 30.0, pair_radius = 50.0, atm_radius = 25.0;
 struct Element {
   int first, count;
@@ -28,16 +31,6 @@ struct Reference {
 };
 #include "gxtb_revd4_data.inc"
 
-double dot(const Vec &a, const Vec &b) {
-  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-}
-Vec cross(const Vec &a, const Vec &b) {
-  return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
-          a[0] * b[1] - a[1] * b[0]};
-}
-Vec difference(const Vec &a, const Vec &b) {
-  return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
-}
 std::array<double, 2> charge_factor(int z, double q) {
   const auto &p = elements[z].charge;
   const double t = std::tanh(p[2] * q + p[3]);
@@ -95,34 +88,9 @@ struct Coefficient {
   double neutral = 0, rho = 0, sum_damping = 0;
   int i, j;
 };
-struct Edge {
-  int i, j;
-  Vec d;
-  double r;
+struct Edge : gxtb::Pair {
   double dcn = 0, inverse = 0, log_slope = 0;
   Coefficient *coefficient = nullptr;
-};
-
-struct Gradient {
-  std::vector<Vec> atoms;
-  Tensor strain{};
-  explicit Gradient(size_t n) : atoms(n) {}
-  void add(const Edge &edge, double slope) {
-    for (int a = 0; a < 3; ++a) {
-      const double g = slope * edge.d[a] / edge.r;
-      if (edge.i != edge.j) {
-        atoms[edge.i][a] -= g;
-        atoms[edge.j][a] += g;
-      }
-      for (int b = 0; b < 3; ++b)
-        strain[3 * b + a] += edge.d[b] * g;
-    }
-  }
-  void output(double *g, double *s) const {
-    for (size_t i = 0; i < atoms.size(); ++i)
-      std::copy_n(atoms[i].data(), 3, g + 3 * i);
-    std::copy(strain.begin(), strain.end(), s);
-  }
 };
 
 double cube(double x) { return x * x * x; }
@@ -142,78 +110,25 @@ public:
            const int *pbc)
       : z(n), atm_energy(n), atm_gradient(n) {
     std::vector<double> cn(n);
-    std::vector<Vec> pos(n);
-    std::array<Vec, 3> lattice{}, dual{};
     for (int i = 0; i < n; ++i) {
       if (numbers[i] < 1 || numbers[i] > 103)
         throw std::invalid_argument("D4Srev requires Z=1..103");
       z[i] = numbers[i] - 1;
-      std::copy_n(xyz + 3 * i, 3, pos[i].begin());
-      for (double x : pos[i])
-        if (!std::isfinite(x))
-          throw std::invalid_argument("Nonfinite D4Srev coordinate");
     }
-    if (pbc[0] || pbc[1] || pbc[2]) {
-      for (int a = 0; a < 3; ++a)
-        std::copy_n(cell + 3 * a, 3, lattice[a].begin());
-      const double vol = dot(lattice[0], cross(lattice[1], lattice[2]));
-      if (!std::isfinite(vol) || std::abs(vol) < 1.e-12)
-        throw std::invalid_argument("Singular D4Srev cell");
-      for (int a = 0; a < 3; ++a) {
-        dual[a] = cross(lattice[(a + 1) % 3], lattice[(a + 2) % 3]);
-        for (double &v : dual[a])
-          v /= vol;
-      }
-    }
-    // Order sites by lattice translation, then by atom index. Only the
-    // smaller endpoint generates the edge, including for self images.
-    for (int i = 0; i < n; ++i) {
-      for (int j = 0; j < n; ++j) {
-        const Vec delta = difference(pos[j], pos[i]);
-        std::array<int, 3> lo{}, hi{};
-        for (int a = 0; a < 3; ++a) {
-          if (!pbc[a])
-            continue;
-          const double center = -dot(delta, dual[a]);
-          const double span =
-              pair_radius * std::sqrt(dot(dual[a], dual[a])) + 1.e-12;
-          if (!std::isfinite(center) ||
-              std::abs(center) + span >= std::numeric_limits<int>::max() - 1)
-            throw std::invalid_argument(
-                "D4Srev lattice image index out of range");
-          lo[a] = static_cast<int>(std::ceil(center - span));
-          hi[a] = static_cast<int>(std::floor(center + span));
-        }
-        for (int a = lo[0]; a <= hi[0]; ++a)
-          for (int b = lo[1]; b <= hi[1]; ++b)
-            for (int c = lo[2]; c <= hi[2]; ++c) {
-              const std::array<int, 4> site{a, b, c, j};
-              if (site <= std::array<int, 4>{0, 0, 0, i})
-                continue;
-              Vec d = delta;
-              for (int k = 0; k < 3; ++k)
-                d[k] +=
-                    a * lattice[0][k] + b * lattice[1][k] + c * lattice[2][k];
-              const double r = std::sqrt(dot(d, d));
-              if (r > pair_radius)
-                continue;
-              if (r < 1.e-6)
-                throw std::invalid_argument(
-                    "Coincident atoms or images in D4Srev");
-              Edge edge{i, j, d, r};
-              if (r <= cn_radius) {
-                const double beta =
-                    7.5 / (elements[z[i]].radius + elements[z[j]].radius);
-                const double u = beta * r - 7.5;
-                const double count = 0.5 * std::erfc(u);
-                cn[i] += count;
-                cn[j] += count;
-                edge.dcn = -beta / std::sqrt(pi) * std::exp(-u * u);
-              }
-              edges.push_back(edge);
-            }
-      }
-    }
+    gxtb::for_each_pair(
+        n, xyz, cell, pbc, pair_radius, [&](const gxtb::Pair &pair) {
+          Edge edge{pair};
+          if (edge.r <= cn_radius) {
+            const double beta =
+                7.5 / (elements[z[edge.i]].radius + elements[z[edge.j]].radius);
+            const double u = beta * edge.r - 7.5;
+            const double count = 0.5 * std::erfc(u);
+            cn[edge.i] += count;
+            cn[edge.j] += count;
+            edge.dcn = -beta / std::sqrt(pi) * std::exp(-u * u);
+          }
+          edges.push_back(edge);
+        });
     std::vector<std::vector<const Edge *>> forward(n);
     std::map<std::pair<int, int>, Response> spectra;
     auto spectrum = [&](int atom, int partner) -> const Response & {
@@ -252,7 +167,7 @@ public:
         for (size_t k = 0; k < j; ++k) {
           const Edge &first = *neighbors[j], &second = *neighbors[k];
           const Vec d = difference(second.d, first.d);
-          Edge third{first.j, second.j, d, std::sqrt(dot(d, d))};
+          Edge third{{first.j, second.j, d, std::sqrt(dot(d, d))}};
           if (third.r > atm_radius)
             continue;
           damp(third, coefficients.at(std::minmax(third.i, third.j)));

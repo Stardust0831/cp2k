@@ -319,7 +319,8 @@ CONTAINS
          CASE (use_embed)
             CALL embed_energy(force_env)
          CASE (use_gxtb)
-            CALL gxtb_evaluate(force_env%gxtb_env)
+            CALL gxtb_evaluate(force_env%gxtb_env, calculate_forces, &
+                               calculate_stress_tensor .AND. virial%pv_availability .AND. .NOT. virial%pv_numer)
          CASE (use_ipi)
             CALL request_forces(force_env%ipi_env)
          CASE default

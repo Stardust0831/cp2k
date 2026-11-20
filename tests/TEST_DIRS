@@ -67,6 +67,7 @@ QMMM/QS/regtest-1
 QS/regtest-tddfpt-force-libxc                               libxc
 SE/regtest-2-2
 xTB/regtest-tblite-gfn2-1                                   tblite
+xTB/regtest-gxtb-periodic                                   tblite
 QS/regtest-ed                                               libint
 Fist/regtest-12
 QS/regtest-nonlinear-optics

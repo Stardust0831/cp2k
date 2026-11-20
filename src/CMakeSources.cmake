@@ -347,6 +347,8 @@ list(
   ipi_environment_types.F
   ipi_server.F
   gxtb_environment.F
+  gxtb_primitives.F
+  gxtb_scf_linalg.F
   gxtb_types.F
   iterate_matrix.F
   kg_correction.F
@@ -1579,7 +1581,9 @@ list(
 
 list(APPEND CP2K_SRCS_F grpp/libgrpp.F)
 
-set(CP2K_SRCS_CPP torch_c_api.cpp ace_c_api.cpp gxtb_revd4.cpp)
+set(CP2K_SRCS_CPP torch_c_api.cpp ace_c_api.cpp gxtb_revd4.cpp gxtb_parameters.cpp
+    gxtb_repulsion.cpp gxtb_exchange.cpp gxtb_electrostatic.cpp gxtb_scf.cpp
+    gxtb_integrals.cpp gxtb_ewald.cpp gxtb_eeq.cpp gxtb_native.cpp)
 
 list(APPEND CP2K_SRCS_F openpmd_api.F input/cp_output_handling_openpmd.F
      cp_realspace_grid_openpmd.F pw/realspace_grid_openpmd.F)

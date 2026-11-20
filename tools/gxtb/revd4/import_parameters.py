@@ -17,7 +17,7 @@ def source(root, name, digest):
 
 
 def table(text, name):
-    match = re.search(rf"^(?:pub static|const) {name}: [^=]+?= (\[.*?\n\]);", text, re.M | re.S)
+    match = re.search(rf"^(?:pub static|const) {name}: [^=]+?= (\[.*?\]);", text, re.M | re.S)
     return ast.literal_eval(re.sub(r"//[^\n]*", "", match[1]))
 
 

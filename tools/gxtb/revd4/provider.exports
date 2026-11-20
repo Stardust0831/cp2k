@@ -1,4 +1,4 @@
 {
-  global: cp2k_gxtb_name_v1; cp2k_gxtb_eval_v2;
+  global: cp2k_gxtb_name_v1; cp2k_gxtb_eval_v2; cp2k_gxtb_eval_v3;
   local: *;
 };

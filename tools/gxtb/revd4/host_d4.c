@@ -9,6 +9,9 @@ struct cache {
 };
 
 #ifdef GXTB_STANDALONE
+#include "../../../src/gxtb_scf.h"
+/* Keep the standalone solver as an independent electronic SCF reference. */
+cp2k_gxtb_scf_fn *cp2k_save_scf_solver(void) { return NULL; }
 #define cp2k_save_d4_host cp2k_gxtb_native_d4
 #else
 const struct cp2k_gxtb_d4_v1 *cp2k_save_d4_host(void);

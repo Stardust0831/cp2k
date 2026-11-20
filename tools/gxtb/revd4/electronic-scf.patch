@@ -1,0 +1,71 @@
+--- a/src/tblite/xtb/CMakeLists.txt
++++ b/src/tblite/xtb/CMakeLists.txt
+@@ -28,0 +29 @@
++  "${dir}/native_scf.f90"
+--- a/src/tblite/xtb/singlepoint.f90
++++ b/src/tblite/xtb/singlepoint.f90
+@@ -23,0 +24,2 @@
++   use iso_c_binding, only: c_associated
++   use tblite_cp2k_scf, only: cp2k_save_scf_solver, run_cp2k_scf
+@@ -116,0 +119,2 @@
++   real(wp), allocatable :: native_weighted(:, :, :)
++   logical :: native_scf
+@@ -141,0 +146 @@
++   native_scf = c_associated(cp2k_save_scf_solver())
+@@ -334,0 +340,9 @@
++   if (native_scf) then
++      call run_cp2k_scf(mol,calc,wfn,ints,pot,ccache, &
++                        eelec,native_weighted,iscf,error,gradient,sigma)
++      if (allocated(error)) then
++         call ctx%set_error(error)
++         return
++      end if
++      converged = .true.
++   else
+@@ -375,0 +390 @@
++   end if
+@@ -396 +411 @@
+-   call calc%iterator%cleanup(iter_cache)
++   if (.not.native_scf) call calc%iterator%cleanup(iter_cache)
+@@ -399 +414 @@
+-      call ctx%delete_solver(solver)
++      if (allocated(solver)) call ctx%delete_solver(solver)
+@@ -450 +465,5 @@
+-      call solver%get_wdensity(wfn%coeff, ints%overlap, wfn%emo, wfn%focc, wdensity, error)
++      if (native_scf) then
++         wdensity = wdensity + native_weighted
++      else
++         call solver%get_wdensity(wfn%coeff, ints%overlap, wfn%emo, wfn%focc, wdensity, error)
++      end if
+@@ -492 +511 @@
+-   call ctx%delete_solver(solver)
++   if (allocated(solver)) call ctx%delete_solver(solver)
+--- a/src/tblite/xtb/gxtb.f90
++++ b/src/tblite/xtb/gxtb.f90
+@@ -21,0 +22,2 @@
++   use iso_c_binding, only: c_associated
++   use tblite_cp2k_scf, only: cp2k_save_scf_solver
+@@ -2248,0 +2251 @@
++   logical :: host_scf
+@@ -2269 +2272,2 @@
+-   call add_increment(calc, mol)
++   host_scf = c_associated(cp2k_save_scf_solver())
++   if (.not.host_scf) call add_increment(calc, mol)
+@@ -2271,4 +2275,6 @@
+-   call add_repulsion(calc, mol, error)
+-   if (allocated(error)) return
+-   call add_dispersion(calc, mol, error, cfg%smooth_cutoff)
+-   if (allocated(error)) return
++   if (.not.host_scf) then
++      call add_repulsion(calc, mol, error)
++      if (allocated(error)) return
++      call add_dispersion(calc, mol, error, cfg%smooth_cutoff)
++      if (allocated(error)) return
++   end if
+@@ -2277,2 +2283,4 @@
+-   call add_exchange(calc, mol)
+-   call add_spin_polarization(calc, mol)
++   if (.not.host_scf) then
++      call add_exchange(calc, mol)
++      call add_spin_polarization(calc, mol)
++   end if

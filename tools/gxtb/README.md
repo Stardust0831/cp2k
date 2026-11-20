@@ -5,25 +5,115 @@ cell in the CP2K process. CP2K constructs the
 Born-von Karman supercell from `REPEATS na nb nc`, passes its lattice and
 atoms to a Gamma-point electronic solver, and returns the energy per input
 cell, the mean force on equivalent images and the pressure-positive virial.
-One MPI rank calls the provider and broadcasts the results. The CP2K changes
-and adapters were written against public interfaces.
+One MPI rank evaluates this supercell and broadcasts the results.
 
-## Open-source CPU provider
+## Internal CPU implementation
+
+Configure this branch with `-DCP2K_USE_TBLITE=ON` and the standard CP2K
+tblite dependency (tested with 0.8.0). With the default empty
+`CP2K_GXTB_PROVIDER_LIBRARY`, select `METHOD GXTB` and omit `LIBRARY`.
+The CP2K source includes the model and its numerical parameter tables.
+Building and running this path requires no Paderborn source, private archive,
+shared adapter, Python, Atomli or Rust. The startup message begins with
+`GXTB| CP2K Gamma g-xTB (stock tblite`.
+[Distorted NaCl input](../../tests/xTB/regtest-gxtb-periodic/nacl.inp)
+
+CP2K evaluates the periodic EEQBC auxiliary charges, contracts the q-vSZP
+basis, constructs the one-electron Hamiltonian and atomic core projectors,
+and builds the screened shell and electrostatic multipole matrices, including
+their Ewald sums. The SCF evaluates the charge, spin, multipole, exchange,
+bond-order, repulsion and D4Srev contributions on the same density. Stock
+tblite supplies low-level Gaussian overlap and moment integrals, the
+sigma/pi/delta bond-frame transform and the charge Ewald splitting parameter.
+BLAS and LAPACK provide the dense matrix operations and generalised
+eigensolve. The numerical data and regeneration scripts carry their source
+attribution. [Parameter provenance](revd4/PARAMETERS.md)
+
+Forces and stress are **semi-analytic**. CP2K evaluates repulsion, dispersion
+and the radial exchange derivatives analytically. It differences the remaining
+geometry-dependent operators and contracts their response with the stationary
+density, multipole potentials and energy-weighted density (including the
+overlap response of exchange). Cartesian and homogeneous strain steps are
+1e-5 bohr and 5e-7. A single electronic solve suffices for a force evaluation.
+A full force and stress evaluation constructs an additional 6N+12 sets of
+geometry matrices for N atoms in the explicit supercell. Energy-only runs
+skip that work. The `STRESS_TENSOR ANALYTICAL` input requests the evaluator's
+virial. This implementation currently supports neutral, three-dimensional
+Gamma supercells on CPU. Primitive-cell multi-k and GPU execution have not
+been implemented on this path.
+
+### Internal implementation checks
+
+The standalone comparison uses the Paderborn SCF and analytic derivatives
+with CP2K's D4Srev. Differences in the last two columns use independent,
+fully converged CP2K total energies for every atomic coordinate and six
+strain components. All runs also compared `REPEATS 2 1 1` with an explicit
+doubled cell.
+
+| Distorted cell | Energy vs CLI (eV/cell) | Max force vs CLI (eV/angstrom) | Max stress vs CLI (eV/angstrom^3) | Force vs energy difference (eV/angstrom) | Stress vs energy difference (eV/angstrom^3) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NaCl, 2 atoms | 2.74e-8 | 9.18e-8 | 1.99e-9 | 3.13e-5 | 9.13e-8 |
+| Diamond Si, 8 atoms | 1.11e-7 | 9.94e-8 | 2.14e-9 | 2.36e-7 | 1.19e-8 |
+| H3, unrestricted | 7.04e-9 | 5.15e-8 | 4.45e-10 | 3.91e-7 | 4.30e-10 |
+| Fluorite CaF2, 3 atoms | 3.88e-3 | 4.96e-3 | 1.34e-2 | 1.72e-5 | 1.04e-6 |
+
+The CaF2 direct comparison fails all three default thresholds. Its EEQBC
+bond capacitance decays with distance. CP2K sums it to an erfc argument of
+8, independently of the cell basis. The pinned multicharge reference uses
+five translations per axis about each Wigner-Seitz representative and
+averages competing representatives. Changing **only** the bounds in its
+`multicharge_model_type::get_dir_trans` from +/-2 to +/-8 reduces the
+energy and force differences to 2.42e-7 eV and 5.24e-8 eV/angstrom.
+The maximum stress difference with this reference is 1.93e-6 eV/angstrom^3,
+above the direct 1e-6 threshold. At a strain of 2e-6 the extended
+reference's own central energy differences differ from its printed stress
+by 1.72e-6 and from CP2K's stress by 2.62e-7 eV/angstrom^3. The default
+reference also has a jump in overlap and moment matrices at a CaF2 shear
+of 2e-5. Internal total-energy derivatives pass at that step. These
+checks do not establish crystal energetics against experiment or DFT.
+
+A two-rank NaCl run passed energy, force, stress, displacement, shear
+and supercell checks. In one CP2K process the sequence water/GFN2,
+NaCl/GXTB, water/GFN2 reproduced the original GFN2 energy to 2e-15 Ha.
+For isolated water placed in a 250-angstrom periodic cell, internal
+g-xTB gave -76.430901041910 Ha, 4.20e-6 Ha above Grimme's molecular
+executable, with a maximum force difference of 8.32e-6 Ha/bohr.
+A separate three-atom CeO2 single point in a 16 x 17 x 18 angstrom
+cell checks f orbitals. Its energy agreed with the geometry-adapter
+calculation to 3.60e-11 Ha.
+
+With the standalone reference built as described below, run from
+`tools/gxtb` with a fresh output directory per case.
+
+```sh
+python3 check_periodic.py /path/to/cp2k.ssmp checks-internal-nacl \
+  --internal --engine save-tblite --reference-cli /path/to/tblite \
+  --reference-accuracy 0.0001 --all-derivatives --force-step 0.0001 --strain-step 0.00002
+```
+
+For Si use `--structure silicon --force-step 0.00025 --strain-step 0.00001`.
+For H3 use `--structure h3 --force-step 0.0001 --strain-step 0.00001`.
+Use the NaCl steps with `--structure caf2` to reproduce the fluorite result.
+
+## Optional Paderborn provider and standalone reference
 
 The build uses Paderborn's public `save_tblite` snapshot
 `35e7942b60edd89bb407ab3da5768d3410af83f5` for the periodic electronic
 solver. Its original g-xTB dispersion dependency was
 `grimme-lab/dftd@99d64ee83832fda03df2c7dd7b7fd9f4c9ebb098`. The source for
-that revision could not be verified. The electronic basis, integrals,
-Hamiltonian, exchange, diagonalization and SCF iteration come from this
-electronic solver. [Electronic solver archive](https://github.com/DCM-Uni-Paderborn/Periodic-g-xTB-Benchmarks/tree/866691a93b36ee582e49d896dfda5b91524dce12/validation/accelerated_exchange/root_a_partial_bridge/final_35e7942_20260717/provider/source)
+that revision could not be verified. The reference CLI uses the original
+basis, integrals, Hamiltonian, exchange, eigensolver and SCF. The v3 CP2K
+adapter supplies its geometry operators to CP2K's own SCF, exchange,
+electrostatic functional, repulsion and dispersion. Older v2 adapters use
+their own electronic solver with CP2K's D4Srev through callbacks.
+[Electronic solver archive](https://github.com/DCM-Uni-Paderborn/Periodic-g-xTB-Benchmarks/tree/866691a93b36ee582e49d896dfda5b91524dce12/validation/accelerated_exchange/root_a_partial_bridge/final_35e7942_20260717/provider/source)
 
 CP2K implements g-xTB 2.0.1 D4Srev in `src/gxtb_revd4.cpp` as part of
 `libcp2k`. It computes coordination numbers, pair-specific C6 interpolation
 on the imaginary frequency grid, screened damping, periodic pair and
 Axilrod-Teller-Muto (ATM) sums, and analytic charge, coordinate and strain
 derivatives. The electronic solver receives CP2K's dispersion functions
-when it enters an energy/force evaluation. Every SCF cycle
+when using the v2 interface. Every SCF cycle
 uses the current Mulliken charges for the two-body energy and its charge
 potential. The three-body term uses neutral reference C6 at the current
 geometry. The dispersion uses the 2.0.1 program's hard cutoffs of 30, 50 and
@@ -65,7 +155,7 @@ pairs. For `M` orbitals per input cell
 and `m` replicated cells the dense electronic eigensolve costs O((mM)^3)
 time and O((mM)^2) memory per SCF iteration. These are algorithmic estimates.
 
-### Qualification
+### Provider qualification
 
 The scripts below take a NumPy/ASE Python environment and a new directory
 for each CP2K run. The direct comparison uses a separate process running

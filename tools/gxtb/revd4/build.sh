@@ -36,7 +36,7 @@ fetch d4.f90 "$stock/d4.f90" 0a16308335e8eb62d1487c8725705ea45dd1c5c8c8eab442565
 fetch cache.f90 "$stock/cache.f90" c55d909c7c2ed7431e9bc1edd55f1ba95093e7b6dc4b105f7fbf513ea3770412
 
 # A different patch or source pin gets a separate, fully staged source tree.
-key=$(cat "$here/build.sh" "$here/save-tblite.patch" | sha256sum | cut -c1-16)
+key=$(cat "$here/build.sh" "$here/save-tblite.patch" "$here/electronic-scf.patch" | sha256sum | cut -c1-16)
 src="$work/sources-$key"
 if [[ ! -d "$src" ]]; then
     stage=$(mktemp -d "$work/staging.XXXXXXXX")
@@ -47,14 +47,16 @@ if [[ ! -d "$src" ]]; then
     tar -xf multicharge.tar.gz --strip-components=1 -C "$stage/multicharge"
     cp d4.f90 cache.f90 "$stage/provider/src/tblite/disp/"
     patch --batch --fuzz=0 -d "$stage/provider" -p1 -i "$here/save-tblite.patch"
+    patch --batch --fuzz=0 -d "$stage/provider" -p1 -i "$here/electronic-scf.patch"
     mv "$stage" "$src"
     trap - EXIT
 fi
 cmake -E copy_if_different "$here/tblite_revd4.f90" "$src/provider/src/tblite/disp/revd4.f90"
+cmake -E copy_if_different "$here/tblite_native_scf.f90" "$src/provider/src/tblite/xtb/native_scf.f90"
 
 build="$work/cmake-$key"
 cmake -S "$here" -B "$build" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$work/install" \
     -DPROVIDER_SOURCE="$src/provider" -DSTOCK_SOURCE="$src/stock" -DMULTICHARGE_SOURCE="$src/multicharge"
-cmake --build "$build" --target gxtb_save tblite-exe --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-4}"
+cmake --build "$build" --target gxtb_save gxtb_kernels tblite-exe --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-4}"
 cmake --install "$build" --component gxtb_runtime

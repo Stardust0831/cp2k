@@ -25,10 +25,10 @@ MODULE gxtb_environment
          INTEGER(c_size_t), VALUE :: capacity
          TYPE(c_ptr) :: model
       END FUNCTION
-      FUNCTION cp_gxtb_eval(model, n, z, pos, cell, radii, energy, grad, strain, msg, capacity) RESULT(stat) BIND(C)
+      FUNCTION cp_gxtb_eval(model, n, z, pos, cell, radii, forces, virial, energy, grad, strain, msg, capacity) RESULT(stat) BIND(C)
          IMPORT :: c_char, c_double, c_int, c_ptr, c_size_t
          TYPE(c_ptr), VALUE :: model
-         INTEGER(c_int), VALUE :: n
+         INTEGER(c_int), VALUE :: n, forces, virial
          INTEGER(c_int), INTENT(IN) :: z(*)
          REAL(c_double), INTENT(IN) :: pos(3,*), cell(3,3), radii(2)
          REAL(c_double), INTENT(OUT) :: energy, grad(3,*), strain(3,3)
@@ -89,8 +89,9 @@ CONTAINS
       END IF
    END SUBROUTINE
 
-   SUBROUTINE gxtb_evaluate(env)
+   SUBROUTINE gxtb_evaluate(env, forces, virial)
       TYPE(gxtb_env_type), INTENT(INOUT) :: env
+      LOGICAL, INTENT(IN) :: forces, virial
       REAL(KIND=dp), ALLOCATABLE :: pos(:,:), grad(:,:), force(:,:)
       INTEGER(c_int), ALLOCATABLE :: z(:)
       INTEGER :: n, total, a, b, c, i, j, last, stat, term
@@ -126,7 +127,8 @@ CONTAINS
          DO i = 1, 3
             h(:,i) = h(:,i)*env%repeats(i)
          END DO
-         stat = cp_gxtb_eval(env%model, INT(total,c_int), z, pos, h, env%radii, env%energy, grad, strain, &
+         stat = cp_gxtb_eval(env%model, INT(total,c_int), z, pos, h, env%radii, MERGE(1_c_int,0_c_int,forces), &
+                             MERGE(1_c_int,0_c_int,virial), env%energy, grad, strain, &
                              msg, LEN(msg, KIND=c_size_t))
          IF (stat /= 0) THEN
             term = INDEX(msg, c_null_char)

@@ -12,18 +12,23 @@ const char *cp2k_gxtb_name_v1(void) {
  * thread. Each cache keeps the host callbacks for its entire lifetime. */
 static _Thread_local const struct cp2k_gxtb_d4_v1 *host;
 const struct cp2k_gxtb_d4_v1 *cp2k_save_d4_host(void) { return host; }
+static _Thread_local cp2k_gxtb_scf_fn *electronic_scf;
+cp2k_gxtb_scf_fn *cp2k_save_scf_solver(void) { return electronic_scf; }
 
-int cp2k_gxtb_eval_v2(const struct cp2k_gxtb_d4_v1 *dispersion, int n,
-                      const int *z, const double *xyz, const double *cell,
-                      const double *radii, double *energy, double *gradient,
-                      double *strain, char *message, size_t capacity) {
+static int evaluate(const struct cp2k_gxtb_d4_v1 *dispersion,
+                    cp2k_gxtb_scf_fn *scf, int n, const int *z,
+                    const double *xyz, const double *cell, const double *radii,
+                    double *energy, double *gradient, double *strain,
+                    char *message, size_t capacity) {
   if (radii[0] != 0 || radii[1] != 0) {
     snprintf(message, capacity,
              "save_tblite uses its own exchange kernel; omit EXCHANGE_RADII");
     return 1;
   }
   const struct cp2k_gxtb_d4_v1 *previous = host;
+  cp2k_gxtb_scf_fn *previous_scf = electronic_scf;
   host = dispersion;
+  electronic_scf = scf;
   const bool periodic[3] = {true, true, true};
   const int length = (int)capacity;
   tblite_error error = tblite_new_error();
@@ -63,5 +68,26 @@ int cp2k_gxtb_eval_v2(const struct cp2k_gxtb_d4_v1 *dispersion, int n,
   tblite_delete_context(&ctx);
   tblite_delete_error(&error);
   host = previous;
+  electronic_scf = previous_scf;
   return status;
+}
+
+int cp2k_gxtb_eval_v2(const struct cp2k_gxtb_d4_v1 *d4, int n, const int *z,
+                      const double *xyz, const double *cell,
+                      const double *radii, double *energy, double *gradient,
+                      double *strain, char *message, size_t capacity) {
+  return evaluate(d4, NULL, n, z, xyz, cell, radii, energy, gradient, strain,
+                  message, capacity);
+}
+
+int cp2k_gxtb_eval_v3(cp2k_gxtb_scf_fn *scf, int n, const int *z,
+                      const double *xyz, const double *cell,
+                      const double *radii, double *energy, double *gradient,
+                      double *strain, char *message, size_t capacity) {
+  if (!scf) {
+    snprintf(message, capacity, "Missing CP2K g-xTB electronic solver");
+    return 1;
+  }
+  return evaluate(NULL, scf, n, z, xyz, cell, radii, energy, gradient, strain,
+                  message, capacity);
 }

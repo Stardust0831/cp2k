@@ -1,0 +1,5 @@
+"nacl.inp" = [
+  {matcher = "M011", tol = 1.0e-11, ref = -622.70088602089},
+  {matcher = "M031", tol = 1.0e-6, ref = -1.40551444e4},
+]
+#EOF

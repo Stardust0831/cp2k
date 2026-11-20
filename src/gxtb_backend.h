@@ -2,6 +2,7 @@
 #ifndef CP2K_GXTB_BACKEND_H
 #define CP2K_GXTB_BACKEND_H
 #include "gxtb_revd4.h"
+#include "gxtb_scf.h"
 #include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +23,14 @@ typedef int cp2k_gxtb_fn_v2(const struct cp2k_gxtb_d4_v1 *dispersion, int n,
                             double *energy, double *gradient, double *strain,
                             char *message, size_t capacity);
 cp2k_gxtb_fn_v2 cp2k_gxtb_eval_v2;
+/* The geometry backend supplies a fixed AO problem to the host SCF once
+ * and contracts the returned density with its integral derivatives. */
+typedef int cp2k_gxtb_fn_v3(cp2k_gxtb_scf_fn *scf, int n, const int *z,
+                            const double *positions, const double *lattice,
+                            const double *radii, double *energy,
+                            double *gradient, double *strain, char *message,
+                            size_t capacity);
+cp2k_gxtb_fn_v3 cp2k_gxtb_eval_v3;
 const char *cp2k_gxtb_name_v1(void);
 #ifdef __cplusplus
 }
