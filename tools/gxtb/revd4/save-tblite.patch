@@ -1,0 +1,139 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 96f0871..3969d70 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,2 +91,2 @@ endif()
+-if(NOT TARGET "dftd::dftd")
+-  find_package("dftd" REQUIRED)
++if(NOT TARGET "dftd4::dftd4")
++  find_package("dftd4" CONFIG REQUIRED)
+@@ -93,0 +94 @@ endif()
++find_library(REVD4_LIBRARY NAMES cp2k_gxtb_revd4 REQUIRED)
+@@ -109 +110,3 @@ set(
+-  "dftd::dftd"
++  "dftd4::dftd4"
++  "multicharge::multicharge"
++  "${REVD4_LIBRARY}"
+diff --git a/src/tblite/disp.f90 b/src/tblite/disp.f90
+index 69f263d..195e6fb 100644
+--- a/src/tblite/disp.f90
++++ b/src/tblite/disp.f90
+@@ -29,2 +29,2 @@ module tblite_disp
+-      & new_d4s_dispersion, new_d4srev_dispersion, twobody_damping_function, &
+-      & threebody_damping_function, get_damping_function_id
++      & new_d4s_dispersion
++   use tblite_disp_revd4, only : revd4_dispersion, new_revd4
+diff --git a/src/tblite/disp/CMakeLists.txt b/src/tblite/disp/CMakeLists.txt
+index 9003731..64dc296 100644
+--- a/src/tblite/disp/CMakeLists.txt
++++ b/src/tblite/disp/CMakeLists.txt
+@@ -23,0 +24 @@ list(
++  "${dir}/revd4.f90"
+diff --git a/src/tblite/post_processing/xtb-ml/energy.f90 b/src/tblite/post_processing/xtb-ml/energy.f90
+index 1bee0c8..bc93926 100644
+--- a/src/tblite/post_processing/xtb-ml/energy.f90
++++ b/src/tblite/post_processing/xtb-ml/energy.f90
+@@ -25 +25,2 @@ module tblite_post_processing_xtbml_energy
+-   use tblite_disp_d4, only : d4_dispersion, new_d4_dispersion, get_damping_function_id
++   use tblite_disp_d4, only : d4_dispersion, new_d4_dispersion
++   use tblite_disp_revd4, only : revd4_dispersion
+@@ -95 +96 @@ subroutine compute_features(self, mol, wfn, ints, calc, caches, mlcache, &
+-   integer :: i, damping_2b, damping_3b
++   integer :: i
+@@ -176,0 +178,9 @@ subroutine compute_features(self, mol, wfn, ints, calc, caches, mlcache, &
++         type is (revd4_dispersion)
++            allocate(e_disp_tot(mol%nat), e_disp_ATM(mol%nat), source=0.0_wp)
++            call cont%update(mol, caches%list(4))
++            call cont%get_engrad(mol, caches%list(4), e_disp_ATM)
++            call cont%get_energy(mol, caches%list(4), wfn, e_disp_tot)
++            call dict%add_entry("E_disp2", e_disp_tot)
++            call dict%add_entry("E_disp3", e_disp_ATM)
++            n_features = n_features + 2
++            tmp_energy = e_disp_tot + e_disp_ATM
+@@ -184,3 +194 @@ subroutine compute_features(self, mol, wfn, ints, calc, caches, mlcache, &
+-            call get_damping_function_id(error, cont%damp, damping_2b, damping_3b)
+-            if(allocated(error)) return
+-            call new_d4_dispersion(d4, mol, damping_2b, damping_3b, s6=0.0_wp, &
++            call new_d4_dispersion(d4, mol, s6=0.0_wp, &
+diff --git a/src/tblite/xtb/calculator.f90 b/src/tblite/xtb/calculator.f90
+index c1f2dd5..e2431df 100644
+--- a/src/tblite/xtb/calculator.f90
++++ b/src/tblite/xtb/calculator.f90
+@@ -51,2 +51 @@ module tblite_xtb_calculator
+-      & new_d4s_dispersion, new_d4srev_dispersion, d3_dispersion, new_d3_dispersion, &
+-      & get_damping_function_id
++      & new_d4s_dispersion, revd4_dispersion, new_revd4, d3_dispersion, new_d3_dispersion
+@@ -499 +498 @@ subroutine add_dispersion(calc, mol, param, error, smooth_cutoff)
+-   integer :: damping_2b_id, damping_3b_id
++   type(revd4_dispersion), allocatable :: rev
+@@ -510,0 +510,10 @@ subroutine add_dispersion(calc, mol, param, error, smooth_cutoff)
++      else if (par%smooth .and. par%rev) then
++         if (par%damping_2b /= "screened" .or. par%damping_3b /= "screened" .or. &
++            & any(abs([par%s6,par%s8,par%a1,par%a2,par%a3,par%a4,par%s9,par%kcn] - &
++            & [1._wp,0._wp,0._wp,8.5302496868_wp,0.5395219242_wp,0.654_wp,1.826410691_wp,7.5_wp]) > 1.e-12_wp)) then
++            call fatal_error(error,"The open D4Srev provider supports the g-xTB 2.0.1 parameters")
++            return
++         end if
++         allocate(rev)
++         call new_revd4(rev,mol,error)
++         call move_alloc(rev,calc%dispersion)
+@@ -511,0 +521,4 @@ subroutine add_dispersion(calc, mol, param, error, smooth_cutoff)
++         if (par%damping_2b /= "rational" .or. par%damping_3b /= "zero_avg") then
++            call fatal_error(error,"The public D4/D4S backend requires rational/zero_avg damping")
++            return
++         end if
+@@ -513,2 +525,0 @@ subroutine add_dispersion(calc, mol, param, error, smooth_cutoff)
+-         call get_damping_function_id(error, par%damping_2b, par%damping_3b, &
+-            & damping_2b_id, damping_3b_id)
+@@ -516,12 +527,3 @@ subroutine add_dispersion(calc, mol, param, error, smooth_cutoff)
+-            if (par%rev) then
+-               call new_d4srev_dispersion(d4, mol, damping_2b=damping_2b_id, &
+-                  & damping_3b=damping_3b_id, s6=par%s6, s8=par%s8, &
+-                  & a1=par%a1, a2=par%a2, a3=par%a3, a4=par%a4, s9=par%s9, &
+-                  & kcn=par%kcn, error=error, disp2_width=smooth_cutoff, &
+-                  & disp3_width=smooth_cutoff)
+-            else
+-               call new_d4s_dispersion(d4, mol, damping_2b=damping_2b_id, &
+-                  & damping_3b=damping_3b_id, s6=par%s6, s8=par%s8, &
+-                  & a1=par%a1, a2=par%a2, a3=par%a3, a4=par%a4, s9=par%s9, &
+-                  & error=error, disp2_width=smooth_cutoff, disp3_width=smooth_cutoff)
+-            end if
++            call new_d4s_dispersion(d4, mol, s6=par%s6, s8=par%s8, &
++               & a1=par%a1, a2=par%a2, s9=par%s9, error=error, &
++               & disp2_width=smooth_cutoff, disp3_width=smooth_cutoff)
+@@ -529,3 +531,2 @@ subroutine add_dispersion(calc, mol, param, error, smooth_cutoff)
+-            call new_d4_dispersion(d4, mol, damping_2b=damping_2b_id, &
+-               & damping_3b=damping_3b_id, s6=par%s6, s8=par%s8, &
+-               & a1=par%a1, a2=par%a2, a3=par%a3, a4=par%a4, s9=par%s9, &
++            call new_d4_dispersion(d4, mol, s6=par%s6, s8=par%s8, &
++               & a1=par%a1, a2=par%a2, s9=par%s9, &
+diff --git a/src/tblite/xtb/gfn2.f90 b/src/tblite/xtb/gfn2.f90
+index 70c8a96..78cb6d3 100644
+--- a/src/tblite/xtb/gfn2.f90
++++ b/src/tblite/xtb/gfn2.f90
+@@ -38,2 +38 @@ module tblite_xtb_gfn2
+-   use tblite_disp_d4, only : d4_dispersion, new_d4_dispersion, twobody_damping_function, &
+-      & threebody_damping_function
++   use tblite_disp_d4, only : d4_dispersion, new_d4_dispersion
+@@ -712,2 +711 @@ subroutine add_dispersion(calc, mol, error, smooth_cutoff)
+-   call new_d4_dispersion(tmp, mol, twobody_damping_function%rational, &
+-      & threebody_damping_function%zero_avg, s6=s6, s8=s8, a1=a1, a2=a2, s9=s9, &
++   call new_d4_dispersion(tmp, mol, s6=s6, s8=s8, a1=a1, a2=a2, s9=s9, &
+diff --git a/src/tblite/xtb/gxtb.f90 b/src/tblite/xtb/gxtb.f90
+index 51e07cb..4cf7be2 100644
+--- a/src/tblite/xtb/gxtb.f90
++++ b/src/tblite/xtb/gxtb.f90
+@@ -47,2 +47 @@ module tblite_xtb_gxtb
+-   use tblite_disp_d4, only : d4_dispersion, new_d4srev_dispersion, &
+-      & twobody_damping_function, threebody_damping_function
++   use tblite_disp_revd4, only : revd4_dispersion, new_revd4
+@@ -2488 +2487 @@ subroutine add_dispersion(calc, mol, error, smooth_cutoff)
+-   type(d4_dispersion), allocatable :: tmp
++   type(revd4_dispersion), allocatable :: tmp
+@@ -2491,5 +2490 @@ subroutine add_dispersion(calc, mol, error, smooth_cutoff)
+-   call new_d4srev_dispersion(tmp, mol, twobody_damping_function%screened, &
+-      & threebody_damping_function%screened, s6=pg_d4srev_s6, s8=pg_d4srev_s8, &
+-      & a1=pg_d4srev_a1, a2=pg_d4srev_a2, a3=pg_d4srev_a3, a4=pg_d4srev_a4, &
+-      & s9=pg_d4srev_s9, kcn=pg_d4srev_kcn, error=error, &
+-      & disp2_width=smooth_cutoff, disp3_width=smooth_cutoff)
++   call new_revd4(tmp, mol, error)

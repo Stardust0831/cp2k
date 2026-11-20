@@ -26,6 +26,8 @@ int cp2k_gxtb_eval_v1(int n, const int *z, const double *xyz,
     calc = tblite_new_gxtb_calculator(ctx, mol, NULL);
     if (calc && !tblite_check_context(ctx)) {
       tblite_set_context_verbosity(ctx, 0);
+      tblite_set_calculator_accuracy(ctx, calc, 0.01);
+      tblite_set_calculator_temperature(ctx, calc, 0.0);
       tblite_set_calculator_guess(ctx, calc, TBLITE_GUESS_EEQBC);
       tblite_get_singlepoint(ctx, mol, calc, result);
       if (!tblite_check_context(ctx)) {

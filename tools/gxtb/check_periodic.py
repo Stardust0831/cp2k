@@ -89,6 +89,8 @@ def main():
     parser.add_argument("output", type=Path, help="New directory for full inputs and logs")
     parser.add_argument("--engine", required=True, choices=("save-tblite", "atomli"))
     parser.add_argument("--library", type=Path, help="Run METHOD GXTB with this shared library (default: i-PI)")
+    parser.add_argument("--reference-cli", type=Path,
+                        help="Compare save-tblite against its standalone executable")
     parser.add_argument("--check-loader-failure", action="store_true",
                         help="Simulate a missing dependency in the Atomli CFFI adapter")
     parser.add_argument("--ranks", type=int, default=1)
@@ -99,6 +101,8 @@ def main():
     parser.add_argument("--force-step", type=float, help="Displacement in angstrom")
     parser.add_argument("--strain-step", type=float, help="Dimensionless homogeneous strain")
     args = parser.parse_args()
+    if args.reference_cli and args.engine != "save-tblite":
+        parser.error("--reference-cli requires the save-tblite engine")
     binary = args.binary.resolve()
     out = args.output.resolve()
     out.mkdir(parents=True)
@@ -152,11 +156,28 @@ def main():
         if (failed.returncode == 0 or "Atomli Python initialization failed" not in output
                 or "ENERGY| Total FORCE_EVAL" in output):
             raise AssertionError(f"Provider initialization failure was not propagated in {case}")
-    direct = atoms.copy()
-    direct.calc = PeriodicGXTB(args.engine, (1, 1, 1), radii)
-    check("energy_eV", abs(energy - direct.get_potential_energy()), 1e-5)
-    check("forces_eV_per_A", abs(forces - direct.get_forces()).max(), 1e-5)
-    check("stress_eV_per_A3", abs(stress - direct.get_stress(voigt=False)).max(), 1e-6)
+    if args.reference_cli:
+        case = out / "standalone"
+        case.mkdir()
+        write(case / "cell.gen", atoms, format="gen")
+        with (case / "tblite.log").open("w") as log:
+            subprocess.run([args.reference_cli.resolve(), "run", "--method", "gxtb", "--acc", "0.01",
+                            "--etemp", "0", "--guess", "eeqbc",
+                            "--grad", "grad.tag", "--json", "results.json", "cell.gen"],
+                           cwd=case, stdout=log, stderr=subprocess.STDOUT, timeout=180, check=True)
+        result = json.loads((case / "results.json").read_text())
+        direct_e = result["energy"] * Hartree
+        direct_f = -np.array(result["gradient"]).reshape(-1, 3) * Hartree / Bohr
+        direct_s = np.array(result["virial"]).reshape(3, 3) * Hartree / atoms.get_volume()
+    else:
+        direct = atoms.copy()
+        direct.calc = PeriodicGXTB(args.engine, (1, 1, 1), radii)
+        direct_e = direct.get_potential_energy()
+        direct_f = direct.get_forces()
+        direct_s = direct.get_stress(voigt=False)
+    check("energy_eV", abs(energy - direct_e), 1e-5)
+    check("forces_eV_per_A", abs(forces - direct_f).max(), 1e-5)
+    check("stress_eV_per_A3", abs(stress - direct_s).max(), 1e-6)
 
     def derivative(label, perturb, step):
         plus, minus = atoms.copy(), atoms.copy()

@@ -1,0 +1,14 @@
+[package]
+name = "cp2k-gxtb-revd4"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+axtb-base = "=0.2.0"
+axtb-d4 = "=0.2.0"
+axtb-gxtb = "=0.2.0"

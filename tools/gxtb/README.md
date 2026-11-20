@@ -9,12 +9,106 @@ One MPI rank calls the provider and broadcasts the results. The CP2K changes
 and adapters were written against public interfaces. Electronic structure and
 parameters come from the separately installed provider.
 
-**Physical limitation in the tested backend.** For the water geometry in this
-directory, the Atomli 0.1.18 periodic energy at 250 angstrom exceeds the
-official molecular g-xTB energy by 0.02478395 Ha. The discrepancy is also
-present when evaluating periodic Atomli directly. This branch is experimental.
+## Open-source CPU provider
 
-## Run a single point
+The build uses Paderborn's public `save_tblite` snapshot
+`35e7942b60edd89bb407ab3da5768d3410af83f5` for the periodic electronic
+solver. Its original g-xTB dispersion dependency was
+`grimme-lab/dftd@99d64ee83832fda03df2c7dd7b7fd9f4c9ebb098`. The source for
+that revision could not be verified. The molecular g-xTB 2.0.1 D4Srev
+implementation used here is published under LGPL-3.0-or-later by
+Atoms for Humanity in the `axtb-gxtb`, `axtb-base` and `axtb-d4` crates,
+version 0.2.0. [Electronic solver archive](https://github.com/DCM-Uni-Paderborn/Periodic-g-xTB-Benchmarks/tree/866691a93b36ee582e49d896dfda5b91524dce12/validation/accelerated_exchange/root_a_partial_bridge/final_35e7942_20260717/provider/source)
+[Molecular D4Srev source and equations](https://github.com/atomsforhumanity/axtb/tree/65d0f64a9a8211f73b0738ff908b7a414975f50b/crates/gxtb/src/revd4)
+
+The fork adds the periodic image sums, coordination numbers, self-image
+pairs, per-cell three-body counting, and analytic coordinate and strain
+derivatives. It calls the public molecular routines for the model data, C6
+coefficients, damping and Axilrod-Teller-Muto (ATM) kernel. Every SCF cycle
+uses the current Mulliken charges for the two-body energy and its charge
+potential. The three-body term uses neutral reference C6 at the current
+geometry. The dispersion uses the 2.0.1 program's hard cutoffs of 30, 50 and
+25 bohr for coordination, two-body and three-body terms, respectively.
+Energy derivatives at cutoff crossings can depend on the displacement step.
+
+Build CP2K from this branch with its usual CMake configuration. The plugin
+requires Linux, Rust/Cargo (tested with 1.91.1), CMake 3.22 or newer, a C and
+a Fortran compiler with OpenMP, BLAS/LAPACK, curl, GNU tar, patch, flock and
+coreutils. Run from `tools/gxtb` with your CP2K executable on PATH.
+
+```sh
+bash revd4/build.sh "$PWD/build-gxtb"
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+cp2k.ssmp -i revd4/nacl.inp
+```
+
+The example selects `METHOD GXTB`, `LIBRARY ./build-gxtb/install/lib/libgxtb_save.so`
+and `REPEATS 1 1 1`. Its expected distorted NaCl energy is
+-622.7008860203 Ha. The provider sets the SCF accuracy to 0.01, uses zero
+electronic temperature and starts from EEQBC charges. It takes its exchange
+settings from the electronic solver. For runs elsewhere, set `LIBRARY` to
+the absolute path and keep the two installed shared libraries together.
+The standalone executable is `build-gxtb/install/bin/tblite`. The build
+verifies the source downloads by SHA-256 and builds the Rust dependencies
+from `Cargo.lock`.
+
+The provider constructs dense pair-coefficient matrices with quadratic
+storage in the number of supercell atoms. For `M` orbitals per input cell
+and `m` replicated cells the dense electronic eigensolve costs O((mM)^3)
+time and O((mM)^2) memory per SCF iteration. These are algorithmic estimates.
+
+### Qualification
+
+The scripts below take a NumPy/ASE Python environment and a new directory
+for each CP2K run. The direct comparison uses a separate process running
+the same provider. Finite differences use independent CP2K energy runs.
+
+```sh
+prefix="$PWD/build-gxtb/install"
+python3 revd4/check.py "$prefix/lib/libcp2k_gxtb_revd4.so"
+cargo test --release --locked --manifest-path revd4/Cargo.toml --target-dir "$PWD/build-gxtb/cargo-target"
+python3 check_periodic.py "$(command -v cp2k.ssmp)" checks-open-nacl --engine save-tblite --library "$prefix/lib/libgxtb_save.so" --reference-cli "$prefix/bin/tblite" --all-derivatives --force-step 0.0001 --strain-step 0.00002
+python3 check_periodic.py "$(command -v cp2k.ssmp)" checks-open-si --engine save-tblite --library "$prefix/lib/libgxtb_save.so" --reference-cli "$prefix/bin/tblite" --all-derivatives --structure silicon
+```
+
+| Structure | Displacement (angstrom) | Strain step | Maximum force error (eV/angstrom) | Maximum stress error (eV/angstrom^3) |
+| --- | ---: | ---: | ---: | ---: |
+| Distorted NaCl, 2 atoms | 1e-4 | 2e-5 | 3.14e-5 | 9.10e-8 |
+| Distorted diamond Si, 8 atoms | 2.5e-4 | 1e-5 | 1.36e-5 | 4.41e-8 |
+
+The table covers all 3N forces and six strains. For both cells CP2K and
+the standalone program agree within 1.2e-7 eV in energy, 1.6e-8 eV/angstrom
+in force and 3.4e-9 eV/angstrom^3 in stress. `REPEATS 2 1 1` and a
+separately supplied doubled structure give the same energy per cell to
+printed precision. The NaCl force difference at the coarser 1e-3 angstrom
+step is 0.030234 eV/angstrom, exceeding the 2e-4 threshold. A separate run
+with the dispersion energy, potential and derivatives all set to zero
+still gives 0.030134 eV/angstrom at that step. Its cause remains open.
+
+At the archived molecular water density the two-body and ATM terms give
+-4.42494068950e-5 and +3.03371243557e-7 Ha, respectively, within
+6.36e-17 Ha of the individual reference terms. On a skew periodic cell,
+finite differences of the dispersion give maximum errors of 5.39e-14 Ha/e
+in the charge potential, 5.38e-15 Ha/bohr in the gradient and 1.28e-13 Ha
+in the strain derivative. A simple-cubic Ar test compares self-image
+interactions against molecular dimers and the two allowed trimer shapes.
+[Molecular reference coordinates, SCF density and energies](https://github.com/atomsforhumanity/axtb/tree/65d0f64a9a8211f73b0738ff908b7a414975f50b/crates/gxtb/tests/reference_v2/reference/water)
+
+For the separate distorted `water.xyz` in this directory the **full**
+molecular g-xTB energy is -76.430905244116 Ha in both the standalone solver
+and Grimme's executable. CP2K at 250 angstrom gives -76.430901049380 Ha,
+a residual of +4.19e-6 Ha. Standard molecular GFN2 on the same geometry
+agrees with CP2K's stock tblite 0.8.0 CLI within 8.9e-16 Ha in energy
+and 9.1e-11 Ha/bohr in gradient at `--acc 0.0001 --etemp 300 --guess sad`.
+These checks cover a CPU explicit Gamma supercell. Primitive-cell Bloch
+sampling and GPU execution are outside this provider's tested path.
+A CP2K build linked with its stock tblite held a Quickstep/GFN2 and a GXTB
+force environment in the same process. Running water/GFN2, NaCl/GXTB and
+water/GFN2 in succession reproduced both reference energies within 2e-15 Ha.
+The two-rank MPI NaCl run passed direct energy, force, stress, displacement,
+shear and explicit-supercell comparisons.
+
+## Atomli CPU provider
 
 Build CP2K on this branch with its usual CMake configuration. The CP2K build
 needs no electronic provider installed. The tested Atomli adapter requires
@@ -47,7 +141,7 @@ O((mM)^3) time and O((mM)^2) storage per SCF iteration, where M is the input
 cell orbital count and m is the product of the three repeats. Iteration count,
 exchange and integral construction also affect the elapsed time.
 
-## End-to-end checks
+### Atomli end-to-end checks
 
 Pass executable paths and new output directories to the scripts. Each check
 writes its input decks, structures, CP2K outputs and JSON results. The default
@@ -139,17 +233,6 @@ Nuclear forces, stress and self-consistent changes in the electronic
 density require additional model terms and integration.
 
 ## Other implementations
-
-`save_tblite.c` is an optional C adapter to the periodic save_tblite API.
-Compile against a build exporting `tblite_new_gxtb_calculator`; omit
-`EXCHANGE_RADII` for this provider. The adapter compiled against the snapshot
-`35e7942b60edd89bb407ab3da5768d3410af83f5` headers. Its runtime has not
-been qualified here. Building that snapshot stopped at its pinned
-`grimme-lab/dftd` dependency `99d64ee83832fda03df2c7dd7b7fd9f4c9ebb098`.
-
-```sh
-cc -std=c11 -shared -fPIC save_tblite.c $(pkg-config --cflags --libs tblite) -o libgxtb_tblite.so
-```
 
 The official development repository publishes Grimme's molecular executable.
 Paderborn's Dynamics of Condensed Matter group publishes a separate CP2K
