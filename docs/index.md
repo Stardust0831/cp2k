@@ -48,7 +48,6 @@ maxdepth: 1
 technologies/eigensolvers/index
 technologies/accelerators/index
 technologies/libraries
-technologies/cpu-affinity
 technologies/python
 ```
 

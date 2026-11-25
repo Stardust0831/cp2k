@@ -45,7 +45,7 @@ the CP2K manual provide several methods for installing CP2K with dependencies:
 - [Build with Spack](https://manual.cp2k.org/trunk/getting-started/build-with-spack.html)
 - [Install from Distribution](https://manual.cp2k.org/trunk/getting-started/distributions.html)
 
-For MPI/OpenMP CPU binding examples, see the [CPU affinity guide](docs/technologies/cpu-affinity.md).
+For MPI/OpenMP CPU binding examples, see the [MPI/ScaLAPACK guidance](docs/technologies/libraries.md#mpi-and-scalapack-required-for-mpi-parallel-builds).
 
 ## Links
 
