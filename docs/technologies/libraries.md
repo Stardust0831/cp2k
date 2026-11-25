@@ -117,7 +117,15 @@ With Open MPI 5 on one node, the following runs two concurrent jobs, each with t
 wait
 ```
 
-These disjoint lists use hwloc core IDs, not Linux CPU numbers. On shared clusters, use scheduler-assigned cores and the site's launch instructions. See the [Open MPI mapping and binding guide](https://docs.open-mpi.org/en/v5.0.11/man-openmpi/man1/mpirun.1.html#mapping-ranking-and-binding-options) for other placements.
+These disjoint lists use hwloc core IDs, not Linux CPU numbers. See the [Open MPI mapping and binding guide](https://docs.open-mpi.org/en/v5.0.11/man-openmpi/man1/mpirun.1.html#mapping-ranking-and-binding-options) for other placements.
+
+In an existing single-node Slurm allocation of at least eight physical cores, run this command in both working directories concurrently, provided the site supports direct MPI launch and core binding (`-c2` must supply two physical cores, not two SMT threads):
+
+```shell
+OMP_NUM_THREADS=2 srun --exact -N1 -n2 -c2 --cpu-bind=cores cp2k.psmp -i input.inp
+```
+
+Without `--overlap`, these [exact steps](https://slurm.schedmd.com/srun.html#OPT_exact) use separate four-core sets; with `task/cgroup` and [`ConstrainCores=yes`](https://slurm.schedmd.com/cgroup.conf.html#OPT_ConstrainCores), cpusets enforce the allocated CPU limits.
 
 CP2K assumes that the MPI library implements MPI version 3; older versions of MPI (e.g., MPI 2.0)
 are not supported. CP2K can make use of the `mpi_f08` module; pass `-DCP2K_USE_MPI_F08=ON` to CMake
