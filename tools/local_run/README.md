@@ -28,10 +28,8 @@ Process-local MPI sizes and scheduler variables are not defaults.
 
 The launcher reads online CPUs and complete SMT sibling groups from sysfs, intersects them with
 `sched_getaffinity`, and selects one allowed hardware thread per physical core. It reserves the
-whole sibling group, so two callers seeing complementary siblings cannot take the same core. **One
-entire system core is left unused by default**; `--reserve-cores N` changes this, including explicit
-0\. The first N machine-wide groups are shared system reservations: a concurrent caller with a
-smaller reserve cannot take them; a larger reserve conflicting with a live calculation fails.
+whole sibling group, so two callers seeing complementary siblings cannot take the same core. All
+free allowed physical cores are available; choose the calculation's size with ranks and threads.
 Insufficient capacity fails immediately. Plans print topology, allowed/available groups and each
 rank's OS CPUs.
 
@@ -58,8 +56,7 @@ the locks. The application's/MPI's exit status is returned directly. **SIGKILL, 
 interrupts, detached descendants and MPI crashes are outside this guarantee**: check for surviving
 ranks before starting another run after such a failure. Do not remove pool files while jobs run;
 persistent empty files are not active reservations. Only cooperating invocations of the same user
-sharing `/tmp` coordinate; other software/users remain free to use these CPUs, including the system
-reserve.
+sharing `/tmp` coordinate; other software/users remain free to use these CPUs.
 
 This is for one local application, outside schedulers. Multi-node jobs, CPU hotplug, different
 container pools and NUMA/GPU tuning are outside scope. WSL uses guest-exposed topology, not a
@@ -74,5 +71,5 @@ OMP_NUM_THREADS=3 cp2k_local.py -n 2 -- /tmp/affinity-probe
 ```
 
 The probe computes on every thread and holds for five seconds (`CP2K_PROBE_HOLD` changes this). Each
-thread must have one CPU, and both calculations' physical groups must be disjoint and exclude the
-system reserve. Initial native placement/lock checks use Open MPI 5.0.8 and hwloc 2.12.1.
+thread must have one CPU, and both calculations' physical groups must be disjoint. Initial native
+placement/lock checks use Open MPI 5.0.8 and hwloc 2.12.1.

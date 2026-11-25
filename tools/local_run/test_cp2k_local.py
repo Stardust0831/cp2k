@@ -18,10 +18,10 @@ class LocalRunTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
 
-    def claim(self, allowed, count, spare=1):
+    def claim(self, allowed, count):
         groups = [(0, 4), (1, 5), (2, 6), (3, 7)]
         return self.stack.enter_context(
-            reserve(self.root / "pool", groups, allowed, count, spare)
+            reserve(self.root / "pool", groups, allowed, count)
         )
 
     def test_arguments(self):
@@ -65,24 +65,23 @@ class LocalRunTests(unittest.TestCase):
                     with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                         parser.parse_args([option, value, "--", "cp2k.psmp"])
 
-    def test_siblings_headroom_and_rollback(self):
+    def test_siblings_and_rollback(self):
         a = self.claim({0, 1, 2, 3}, 2)
-        self.assertEqual(a[2], [1, 2])
-        # A zero-reserve peer still cannot take A's shared system reserve.
-        b = self.claim({4, 5, 6, 7}, 1, spare=0)
-        self.assertEqual(b[2], [7])
+        self.assertEqual(a[1], [0, 1])
+        b = self.claim({4, 5, 6, 7}, 2)
+        self.assertEqual(b[1], [6, 7])
         with self.assertRaisesRegex(ValueError, "only 0 available"):
             self.claim(set(range(8)), 1)
-        for lock in a[3] + b[3]:
+        for lock in a[2] + b[2]:
             lock.close()
-        with self.assertRaisesRegex(ValueError, "only 3 available"):
-            self.claim(set(range(8)), 4)
-        self.assertEqual(self.claim(set(range(8)), 3)[2], [1, 2, 3])
+        with self.assertRaisesRegex(ValueError, "only 4 available"):
+            self.claim(set(range(8)), 5)
+        self.assertEqual(self.claim(set(range(8)), 4)[1], [0, 1, 2, 3])
 
-    def test_larger_reserve_conflict(self):
-        self.claim(set(range(8)), 1, spare=0)
-        with self.assertRaisesRegex(ValueError, "System reserve"):
-            self.claim(set(range(8)), 1)
+    def test_single_allowed_core(self):
+        self.assertEqual(self.claim({4}, 1)[1], [4])
+        with self.assertRaisesRegex(ValueError, "only 0 available"):
+            self.claim({0}, 1)
 
     def test_private_pool(self):
         pool = self.root / "pool"
@@ -108,8 +107,8 @@ class LocalRunTests(unittest.TestCase):
         online, groups = topology(self.root)
         self.assertEqual(online, {0, 1, 4})
         self.assertEqual(groups, [(0, 4), (1, 5)])
-        with reserve(self.root / "pool", groups, online & {4, 5}, 1, 0) as allocation:
-            self.assertEqual(allocation[2], [4])
+        with reserve(self.root / "pool", groups, online & {4, 5}, 1) as allocation:
+            self.assertEqual(allocation[1], [4])
         (self.root / "cpu4/topology/thread_siblings_list").write_text("4")
         with self.assertRaisesRegex(ValueError, "Inconsistent"):
             topology(self.root)

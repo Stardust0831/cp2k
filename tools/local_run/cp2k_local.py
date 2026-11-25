@@ -59,7 +59,7 @@ def open_lock(path):
 
 
 @contextmanager
-def reserve(directory, groups, allowed, count, spare):
+def reserve(directory, groups, allowed, count):
     directory = Path(directory)
     directory.mkdir(mode=0o700, exist_ok=True)
     info = directory.lstat()
@@ -69,40 +69,33 @@ def reserve(directory, groups, allowed, count, spare):
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise ValueError(f"Pool must be owned by this user with mode 0700: {directory}")
-    reserved, free, locked = groups[:spare], [], []
+    free, locked = [], []
     # The inner stack rolls back partial claims before releasing the mutex.
     with open_lock(directory / "allocation.lock") as mutex, ExitStack() as claims:
         fcntl.flock(mutex, fcntl.LOCK_EX)
-        for group in reserved + [g for g in groups[spare:] if set(g) & allowed]:
+        for group in [g for g in groups if set(g) & allowed]:
             path = directory / ("core-" + "-".join(map(str, group)) + ".lock")
             lock = claims.enter_context(open_lock(path))
-            system = group in reserved
             try:
-                fcntl.flock(
-                    lock, (fcntl.LOCK_SH if system else fcntl.LOCK_EX) | fcntl.LOCK_NB
-                )
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 lock.close()
-                if system:
-                    raise ValueError(f"System reserve {list(group)} is in use")
                 continue
             locked.append(lock)
-            if not system:
-                free.append(group)
+            free.append(group)
         if len(free) < count:
             raise ValueError(
                 f"Need {count} physical cores, only {len(free)} available after reservations"
             )
-        for lock in locked[spare + count :]:
+        for lock in locked[count:]:
             lock.close()
         held = claims.pop_all()
     # Persistent lock inodes, inherited by mpirun; never unlink or LOCK_UN them.
     with held:
         yield (
-            reserved,
             free,
             [min(set(g) & allowed) for g in free[:count]],
-            locked[: spare + count],
+            locked[:count],
         )
 
 
@@ -129,12 +122,6 @@ def argument_parser():
             metavar="N",
             help=f"{name}: CLI > {variable} > 1 (positive integer)",
         )
-    parser.add_argument(
-        "--reserve-cores",
-        type=int,
-        default=1,
-        help="whole system cores left unused (default: 1)",
-    )
     parser.add_argument("--mpirun", default="mpirun", help="Open MPI 5 executable")
     parser.add_argument(
         "--dry-run",
@@ -175,8 +162,8 @@ def main():
     args = parser.parse_args()
     if args.command[:1] == ["--"]:
         args.command.pop(0)
-    if args.reserve_cores < 0 or not args.command:
-        parser.error("nonnegative reserve-cores and an application are required")
+    if not args.command:
+        parser.error("an application is required")
     if sys.platform != "linux" or os.getuid() == 0:
         parser.error("run as an ordinary user on Linux")
     if any(
@@ -202,8 +189,7 @@ def main():
         groups,
         allowed,
         args.ranks * args.threads,
-        args.reserve_cores,
-    ) as (reserved, free, selected, locks):
+    ) as (free, selected, locks):
         layout = [
             selected[i : i + args.threads]
             for i in range(0, len(selected), args.threads)
@@ -235,7 +221,6 @@ def main():
                 online=sorted(online),
                 allowed=sorted(allowed),
                 physical_cores=groups,
-                system_cores=reserved,
                 available_cores=free,
                 rank_cpus=layout,
             )
