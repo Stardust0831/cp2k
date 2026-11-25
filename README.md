@@ -47,8 +47,7 @@ the CP2K manual provide several methods for installing CP2K with dependencies:
 
 ## CPU binding
 
-Binding MPI ranks to CPUs can affect CP2K performance. Open MPI does not infer the OpenMP thread
-count. With Open MPI 5, this example uses two ranks with three threads each on six physical cores:
+Binding MPI ranks to CPUs can affect CP2K performance. Open MPI does not infer the OpenMP thread count. With Open MPI 5, this example uses two ranks with three threads each on six physical cores:
 
 ```shell
 OMP_NUM_THREADS=3 OMP_PLACES=cores OMP_PROC_BIND=close \
@@ -56,10 +55,7 @@ OMP_NUM_THREADS=3 OMP_PLACES=cores OMP_PROC_BIND=close \
   cp2k.psmp -i input.inp -o output.out
 ```
 
-Check the binding report for two disjoint sets of three cores.
-When tuning performance, also consider NUMA memory locality and which cores share an L3 cache.
-For pure MPI, use `OMP_NUM_THREADS=1` and `--map-by core`. See the [MPI/ScaLAPACK guidance](https://manual.cp2k.org/trunk/technologies/libraries.html#mpi-and-scalapack-required-for-mpi-parallel-builds)
-and [Open MPI binding examples](https://docs.open-mpi.org/en/v5.0.11/man-openmpi/man1/mpirun.1.html#mapping-ranking-and-binding-oh-my).
+Check the binding report for two disjoint sets of three cores. When tuning performance, also consider NUMA memory locality and which cores share an L3 cache. For pure MPI, use `OMP_NUM_THREADS=1` and `--map-by core`. See the [MPI/ScaLAPACK guidance](https://manual.cp2k.org/trunk/technologies/libraries.html#mpi-and-scalapack-required-for-mpi-parallel-builds) and [Open MPI binding examples](https://docs.open-mpi.org/en/v5.0.11/man-openmpi/man1/mpirun.1.html#mapping-ranking-and-binding-oh-my).
 
 ## Links
 
