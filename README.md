@@ -45,17 +45,7 @@ the CP2K manual provide several methods for installing CP2K with dependencies:
 - [Build with Spack](https://manual.cp2k.org/trunk/getting-started/build-with-spack.html)
 - [Install from Distribution](https://manual.cp2k.org/trunk/getting-started/distributions.html)
 
-## CPU binding
-
-With Open MPI 5, run `cp2k.psmp` on one node using two MPI ranks and three OpenMP threads per rank (six physical cores):
-
-```shell
-OMP_NUM_THREADS=3 OMP_PLACES=cores OMP_PROC_BIND=close \
-  mpirun -np 2 --map-by slot:PE=3 --bind-to core --display bindings \
-  cp2k.psmp -i input.inp -o output.out
-```
-
-See the [manual](https://manual.cp2k.org/trunk/technologies/libraries.html#mpi-and-scalapack-required-for-mpi-parallel-builds) for binding checks, pure MPI runs, and NUMA/L3 placement.
+For MPI/OpenMP CPU binding examples, see the [CPU affinity guide](docs/technologies/cpu-affinity.md).
 
 ## Links
 

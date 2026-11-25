@@ -97,6 +97,18 @@ If your computing platform does not provide MPI, there are several freely availa
 When building MPICH with GCC 10, the `-fallow-argument-mismatch` compiler flag may be needed.
 ```
 
+```{note}
+Open MPI applies process binding by default. This can affect hybrid MPI+OpenMP runs because the
+launcher does not infer the number of OpenMP threads required by each MPI rank. A binding that is
+appropriate for an MPI-only calculation can therefore leave each rank with too few CPUs for its
+OpenMP threads.
+
+For hybrid runs, inspect the resulting mapping and binding, for example with
+`mpirun --display map,bind ...`. Depending on the scheduler allocation and node topology, either
+disable binding with `--bind-to none` or explicitly allocate the required number of cores per rank,
+for example with `--map-by slot:PE=<OMP_NUM_THREADS> --bind-to core`.
+```
+
 CP2K assumes that the MPI library implements MPI version 3; older versions of MPI (e.g., MPI 2.0)
 are not supported. CP2K can make use of the `mpi_f08` module; pass `-DCP2K_USE_MPI_F08=ON` to CMake
 to enable it.
@@ -110,28 +122,6 @@ lower thread-support level is insufficient.
 For more information of ScaLAPACK, see <http://www.netlib.org/scalapack/>. ScaLAPACK can be part of
 AOCL (AMD) or oneMKL (Intel); these libraries are recommended on the corresponding machines if
 available.
-
-### CPU binding with Open MPI
-
-CPU binding can affect CP2K performance. For `cp2k.psmp`, Open MPI places the MPI ranks, while the OpenMP runtime places the threads within each rank. Open MPI applies binding by default but does not infer `OMP_NUM_THREADS`, so explicitly give each rank enough cores for its threads.
-
-On a single Linux node with Open MPI 5, this example uses two MPI ranks with three OpenMP threads each, requiring six available physical cores:
-
-```shell
-OMP_NUM_THREADS=3 OMP_PLACES=cores OMP_PROC_BIND=close \
-  mpirun -np 2 --map-by slot:PE=3 --bind-to core --display bindings \
-  cp2k.psmp -i input.inp -o output.out
-```
-
-`PE=3` assigns three processing elements to each rank; Open MPI counts physical cores by default. Keep the MPI ranks times threads per rank within the physical cores available to the job. `OMP_PLACES=cores` and `OMP_PROC_BIND=close` bind the threads to successive core places within each rank's allocation. On SMT machines, a core place can include multiple sibling hardware threads, so this does not pin a thread to a single logical CPU.
-
-Check the binding report for two disjoint sets of three cores. Set `OMP_DISPLAY_AFFINITY=TRUE` to also inspect the OpenMP thread bindings. Open MPI 5 supports the older `--report-bindings` spelling, but recommends `--display bindings`. For a pure MPI run, use `OMP_NUM_THREADS=1` and `--map-by core`, keeping `--bind-to core`.
-
-For NUMA and cache locality, inspect the node topology with `lstopo` (from hwloc) or `lscpu`. NUMA domains describe memory locality, while L3 cache groups identify cores sharing a cache; their boundaries need not coincide. Keeping a rank's threads in one NUMA domain can reduce remote memory accesses, and sharing an L3 cache can help data reuse, but cache capacity and memory bandwidth can also become bottlenecks. CPU binding alone does not determine memory page placement; allocation and first-touch behavior also matter.
-
-To compare placements, replace `--map-by slot:PE=3` with `--map-by numa:PE=3` or `--map-by l3cache:PE=3`, keeping `--bind-to core` and the OpenMP settings above. These map ranks across the available NUMA domains or L3 caches, respectively; each selected domain or cache must have enough allocated cores for the rank. The binding still limits each rank to its requested three cores. Verify the resulting bindings and benchmark a representative CP2K input, since the best rank/thread split and placement depend on the calculation and hardware.
-
-Independent `mpirun` invocations do not coordinate their CPU assignments and can select the same cores. On shared clusters, use the scheduler's allocation and the site's launch instructions. See Open MPI's [mapping and binding options](https://docs.open-mpi.org/en/v5.0.11/man-openmpi/man1/mpirun.1.html#mapping-ranking-and-binding-options) and [memory affinity guidance](https://docs.open-mpi.org/en/v5.0.11/tuning-apps/affinity.html#memory-affinity) for details.
 
 ## LIBINT (ERI calculation for HFX)
 
