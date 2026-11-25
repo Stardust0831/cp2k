@@ -94,7 +94,8 @@ Libraries that subsequently change affinity or thread counts themselves are outs
 ## Checks
 
 Small regression tests cover SMT sibling masks, offline CPUs, atomic competing reservations, shared
-system headroom, capacity rollback, and pool ownership/permissions without requiring MPI:
+system headroom, capacity rollback, pool ownership/permissions and cleanup of a detached orphan that
+ignores SIGTERM, without requiring MPI:
 
 ```shell
 python3 -m unittest discover -s tools/local_run -v

@@ -4,6 +4,8 @@
 import multiprocessing
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -134,6 +136,35 @@ class LocalRunTests(unittest.TestCase):
         self.assertEqual(cpu_list("0-2,7,9-10\n"), {0, 1, 2, 7, 9, 10})
         with self.assertRaises(ValueError):
             cpu_list("4-2")
+
+    def test_orphan_in_separate_session_is_reaped_before_release(self):
+        marker = Path(self.temp.name) / "orphan.pid"
+        child = (
+            "import os, signal, time; from pathlib import Path; "
+            "os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)"
+        )
+        application = (
+            "import subprocess, sys, time; from pathlib import Path\n"
+            f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+            f"while not Path({str(marker)!r}).exists(): time.sleep(.01)\n"
+            "sys.exit(17)\n"
+        )
+        supervisor = (
+            "import os, sys; from cp2k_local import Pool, run_guarded\n"
+            f"pool = Pool({str(self.directory)!r})\n"
+            "pool.reserve([(0,)], {0}, 1, 0)\n"
+            f"sys.exit(run_guarded([sys.executable, '-c', {application!r}], "
+            "list(os.sched_getaffinity(0)), pool))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", supervisor],
+            cwd=Path(__file__).resolve().parent,
+            timeout=15,
+        )
+        self.assertEqual(completed.returncode, 17)
+        self.assertFalse(Path(f"/proc/{marker.read_text()}").exists())
+        self.assertEqual(self.pool().reserve([(0,)], {0}, 1, 0)[2], [0])
 
 
 if __name__ == "__main__":
