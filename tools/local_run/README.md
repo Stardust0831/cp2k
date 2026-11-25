@@ -2,7 +2,7 @@
 
 `cp2k_local.py` runs one Open MPI application on a Linux workstation. Two invocations by the same
 user coordinate physical-core reservations, including when their allowed CPU masks contain different
-SMT siblings of the same core. Each rank receives `--threads` different physical cores, and each OpenMP
+SMT siblings of the same core. Each rank receives one different physical core per OpenMP thread, and each
 thread uses one singleton CPU place. No root privileges, scheduler, service, or toolchain setup changes
 are needed.
 
@@ -19,17 +19,31 @@ python3 /path/to/cp2k/tools/local_run/cp2k_local.py \
 ```
 
 The command may be run concurrently in another terminal. On a 16-core workstation, two requests
-for 2 ranks with 3 threads each fit while leaving 2 whole cores unused by both calculations:
+for 2 ranks with 3 threads each fit while leaving 2 whole cores unused by both calculations. Ranks and
+threads are resolved independently, so CLI and environment values can be mixed:
 
 ```shell
-# Terminal A, in calculation-a/
-python3 /path/to/cp2k/tools/local_run/cp2k_local.py \
-  -n 2 -t 3 --reserve-cores 2 -- cp2k.psmp -i input.inp -o output.out
+# Terminal A, in calculation-a/: ranks from CLI, threads from environment
+OMP_NUM_THREADS=3 python3 /path/to/cp2k/tools/local_run/cp2k_local.py \
+  -n 2 --reserve-cores 2 -- cp2k.psmp -i input.inp -o output.out
 
-# Terminal B, in calculation-b/
-python3 /path/to/cp2k/tools/local_run/cp2k_local.py \
-  -n 2 -t 3 --reserve-cores 2 -- cp2k.psmp -i input.inp -o output.out
+# Terminal B, in calculation-b/: ranks from environment, threads from CLI
+MPI_RANKS=2 python3 /path/to/cp2k/tools/local_run/cp2k_local.py \
+  -t 3 --reserve-cores 2 -- cp2k.psmp -i input.inp -o output.out
 ```
+
+| Setting | First choice | Otherwise, if set | Default |
+| --- | --- | --- | --- |
+| MPI ranks | `-n` / `--ranks` | `MPI_RANKS` | 1 |
+| OpenMP threads per rank | `-t` / `--threads` | `OMP_NUM_THREADS` | 1 |
+
+`MPI_RANKS` follows the spelling used by CP2K benchmarks; MPI has no universal environment variable
+for the launch size. Process-local `OMPI_COMM_WORLD_SIZE` and scheduler variables are not launch-size
+defaults. With neither CLI options nor these two environment variables, the launcher uses 1 rank and
+1 thread. Each selected value must be a positive decimal integer: empty, nonnumeric, zero, negative
+values and nested OpenMP lists such as `OMP_NUM_THREADS=4,2` are rejected. An explicit CLI value
+overrides its environment variable without validating the unused value, so
+`OMP_NUM_THREADS=4,2 python3 .../cp2k_local.py -t 3 -- cp2k.psmp ...` uses three threads per rank.
 
 Use `--mpirun /path/to/mpirun` to select an installation. `--dry-run` prints the current plan and
 releases its temporary reservation; it does not promise the same CPUs will remain available later.
@@ -95,7 +109,8 @@ Libraries that subsequently change affinity or thread counts themselves are outs
 
 Small regression tests cover SMT sibling masks, offline CPUs, atomic competing reservations, shared
 system headroom, capacity rollback, pool ownership/permissions and cleanup of a detached orphan that
-ignores SIGTERM, without requiring MPI:
+ignores SIGTERM, plus independent CLI/environment/default selection and invalid-value handling,
+without requiring MPI:
 
 ```shell
 python3 -m unittest discover -s tools/local_run -v

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Small Linux-only regression tests; no MPI installation is needed."""
 
+from contextlib import redirect_stderr
+import io
 import multiprocessing
 import os
 from pathlib import Path
@@ -8,8 +10,82 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from cp2k_local import Pool, cpu_list, topology
+from cp2k_local import Pool, argument_parser, cpu_list, topology
+
+
+class ArgumentTests(unittest.TestCase):
+    def parse(self, cli, env):
+        with patch.dict(os.environ, env, clear=True):
+            return argument_parser().parse_args([*cli, "--", "cp2k.psmp"])
+
+    def test_independent_sources(self):
+        for cli, env, expected in (
+            ([], {}, (1, 1)),
+            (["-n", "2", "-t", "3"], {}, (2, 3)),
+            (["--ranks", "2", "--threads", "3"], {}, (2, 3)),
+            ([], {"MPI_RANKS": "2", "OMP_NUM_THREADS": "3"}, (2, 3)),
+            (["-n", "2"], {"MPI_RANKS": "7", "OMP_NUM_THREADS": "3"}, (2, 3)),
+            (["-t", "3"], {"MPI_RANKS": "2", "OMP_NUM_THREADS": "7"}, (2, 3)),
+            ([], {"MPI_RANKS": "2"}, (2, 1)),
+            ([], {"OMP_NUM_THREADS": "3"}, (1, 3)),
+            (["-n", "2"], {}, (2, 1)),
+            (["-t", "3"], {}, (1, 3)),
+            ([], {"OMPI_COMM_WORLD_SIZE": "9", "SLURM_NTASKS": "8"}, (1, 1)),
+        ):
+            with self.subTest(cli=cli, env=env):
+                args = self.parse(cli, env)
+                self.assertEqual((args.ranks, args.threads), expected)
+
+    def test_invalid_selected_values(self):
+        for option, variable in (
+            ("--ranks", "MPI_RANKS"),
+            ("--threads", "OMP_NUM_THREADS"),
+        ):
+            for value in ("", "abc", "0", "-1", "2,3", "1.5", "1_0"):
+                # A valid fallback must not hide an invalid explicit CLI value.
+                for cli, env in (
+                    ([], {variable: value}),
+                    ([option, value], {variable: "2"}),
+                ):
+                    with self.subTest(cli=cli, env=env):
+                        stderr = io.StringIO()
+                        with (
+                            redirect_stderr(stderr),
+                            self.assertRaises(SystemExit) as exc,
+                        ):
+                            self.parse(cli, env)
+                        self.assertEqual(exc.exception.code, 2)
+                        self.assertIn(option, stderr.getvalue())
+                        self.assertIn("expected a positive integer", stderr.getvalue())
+                        self.assertIn(repr(value), stderr.getvalue())
+                        if "," in value:
+                            self.assertIn(
+                                "thread lists are not supported", stderr.getvalue()
+                            )
+
+    def test_cli_overrides_invalid_environment(self):
+        for value in ("", "abc", "0", "-1", "2,3"):
+            for cli, env in (
+                (["-n", "2"], {"MPI_RANKS": value, "OMP_NUM_THREADS": "3"}),
+                (["-t", "3"], {"MPI_RANKS": "2", "OMP_NUM_THREADS": value}),
+                (
+                    ["--ranks", "2", "--threads", "3"],
+                    {"MPI_RANKS": value, "OMP_NUM_THREADS": value},
+                ),
+            ):
+                with self.subTest(cli=cli, env=env):
+                    args = self.parse(cli, env)
+                    self.assertEqual((args.ranks, args.threads), (2, 3))
+
+    def test_help_describes_both_priorities(self):
+        with patch.dict(os.environ, {"MPI_RANKS": "bad", "OMP_NUM_THREADS": "bad"}):
+            help_text = argument_parser().format_help()
+        self.assertIn("CLI > MPI_RANKS > 1", help_text)
+        self.assertIn("CLI > OMP_NUM_THREADS > 1", help_text)
+        self.assertIn("OMP_NUM_THREADS=3 python3 cp2k_local.py -n 2", help_text)
+        self.assertIn("MPI_RANKS=2 python3 cp2k_local.py -t 3", help_text)
 
 
 def compete(directory, allowed, start, results, release):
@@ -125,8 +201,6 @@ class LocalRunTests(unittest.TestCase):
 
     def test_owner_check(self):
         # No chown or second OS user is needed to exercise the UID rejection.
-        from unittest.mock import patch
-
         self.directory.mkdir(mode=0o700)
         with patch("cp2k_local.os.getuid", return_value=os.getuid() + 1):
             with self.assertRaisesRegex(ValueError, "owned by this user"):

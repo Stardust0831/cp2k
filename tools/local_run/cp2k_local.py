@@ -92,10 +92,12 @@ class Pool:
             raise ValueError(f"Unsafe pool lock: {name}")
         return fd
 
+    def release_locks(self, keep=0):
+        while len(self.fds) > keep:
+            os.close(self.fds.pop())
+
     def close(self):
-        for fd in self.fds:
-            os.close(fd)
-        self.fds.clear()
+        self.release_locks()
         if self.directory is not None:
             os.close(self.directory)
             self.directory = None
@@ -133,14 +135,10 @@ class Pool:
                     f"after {spare} system cores and other participants' reservations"
                 )
             # Keep the first count calculation locks and all system locks.
-            for fd in self.fds[spare + count :]:
-                os.close(fd)
-            del self.fds[spare + count :]
+            self.release_locks(spare + count)
             return reserved, free, [min(set(g) & allowed) for g in free[:count]]
         except BaseException:
-            for fd in self.fds:
-                os.close(fd)
-            self.fds.clear()
+            self.release_locks()
             raise
         finally:
             os.close(mutex)
@@ -304,10 +302,38 @@ def run_guarded(command, cpus, pool):
             signal.signal(signum, handler)
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-n", "--ranks", type=int, required=True)
-    parser.add_argument("-t", "--threads", type=int, required=True)
+def positive_integer(value):
+    if not re.fullmatch(r"[0-9]+", value) or int(value) == 0:
+        detail = "; OpenMP thread lists are not supported" if "," in value else ""
+        raise argparse.ArgumentTypeError(
+            f"expected a positive integer, got {value!r}{detail}"
+        )
+    return int(value)
+
+
+def argument_parser():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Mixed-source examples (each uses 2 ranks and 3 threads per rank):\n"
+            "  OMP_NUM_THREADS=3 python3 cp2k_local.py -n 2 -- cp2k.psmp -i input.inp\n"
+            "  MPI_RANKS=2 python3 cp2k_local.py -t 3 -- cp2k.psmp -i input.inp"
+        ),
+    )
+    # Argparse converts string defaults only when the CLI did not override them.
+    for short, name, variable, description in (
+        ("-n", "ranks", "MPI_RANKS", "MPI ranks"),
+        ("-t", "threads", "OMP_NUM_THREADS", "OpenMP threads per rank"),
+    ):
+        parser.add_argument(
+            short,
+            f"--{name}",
+            type=positive_integer,
+            default=os.environ.get(variable, "1"),
+            metavar="N",
+            help=f"{description}: CLI > {variable} > 1; a single positive integer",
+        )
     parser.add_argument(
         "--reserve-cores",
         type=int,
@@ -325,13 +351,16 @@ def main(argv=None):
         nargs=argparse.REMAINDER,
         help="-- cp2k.psmp -i input.inp -o output.out",
     )
+    return parser
+
+
+def main(argv=None):
+    parser = argument_parser()
     args = parser.parse_args(argv)
     if args.command[:1] == ["--"]:
         args.command.pop(0)
-    if args.ranks < 1 or args.threads < 1 or args.reserve_cores < 0 or not args.command:
-        parser.error(
-            "positive ranks/threads, nonnegative reserve-cores and a command are required"
-        )
+    if args.reserve_cores < 0 or not args.command:
+        parser.error("nonnegative reserve-cores and a command are required")
     if (
         sys.platform != "linux"
         or not hasattr(os, "pidfd_open")
