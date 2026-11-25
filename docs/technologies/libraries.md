@@ -109,41 +109,15 @@ disable binding with `--bind-to none` or explicitly allocate the required number
 for example with `--map-by slot:PE=<OMP_NUM_THREADS> --bind-to core`.
 ```
 
-With Open MPI 5 on a single Linux node, run `cp2k.psmp` using two MPI ranks and one thread per rank on two available physical cores:
+With Open MPI 5 on one node, the following runs two concurrent jobs, each with two MPI ranks and two OpenMP threads per rank. It assumes eight available physical cores with hwloc logical core IDs 0–7 (check with `lstopo`) and an `input.inp` in each of `job1/` and `job2/`:
 
 ```shell
-OMP_NUM_THREADS=1 \
-  mpirun -np 2 --map-by core --bind-to core \
-  cp2k.psmp -i input.inp -o output.out
+(cd job1 && OMP_NUM_THREADS=2 mpirun -np 2 --prtemca hwloc_default_cpu_list 0-3 --map-by slot:PE=2 --bind-to core cp2k.psmp -i input.inp) &
+(cd job2 && OMP_NUM_THREADS=2 mpirun -np 2 --prtemca hwloc_default_cpu_list 4-7 --map-by slot:PE=2 --bind-to core cp2k.psmp -i input.inp) &
+wait
 ```
 
-For two MPI ranks with three OpenMP threads each, allow six physical cores:
-
-```shell
-OMP_NUM_THREADS=3 \
-  mpirun -np 2 --map-by slot:PE=3 --bind-to core \
-  cp2k.psmp -i input.inp -o output.out
-```
-
-`PE=3` assigns three processing elements to each rank; Open MPI counts physical cores by default. Keep ranks times threads per rank within the physical cores available to the job. Use the MPI installation that matches your CP2K build. If `OMP_NUM_THREADS` is already exported with the corresponding value, omit the inline assignment.
-
-Without explicit OpenMP affinity settings, threads run within the rank's MPI CPU mask with placement chosen by the runtime; set `OMP_PLACES=cores OMP_PROC_BIND=close` to bind threads to separate core places.
-
-For NUMA and L3 cache placement, inspect the topology with `lstopo` (from hwloc) or `lscpu -e=CPU,CORE,SOCKET,NODE,CACHE`. NUMA domains describe memory locality; L3 cache groups identify cores sharing a cache, and their boundaries need not coincide. Keeping a rank's threads within a domain can help locality, but cache capacity, memory bandwidth, and the calculation also affect performance. CPU binding alone does not determine memory page placement; allocation and first-touch behavior matter too.
-
-As an example for the AMD Ryzen 9 9950X3D2 Dual Edition, assume two CCDs, each with its own L3 cache and eight physical cores, and a job with all 16 physical cores available. After checking this topology with `lstopo`, place two ranks in each L3 group, with four threads per rank:
-
-```shell
-OMP_NUM_THREADS=4 \
-  mpirun -np 4 --map-by ppr:2:l3cache:PE=4 --bind-to core \
-  cp2k.psmp -i input.inp -o output.out
-```
-
-`ppr:2:l3cache:PE=4` assigns two ranks per L3 group and four cores per rank: eight cores per group and 16 in total. This illustrates the specified topology and has not been benchmarked on this processor; compare timings for a representative CP2K input before choosing a placement.
-
-Explicit `--bind-to core` avoids relying on the site's default binding policy. To check a run, add `--report-bindings` to `mpirun` to inspect each rank's CPU mask, and optionally set `OMP_DISPLAY_AFFINITY=TRUE` for thread bindings. On SMT machines, a core place can include multiple sibling hardware threads.
-
-These commands can be used on a workstation, but independent `mpirun` invocations do not coordinate CPU assignments and can select the same cores. On shared clusters, use the scheduler's allocation and the site's launch instructions. See Open MPI's [mapping and binding options](https://docs.open-mpi.org/en/v5.0.11/man-openmpi/man1/mpirun.1.html#mapping-ranking-and-binding-options) and [memory affinity guidance](https://docs.open-mpi.org/en/v5.0.11/tuning-apps/affinity.html#memory-affinity) for details.
+These disjoint lists use hwloc core IDs, not Linux CPU numbers. On shared clusters, use scheduler-assigned cores and the site's launch instructions. See the [Open MPI mapping and binding guide](https://docs.open-mpi.org/en/v5.0.11/man-openmpi/man1/mpirun.1.html#mapping-ranking-and-binding-options) for other placements.
 
 CP2K assumes that the MPI library implements MPI version 3; older versions of MPI (e.g., MPI 2.0)
 are not supported. CP2K can make use of the `mpi_f08` module; pass `-DCP2K_USE_MPI_F08=ON` to CMake
