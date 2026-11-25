@@ -14,12 +14,13 @@ MODULE cp_control_types
                                               cp_fm_type
    USE eeq_input,                       ONLY: eeq_solver_type
    USE input_constants,                 ONLY: &
-        do_full_density, rtp_bse_ham_G0W0, rtp_method_tddft, tblite_cli_born_kernel_auto, &
-        tblite_cli_solution_state_gsolv, tblite_cli_solvation_none, tblite_guess_ceh, &
-        tblite_guess_sad, tblite_mixer_damping_default, tblite_mixer_iterations_default, &
-        tblite_mixer_max_weight_default, tblite_mixer_min_weight_default, &
-        tblite_mixer_omega0_default, tblite_mixer_weight_factor_default, tblite_scc_mixer_auto, &
-        tblite_solver_gvd, use_mom_ref_coac
+        do_full_density, mtlr_initialization_unresolved, rtp_bse_ham_gw, rtp_method_tddft, &
+        tblite_cli_born_kernel_auto, tblite_cli_solution_state_gsolv, tblite_cli_solvation_none, &
+        tblite_guess_ceh, tblite_guess_sad, tblite_mixer_damping_default, &
+        tblite_mixer_iterations_default, tblite_mixer_max_weight_default, &
+        tblite_mixer_min_weight_default, tblite_mixer_omega0_default, &
+        tblite_mixer_weight_factor_default, tblite_scc_mixer_auto, tblite_solver_gvd, &
+        use_mom_ref_coac
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
@@ -99,7 +100,7 @@ MODULE cp_control_types
       INTEGER                              :: propagator = 0
       LOGICAL                              :: fixed_ions = .FALSE.
       INTEGER                              :: rtp_method = rtp_method_tddft
-      INTEGER                              :: rtbse_ham = rtp_bse_ham_G0W0
+      INTEGER                              :: rtbse_ham = rtp_bse_ham_gw
       INTEGER                              :: initial_wfn = 0
       REAL(dp)                             :: eps_exp = 0.0_dp
       LOGICAL                              :: initial_step = .FALSE.
@@ -107,6 +108,7 @@ MODULE cp_control_types
       INTEGER                              :: aspc_order = 0
       INTEGER                              :: sc_check_start = 0
       LOGICAL                              :: apply_wfn_mix_init_restart = .FALSE.
+      LOGICAL                              :: localize_initial_wfn = .FALSE.
       LOGICAL                              :: apply_delta_pulse = .FALSE.
       LOGICAL                              :: apply_delta_pulse_mag = .FALSE.
       LOGICAL                              :: periodic = .FALSE.
@@ -262,6 +264,7 @@ MODULE cp_control_types
       !
       INTEGER                              :: sto_ng = 0
       INTEGER                              :: h_sto_ng = 0
+      LOGICAL                              :: sto_flex = .FALSE.
       INTEGER                              :: tblite_method = 0
       INTEGER                              :: tblite_scc_mixer = tblite_scc_mixer_auto
       INTEGER                              :: tblite_mixer_iterations = tblite_mixer_iterations_default
@@ -278,6 +281,7 @@ MODULE cp_control_types
       INTEGER                              :: vdw_type = -1
       CHARACTER(LEN=default_path_length)   :: parameter_file_path = ""
       CHARACTER(LEN=default_path_length)   :: parameter_file_name = ""
+      CHARACTER(LEN=default_path_length)   :: spinpol_param_file_name = ""
       !
       CHARACTER(LEN=default_path_length)   :: dispersion_parameter_file = ""
       REAL(KIND=dp)                        :: epscn = 0.0_dp
@@ -296,6 +300,7 @@ MODULE cp_control_types
       !
       LOGICAL                              :: xb_interaction = .FALSE.
       LOGICAL                              :: do_nonbonded = .FALSE.
+      LOGICAL                              :: do_spinpol = .FALSE.
       LOGICAL                              :: coulomb_interaction = .FALSE.
       LOGICAL                              :: coulomb_lr = .FALSE.
       LOGICAL                              :: tb3_interaction = .FALSE.
@@ -310,7 +315,11 @@ MODULE cp_control_types
          DIMENSION(:, :), POINTER          :: kab_param => NULL()
       INTEGER, DIMENSION(:, :), POINTER    :: kab_types => NULL()
       INTEGER                              :: kab_nval = 0
-      REAL, DIMENSION(:), POINTER          :: kab_vals => NULL()
+      REAL(KIND=dp), DIMENSION(:), POINTER :: kab_vals => NULL()
+      !
+      INTEGER, DIMENSION(:), POINTER       :: spinpol_type => NULL()
+      REAL(KIND=dp), DIMENSION(:, :), &
+         POINTER                           :: spinpol_vals => NULL()
       !
       TYPE(pair_potential_p_type), POINTER :: nonbonded => NULL()
       REAL(KIND=dp)                        :: eps_pair = 0.0_dp
@@ -367,8 +376,9 @@ MODULE cp_control_types
                                               lmax_sphere = 0, &
                                               quadrature = 0
       LOGICAL                              :: accurate_xcint = .FALSE.
+      INTEGER                              :: oweights = 0
       REAL(KIND=dp)                        :: aweights = 0.0_dp
-      REAL(KIND=dp), DIMENSION(:), POINTER  :: aw => NULL()
+      REAL(KIND=dp), DIMENSION(:), POINTER :: aw => NULL()
       LOGICAL                              :: alpha0_hard_from_input = .FALSE., &
                                               force_paw = .FALSE., &
                                               non_paw_atoms = .FALSE., &
@@ -424,7 +434,6 @@ MODULE cp_control_types
 ! \brief some parameters useful for ddapc_restraints
 ! **************************************************************************************************
    TYPE ddapc_restraint_type
-      INTEGER                              :: ref_count = 0
       REAL(KIND=dp)                        :: strength = 0.0_dp
       REAL(KIND=dp)                        :: TARGET = 0.0_dp
       REAL(KIND=dp)                        :: ddapc_order_p = 0.0_dp
@@ -475,6 +484,25 @@ MODULE cp_control_types
       LOGICAL                              :: static = .FALSE.
       REAL(KIND=dp)                        :: scaling_factor = 0.0_dp
    END TYPE expot_control_type
+
+! **************************************************************************************************
+! \brief Parameters for frozen-density embedding (FDE)
+! **************************************************************************************************
+   TYPE fde_control_type
+      LOGICAL                              :: freeze_and_thaw = .FALSE.
+      INTEGER                              :: max_ft_iter = 50
+      REAL(KIND=dp)                        :: eps_ft_density = 1.0e-5_dp
+      REAL(KIND=dp)                        :: eps_ft_energy = 1.0e-6_dp
+      REAL(KIND=dp)                        :: density_mixing = 1.0_dp
+      CHARACTER(LEN=default_path_length)   :: command = "pymolcas"
+      CHARACTER(LEN=default_path_length)   :: project = "sub"
+      CHARACTER(LEN=default_path_length)   :: workdir = ""
+      CHARACTER(LEN=default_path_length)   :: molcas_input_template = ""
+      CHARACTER(LEN=default_path_length)   :: pot_file = "EMBPOT"
+      CHARACTER(LEN=default_path_length)   :: grid_file = "EMBGRID"
+      CHARACTER(LEN=default_path_length)   :: rho_file = "EMBRHOA"
+      CHARACTER(LEN=default_path_length)   :: result_file = "EMBRES"
+   END TYPE fde_control_type
 
 ! **************************************************************************************************
 ! \brief Parameters useful for Maxwell equation evaluation of external potential
@@ -555,7 +583,9 @@ MODULE cp_control_types
 ! **************************************************************************************************
    TYPE sccs_control_type
       LOGICAL                              :: sccs_activated = .FALSE., &
-                                              saa_activated = .FALSE.
+                                              saa_activated = .FALSE., &
+                                              core_fill = .FALSE., &
+                                              core_fill_printed = .FALSE.
       INTEGER                              :: derivative_method = 0, &
                                               max_iter = 0, &
                                               method_id = 0
@@ -575,7 +605,12 @@ MODULE cp_control_types
                                               delta_eta = 0.0_dp, &
                                               alpha_zeta = 0.0_dp, &
                                               delta_zeta = 0.0_dp, &
-                                              R_solv = 0.0_dp
+                                              R_solv = 0.0_dp, &
+                                              core_fill_spread = 0.0_dp
+      ! Per-kind overrides of the core fill spread (kind label, spread in bohr)
+      CHARACTER(LEN=default_string_length), DIMENSION(:), &
+         ALLOCATABLE                       :: core_fill_kind_label
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: core_fill_kind_spread
    END TYPE sccs_control_type
 
 ! **************************************************************************************************
@@ -688,6 +723,7 @@ MODULE cp_control_types
       ! Compute exciton descriptors
       LOGICAL                              :: do_exciton_descriptors = .FALSE.
       LOGICAL                              :: do_directional_exciton_descriptors = .FALSE.
+      LOGICAL                              :: do_directional_exciton_crosscorrelation = .FALSE.
       !
       ! DIPOLE_MOMENTS subsection
       !
@@ -762,6 +798,7 @@ MODULE cp_control_types
       TYPE(smeagol_control_type), POINTER  :: smeagol_control => NULL()
       TYPE(paep_control_type), POINTER     :: paep_control => NULL()
       TYPE(pcc_control_type), POINTER      :: pcc_control => NULL()
+      TYPE(fde_control_type), POINTER      :: fde_control => NULL()
       TYPE(efield_p_type), POINTER, &
          DIMENSION(:)                      :: efield_fields => NULL()
       TYPE(hairy_probes_type), POINTER, &
@@ -781,11 +818,18 @@ MODULE cp_control_types
                                               auto_basis_ri_hxc = 1, &
                                               auto_basis_ri_xas = 1, &
                                               auto_basis_ri_hfx = 1, &
-                                              localize_each = 1
-      REAL(KIND=dp)                        :: relax_multiplicity = 0.0_dp, &
+                                              localize_each = 1, &
+                                              mtlr_ikind = 1, &
+                                              mtlr_initialization_mode = mtlr_initialization_unresolved, &
+                                              max_mtlr_iter = 10
+      REAL(KIND=dp)                        :: eps_u_j_loop = 0.01_dp, &
+                                              relax_multiplicity = 0.0_dp, &
                                               sic_scaling_a = 0.0_dp, &
                                               sic_scaling_b = 0.0_dp, &
-                                              pos_dir_surf_dip = 0.0_dp
+                                              pos_dir_surf_dip = 0.0_dp, &
+                                              perturbation_strength = 0.0_dp, &
+                                              trq(2) = 0.0_dp, &
+                                              vhxc(2) = 0.0_dp
       LOGICAL                              :: do_xas_calculation = .FALSE., &
                                               do_xas_tdp_calculation = .FALSE., &
                                               drho_by_collocation = .FALSE., &
@@ -795,6 +839,9 @@ MODULE cp_control_types
                                               uks = .FALSE., &
                                               lsd = .FALSE., &
                                               dft_plus_u = .FALSE., &
+                                              mtlr_u_j = .FALSE., &
+                                              mtlr_reference_scf = .FALSE., &
+                                              mtlr_reference_scf_explicit = .FALSE., &
                                               apply_efield = .FALSE., &
                                               apply_efield_field = .FALSE., &
                                               apply_vector_potential = .FALSE., &
@@ -820,8 +867,10 @@ MODULE cp_control_types
                                               hairy_probes = .FALSE., &
                                               do_paep = .FALSE., &
                                               do_pcc = .FALSE., &
+                                              do_fde = .FALSE., &
                                               ! If true, then no other XC functionals are allowed
-                                              use_gauxc = .FALSE.
+                                              use_gauxc = .FALSE., &
+                                              mtlr_dft_with_perturbation = .FALSE.
    END TYPE dft_control_type
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'cp_control_types'
@@ -851,7 +900,8 @@ MODULE cp_control_types
              smeared_type, &
              hairy_probes_type, &
              paep_control_type, &
-             pcc_control_type
+             pcc_control_type, &
+             fde_control_type
 
    ! Public subroutines
 
@@ -863,7 +913,9 @@ MODULE cp_control_types
              expot_control_create, &
              ddapc_control_create, &
              rixs_control_create, &
-             rixs_control_release
+             rixs_control_release, &
+             fde_control_create, &
+             fde_control_release
 
 CONTAINS
 
@@ -891,8 +943,9 @@ CONTAINS
    SUBROUTINE mulliken_control_release(mulliken_restraint_control)
       TYPE(mulliken_restraint_type), INTENT(INOUT)       :: mulliken_restraint_control
 
-      IF (ASSOCIATED(mulliken_restraint_control%atoms)) &
+      IF (ASSOCIATED(mulliken_restraint_control%atoms)) THEN
          DEALLOCATE (mulliken_restraint_control%atoms)
+      END IF
       mulliken_restraint_control%strength = 0.0_dp
       mulliken_restraint_control%target = 0.0_dp
       mulliken_restraint_control%natoms = 0
@@ -927,10 +980,12 @@ CONTAINS
    SUBROUTINE ddapc_control_release(ddapc_restraint_control)
       TYPE(ddapc_restraint_type), INTENT(INOUT)          :: ddapc_restraint_control
 
-      IF (ASSOCIATED(ddapc_restraint_control%atoms)) &
+      IF (ASSOCIATED(ddapc_restraint_control%atoms)) THEN
          DEALLOCATE (ddapc_restraint_control%atoms)
-      IF (ASSOCIATED(ddapc_restraint_control%coeff)) &
+      END IF
+      IF (ASSOCIATED(ddapc_restraint_control%coeff)) THEN
          DEALLOCATE (ddapc_restraint_control%coeff)
+      END IF
       ddapc_restraint_control%strength = 0.0_dp
       ddapc_restraint_control%target = 0.0_dp
       ddapc_restraint_control%natoms = 0
@@ -989,6 +1044,7 @@ CONTAINS
       NULLIFY (dft_control%probe)
       NULLIFY (dft_control%paep_control)
       NULLIFY (dft_control%pcc_control)
+      NULLIFY (dft_control%fde_control)
       dft_control%do_sccs = .FALSE.
       dft_control%apply_embed_pot = .FALSE.
       dft_control%apply_dmfet_pot = .FALSE.
@@ -1041,6 +1097,7 @@ CONTAINS
       END IF
       IF (ASSOCIATED(dft_control%pcc_control)) DEALLOCATE (dft_control%pcc_control)
       IF (ASSOCIATED(dft_control%paep_control)) DEALLOCATE (dft_control%paep_control)
+      CALL fde_control_release(dft_control%fde_control)
 
    END SUBROUTINE dft_control_release
 
@@ -1207,18 +1264,21 @@ CONTAINS
       IF (ASSOCIATED(proj_mo_list)) THEN
          DO i = 1, SIZE(proj_mo_list)
             IF (ASSOCIATED(proj_mo_list(i)%proj_mo)) THEN
-               IF (ALLOCATED(proj_mo_list(i)%proj_mo%ref_mo_index)) &
+               IF (ALLOCATED(proj_mo_list(i)%proj_mo%ref_mo_index)) THEN
                   DEALLOCATE (proj_mo_list(i)%proj_mo%ref_mo_index)
+               END IF
                IF (ALLOCATED(proj_mo_list(i)%proj_mo%mo_ref)) THEN
                   DO mo_ref_nbr = 1, SIZE(proj_mo_list(i)%proj_mo%mo_ref)
                      CALL cp_fm_release(proj_mo_list(i)%proj_mo%mo_ref(mo_ref_nbr))
                   END DO
                   DEALLOCATE (proj_mo_list(i)%proj_mo%mo_ref)
                END IF
-               IF (ALLOCATED(proj_mo_list(i)%proj_mo%td_mo_index)) &
+               IF (ALLOCATED(proj_mo_list(i)%proj_mo%td_mo_index)) THEN
                   DEALLOCATE (proj_mo_list(i)%proj_mo%td_mo_index)
-               IF (ALLOCATED(proj_mo_list(i)%proj_mo%td_mo_occ)) &
+               END IF
+               IF (ALLOCATED(proj_mo_list(i)%proj_mo%td_mo_occ)) THEN
                   DEALLOCATE (proj_mo_list(i)%proj_mo%td_mo_occ)
+               END IF
                DEALLOCATE (proj_mo_list(i)%proj_mo)
             END IF
          END DO
@@ -1244,8 +1304,9 @@ CONTAINS
                IF (ASSOCIATED(efield_fields(i)%efield%envelop_i_vars)) THEN
                   DEALLOCATE (efield_fields(i)%efield%envelop_i_vars)
                END IF
-               IF (ASSOCIATED(efield_fields(i)%efield%polarisation)) &
+               IF (ASSOCIATED(efield_fields(i)%efield%polarisation)) THEN
                   DEALLOCATE (efield_fields(i)%efield%polarisation)
+               END IF
                DEALLOCATE (efield_fields(i)%efield)
             END IF
          END DO
@@ -1296,6 +1357,8 @@ CONTAINS
       NULLIFY (xtb_control%kab_types)
       NULLIFY (xtb_control%nonbonded)
       NULLIFY (xtb_control%rcpair)
+      NULLIFY (xtb_control%spinpol_type)
+      NULLIFY (xtb_control%spinpol_vals)
 
    END SUBROUTINE xtb_control_create
 
@@ -1321,6 +1384,12 @@ CONTAINS
          END IF
          IF (ASSOCIATED(xtb_control%nonbonded)) THEN
             CALL pair_potential_p_release(xtb_control%nonbonded)
+         END IF
+         IF (ASSOCIATED(xtb_control%spinpol_type)) THEN
+            DEALLOCATE (xtb_control%spinpol_type)
+         END IF
+         IF (ASSOCIATED(xtb_control%spinpol_vals)) THEN
+            DEALLOCATE (xtb_control%spinpol_vals)
          END IF
          DEALLOCATE (xtb_control)
       END IF
@@ -1426,5 +1495,30 @@ CONTAINS
       END IF
 
    END SUBROUTINE maxwell_control_release
+
+! **************************************************************************************************
+!> \brief ...
+!> \param fde_control ...
+! **************************************************************************************************
+   SUBROUTINE fde_control_create(fde_control)
+      TYPE(fde_control_type), POINTER                    :: fde_control
+
+      CPASSERT(.NOT. ASSOCIATED(fde_control))
+      ALLOCATE (fde_control)
+
+   END SUBROUTINE fde_control_create
+
+! **************************************************************************************************
+!> \brief ...
+!> \param fde_control ...
+! **************************************************************************************************
+   SUBROUTINE fde_control_release(fde_control)
+      TYPE(fde_control_type), POINTER                    :: fde_control
+
+      IF (ASSOCIATED(fde_control)) THEN
+         DEALLOCATE (fde_control)
+      END IF
+
+   END SUBROUTINE fde_control_release
 
 END MODULE cp_control_types

@@ -30,7 +30,8 @@ MODULE dm_ls_scf_qs
                                               ls_cluster_molecular,&
                                               ls_mstruct_type,&
                                               ls_scf_env_type
-   USE input_constants,                 ONLY: ls_cluster_atomic,&
+   USE input_constants,                 ONLY: external_density_guess,&
+                                              ls_cluster_atomic,&
                                               ls_cluster_molecular
    USE kinds,                           ONLY: default_string_length,&
                                               dp
@@ -52,6 +53,7 @@ MODULE dm_ls_scf_qs
    USE qs_energy_types,                 ONLY: qs_energy_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
+   USE qs_external_density,             ONLY: read_scf_guess_density
    USE qs_gspace_mixing,                ONLY: gspace_mixing
    USE qs_harris_types,                 ONLY: harris_type
    USE qs_harris_utils,                 ONLY: harris_density_update
@@ -71,6 +73,7 @@ MODULE dm_ls_scf_qs
                                               qs_rho_type
    USE qs_subsys_types,                 ONLY: qs_subsys_get,&
                                               qs_subsys_type
+   USE scf_control_types,               ONLY: scf_control_type
    USE tblite_interface,                ONLY: tb_get_energy
    USE tblite_types,                    ONLY: tblite_type
 #include "./base/base_uses.f90"
@@ -107,7 +110,7 @@ CONTAINS
       INTEGER                                            :: handle, iatom, imol, jatom, natom, nmol
       INTEGER, ALLOCATABLE, DIMENSION(:), TARGET         :: atom_to_cluster, atom_to_cluster_primus, &
                                                             clustered_blk_sizes, primus_of_mol
-      INTEGER, DIMENSION(:), POINTER                     :: clustered_col_dist, clustered_row_dist, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: clustered_col_dist, clustered_row_dist, &
                                                             ls_blk_sizes, ls_col_dist, ls_row_dist
       TYPE(dbcsr_distribution_type)                      :: ls_dist, ls_dist_clustered
 
@@ -218,7 +221,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'matrix_qs_to_ls'
 
       INTEGER                                            :: handle
-      INTEGER, DIMENSION(:), POINTER                     :: pao_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: pao_blk_sizes
       TYPE(dbcsr_type)                                   :: matrix_pao, matrix_tmp
       TYPE(dbcsr_type), POINTER                          :: matrix_trafo
 
@@ -313,7 +316,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'matrix_ls_to_qs'
 
       INTEGER                                            :: handle
-      INTEGER, DIMENSION(:), POINTER                     :: pao_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: pao_blk_sizes
       LOGICAL                                            :: my_keep_sparsity
       TYPE(dbcsr_type)                                   :: matrix_declustered, matrix_tmp1, &
                                                             matrix_tmp2
@@ -322,8 +325,9 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       my_keep_sparsity = .TRUE.
-      IF (PRESENT(keep_sparsity)) &
+      IF (PRESENT(keep_sparsity)) THEN
          my_keep_sparsity = keep_sparsity
+      END IF
 
       IF (.NOT. ls_mstruct%do_pao) THEN
          CALL dbcsr_create(matrix_declustered, template=matrix_qs)
@@ -477,9 +481,10 @@ CONTAINS
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
       TYPE(qs_rho_type), POINTER                         :: rho
+      TYPE(scf_control_type), POINTER                    :: scf_control
 
       CALL timeset(routineN, handle)
-      NULLIFY (rho, rho_ao)
+      NULLIFY (rho, rho_ao, scf_control)
 
       ! get a useful output_unit
       logger => cp_get_default_logger()
@@ -501,11 +506,15 @@ CONTAINS
                       has_unit_metric=has_unit_metric, &
                       para_env=para_env, &
                       nelectron_spin=nelectron_spin, &
-                      rho=rho)
+                      rho=rho, &
+                      scf_control=scf_control)
 
       CALL qs_rho_get(rho, rho_ao=rho_ao)
 
       nspin = dft_control%nspins
+      IF (qs_env%harris_method .AND. scf_control%density_guess == external_density_guess) THEN
+         CPABORT("EXTERNAL_DENSITY SCF guess is incompatible with HARRIS_METHOD")
+      END IF
 
       ! create an initial atomic guess
       IF (dft_control%qs_control%dftb .OR. dft_control%qs_control%semi_empirical .OR. &
@@ -521,7 +530,11 @@ CONTAINS
       do_scf = .TRUE.
       IF (PRESENT(nonscf)) do_scf = .NOT. nonscf
       IF (do_scf) THEN
-         CALL qs_rho_update_rho(rho, qs_env=qs_env)
+         IF (scf_control%density_guess == external_density_guess) THEN
+            CALL read_scf_guess_density(qs_env, scf_control%external_density_file_name)
+         ELSE
+            CALL qs_rho_update_rho(rho, qs_env=qs_env)
+         END IF
          CALL qs_ks_did_change(qs_env%ks_env, rho_changed=.TRUE.)
          CALL qs_ks_update_qs_env(qs_env, calculate_forces=.FALSE., just_energy=.FALSE.)
          CALL ls_scf_tblite_energy(qs_env, qs_energy)
@@ -583,8 +596,9 @@ CONTAINS
       ! compute the corresponding KS matrix and new energy, mix density if requested
       CALL qs_rho_update_rho(rho, qs_env=qs_env)
       IF (ls_scf_env%do_rho_mixing) THEN
-         IF (ls_scf_env%density_mixing_method == direct_mixing_nr) &
+         IF (ls_scf_env%density_mixing_method == direct_mixing_nr) THEN
             CPABORT("Direct P mixing not implemented in linear scaling SCF. ")
+         END IF
          IF (ls_scf_env%density_mixing_method >= gspace_mixing_nr) THEN
             IF (iscf > MAX(ls_scf_env%mixing_store%nskip_mixing, 1)) THEN
                CALL gspace_mixing(qs_env, ls_scf_env%density_mixing_method, &
@@ -839,9 +853,9 @@ CONTAINS
             CALL get_qs_env(qs_env, rho_atom_set=rho_atom)
             CALL mixing_init(ls_scf_env%density_mixing_method, rho, ls_scf_env%mixing_store, &
                              ls_scf_env%para_env, rho_atom=rho_atom)
-         ELSEIF (dft_control%qs_control%dftb .OR. dft_control%qs_control%xtb) THEN
+         ELSE IF (dft_control%qs_control%dftb .OR. dft_control%qs_control%xtb) THEN
             CALL charge_mixing_init(ls_scf_env%mixing_store)
-         ELSEIF (dft_control%qs_control%semi_empirical) THEN
+         ELSE IF (dft_control%qs_control%semi_empirical) THEN
             CPABORT('SE Code not possible')
          ELSE
             CALL mixing_init(ls_scf_env%density_mixing_method, rho, ls_scf_env%mixing_store, &

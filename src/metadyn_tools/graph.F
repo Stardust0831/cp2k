@@ -65,7 +65,7 @@ PROGRAM graph
    ndim = 1
    ndw = 1
    nt_p = 9999999
-   eps_cut = 1e-6
+   eps_cut = 1e-6_dp
    file = 'HILLS'
    out1 = 'fes.dat'
    out2 = 'fes_int.dat'
@@ -200,8 +200,9 @@ PROGRAM graph
       END IF
 
    END DO
-   IF (COUNT([l_orac, l_cp2k, l_cpmd]) /= 1) &
+   IF (COUNT([l_orac, l_cp2k, l_cpmd]) /= 1) THEN
       CPABORT("Error! You've to specify either ORAC, CP2K or CPMD!")
+   END IF
 
    ! For CPMD move filename to colvar_mtd
    IF (l_cpmd) THEN
@@ -358,9 +359,10 @@ PROGRAM graph
          END IF
 
       END DO
-      IF (ANY(mep_input_data%minima == HUGE(0.0_dp))) &
+      IF (ANY(mep_input_data%minima == HUGE(0.0_dp))) THEN
          CALL cp_abort(__LOCATION__, &
                        "-find-path requires the specification of -point-a and -point-b !")
+      END IF
    ELSE
       ALLOCATE (mep_input_data%minima(0, 0))
    END IF
@@ -535,8 +537,8 @@ PROGRAM graph
    IF (fix) THEN
       DO it = 1, nt
          DO id = 1, ndim - ndw
-            x0(id) = MIN(x0(id), ss0(id, it) - 3.*delta_s(id, it))
-            xf(id) = MAX(xf(id), ss0(id, it) + 3.*delta_s(id, it))
+            x0(id) = MIN(x0(id), ss0(id, it) - 3.0_dp*delta_s(id, it))
+            xf(id) = MAX(xf(id), ss0(id, it) + 3.0_dp*delta_s(id, it))
          END DO
       END DO
       it = 0
@@ -552,8 +554,8 @@ PROGRAM graph
                x0(id) = -pi
                xf(id) = pi
             ELSE
-               x0(id) = MIN(x0(id), ss0(id, it) - 3.*delta_s(id, it))
-               xf(id) = MAX(xf(id), ss0(id, it) + 3.*delta_s(id, it))
+               x0(id) = MIN(x0(id), ss0(id, it) - 3.0_dp*delta_s(id, it))
+               xf(id) = MAX(xf(id), ss0(id, it) + 3.0_dp*delta_s(id, it))
             END IF
          END DO
       END DO
@@ -647,7 +649,7 @@ PROGRAM graph
 
          IF (.NOT. lstride .AND. MOD(it, nwr) == 0) THEN
             WRITE (iw, '("FES|",T7,a,i4,a2)') "Mapping Gaussians ::", INT(10*ANINT(10.*it/nt)), " %"
-         ELSEIF (.NOT. lstride .AND. it == nt) THEN
+         ELSE IF (.NOT. lstride .AND. it == nt) THEN
             WRITE (iw, '("FES|",T7,a,i4,a2)') "Mapping Gaussians ::", INT(10*ANINT(10.*it/nt)), " %"
          END IF
       END DO Hills
@@ -663,7 +665,7 @@ PROGRAM graph
 
          IF (ncount < 10) THEN
             WRITE (out3_stride, '(A,i1)') TRIM(out3), ncount
-         ELSEIF (ncount < 100) THEN
+         ELSE IF (ncount < 100) THEN
             WRITE (out3_stride, '(A,i2)') TRIM(out3), ncount
          ELSE
             WRITE (out3_stride, '(A,i3)') TRIM(out3), ncount
@@ -689,7 +691,7 @@ PROGRAM graph
    CALL open_file(unit_number=unit_nr, file_name=out3, file_action="WRITE", file_status="UNKNOWN", file_form="FORMATTED")
    IF (l_cube) THEN
       ind = 1
-      CALL fes_cube_write(ndim, fes, ind, ndim, ngrid, dp_grid, x0, ndw, l_fes_int, file)
+      CALL fes_cube_write(ndim, fes, ind, ndim, ngrid, dp_grid, x0, ndw, l_fes_int, file, unit_nr)
    ELSE
       ix = 0
       IF (l_math) WRITE (unit_nr, '(10g12.5)') (ngrid(id), id=ndim, ndim - ndw + 1, -1), ix

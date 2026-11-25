@@ -13,7 +13,7 @@
 !> \author fschiff (06.2010)
 ! **************************************************************************************************
 MODULE qs_efield_berry
-   USE ai_moments,                      ONLY: cossin
+   USE ai_moments,                      ONLY: expikr
    USE atomic_kind_types,               ONLY: atomic_kind_type,&
                                               get_atomic_kind,&
                                               get_atomic_kind_set
@@ -168,8 +168,6 @@ CONTAINS
 
          CALL dbcsr_copy(cosmat(i)%matrix, matrix_s(1)%matrix, 'COS MAT')
          CALL dbcsr_copy(sinmat(i)%matrix, matrix_s(1)%matrix, 'SIN MAT')
-         CALL dbcsr_set(cosmat(i)%matrix, 0.0_dp)
-         CALL dbcsr_set(sinmat(i)%matrix, 0.0_dp)
 
          kvec(:) = twopi*cell%h_inv(i, :)
          CALL build_berry_moment_matrix(qs_env, cosmat(i)%matrix, sinmat(i)%matrix, kvec)
@@ -193,9 +191,10 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_efield_derivatives'
 
       COMPLEX(dp)                                        :: zdet, zdeta, zi(3)
-      INTEGER :: atom_a, atom_b, handle, i, ia, iatom, icol, idir, ikind, irow, iset, ispin, j, &
-         jatom, jkind, jset, ldab, ldsa, ldsb, lsab, n1, n2, nao, natom, ncoa, ncob, nkind, nmo, &
-         nseta, nsetb, sgfa, sgfb
+      COMPLEX(dp), ALLOCATABLE                           :: dexpab(:, :, :, :), expab(:, :)
+      INTEGER :: atom_a, atom_b, handle, i, ia, iatom, icenter, icol, idir, ikind, irow, iset, &
+         ispin, j, jatom, jkind, jset, ldab, ldsa, ldsb, lsab, n1, n2, nao, natom, ncoa, ncob, &
+         nkind, nmo, nseta, nsetb, sgfa, sgfb
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_of_kind
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, lb_max, lb_min, npgfa, &
                                                             npgfb, nsgfa, nsgfb
@@ -206,8 +205,7 @@ CONTAINS
                                                             focc, fpolvec(3), hmat(3, 3), occ, &
                                                             qi(3), strength, ti(3)
       REAL(dp), DIMENSION(3)                             :: forcea, forceb, kvec, ra, rab, rb, ria
-      REAL(dp), DIMENSION(:, :), POINTER                 :: cosab, iblock, rblock, sinab, work
-      REAL(dp), DIMENSION(:, :, :), POINTER              :: dcosab, dsinab
+      REAL(dp), DIMENSION(:, :), POINTER                 :: iblock, rblock, work
       REAL(KIND=dp), DIMENSION(:), POINTER               :: set_radius_a, set_radius_b
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: rpgfa, rpgfb, sphi_a, sphi_b, zeta, zetb
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
@@ -263,7 +261,7 @@ CONTAINS
       END IF
 
       fieldpol = dft_control%period_efield%polarisation
-      fieldpol = fieldpol/SQRT(DOT_PRODUCT(fieldpol, fieldpol))
+      fieldpol = fieldpol/NORM2(fieldpol)
       fieldpol = -fieldpol*strength
       hmat = cell%hmat(:, :)/twopi
       DO idir = 1, 3
@@ -296,8 +294,9 @@ CONTAINS
             END IF
          END IF
          IF (use_virial) THEN
-            IF (para_env%mepos == 0) &
+            IF (para_env%mepos == 0) THEN
                CALL virial_pair_force(virial%pv_virial, 1.0_dp, forcea, ria)
+            END IF
          END IF
       END DO
       qi = AIMAG(LOG(zi))
@@ -355,8 +354,8 @@ CONTAINS
          END DO
          ! integration
          CALL get_qs_kind_set(qs_kind_set, maxco=ldab, maxsgf=lsab)
-         ALLOCATE (cosab(ldab, ldab), sinab(ldab, ldab), work(ldab, ldab))
-         ALLOCATE (dcosab(ldab, ldab, 3), dsinab(ldab, ldab, 3))
+         ALLOCATE (expab(ldab, ldab), work(ldab, ldab))
+         ALLOCATE (dexpab(ldab, ldab, 3, 2))
          lsab = MAX(ldab, lsab)
          DO i = 1, 3
             ALLOCATE (dcost(i, 1)%block(lsab, lsab), dsint(i, 1)%block(lsab, lsab))
@@ -517,27 +516,18 @@ CONTAINS
                         IF (set_radius_a(iset) + set_radius_b(jset) < dab) CYCLE
                         ncob = npgfb(jset)*ncoset(lb_max(jset))
                         sgfb = first_sgfb(1, jset)
-                        ! Calculate the primitive integrals (da|b)
-                        CALL cossin(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
+                        ! Calculate both basis-center derivatives from one primitive recurrence.
+                        CALL expikr(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
                                     lb_max(jset), npgfb(jset), zetb(:, jset), rpgfb(:, jset), lb_min(jset), &
-                                    ra, rb, kvec, cosab, sinab, dcosab, dsinab)
-                        DO i = 1, 3
-                           CALL contract_all(dcost(i, 1)%block, dsint(i, 1)%block, &
-                                             ncoa, nsgfa(iset), sgfa, sphi_a, ldsa, &
-                                             ncob, nsgfb(jset), sgfb, sphi_b, ldsb, &
-                                             dcosab(:, :, i), dsinab(:, :, i), ldab, work, ldab)
-                        END DO
-                        ! Calculate the primitive integrals (a|db)
-                        CALL cossin(lb_max(jset), npgfb(jset), zetb(:, jset), rpgfb(:, jset), lb_min(jset), &
-                                    la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
-                                    rb, ra, kvec, cosab, sinab, dcosab, dsinab)
-                        DO i = 1, 3
-                           dcosab(1:ncoa, 1:ncob, i) = TRANSPOSE(dcosab(1:ncob, 1:ncoa, i))
-                           dsinab(1:ncoa, 1:ncob, i) = TRANSPOSE(dsinab(1:ncob, 1:ncoa, i))
-                           CALL contract_all(dcost(i, 2)%block, dsint(i, 2)%block, &
-                                             ncoa, nsgfa(iset), sgfa, sphi_a, ldsa, &
-                                             ncob, nsgfb(jset), sgfb, sphi_b, ldsb, &
-                                             dcosab(:, :, i), dsinab(:, :, i), ldab, work, ldab)
+                                    ra, rb, kvec, expab, dexpab(:, :, :, 1), dexpab(:, :, :, 2))
+                        DO icenter = 1, 2
+                           DO i = 1, 3
+                              CALL contract_all(dcost(i, icenter)%block, dsint(i, icenter)%block, &
+                                                ncoa, nsgfa(iset), sgfa, sphi_a, ldsa, &
+                                                ncob, nsgfb(jset), sgfb, sphi_b, ldsb, &
+                                                REAL(dexpab(1:ncoa, 1:ncob, i, icenter), KIND=dp), &
+                                                AIMAG(dexpab(1:ncoa, 1:ncob, i, icenter)), ncoa, work, ldab)
+                           END DO
                         END DO
                      END DO
                   END DO
@@ -657,7 +647,7 @@ CONTAINS
          DO ikind = 1, SIZE(atomic_kind_set)
             CALL para_env%sum(force(ikind)%efield)
          END DO
-         DEALLOCATE (cosab, sinab, work, dcosab, dsinab)
+         DEALLOCATE (expab, work, dexpab)
          DO i = 1, 3
             DEALLOCATE (dcost(i, 1)%block, dsint(i, 1)%block)
             DEALLOCATE (dcost(i, 2)%block, dsint(i, 2)%block)
@@ -681,9 +671,10 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_dispfield_derivatives'
 
       COMPLEX(dp)                                        :: zdet, zdeta, zi(3)
-      INTEGER :: handle, i, ia, iatom, icol, idir, ikind, iodeb, irow, iset, ispin, jatom, jkind, &
-         jset, ldab, ldsa, ldsb, lsab, n1, n2, nao, natom, ncoa, ncob, nkind, nmo, nseta, nsetb, &
-         sgfa, sgfb
+      COMPLEX(dp), ALLOCATABLE                           :: dexpab(:, :, :, :), expab(:, :)
+      INTEGER :: handle, i, ia, iatom, icenter, icol, idir, ikind, iodeb, irow, iset, ispin, &
+         jatom, jkind, jset, ldab, ldsa, ldsb, lsab, n1, n2, nao, natom, ncoa, ncob, nkind, nmo, &
+         nseta, nsetb, sgfa, sgfb
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_of_kind
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, lb_max, lb_min, npgfa, &
                                                             npgfb, nsgfa, nsgfb
@@ -693,8 +684,8 @@ CONTAINS
          hmat(3, 3), occ, omega, qi(3), rlog(3), strength, zlog(3)
       REAL(dp), DIMENSION(3)                             :: dfilter, forcea, forceb, kvec, ra, rab, &
                                                             rb, ria
-      REAL(dp), DIMENSION(:, :), POINTER                 :: cosab, iblock, rblock, sinab, work
-      REAL(dp), DIMENSION(:, :, :), POINTER              :: dcosab, dsinab, force_tmp
+      REAL(dp), DIMENSION(:, :), POINTER                 :: iblock, rblock, work
+      REAL(dp), DIMENSION(:, :, :), POINTER              :: force_tmp
       REAL(KIND=dp), DIMENSION(:), POINTER               :: set_radius_a, set_radius_b
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: rpgfa, rpgfb, sphi_a, sphi_b, zeta, zetb
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
@@ -752,7 +743,7 @@ CONTAINS
       END IF
 
       fieldpol = dft_control%period_efield%polarisation
-      fieldpol = fieldpol/SQRT(DOT_PRODUCT(fieldpol, fieldpol))
+      fieldpol = fieldpol/NORM2(fieldpol)
       fieldpol = fieldpol*strength
 
       omega = cell%deth
@@ -843,8 +834,8 @@ CONTAINS
          END DO
          ! integration
          CALL get_qs_kind_set(qs_kind_set, maxco=ldab, maxsgf=lsab)
-         ALLOCATE (cosab(ldab, ldab), sinab(ldab, ldab), work(ldab, ldab))
-         ALLOCATE (dcosab(ldab, ldab, 3), dsinab(ldab, ldab, 3))
+         ALLOCATE (expab(ldab, ldab), work(ldab, ldab))
+         ALLOCATE (dexpab(ldab, ldab, 3, 2))
          lsab = MAX(lsab, ldab)
          DO i = 1, 3
             ALLOCATE (dcost(i, 1)%block(lsab, lsab), dsint(i, 1)%block(lsab, lsab))
@@ -1002,27 +993,18 @@ CONTAINS
                      IF (set_radius_a(iset) + set_radius_b(jset) < dab) CYCLE
                      ncob = npgfb(jset)*ncoset(lb_max(jset))
                      sgfb = first_sgfb(1, jset)
-                     ! Calculate the primitive integrals (da|b)
-                     CALL cossin(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
+                     ! Calculate both basis-center derivatives from one primitive recurrence.
+                     CALL expikr(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
                                  lb_max(jset), npgfb(jset), zetb(:, jset), rpgfb(:, jset), lb_min(jset), &
-                                 ra, rb, kvec, cosab, sinab, dcosab, dsinab)
-                     DO i = 1, 3
-                        CALL contract_all(dcost(i, 1)%block, dsint(i, 1)%block, &
-                                          ncoa, nsgfa(iset), sgfa, sphi_a, ldsa, &
-                                          ncob, nsgfb(jset), sgfb, sphi_b, ldsb, &
-                                          dcosab(:, :, i), dsinab(:, :, i), ldab, work, ldab)
-                     END DO
-                     ! Calculate the primitive integrals (a|db)
-                     CALL cossin(lb_max(jset), npgfb(jset), zetb(:, jset), rpgfb(:, jset), lb_min(jset), &
-                                 la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
-                                 rb, ra, kvec, cosab, sinab, dcosab, dsinab)
-                     DO i = 1, 3
-                        dcosab(1:ncoa, 1:ncob, i) = TRANSPOSE(dcosab(1:ncob, 1:ncoa, i))
-                        dsinab(1:ncoa, 1:ncob, i) = TRANSPOSE(dsinab(1:ncob, 1:ncoa, i))
-                        CALL contract_all(dcost(i, 2)%block, dsint(i, 2)%block, &
-                                          ncoa, nsgfa(iset), sgfa, sphi_a, ldsa, &
-                                          ncob, nsgfb(jset), sgfb, sphi_b, ldsb, &
-                                          dcosab(:, :, i), dsinab(:, :, i), ldab, work, ldab)
+                                 ra, rb, kvec, expab, dexpab(:, :, :, 1), dexpab(:, :, :, 2))
+                     DO icenter = 1, 2
+                        DO i = 1, 3
+                           CALL contract_all(dcost(i, icenter)%block, dsint(i, icenter)%block, &
+                                             ncoa, nsgfa(iset), sgfa, sphi_a, ldsa, &
+                                             ncob, nsgfb(jset), sgfb, sphi_b, ldsb, &
+                                             REAL(dexpab(1:ncoa, 1:ncob, i, icenter), KIND=dp), &
+                                             AIMAG(dexpab(1:ncoa, 1:ncob, i, icenter)), ncoa, work, ldab)
+                        END DO
                      END DO
                   END DO
                END DO
@@ -1170,7 +1152,7 @@ CONTAINS
             CALL para_env%sum(force(ikind)%efield)
          END DO
          DEALLOCATE (force_tmp)
-         DEALLOCATE (cosab, sinab, work, dcosab, dsinab)
+         DEALLOCATE (expab, work, dexpab)
          DO i = 1, 3
             DEALLOCATE (dcost(i, 1)%block, dsint(i, 1)%block)
             DEALLOCATE (dcost(i, 2)%block, dsint(i, 2)%block)

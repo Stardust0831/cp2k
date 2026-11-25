@@ -71,7 +71,8 @@ MODULE cp_fm_basic_linalg
              cp_fm_rot_cols, & ! rotates two columns
              cp_fm_Gram_Schmidt_orthonorm, & ! Gram-Schmidt orthonormalization of columns of a full matrix, &
              cp_fm_det, & ! determinant of a real matrix with correct sign
-             cp_fm_matvec ! matrix-vector multiplication (vector replicated)
+             cp_fm_matvec, & ! matrix-vector multiplication (vector replicated)
+             cp_fm_add_on_diag ! add a scalar to the diagonal
 
    REAL(KIND=dp), EXTERNAL :: dlange, pdlange, pdlatra
 
@@ -450,7 +451,7 @@ CONTAINS
 !> \brief computes matrix_c = beta * matrix_c + alpha * ( matrix_a  ** transa ) * ( matrix_b ** transb )
 !> \param transa : 'N' -> normal   'T' -> transpose
 !>      alpha,beta :: can be 0.0_dp and 1.0_dp
-!> \param transb ...
+!> \param transb same operation choices as transa
 !> \param m ...
 !> \param n ...
 !> \param k ...
@@ -1316,10 +1317,13 @@ CONTAINS
    END SUBROUTINE cp_fm_uplo_to_full
 
 ! **************************************************************************************************
-!> \brief scales column i of matrix a with scaling(i)
-!> \param matrixa ...
-!> \param scaling : an array used for scaling the columns,
-!>                  SIZE(scaling) determines the number of columns to be scaled
+!> \brief Scales columns of the full matrix by corresponding factors.
+!> \param matrixa target matrix; columns outside the selected window are unchanged
+!> \param scaling factors for consecutive columns starting at first_col;
+!>        the window is truncated at the last global column of the matrix
+!> \param first_col first global column to scale (defaults to 1)
+!> \param source optional source with the same shape and distribution as matrixa;
+!>        if omitted, matrixa is scaled in place
 !> \author Joost VandeVondele
 !> \note
 !>      this is very useful as a first step in the computation of C = sum_i alpha_i A_i transpose (A_i)
@@ -1327,46 +1331,35 @@ CONTAINS
 !>      this procedure can be up to 20 times faster than calling cp_fm_syrk n times
 !>      where every vector has a different prefactor
 ! **************************************************************************************************
-   SUBROUTINE cp_fm_column_scale(matrixa, scaling)
-      TYPE(cp_fm_type), INTENT(IN)             :: matrixa
-      REAL(KIND=dp), DIMENSION(:), INTENT(IN)  :: scaling
+   SUBROUTINE cp_fm_column_scale(matrixa, scaling, first_col, source)
+      TYPE(cp_fm_type), INTENT(IN)                       :: matrixa
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: scaling
+      INTEGER, INTENT(IN), OPTIONAL                      :: first_col
+      TYPE(cp_fm_type), INTENT(IN), OPTIONAL             :: source
 
-      INTEGER                                  :: k, mypcol, myprow, n, ncol_global, &
-                                                  npcol, nprow
-      REAL(KIND=dp), DIMENSION(:, :), POINTER  :: a
-#if defined(__parallel)
-      INTEGER                                  :: icol_global, icol_local, &
-                                                  ipcol, iprow, irow_local
-#else
-      INTEGER                                  :: i
-#endif
-
-      myprow = matrixa%matrix_struct%context%mepos(1)
-      mypcol = matrixa%matrix_struct%context%mepos(2)
-      nprow = matrixa%matrix_struct%context%num_pe(1)
-      npcol = matrixa%matrix_struct%context%num_pe(2)
-
-      ncol_global = matrixa%matrix_struct%ncol_global
+      INTEGER                                            :: first, i_factor, icol_local, ncol_local, &
+                                                            nrow_local
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices
+      LOGICAL                                            :: compatible_layout
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: a, b
 
       a => matrixa%local_data
-      n = SIZE(a, 1)
-      k = MIN(SIZE(scaling), ncol_global)
+      b => a
+      IF (PRESENT(source)) THEN
+         compatible_layout = cp_fm_struct_equivalent(matrixa%matrix_struct, source%matrix_struct)
+         CPASSERT(compatible_layout)
+         b => source%local_data
+      END IF
+      first = 1
+      IF (PRESENT(first_col)) first = first_col
+      CPASSERT(first >= 1)
+      CALL cp_fm_get_info(matrixa, nrow_local=nrow_local, ncol_local=ncol_local, col_indices=col_indices)
 
-#if defined(__parallel)
-
-      DO icol_global = 1, k
-         CALL infog2l(1, icol_global, matrixa%matrix_struct%descriptor, &
-                      nprow, npcol, myprow, mypcol, &
-                      irow_local, icol_local, iprow, ipcol)
-         IF ((ipcol == mypcol)) THEN
-            CALL DSCAL(n, scaling(icol_global), a(:, icol_local), 1)
-         END IF
+      DO icol_local = 1, ncol_local
+         i_factor = col_indices(icol_local) - first + 1
+         IF (i_factor < 1 .OR. i_factor > SIZE(scaling)) CYCLE
+         a(1:nrow_local, icol_local) = scaling(i_factor)*b(1:nrow_local, icol_local)
       END DO
-#else
-      DO i = 1, k
-         CALL DSCAL(n, scaling(i), a(:, i), 1)
-      END DO
-#endif
    END SUBROUTINE cp_fm_column_scale
 
 ! **************************************************************************************************
@@ -1792,7 +1785,7 @@ CONTAINS
 !> \brief Convenience function. Computes the matrix multiplications needed
 !>        for the multiplication of complex matrices.
 !>        C = beta * C + alpha * ( A  ** transa ) * ( B ** transb )
-!> \param transa : 'N' -> normal   'T' -> transpose
+!> \param transa : 'N' -> normal   'T' -> transpose   'C' -> conjugate transpose
 !>      alpha,beta :: can be 0.0_dp and 1.0_dp
 !> \param transb ...
 !> \param m ...
@@ -1830,32 +1823,48 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'cp_complex_fm_gemm'
 
+      CHARACTER(LEN=1)                                   :: transa_real, transb_real
       INTEGER                                            :: handle
+      REAL(KIND=dp)                                      :: sign_a, sign_b
 
       CALL timeset(routineN, handle)
 
-      CALL cp_fm_gemm(transa, transb, m, n, k, alpha, A_re, B_re, beta, C_re, &
+      transa_real = transa
+      transb_real = transb
+      sign_a = 1.0_dp
+      sign_b = 1.0_dp
+      IF (transa == "C") THEN
+         transa_real = "T"
+         sign_a = -1.0_dp
+      END IF
+      IF (transb == "C") THEN
+         transb_real = "T"
+         sign_b = -1.0_dp
+      END IF
+
+      CALL cp_fm_gemm(transa_real, transb_real, m, n, k, alpha, A_re, B_re, beta, C_re, &
                       a_first_col=a_first_col, &
                       a_first_row=a_first_row, &
                       b_first_col=b_first_col, &
                       b_first_row=b_first_row, &
                       c_first_col=c_first_col, &
                       c_first_row=c_first_row)
-      CALL cp_fm_gemm(transa, transb, m, n, k, -alpha, A_im, B_im, 1.0_dp, C_re, &
+      CALL cp_fm_gemm(transa_real, transb_real, m, n, k, -sign_a*sign_b*alpha, &
+                      A_im, B_im, 1.0_dp, C_re, &
                       a_first_col=a_first_col, &
                       a_first_row=a_first_row, &
                       b_first_col=b_first_col, &
                       b_first_row=b_first_row, &
                       c_first_col=c_first_col, &
                       c_first_row=c_first_row)
-      CALL cp_fm_gemm(transa, transb, m, n, k, alpha, A_re, B_im, beta, C_im, &
+      CALL cp_fm_gemm(transa_real, transb_real, m, n, k, sign_b*alpha, A_re, B_im, beta, C_im, &
                       a_first_col=a_first_col, &
                       a_first_row=a_first_row, &
                       b_first_col=b_first_col, &
                       b_first_row=b_first_row, &
                       c_first_col=c_first_col, &
                       c_first_row=c_first_row)
-      CALL cp_fm_gemm(transa, transb, m, n, k, alpha, A_im, B_re, 1.0_dp, C_im, &
+      CALL cp_fm_gemm(transa_real, transb_real, m, n, k, sign_a*alpha, A_im, B_re, 1.0_dp, C_im, &
                       a_first_col=a_first_col, &
                       a_first_row=a_first_row, &
                       b_first_col=b_first_col, &
@@ -2531,7 +2540,10 @@ CONTAINS
       DO ic = 1, ncl
          xvl(ic) = xv(cind(ic))
       END DO
-      yvl(1:nrl) = MATMUL(amat%local_data, xvl(1:ncl))
+      yvl = 0.0_dp
+      IF (nrl > 0 .AND. ncl > 0) THEN
+         yvl(1:nrl) = MATMUL(amat%local_data(1:nrl, 1:ncl), xvl)
+      END IF
       yvm = 0.0_dp
       DO ir = 1, nrl
          yvm(rind(ir)) = yvl(ir)
@@ -2551,5 +2563,57 @@ CONTAINS
 #endif
 
    END SUBROUTINE cp_fm_matvec
+
+! **************************************************************************************************
+!> \brief Adds a scalar to the diagonal of a distributed real full matrix.
+!> \param matrix input/output matrix
+!> \param alpha scalar added to each diagonal element
+!> \param n_active optional number of physical rows/columns
+! **************************************************************************************************
+   SUBROUTINE cp_fm_add_on_diag(matrix, alpha, n_active)
+      TYPE(cp_fm_type), INTENT(IN)                       :: matrix
+      REAL(KIND=dp), INTENT(IN)                          :: alpha
+      INTEGER, INTENT(IN), OPTIONAL                      :: n_active
+
+      INTEGER                                            :: i_global, n_diag, ncol_global, nrow_global
+#if defined(__parallel)
+      INTEGER                                            :: icol_local, ipcol, iprow, irow, irow_local, &
+                                                            mypcol, myprow, npcol, nprow, nrow_local
+      INTEGER, DIMENSION(9)                              :: desca
+      INTEGER, DIMENSION(:), POINTER                     :: row_indices
+      TYPE(cp_blacs_env_type), POINTER                   :: context
+#endif
+
+      CALL cp_fm_get_info(matrix, nrow_global=nrow_global, ncol_global=ncol_global)
+
+      n_diag = MIN(nrow_global, ncol_global)
+      IF (PRESENT(n_active)) n_diag = n_active
+      CPASSERT(n_diag >= 0 .AND. n_diag <= MIN(nrow_global, ncol_global))
+
+#if defined(__parallel)
+      CALL cp_fm_get_info(matrix, nrow_local=nrow_local, row_indices=row_indices)
+      context => matrix%matrix_struct%context
+      myprow = context%mepos(1)
+      mypcol = context%mepos(2)
+      nprow = context%num_pe(1)
+      npcol = context%num_pe(2)
+      desca(:) = matrix%matrix_struct%descriptor(:)
+
+      DO irow = 1, nrow_local
+         i_global = row_indices(irow)
+         IF (i_global > n_diag) EXIT
+         CALL infog2l(i_global, i_global, desca, nprow, npcol, myprow, mypcol, &
+                      irow_local, icol_local, iprow, ipcol)
+         IF ((iprow == myprow) .AND. (ipcol == mypcol)) THEN
+            matrix%local_data(irow_local, icol_local) = matrix%local_data(irow_local, icol_local) + alpha
+         END IF
+      END DO
+#else
+      DO i_global = 1, n_diag
+         matrix%local_data(i_global, i_global) = matrix%local_data(i_global, i_global) + alpha
+      END DO
+#endif
+
+   END SUBROUTINE cp_fm_add_on_diag
 
 END MODULE cp_fm_basic_linalg

@@ -460,6 +460,24 @@ CONTAINS
             CPABORT("Kernel type not implemented")
          END IF
 
+         ! Add HFXLR before returning the subgroup kernel to the global matrices.
+         IF (tddfpt_control%kernel == tddfpt_kernel_full .AND. tddfpt_control%do_hfxlr) THEN
+            rcut = tddfpt_control%hfxlr_rcut
+            scale = tddfpt_control%hfxlr_scale
+            DO ivect = 1, nvects
+               IF (ALLOCATED(work_matrices%evects_sub)) THEN
+                  IF (ASSOCIATED(work_matrices%evects_sub(1, ivect)%matrix_struct)) THEN
+                     CALL tddfpt_apply_hfxlr_kernel(qs_env, sub_env, rcut, scale, work_matrices, &
+                                                    work_matrices%evects_sub(:, ivect), &
+                                                    work_matrices%Aop_evects_sub(:, ivect))
+                  END IF
+               ELSE
+                  CALL tddfpt_apply_hfxlr_kernel(qs_env, sub_env, rcut, scale, work_matrices, &
+                                                 evects(:, ivect), Aop_evects(:, ivect))
+               END IF
+            END DO
+         END IF
+
          IF (ALLOCATED(work_matrices%evects_sub)) THEN
             DO ivect = 1, nvects
                DO ispin = 1, SIZE(evects, 1)
@@ -520,7 +538,7 @@ CONTAINS
                CPABORT("Kernel type not implemented")
             END IF
          END IF
-         ! short/long range HFX
+         ! short range HFX
          IF (tddfpt_control%kernel == tddfpt_kernel_full) THEN
             IF (tddfpt_control%do_hfxsr) THEN
                re_int = tddfpt_control%hfxsr_re_int
@@ -541,25 +559,6 @@ CONTAINS
                                               work_hmat=work_matrices%hfxsr_hmat_asymm, &
                                               wfm_rho_orb=work_matrices%hfxsr_fm_ao_ao)
                tddfpt_control%hfxsr_re_int = .FALSE.
-            END IF
-            IF (tddfpt_control%do_hfxlr) THEN
-               rcut = tddfpt_control%hfxlr_rcut
-               scale = tddfpt_control%hfxlr_scale
-               DO ivect = 1, nvects
-                  IF (ALLOCATED(work_matrices%evects_sub)) THEN
-                     IF (ASSOCIATED(work_matrices%evects_sub(1, ivect)%matrix_struct)) THEN
-                        CALL tddfpt_apply_hfxlr_kernel(qs_env, sub_env, rcut, scale, work_matrices, &
-                                                       work_matrices%evects_sub(:, ivect), &
-                                                       work_matrices%Aop_evects_sub(:, ivect))
-                     ELSE
-                        ! skip trial vectors which are assigned to different parallel groups
-                        CYCLE
-                     END IF
-                  ELSE
-                     CALL tddfpt_apply_hfxlr_kernel(qs_env, sub_env, rcut, scale, work_matrices, &
-                                                    evects(:, ivect), Aop_evects(:, ivect))
-                  END IF
-               END DO
             END IF
          END IF
          IF ((do_bse) .OR. (do_bse_w_only)) THEN
@@ -779,8 +778,9 @@ CONTAINS
 
                      ! eref = e_virt - e_occ - lambda = e_virt - e_occ - (eref_scale*lambda + (1-eref_scale)*lambda);
                      ! eref_new = e_virt - e_occ - eref_scale*lambda = eref + (1 - eref_scale)*lambda
-                     IF (ABS(eref) < threshold) &
+                     IF (ABS(eref) < threshold) THEN
                         eref = eref + (1.0_dp - eref_scale)*lambda
+                     END IF
 
                      weights_ldata(irow_local, icol_local) = weights_ldata(irow_local, icol_local)/eref
                   END DO
@@ -930,8 +930,9 @@ CONTAINS
          conv = MAXVAL(ABS(evals_last(1:nstates) - evals(1:nstates)))
 
          nvects_exist = nvects_exist + nvects_new
-         IF (nvects_exist + nvects_new > max_krylov_vects) &
+         IF (nvects_exist + nvects_new > max_krylov_vects) THEN
             nvects_new = max_krylov_vects - nvects_exist
+         END IF
          IF (iter >= tddfpt_control%niters) nvects_new = 0
 
          IF (conv > tddfpt_control%conv .AND. nvects_new > 0) THEN
@@ -982,8 +983,9 @@ CONTAINS
          IF (iter_unit > 0) THEN
             nstates_conv = 0
             DO istate = 1, nstates
-               IF (ABS(evals_last(istate) - evals(istate)) <= tddfpt_control%conv) &
+               IF (ABS(evals_last(istate) - evals(istate)) <= tddfpt_control%conv) THEN
                   nstates_conv = nstates_conv + 1
+               END IF
             END DO
 
             WRITE (iter_unit, '(T7,I8,T24,F7.1,T40,ES11.4,T66,I8)') iter, t2 - t1, conv, nstates_conv

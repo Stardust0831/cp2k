@@ -6,8 +6,8 @@
 [ "${BASH_SOURCE[0]}" ] && SCRIPT_NAME="${BASH_SOURCE[0]}" || SCRIPT_NAME=$0
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_NAME")/.." && pwd -P)"
 
-libxsmm_ver="2.0.0"
-libxsmm_sha256="7e532dc5520f864ce6d7f44f3fd50365e3edb23da97dbdc54fd53845d86a290b"
+libxsmm_ver="5fdf801"
+libxsmm_sha256="567d0519d24eca37e9033f00626a130fc03ed06d381bbe6feca5b5014f98ee68"
 source "${SCRIPT_DIR}"/common_vars.sh
 source "${SCRIPT_DIR}"/tool_kit.sh
 source "${SCRIPT_DIR}"/signal_trap.sh
@@ -22,8 +22,8 @@ cd "${BUILDDIR}"
 case "$with_libxsmm" in
   __INSTALL__)
     echo "==================== Installing Libxsmm ===================="
-    if [[ ("$OPENBLAS_ARCH" != "x86_64") && ("$OPENBLAS_ARCH" != "arm64") ]]; then
-      report_warning $LINENO "libxsmm is not supported on arch ${OPENBLAS_ARCH}"
+    if [[ ("$SYSTEM_ARCH" != "x86_64") && ("$SYSTEM_ARCH" != "arm64") ]]; then
+      report_warning $LINENO "libxsmm is not supported on arch ${SYSTEM_ARCH}"
       cat << EOF > "${BUILDDIR}/setup_libxsmm"
 with_libxsmm="__DONTUSE__"
 EOF
@@ -34,12 +34,18 @@ EOF
     if verify_checksums "${install_lock_file}"; then
       echo "libxsmm-${libxsmm_ver} is already installed, skipping it."
     else
-      retrieve_package "${libxsmm_sha256}" "libxsmm-${libxsmm_ver}.tar.gz"
+      if [ -f "libxsmm-${libxsmm_ver}.tar.gz" ] && checksum "${libxsmm_sha256}" "libxsmm-${libxsmm_ver}.tar.gz"; then
+        echo "libxsmm-${libxsmm_ver}.tar.gz is found and checksum is right"
+      else
+        download_pkg_from_urlpath "${libxsmm_sha256}" "${libxsmm_ver}" \
+          https://codeload.github.com/libxsmm/libxsmm/tar.gz "libxsmm-${libxsmm_ver}.tar.gz"
+      fi
       echo "Installing from scratch into ${pkg_install_dir}"
       [ -d libxsmm-${libxsmm_ver} ] && rm -rf libxsmm-${libxsmm_ver}
       tar -xzf libxsmm-${libxsmm_ver}.tar.gz
       cd libxsmm-${libxsmm_ver}
-      mkdir build && cd build
+      # Not "build": the source has a file BUILD, and macOS file names ignore case.
+      mkdir build-cp2k && cd build-cp2k
       cmake \
         -DCMAKE_INSTALL_PREFIX="${pkg_install_dir}" \
         -DCMAKE_INSTALL_LIBDIR="lib" \

@@ -80,6 +80,9 @@ MODULE xc_gauxc_interface
    USE gauxc_runtime_environment, ONLY: &
       gauxc_device_runtime_environment_new
 #endif
+#if defined(GAUXC_HAS_DEVICE) && defined(__LIBTORCH)
+   USE torch_api, ONLY: torch_cuda_device_count, torch_cuda_is_available
+#endif
    USE gauxc_molecule, ONLY: &
       gauxc_delete, &
       gauxc_molecule_new_from_atoms, &
@@ -185,6 +188,7 @@ MODULE xc_gauxc_interface
       TYPE(gauxc_molecular_weights_factory_type) :: mwf
       TYPE(gauxc_runtime_environment_type) :: rt
       LOGICAL :: owns_rt = .FALSE.
+      LOGICAL :: uses_device_runtime = .FALSE.
    END TYPE cp_gauxc_grid_type
 
    TYPE cp_gauxc_integrator_type
@@ -507,6 +511,9 @@ CONTAINS
 !> \param status ...
 !> \param mpi_comm optional communicator for a grid-local GauXC runtime
 !> \param force_new_runtime force creation of a grid-local GauXC runtime
+!> \param int_exec_space optional integrator execution space; a DEVICE
+!>        integrator also requires a device runtime even when the load
+!>        balancer stays on the host
 !> \return ...
 ! **************************************************************************************************
    FUNCTION gauxc_create_grid( &
@@ -520,7 +527,8 @@ CONTAINS
       device_runtime_fill_fraction, &
       status, &
       mpi_comm, &
-      force_new_runtime) RESULT(res)
+      force_new_runtime, &
+      int_exec_space) RESULT(res)
 
       TYPE(cp_gauxc_molecule_type), INTENT(IN)           :: molecule
       TYPE(cp_gauxc_basisset_type), INTENT(in)           :: basis
@@ -531,10 +539,12 @@ CONTAINS
       TYPE(cp_gauxc_status_type), INTENT(OUT)            :: status
       INTEGER, INTENT(IN), OPTIONAL                      :: mpi_comm
       LOGICAL, INTENT(IN), OPTIONAL                      :: force_new_runtime
+      CHARACTER(len=*), INTENT(IN), OPTIONAL             :: int_exec_space
       TYPE(cp_gauxc_grid_type)                           :: res
 
 #ifdef __GAUXC
       INTEGER(c_int)                                     :: grid_type_local, int_exec_space_local, &
+                                                            int_exec_requested, &
                                                             lb_exec_space_local, &
                                                             pruning_scheme_local, radial_quad_local
       LOGICAL                                            :: force_new_runtime_local, use_device_runtime
@@ -543,11 +553,28 @@ CONTAINS
       radial_quad_local = read_radial_quad(radial_quadrature)
       pruning_scheme_local = read_pruning_scheme(pruning_scheme)
       lb_exec_space_local = read_execution_space(lb_exec_space)
-      int_exec_space_local = read_execution_space("host")
-      use_device_runtime = (lb_exec_space_local == gauxc_executionspace%device)
+      int_exec_requested = read_execution_space("host")
+      IF (PRESENT(int_exec_space)) int_exec_requested = read_execution_space(int_exec_space)
+      use_device_runtime = (lb_exec_space_local == gauxc_executionspace%device) .OR. &
+                           (int_exec_requested == gauxc_executionspace%device)
+      IF (use_device_runtime) THEN
+         int_exec_space_local = gauxc_executionspace%device
+      ELSE
+         int_exec_space_local = gauxc_executionspace%host
+      END IF
+#if defined(GAUXC_HAS_DEVICE) && defined(__LIBTORCH)
+      IF (use_device_runtime) THEN
+         IF (.NOT. torch_cuda_is_available() .OR. torch_cuda_device_count() <= 0) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "GPU execution was requested for GauXC, but no usable CUDA device was found. "// &
+                          "Set GAUXC%USE_GPU HOST to force host-only execution.")
+         END IF
+      END IF
+#endif
       force_new_runtime_local = .FALSE.
       IF (PRESENT(force_new_runtime)) force_new_runtime_local = force_new_runtime
       res%owns_rt = .FALSE.
+      res%uses_device_runtime = .FALSE.
 
       IF (use_device_runtime) THEN
 #ifdef GAUXC_HAS_DEVICE
@@ -566,6 +593,7 @@ CONTAINS
 #endif
          GAUXC_RETURN_IF_ERROR(status)
          res%owns_rt = .TRUE.
+         res%uses_device_runtime = .TRUE.
 #else
          MARK_USED(device_runtime_fill_fraction)
          CPABORT("GauXC was built without device runtime support")
@@ -642,9 +670,11 @@ CONTAINS
       MARK_USED(batch_size)
       MARK_USED(device_runtime_fill_fraction)
       MARK_USED(grid_type)
+      MARK_USED(int_exec_space)
       MARK_USED(lb_exec_space)
       MARK_USED(mpi_comm)
       MARK_USED(force_new_runtime)
+      MARK_USED(int_exec_space)
       MARK_USED(molecule)
       MARK_USED(pruning_scheme)
       MARK_USED(radial_quadrature)
@@ -730,8 +760,7 @@ CONTAINS
       model) RESULT(res)
 
       TYPE(cp_gauxc_integrator_type), INTENT(IN)         :: integrator
-      ! Must be inout since we need to modify the matrix for some code paths
-      REAL(c_double), DIMENSION(:, :)                    :: density_scalar
+      REAL(c_double), DIMENSION(:, :), INTENT(IN)        :: density_scalar
       REAL(c_double), DIMENSION(:, :), INTENT(IN), &
          OPTIONAL                                        :: density_zeta
       INTEGER, INTENT(IN)                                :: nspins
@@ -742,6 +771,7 @@ CONTAINS
 #ifdef __GAUXC
       CHARACTER(len=default_path_length)                 :: model_key
       LOGICAL                                            :: use_gauxc_model
+      REAL(c_double), ALLOCATABLE, DIMENSION(:, :)       :: density_scalar_rks
 #ifdef GAUXC_HAS_ONEDFT
       REAL(c_double), ALLOCATABLE, DIMENSION(:, :)       :: density_zeta_zero
 #if defined (__HAS_IEEE_EXCEPTIONS)
@@ -817,12 +847,18 @@ CONTAINS
       END IF
 
       IF (nspins == 1) THEN
+         ! xmat factor 2 is applied by both CP2K and GauXC
+         ! "unapply" it here to even things back out.
+         ! This is NOT necessary in the Skala branch.
+         ALLOCATE (density_scalar_rks, mold=density_scalar)
+         density_scalar_rks(:, :) = 0.5_dp*density_scalar
          CALL gauxc_integrator_eval_exc_vxc_rks( &
             status%status, &
             integrator%integrator, &
-            density_scalar, &
+            density_scalar_rks, &
             res%exc, &
             res%vxc_scalar)
+         DEALLOCATE (density_scalar_rks)
       ELSE
          CPASSERT(PRESENT(density_zeta))
 
@@ -887,6 +923,7 @@ CONTAINS
 #ifdef __GAUXC
       CHARACTER(len=default_path_length)                 :: model_key
       LOGICAL                                            :: use_gauxc_model
+      REAL(c_double), ALLOCATABLE, DIMENSION(:, :)       :: density_scalar_rks
 #ifdef GAUXC_HAS_ONEDFT
       REAL(c_double), ALLOCATABLE, DIMENSION(:, :)       :: density_zeta_zero
 #if defined (__HAS_IEEE_EXCEPTIONS)
@@ -947,11 +984,14 @@ CONTAINS
       END IF
 
       IF (nspins == 1) THEN
+         ALLOCATE (density_scalar_rks, mold=density_scalar)
+         density_scalar_rks(:, :) = 0.5_dp*density_scalar
          CALL gauxc_integrator_eval_exc_grad_rks( &
             status%status, &
             integrator%integrator, &
-            density_scalar, &
+            density_scalar_rks, &
             res%exc_grad)
+         DEALLOCATE (density_scalar_rks)
       ELSE
          CPASSERT(PRESENT(density_zeta))
          CALL gauxc_integrator_eval_exc_grad_uks( &

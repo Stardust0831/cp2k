@@ -12,21 +12,26 @@
 !> \author JGH
 ! **************************************************************************************************
 MODULE input_cp2k_kpoints
-   USE bibliography,                    ONLY: MacDonald1978,&
-                                              Monkhorst1976
-   USE input_keyword_types,             ONLY: keyword_create,&
-                                              keyword_release,&
-                                              keyword_type
-   USE input_section_types,             ONLY: section_add_keyword,&
-                                              section_create,&
-                                              section_type
-   USE input_val_types,                 ONLY: char_t,&
-                                              enum_t,&
-                                              real_t
-   USE kinds,                           ONLY: default_path_length,&
-                                              dp
-   USE string_utilities,                ONLY: newline,&
-                                              s2a
+   USE bibliography, ONLY: MacDonald1978, &
+                           Monkhorst1976, &
+                           Quan2026
+   USE cp_units, ONLY: cp_unit_to_cp2k
+   USE input_constants, ONLY: rskp_backend_fft, &
+                              rskp_backend_gemm
+   USE input_keyword_types, ONLY: keyword_create, &
+                                  keyword_release, &
+                                  keyword_type
+   USE input_section_types, ONLY: section_add_keyword, &
+                                  section_create, &
+                                  section_type
+   USE input_val_types, ONLY: char_t, &
+                              enum_t, &
+                              integer_t, &
+                              real_t
+   USE kinds, ONLY: default_path_length, &
+                    dp
+   USE string_utilities, ONLY: newline, &
+                               s2a
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -43,6 +48,7 @@ MODULE input_cp2k_kpoints
 
    PUBLIC :: create_kpoints_section
    PUBLIC :: create_kpoint_set_section
+   PUBLIC :: create_unfolding_section
    PUBLIC :: use_real_wfn, use_complex_wfn
    PUBLIC :: use_k290_kpoint_symmetry, use_spglib_kpoint_symmetry
    PUBLIC :: use_k290_kpoint_backend, use_spglib_kpoint_backend
@@ -59,6 +65,7 @@ CONTAINS
 !>      SYMMETRY         [on, off]
 !>      WAVEFUNCTION     [real, complex]
 !>      FULL_GRID        [on, off]
+!>      RSKP_TRANSFORM   [gemm, fft]
 !>      INVERSION_SYMMETRY_ONLY [on, off]
 !>      DEBUG_FULL_KPOINT_SYMMETRY [on, off]
 !>      SYMMETRY_BACKEND [K290, SPGLIB]
@@ -142,6 +149,21 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="RSKP_TRANSFORM", &
+                          description="Select the backend for bulk real-space/k-point transforms, including RI-RS GW. "// &
+                          "GEMM contracts captured image panels with Bloch phases in k-point batches. "// &
+                          "FFT uses supported regular grids; forward transforms also accept subsets. "// &
+                          "Inverse FFT accepts weighted regular-grid subsets "// &
+                          "without spatial rotations. Explicit single-point and property Fourier calls "// &
+                          "are independent of this setting. Unsupported forced FFT configurations abort.", &
+                          usage="RSKP_TRANSFORM GEMM", type_of_var=enum_t, &
+                          enum_c_vals=s2a("GEMM", "FFT"), &
+                          enum_i_vals=[rskp_backend_gemm, rskp_backend_fft], &
+                          enum_desc=s2a("Use sparse phase GEMMs.", "Use regular-grid lattice FFTs."), &
+                          default_i_val=rskp_backend_gemm)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="INVERSION_SYMMETRY_ONLY", &
                           description="Restrict k-point reduction to k-space inversion "// &
                           "(time-reversal) symmetry.", &
@@ -202,6 +224,9 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="EPS_SYMMETRY", variants=["EPS_GEO"], &
                           description="Accuracy in k-point symmetry determination."//newline// &
+                          "K290 applies this value in lattice and fractional-coordinate checks. "// &
+                          "SPGLIB uses a Cartesian distance tolerance in bohr. The same numerical "// &
+                          "value is therefore not an equivalent geometric tolerance for both backends."//newline// &
                           "EPS_GEO is accepted as an alias.", &
                           usage="EPS_SYMMETRY <real>", &
                           default_r_val=1.0e-6_dp)
@@ -211,7 +236,8 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="PARALLEL_GROUP_SIZE", &
                           description="Number of MPI processes to be used for a single k-point."// &
                           " This number must divide the total number of processes."// &
-                          " The number of groups must divide the total number of kpoints."// &
+                          " The number of groups must not exceed the number of kpoints."// &
+                          " Kpoints are distributed as evenly as possible among the groups."// &
                           " Value=-1 (smallest possible number of processes per group, satisfying the constraints)."// &
                           " Value=0 (all processes)."// &
                           " Value=n (exactly n processes).", &
@@ -284,5 +310,97 @@ CONTAINS
       CALL keyword_release(keyword)
 
    END SUBROUTINE create_kpoint_set_section
+
+! **************************************************************************************************
+!> \brief Unfolding subsection of &BAND_STRUCTURE: projection of supercell bands onto a
+!>        primitive-cell k-path (Quan et al., PRB 113, 085112 (2026))
+!> \param section ...
+! **************************************************************************************************
+   SUBROUTINE create_unfolding_section(section)
+      TYPE(section_type), POINTER                        :: section
+
+      TYPE(keyword_type), POINTER                        :: keyword
+
+      CPASSERT(.NOT. ASSOCIATED(section))
+      CALL section_create(section, __LOCATION__, name="UNFOLDING", &
+                          description="Unfold the supercell band structure onto a primitive"// &
+                          " cell. When this section is enabled, SPECIAL_POINTs give"// &
+                          " primitive-cell k coordinates. CP2K diagonalizes the unique folded"// &
+                          " supercell K-points and writes the total spectral weight in column 4"// &
+                          " of the band structure file (followed by per-group weights when"// &
+                          " multiple ATOMS groups are defined).", &
+                          n_keywords=0, n_subsections=0, repeats=.FALSE., &
+                          citations=[Quan2026])
+      NULLIFY (keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="TRANSFORMATION_MATRIX", &
+                          description="Integer $3 \times 3$ matrix $\mathbf{M}$ relating the"// &
+                          " supercell vectors $\mathbf{A}_1, \mathbf{A}_2, \mathbf{A}_3$ in"// &
+                          " [CELL](#CP2K_INPUT.FORCE_EVAL.SUBSYS.CELL) (after"// &
+                          " MULTIPLE_UNIT_CELL, if any) to the target primitive-cell vectors"// &
+                          " $\mathbf{a}_1, \mathbf{a}_2, \mathbf{a}_3$:"// &
+                          " $[\mathbf{A}_1\ \mathbf{A}_2\ \mathbf{A}_3] ="// &
+                          " [\mathbf{a}_1\ \mathbf{a}_2\ \mathbf{a}_3]\,\mathbf{M}$, so"// &
+                          " column $j$ of $\mathbf{M}$ gives the expansion coefficients"// &
+                          " $\mathbf{A}_j = \sum_{i=1}^{3} M_{ij}\mathbf{a}_i$. Give the nine"// &
+                          " entries row by row."//newline//newline// &
+                          "Example: a hexagonal primitive cell"// &
+                          " ($\gamma = 120^\circ$) and its orthorhombic supercell"// &
+                          " $\mathbf{A}_1 = \mathbf{a}_1$,"// &
+                          " $\mathbf{A}_2 = \mathbf{a}_1 + 2\mathbf{a}_2$,"// &
+                          " $\mathbf{A}_3 = \mathbf{a}_3$ give"// &
+                          " $\mathbf{M} = \begin{bmatrix} 1 & 1 & 0 \\ 0 & 2 & 0"// &
+                          " \\ 0 & 0 & 1 \end{bmatrix}$ ($m = |\det\mathbf{M}| = 2$), entered"// &
+                          " as `1 1 0 0 2 0 0 0 1`. This column-vector convention matches"// &
+                          " VESTA and Phonopy, and is the transpose of row-vector conventions"// &
+                          " such as ASE and pymatgen. To verify $\mathbf{M}$, compare the"// &
+                          " primitive cell vectors printed in the `UNFOLD_BAND|` summary with"// &
+                          " the intended primitive cell; for a defect-free supercell the"// &
+                          " number of incomplete sets must be zero.", &
+                          usage="TRANSFORMATION_MATRIX 1 1 0 0 2 0 0 0 1", &
+                          type_of_var=integer_t, n_var=9, &
+                          default_i_vals=[1, 0, 0, 0, 1, 0, 0, 0, 1])
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="ATOMS", &
+                          description="Select which supercell atoms are unfolded. Repeat the"// &
+                          " keyword to define disjoint atom groups; equivalent primitive-cell"// &
+                          " sites (see SYMM_TOL) are identified independently within each"// &
+                          " group."//newline//newline// &
+                          "- Absent: all atoms are unfolded together as a single group."//newline// &
+                          "- Given once: only the listed atoms are unfolded; unlisted atoms"// &
+                          " are excluded from the weights (e.g., a film on an incommensurate"// &
+                          " substrate)."//newline// &
+                          "- Given $G \ge 2$ times: each group is unfolded independently."// &
+                          " Column 4 holds the combined weight and columns 5 to $4+G$ hold"// &
+                          " the per-group weights (e.g., layer-resolved weights in a"// &
+                          " heterostructure). Atoms not listed in any group are excluded."// &
+                          " With $\mathbf{M} = \mathbf{I}$ this reduces to Loewdin-projected"// &
+                          " (fat) bands per group.", &
+                          usage="ATOMS 1..24", n_var=-1, type_of_var=integer_t, repeats=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="SYMM_TOL", &
+                          description="Cartesian tolerance used to identify equivalent sites:"// &
+                          " sets of supercell atoms that are images of the same"// &
+                          " primitive-cell site under primitive lattice translations. Atoms"// &
+                          " are matched by element (with GHOST kinds treated as their base"// &
+                          " element), and equivalent atoms must share the same basis set. In"// &
+                          " an ideal supercell each set contains $m = |\det\mathbf{M}|$ atoms;"// &
+                          " a vacancy leaves an incomplete set with fewer members. The"// &
+                          " tolerance must be positive and smaller than half the smallest"// &
+                          " primitive-cell plane distance (checked at runtime), with a"// &
+                          " $0.5\,\mathrm{\AA}$ default suited to typical thermal"// &
+                          " displacements. Check the `UNFOLD_BAND|` summary in the output: if"// &
+                          " large relaxations split equivalent atoms into unexpected"// &
+                          " incomplete sets (leaving uncancelled folded bands), increase"// &
+                          " SYMM_TOL; if nearby inequivalent sites trigger an"// &
+                          " assignment-conflict or ambiguity abort, decrease SYMM_TOL or"// &
+                          " separate them with ATOMS.", &
+                          usage="SYMM_TOL 0.5", unit_str="angstrom", &
+                          default_r_val=cp_unit_to_cp2k(0.5_dp, "angstrom"))
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+   END SUBROUTINE create_unfolding_section
 
 END MODULE input_cp2k_kpoints

@@ -12,22 +12,14 @@
 ! **************************************************************************************************
 MODULE bse_util
    USE atomic_kind_types,               ONLY: atomic_kind_type
+   USE bse_types,                       ONLY: bse_env_type
    USE cell_types,                      ONLY: cell_type
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_control_types,                ONLY: dft_control_type
-   USE cp_dbcsr_api,                    ONLY: dbcsr_create,&
-                                              dbcsr_init_p,&
-                                              dbcsr_p_type,&
-                                              dbcsr_set,&
-                                              dbcsr_type_symmetric
-   USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
-   USE cp_dbcsr_operations,             ONLY: cp_dbcsr_sm_fm_multiply,&
-                                              dbcsr_allocate_matrix_set,&
-                                              dbcsr_deallocate_matrix_set
-   USE cp_fm_basic_linalg,              ONLY: cp_fm_trace,&
-                                              cp_fm_uplo_to_full
-   USE cp_fm_cholesky,                  ONLY: cp_fm_cholesky_decompose,&
-                                              cp_fm_cholesky_invert
+   USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
+   USE cp_dbcsr_operations,             ONLY: cp_dbcsr_sm_fm_multiply
+   USE cp_fm_basic_linalg,              ONLY: cp_fm_trace
+   USE cp_fm_redistribution,            ONLY: cp_fm_permute
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
@@ -43,41 +35,35 @@ MODULE bse_util
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
    USE cp_realspace_grid_cube,          ONLY: cp_pw_to_cube
-   USE input_constants,                 ONLY: bse_screening_alpha,&
+   USE input_constants,                 ONLY: bse_iterdiag,&
+                                              bse_screening_alpha,&
                                               bse_screening_rpa,&
-                                              bse_screening_tdhf,&
-                                              use_mom_ref_coac
-   USE input_section_types,             ONLY: section_vals_type
+                                              bse_screening_tdhf
+   USE input_section_types,             ONLY: section_vals_type,&
+                                              section_vals_val_get
    USE kinds,                           ONLY: default_path_length,&
                                               dp,&
                                               int_8
-   USE message_passing,                 ONLY: mp_para_env_type,&
-                                              mp_request_type
-   USE moments_utils,                   ONLY: get_reference_point
-   USE mp2_types,                       ONLY: integ_mat_buffer_type,&
-                                              mp2_type
+   USE message_passing,                 ONLY: mp_para_env_type
+   USE mo_window,                       ONLY: combine_mo_windows,&
+                                              determine_mo_window,&
+                                              mo_window_type
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_list_types,             ONLY: particle_list_type
    USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: evolt
    USE pw_env_types,                    ONLY: pw_env_get,&
                                               pw_env_type
-   USE pw_poisson_types,                ONLY: pw_poisson_type
    USE pw_pool_types,                   ONLY: pw_pool_p_type,&
                                               pw_pool_type
    USE pw_types,                        ONLY: pw_c1d_gs_type,&
                                               pw_r3d_rs_type
    USE qs_collocate_density,            ONLY: calculate_wavefunction
-   USE qs_environment_types,            ONLY: get_qs_env,&
-                                              qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE qs_mo_types,                     ONLY: get_mo_set,&
                                               mo_set_type
-   USE qs_moments,                      ONLY: build_local_moment_matrix
-   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_subsys_types,                 ONLY: qs_subsys_get,&
                                               qs_subsys_type
-   USE rpa_communication,               ONLY: communicate_buffer
    USE util,                            ONLY: sort,&
                                               sort_unique
 #include "./base/base_uses.f90"
@@ -88,691 +74,108 @@ MODULE bse_util
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'bse_util'
 
-   PUBLIC :: mult_B_with_W, fm_general_add_bse, truncate_fm, &
-             deallocate_matrices_bse, comp_eigvec_coeff_BSE, sort_excitations, &
-             estimate_BSE_resources, filter_eigvec_contrib, truncate_BSE_matrices, &
-             determine_cutoff_indices, adapt_BSE_input_params, get_multipoles_mo, &
-             reshuffle_eigvec, print_bse_nto_cubes, trace_exciton_descr
+   PUBLIC :: screen_slabs, bse_window_from_dft, bse_window_from_mos, &
+             comp_eigvec_coeff_BSE, sort_excitations, &
+             estimate_BSE_resources, fulldiag_memory_estimate_GB, filter_eigvec_contrib, truncate_BSE_matrices, &
+             adapt_BSE_input_params, adapt_BSE_screening, get_multipoles_mo, &
+             reshuffle_eigvec, print_bse_nto_cubes, trace_exciton_descr, &
+             get_bse_spin_block_layout, assemble_joint_ov_slab, &
+             ia_of_occ_virt, occ_of_ia, virt_of_ia
 
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Multiplies B-matrix (RI-3c-Integrals) with W (screening) to obtain \bar{B}
-!> \param fm_mat_S_ij_bse ...
-!> \param fm_mat_S_ia_bse ...
-!> \param fm_mat_S_bar_ia_bse ...
-!> \param fm_mat_S_bar_ij_bse ...
-!> \param fm_mat_Q_static_bse_gemm ...
-!> \param dimen_RI ...
-!> \param homo ...
-!> \param virtual ...
+!> \brief Compound transition index ia = (i-1)*virt + a of the pair (i, a): a is the fast index
+!> \param i_occ occupied level
+!> \param a_virt virtual level
+!> \param virt number of virtual levels
+!> \return ia
 ! **************************************************************************************************
-   SUBROUTINE mult_B_with_W(fm_mat_S_ij_bse, fm_mat_S_ia_bse, fm_mat_S_bar_ia_bse, &
-                            fm_mat_S_bar_ij_bse, fm_mat_Q_static_bse_gemm, &
-                            dimen_RI, homo, virtual)
+   PURE FUNCTION ia_of_occ_virt(i_occ, a_virt, virt) RESULT(ia)
 
-      TYPE(cp_fm_type), INTENT(IN)                       :: fm_mat_S_ij_bse, fm_mat_S_ia_bse
-      TYPE(cp_fm_type), INTENT(OUT)                      :: fm_mat_S_bar_ia_bse, fm_mat_S_bar_ij_bse
-      TYPE(cp_fm_type), INTENT(IN)                       :: fm_mat_Q_static_bse_gemm
-      INTEGER, INTENT(IN)                                :: dimen_RI, homo, virtual
+      INTEGER, INTENT(IN)                                :: i_occ, a_virt, virt
+      INTEGER                                            :: ia
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'mult_B_with_W'
+      ia = (i_occ - 1)*virt + a_virt
 
-      INTEGER                                            :: handle, i_global, iiB, info_chol, &
-                                                            j_global, jjB, ncol_local, nrow_local
-      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
-      TYPE(cp_fm_type)                                   :: fm_work
-
-      CALL timeset(routineN, handle)
-
-      CALL cp_fm_create(fm_mat_S_bar_ia_bse, fm_mat_S_ia_bse%matrix_struct)
-      CALL cp_fm_set_all(fm_mat_S_bar_ia_bse, 0.0_dp)
-
-      CALL cp_fm_create(fm_mat_S_bar_ij_bse, fm_mat_S_ij_bse%matrix_struct)
-      CALL cp_fm_set_all(fm_mat_S_bar_ij_bse, 0.0_dp)
-
-      CALL cp_fm_create(fm_work, fm_mat_Q_static_bse_gemm%matrix_struct)
-      CALL cp_fm_set_all(fm_work, 0.0_dp)
-
-      ! get info of fm_mat_Q_static_bse and compute ((1+Q(0))^-1-1)
-      CALL cp_fm_get_info(matrix=fm_mat_Q_static_bse_gemm, &
-                          nrow_local=nrow_local, &
-                          ncol_local=ncol_local, &
-                          row_indices=row_indices, &
-                          col_indices=col_indices)
-
-      DO jjB = 1, ncol_local
-         j_global = col_indices(jjB)
-         DO iiB = 1, nrow_local
-            i_global = row_indices(iiB)
-            IF (j_global == i_global .AND. i_global <= dimen_RI) THEN
-               fm_mat_Q_static_bse_gemm%local_data(iiB, jjB) = fm_mat_Q_static_bse_gemm%local_data(iiB, jjB) + 1.0_dp
-            END IF
-         END DO
-      END DO
-
-      ! calculate Trace(Log(Matrix)) as Log(DET(Matrix)) via cholesky decomposition
-      CALL cp_fm_cholesky_decompose(matrix=fm_mat_Q_static_bse_gemm, n=dimen_RI, info_out=info_chol)
-
-      IF (info_chol /= 0) THEN
-         CALL cp_abort(__LOCATION__, 'Cholesky decomposition failed for static polarization in BSE')
-      END IF
-
-      ! calculate [1+Q(i0)]^-1
-      CALL cp_fm_cholesky_invert(fm_mat_Q_static_bse_gemm)
-
-      ! symmetrize the result
-      CALL cp_fm_uplo_to_full(fm_mat_Q_static_bse_gemm, fm_work)
-
-      CALL parallel_gemm(transa="N", transb="N", m=dimen_RI, n=homo**2, k=dimen_RI, alpha=1.0_dp, &
-                         matrix_a=fm_mat_Q_static_bse_gemm, matrix_b=fm_mat_S_ij_bse, beta=0.0_dp, &
-                         matrix_c=fm_mat_S_bar_ij_bse)
-
-      ! fm_mat_S_bar_ia_bse has a different blacs_env as fm_mat_S_ij_bse since we take
-      ! fm_mat_S_ia_bse from RPA. Therefore, we also need a different fm_mat_Q_static_bse_gemm
-      CALL parallel_gemm(transa="N", transb="N", m=dimen_RI, n=homo*virtual, k=dimen_RI, alpha=1.0_dp, &
-                         matrix_a=fm_mat_Q_static_bse_gemm, matrix_b=fm_mat_S_ia_bse, beta=0.0_dp, &
-                         matrix_c=fm_mat_S_bar_ia_bse)
-
-      CALL cp_fm_release(fm_work)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE mult_B_with_W
+   END FUNCTION ia_of_occ_virt
 
 ! **************************************************************************************************
-!> \brief Adds and reorders full matrices with a combined index structure, e.g. adding W_ij,ab
-!> to A_ia, jb which needs MPI communication.
-!> \param fm_out ...
-!> \param fm_in ...
-!> \param beta ...
-!> \param nrow_secidx_in ...
-!> \param ncol_secidx_in ...
-!> \param nrow_secidx_out ...
-!> \param ncol_secidx_out ...
-!> \param unit_nr ...
-!> \param reordering ...
-!> \param mp2_env ...
+!> \brief Occupied level of the compound transition index ia = (i-1)*virt + a
+!> \param ia compound transition index
+!> \param virt number of virtual levels
+!> \return i
 ! **************************************************************************************************
-   SUBROUTINE fm_general_add_bse(fm_out, fm_in, beta, nrow_secidx_in, ncol_secidx_in, &
-                                 nrow_secidx_out, ncol_secidx_out, unit_nr, reordering, mp2_env)
+   PURE FUNCTION occ_of_ia(ia, virt) RESULT(i_occ)
 
-      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_out
-      TYPE(cp_fm_type), INTENT(IN)                       :: fm_in
-      REAL(kind=dp)                                      :: beta
-      INTEGER, INTENT(IN)                                :: nrow_secidx_in, ncol_secidx_in, &
-                                                            nrow_secidx_out, ncol_secidx_out
-      INTEGER                                            :: unit_nr
-      INTEGER, DIMENSION(4)                              :: reordering
-      TYPE(mp2_type), INTENT(IN)                         :: mp2_env
+      INTEGER, INTENT(IN)                                :: ia, virt
+      INTEGER                                            :: i_occ
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'fm_general_add_bse'
+      i_occ = (ia - 1)/virt + 1
 
-      INTEGER :: col_idx_loc, dummy, handle, handle2, i_entry_rec, idx_col_out, idx_row_out, ii, &
-         iproc, jj, ncol_block_in, ncol_block_out, ncol_local_in, ncol_local_out, nprocs, &
-         nrow_block_in, nrow_block_out, nrow_local_in, nrow_local_out, proc_send, row_idx_loc, &
-         send_pcol, send_prow
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: entry_counter, num_entries_rec, &
-                                                            num_entries_send
-      INTEGER, DIMENSION(4)                              :: indices_in
-      INTEGER, DIMENSION(:), POINTER                     :: col_indices_in, col_indices_out, &
-                                                            row_indices_in, row_indices_out
-      TYPE(integ_mat_buffer_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: buffer_rec, buffer_send
-      TYPE(mp_para_env_type), POINTER                    :: para_env_out
-      TYPE(mp_request_type), DIMENSION(:, :), POINTER    :: req_array
-
-      CALL timeset(routineN, handle)
-      CALL timeset(routineN//"_1_setup", handle2)
-
-      para_env_out => fm_out%matrix_struct%para_env
-      ! A_iajb
-      ! We start by moving data from local parts of W_ijab to the full matrix A_iajb using buffers
-      CALL cp_fm_get_info(matrix=fm_out, &
-                          nrow_local=nrow_local_out, &
-                          ncol_local=ncol_local_out, &
-                          row_indices=row_indices_out, &
-                          col_indices=col_indices_out, &
-                          nrow_block=nrow_block_out, &
-                          ncol_block=ncol_block_out)
-
-      ALLOCATE (num_entries_rec(0:para_env_out%num_pe - 1))
-      ALLOCATE (num_entries_send(0:para_env_out%num_pe - 1))
-
-      num_entries_rec(:) = 0
-      num_entries_send(:) = 0
-
-      dummy = 0
-
-      CALL cp_fm_get_info(matrix=fm_in, &
-                          nrow_local=nrow_local_in, &
-                          ncol_local=ncol_local_in, &
-                          row_indices=row_indices_in, &
-                          col_indices=col_indices_in, &
-                          nrow_block=nrow_block_in, &
-                          ncol_block=ncol_block_in)
-
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A14,A10,T71,I10)') 'BSE|DEBUG|', 'Row number of ', fm_out%name, &
-            fm_out%matrix_struct%nrow_global
-         WRITE (unit_nr, '(T2,A10,T13,A17,A10,T71,I10)') 'BSE|DEBUG|', 'Column number of ', fm_out%name, &
-            fm_out%matrix_struct%ncol_global
-
-         WRITE (unit_nr, '(T2,A10,T13,A18,A10,T71,I10)') 'BSE|DEBUG|', 'Row block size of ', fm_out%name, nrow_block_out
-         WRITE (unit_nr, '(T2,A10,T13,A21,A10,T71,I10)') 'BSE|DEBUG|', 'Column block size of ', fm_out%name, ncol_block_out
-
-         WRITE (unit_nr, '(T2,A10,T13,A14,A10,T71,I10)') 'BSE|DEBUG|', 'Row number of ', fm_in%name, &
-            fm_in%matrix_struct%nrow_global
-         WRITE (unit_nr, '(T2,A10,T13,A17,A10,T71,I10)') 'BSE|DEBUG|', 'Column number of ', fm_in%name, &
-            fm_in%matrix_struct%ncol_global
-
-         WRITE (unit_nr, '(T2,A10,T13,A18,A10,T71,I10)') 'BSE|DEBUG|', 'Row block size of ', fm_in%name, nrow_block_in
-         WRITE (unit_nr, '(T2,A10,T13,A21,A10,T71,I10)') 'BSE|DEBUG|', 'Column block size of ', fm_in%name, ncol_block_in
-      END IF
-
-      ! Use scalapack wrapper to find process index in fm_out
-      ! To that end, we obtain the global index in fm_out from the level indices
-      indices_in(:) = 0
-      DO row_idx_loc = 1, nrow_local_in
-         indices_in(1) = (row_indices_in(row_idx_loc) - 1)/nrow_secidx_in + 1
-         indices_in(2) = MOD(row_indices_in(row_idx_loc) - 1, nrow_secidx_in) + 1
-         DO col_idx_loc = 1, ncol_local_in
-            indices_in(3) = (col_indices_in(col_idx_loc) - 1)/ncol_secidx_in + 1
-            indices_in(4) = MOD(col_indices_in(col_idx_loc) - 1, ncol_secidx_in) + 1
-
-            idx_row_out = indices_in(reordering(2)) + (indices_in(reordering(1)) - 1)*nrow_secidx_out
-            idx_col_out = indices_in(reordering(4)) + (indices_in(reordering(3)) - 1)*ncol_secidx_out
-
-            send_prow = fm_out%matrix_struct%g2p_row(idx_row_out)
-            send_pcol = fm_out%matrix_struct%g2p_col(idx_col_out)
-
-            proc_send = fm_out%matrix_struct%context%blacs2mpi(send_prow, send_pcol)
-
-            num_entries_send(proc_send) = num_entries_send(proc_send) + 1
-
-         END DO
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_2_comm_entry_nums", handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A27)') 'BSE|DEBUG|', 'Communicating entry numbers'
-      END IF
-
-      CALL para_env_out%alltoall(num_entries_send, num_entries_rec, 1)
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_3_alloc_buffer", handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A18)') 'BSE|DEBUG|', 'Allocating buffers'
-      END IF
-
-      ! Buffers for entries and their indices
-      ALLOCATE (buffer_rec(0:para_env_out%num_pe - 1))
-      ALLOCATE (buffer_send(0:para_env_out%num_pe - 1))
-
-      ! allocate data message and corresponding indices
-      DO iproc = 0, para_env_out%num_pe - 1
-
-         ALLOCATE (buffer_rec(iproc)%msg(num_entries_rec(iproc)))
-         buffer_rec(iproc)%msg = 0.0_dp
-
-      END DO
-
-      DO iproc = 0, para_env_out%num_pe - 1
-
-         ALLOCATE (buffer_send(iproc)%msg(num_entries_send(iproc)))
-         buffer_send(iproc)%msg = 0.0_dp
-
-      END DO
-
-      DO iproc = 0, para_env_out%num_pe - 1
-
-         ALLOCATE (buffer_rec(iproc)%indx(num_entries_rec(iproc), 2))
-         buffer_rec(iproc)%indx = 0
-
-      END DO
-
-      DO iproc = 0, para_env_out%num_pe - 1
-
-         ALLOCATE (buffer_send(iproc)%indx(num_entries_send(iproc), 2))
-         buffer_send(iproc)%indx = 0
-
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_4_buf_from_fmin_"//fm_out%name, handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A18,A10,A13)') 'BSE|DEBUG|', 'Writing data from ', fm_in%name, ' into buffers'
-      END IF
-
-      ALLOCATE (entry_counter(0:para_env_out%num_pe - 1))
-      entry_counter(:) = 0
-
-      ! Now we can write the actual data and indices to the send-buffer
-      DO row_idx_loc = 1, nrow_local_in
-         indices_in(1) = (row_indices_in(row_idx_loc) - 1)/nrow_secidx_in + 1
-         indices_in(2) = MOD(row_indices_in(row_idx_loc) - 1, nrow_secidx_in) + 1
-         DO col_idx_loc = 1, ncol_local_in
-            indices_in(3) = (col_indices_in(col_idx_loc) - 1)/ncol_secidx_in + 1
-            indices_in(4) = MOD(col_indices_in(col_idx_loc) - 1, ncol_secidx_in) + 1
-
-            idx_row_out = indices_in(reordering(2)) + (indices_in(reordering(1)) - 1)*nrow_secidx_out
-            idx_col_out = indices_in(reordering(4)) + (indices_in(reordering(3)) - 1)*ncol_secidx_out
-
-            send_prow = fm_out%matrix_struct%g2p_row(idx_row_out)
-            send_pcol = fm_out%matrix_struct%g2p_col(idx_col_out)
-
-            proc_send = fm_out%matrix_struct%context%blacs2mpi(send_prow, send_pcol)
-            entry_counter(proc_send) = entry_counter(proc_send) + 1
-
-            buffer_send(proc_send)%msg(entry_counter(proc_send)) = &
-               fm_in%local_data(row_idx_loc, col_idx_loc)
-
-            buffer_send(proc_send)%indx(entry_counter(proc_send), 1) = idx_row_out
-            buffer_send(proc_send)%indx(entry_counter(proc_send), 2) = idx_col_out
-
-         END DO
-      END DO
-
-      ALLOCATE (req_array(1:para_env_out%num_pe, 4))
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_5_comm_buffer", handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A21)') 'BSE|DEBUG|', 'Communicating buffers'
-      END IF
-
-      ! communicate the buffer
-      CALL communicate_buffer(para_env_out, num_entries_rec, num_entries_send, buffer_rec, &
-                              buffer_send, req_array)
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_6_buffer_to_fmout"//fm_out%name, handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A24,A10)') 'BSE|DEBUG|', 'Writing from buffers to ', fm_out%name
-      END IF
-
-      ! fill fm_out with the entries from buffer_rec, i.e. buffer_rec are parts of fm_in
-      nprocs = para_env_out%num_pe
-
-!$OMP PARALLEL DO DEFAULT(NONE) &
-!$OMP SHARED(fm_out, nprocs, num_entries_rec, buffer_rec, beta) &
-!$OMP PRIVATE(iproc, i_entry_rec, ii, jj)
-      DO iproc = 0, nprocs - 1
-         DO i_entry_rec = 1, num_entries_rec(iproc)
-            ii = fm_out%matrix_struct%g2l_row(buffer_rec(iproc)%indx(i_entry_rec, 1))
-            jj = fm_out%matrix_struct%g2l_col(buffer_rec(iproc)%indx(i_entry_rec, 2))
-
-            fm_out%local_data(ii, jj) = fm_out%local_data(ii, jj) + beta*buffer_rec(iproc)%msg(i_entry_rec)
-         END DO
-      END DO
-!$OMP END PARALLEL DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_7_cleanup", handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A41)') 'BSE|DEBUG|', 'Starting cleanup of communication buffers'
-      END IF
-
-      !Clean up all the arrays from the communication process
-      DO iproc = 0, para_env_out%num_pe - 1
-         DEALLOCATE (buffer_rec(iproc)%msg)
-         DEALLOCATE (buffer_rec(iproc)%indx)
-         DEALLOCATE (buffer_send(iproc)%msg)
-         DEALLOCATE (buffer_send(iproc)%indx)
-      END DO
-      DEALLOCATE (buffer_rec, buffer_send)
-      DEALLOCATE (req_array)
-      DEALLOCATE (entry_counter)
-      DEALLOCATE (num_entries_rec, num_entries_send)
-
-      CALL timestop(handle2)
-      CALL timestop(handle)
-
-   END SUBROUTINE fm_general_add_bse
+   END FUNCTION occ_of_ia
 
 ! **************************************************************************************************
-!> \brief Routine for truncating a full matrix as given by the energy cutoffs in the input file.
-!>  Logic: Matrices have some dimension dimen_RI x nrow_in*ncol_in  for the incoming (untruncated) matrix
-!>  and dimen_RI x nrow_out*ncol_out for the truncated matrix. The truncation is done by resorting the indices
-!>  via parallel communication.
-!> \param fm_out ...
-!> \param fm_in ...
-!> \param ncol_in ...
-!> \param nrow_out ...
-!> \param ncol_out ...
-!> \param unit_nr ...
-!> \param mp2_env ...
-!> \param nrow_offset ...
-!> \param ncol_offset ...
+!> \brief Virtual level of the compound transition index ia = (i-1)*virt + a
+!> \param ia compound transition index
+!> \param virt number of virtual levels
+!> \return a
 ! **************************************************************************************************
-   SUBROUTINE truncate_fm(fm_out, fm_in, ncol_in, &
-                          nrow_out, ncol_out, unit_nr, mp2_env, &
-                          nrow_offset, ncol_offset)
+   PURE FUNCTION virt_of_ia(ia, virt) RESULT(a_virt)
 
-      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_out
-      TYPE(cp_fm_type), INTENT(IN)                       :: fm_in
-      INTEGER                                            :: ncol_in, nrow_out, ncol_out, unit_nr
-      TYPE(mp2_type), INTENT(INOUT)                      :: mp2_env
-      INTEGER, INTENT(IN), OPTIONAL                      :: nrow_offset, ncol_offset
+      INTEGER, INTENT(IN)                                :: ia, virt
+      INTEGER                                            :: a_virt
 
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'truncate_fm'
+      a_virt = MOD(ia - 1, virt) + 1
 
-      INTEGER :: col_idx_loc, dummy, handle, handle2, i_entry_rec, idx_col_first, idx_col_in, &
-         idx_col_out, idx_col_sec, idx_row_in, ii, iproc, jj, ncol_block_in, ncol_block_out, &
-         ncol_local_in, ncol_local_out, nprocs, nrow_block_in, nrow_block_out, nrow_local_in, &
-         nrow_local_out, proc_send, row_idx_loc, send_pcol, send_prow
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: entry_counter, num_entries_rec, &
-                                                            num_entries_send
-      INTEGER, DIMENSION(:), POINTER                     :: col_indices_in, col_indices_out, &
-                                                            row_indices_in, row_indices_out
-      LOGICAL                                            :: correct_ncol, correct_nrow
-      TYPE(integ_mat_buffer_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: buffer_rec, buffer_send
-      TYPE(mp_para_env_type), POINTER                    :: para_env_out
-      TYPE(mp_request_type), DIMENSION(:, :), POINTER    :: req_array
-
-      CALL timeset(routineN, handle)
-      CALL timeset(routineN//"_1_setup", handle2)
-
-      correct_nrow = .FALSE.
-      correct_ncol = .FALSE.
-      !In case of truncation in the occupied space, we need to correct the interval of indices
-      IF (PRESENT(nrow_offset)) THEN
-         correct_nrow = .TRUE.
-      END IF
-      IF (PRESENT(ncol_offset)) THEN
-         correct_ncol = .TRUE.
-      END IF
-
-      para_env_out => fm_out%matrix_struct%para_env
-
-      CALL cp_fm_get_info(matrix=fm_out, &
-                          nrow_local=nrow_local_out, &
-                          ncol_local=ncol_local_out, &
-                          row_indices=row_indices_out, &
-                          col_indices=col_indices_out, &
-                          nrow_block=nrow_block_out, &
-                          ncol_block=ncol_block_out)
-
-      ALLOCATE (num_entries_rec(0:para_env_out%num_pe - 1))
-      ALLOCATE (num_entries_send(0:para_env_out%num_pe - 1))
-
-      num_entries_rec(:) = 0
-      num_entries_send(:) = 0
-
-      dummy = 0
-
-      CALL cp_fm_get_info(matrix=fm_in, &
-                          nrow_local=nrow_local_in, &
-                          ncol_local=ncol_local_in, &
-                          row_indices=row_indices_in, &
-                          col_indices=col_indices_in, &
-                          nrow_block=nrow_block_in, &
-                          ncol_block=ncol_block_in)
-
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A14,A10,T71,I10)') 'BSE|DEBUG|', 'Row number of ', fm_out%name, &
-            fm_out%matrix_struct%nrow_global
-         WRITE (unit_nr, '(T2,A10,T13,A17,A10,T71,I10)') 'BSE|DEBUG|', 'Column number of ', fm_out%name, &
-            fm_out%matrix_struct%ncol_global
-
-         WRITE (unit_nr, '(T2,A10,T13,A18,A10,T71,I10)') 'BSE|DEBUG|', 'Row block size of ', fm_out%name, nrow_block_out
-         WRITE (unit_nr, '(T2,A10,T13,A21,A10,T71,I10)') 'BSE|DEBUG|', 'Column block size of ', fm_out%name, ncol_block_out
-
-         WRITE (unit_nr, '(T2,A10,T13,A14,A10,T71,I10)') 'BSE|DEBUG|', 'Row number of ', fm_in%name, &
-            fm_in%matrix_struct%nrow_global
-         WRITE (unit_nr, '(T2,A10,T13,A17,A10,T71,I10)') 'BSE|DEBUG|', 'Column number of ', fm_in%name, &
-            fm_in%matrix_struct%ncol_global
-
-         WRITE (unit_nr, '(T2,A10,T13,A18,A10,T71,I10)') 'BSE|DEBUG|', 'Row block size of ', fm_in%name, nrow_block_in
-         WRITE (unit_nr, '(T2,A10,T13,A21,A10,T71,I10)') 'BSE|DEBUG|', 'Column block size of ', fm_in%name, ncol_block_in
-      END IF
-
-      ! We find global indices in S with nrow_in and ncol_in for truncation
-      DO col_idx_loc = 1, ncol_local_in
-         idx_col_in = col_indices_in(col_idx_loc)
-
-         idx_col_first = (idx_col_in - 1)/ncol_in + 1
-         idx_col_sec = MOD(idx_col_in - 1, ncol_in) + 1
-
-         ! If occupied orbitals are included, these have to be handled differently
-         ! due to their reversed indexing
-         IF (correct_nrow) THEN
-            idx_col_first = idx_col_first - nrow_offset + 1
-            IF (idx_col_first <= 0) CYCLE
-         ELSE
-            IF (idx_col_first > nrow_out) EXIT
-         END IF
-         IF (correct_ncol) THEN
-            idx_col_sec = idx_col_sec - ncol_offset + 1
-            IF (idx_col_sec <= 0) CYCLE
-         ELSE
-            IF (idx_col_sec > ncol_out) CYCLE
-         END IF
-
-         idx_col_out = idx_col_sec + (idx_col_first - 1)*ncol_out
-
-         DO row_idx_loc = 1, nrow_local_in
-            idx_row_in = row_indices_in(row_idx_loc)
-
-            send_prow = fm_out%matrix_struct%g2p_row(idx_row_in)
-            send_pcol = fm_out%matrix_struct%g2p_col(idx_col_out)
-
-            proc_send = fm_out%matrix_struct%context%blacs2mpi(send_prow, send_pcol)
-
-            num_entries_send(proc_send) = num_entries_send(proc_send) + 1
-
-         END DO
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_2_comm_entry_nums", handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A27)') 'BSE|DEBUG|', 'Communicating entry numbers'
-      END IF
-
-      CALL para_env_out%alltoall(num_entries_send, num_entries_rec, 1)
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_3_alloc_buffer", handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A18)') 'BSE|DEBUG|', 'Allocating buffers'
-      END IF
-
-      ! Buffers for entries and their indices
-      ALLOCATE (buffer_rec(0:para_env_out%num_pe - 1))
-      ALLOCATE (buffer_send(0:para_env_out%num_pe - 1))
-
-      ! allocate data message and corresponding indices
-      DO iproc = 0, para_env_out%num_pe - 1
-
-         ALLOCATE (buffer_rec(iproc)%msg(num_entries_rec(iproc)))
-         buffer_rec(iproc)%msg = 0.0_dp
-
-      END DO
-
-      DO iproc = 0, para_env_out%num_pe - 1
-
-         ALLOCATE (buffer_send(iproc)%msg(num_entries_send(iproc)))
-         buffer_send(iproc)%msg = 0.0_dp
-
-      END DO
-
-      DO iproc = 0, para_env_out%num_pe - 1
-
-         ALLOCATE (buffer_rec(iproc)%indx(num_entries_rec(iproc), 2))
-         buffer_rec(iproc)%indx = 0
-
-      END DO
-
-      DO iproc = 0, para_env_out%num_pe - 1
-
-         ALLOCATE (buffer_send(iproc)%indx(num_entries_send(iproc), 2))
-         buffer_send(iproc)%indx = 0
-
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_4_buf_from_fmin_"//fm_out%name, handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A18,A10,A13)') 'BSE|DEBUG|', 'Writing data from ', fm_in%name, ' into buffers'
-      END IF
-
-      ALLOCATE (entry_counter(0:para_env_out%num_pe - 1))
-      entry_counter(:) = 0
-
-      ! Now we can write the actual data and indices to the send-buffer
-      DO col_idx_loc = 1, ncol_local_in
-         idx_col_in = col_indices_in(col_idx_loc)
-
-         idx_col_first = (idx_col_in - 1)/ncol_in + 1
-         idx_col_sec = MOD(idx_col_in - 1, ncol_in) + 1
-
-         ! If occupied orbitals are included, these have to be handled differently
-         ! due to their reversed indexing
-         IF (correct_nrow) THEN
-            idx_col_first = idx_col_first - nrow_offset + 1
-            IF (idx_col_first <= 0) CYCLE
-         ELSE
-            IF (idx_col_first > nrow_out) EXIT
-         END IF
-         IF (correct_ncol) THEN
-            idx_col_sec = idx_col_sec - ncol_offset + 1
-            IF (idx_col_sec <= 0) CYCLE
-         ELSE
-            IF (idx_col_sec > ncol_out) CYCLE
-         END IF
-
-         idx_col_out = idx_col_sec + (idx_col_first - 1)*ncol_out
-
-         DO row_idx_loc = 1, nrow_local_in
-            idx_row_in = row_indices_in(row_idx_loc)
-
-            send_prow = fm_out%matrix_struct%g2p_row(idx_row_in)
-
-            send_pcol = fm_out%matrix_struct%g2p_col(idx_col_out)
-
-            proc_send = fm_out%matrix_struct%context%blacs2mpi(send_prow, send_pcol)
-            entry_counter(proc_send) = entry_counter(proc_send) + 1
-
-            buffer_send(proc_send)%msg(entry_counter(proc_send)) = &
-               fm_in%local_data(row_idx_loc, col_idx_loc)
-            !No need to create row_out, since it is identical to incoming
-            !We dont change the RI index for any fm_mat_XX_BSE
-            buffer_send(proc_send)%indx(entry_counter(proc_send), 1) = idx_row_in
-            buffer_send(proc_send)%indx(entry_counter(proc_send), 2) = idx_col_out
-
-         END DO
-      END DO
-
-      ALLOCATE (req_array(1:para_env_out%num_pe, 4))
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_5_comm_buffer", handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A21)') 'BSE|DEBUG|', 'Communicating buffers'
-      END IF
-
-      ! communicate the buffer
-      CALL communicate_buffer(para_env_out, num_entries_rec, num_entries_send, buffer_rec, &
-                              buffer_send, req_array)
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_6_buffer_to_fmout"//fm_out%name, handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A24,A10)') 'BSE|DEBUG|', 'Writing from buffers to ', fm_out%name
-      END IF
-
-      ! fill fm_out with the entries from buffer_rec, i.e. buffer_rec are parts of fm_in
-      nprocs = para_env_out%num_pe
-
-!$OMP PARALLEL DO DEFAULT(NONE) &
-!$OMP SHARED(fm_out, nprocs, num_entries_rec, buffer_rec) &
-!$OMP PRIVATE(iproc, i_entry_rec, ii, jj)
-      DO iproc = 0, nprocs - 1
-         DO i_entry_rec = 1, num_entries_rec(iproc)
-            ii = fm_out%matrix_struct%g2l_row(buffer_rec(iproc)%indx(i_entry_rec, 1))
-            jj = fm_out%matrix_struct%g2l_col(buffer_rec(iproc)%indx(i_entry_rec, 2))
-
-            fm_out%local_data(ii, jj) = fm_out%local_data(ii, jj) + buffer_rec(iproc)%msg(i_entry_rec)
-         END DO
-      END DO
-!$OMP END PARALLEL DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_7_cleanup", handle2)
-      IF (unit_nr > 0 .AND. mp2_env%bse%bse_debug_print) THEN
-         WRITE (unit_nr, '(T2,A10,T13,A41)') 'BSE|DEBUG|', 'Starting cleanup of communication buffers'
-      END IF
-
-      !Clean up all the arrays from the communication process
-      DO iproc = 0, para_env_out%num_pe - 1
-         DEALLOCATE (buffer_rec(iproc)%msg)
-         DEALLOCATE (buffer_rec(iproc)%indx)
-         DEALLOCATE (buffer_send(iproc)%msg)
-         DEALLOCATE (buffer_send(iproc)%indx)
-      END DO
-      DEALLOCATE (buffer_rec, buffer_send)
-      DEALLOCATE (req_array)
-      DEALLOCATE (entry_counter)
-      DEALLOCATE (num_entries_rec, num_entries_send)
-
-      CALL timestop(handle2)
-      CALL timestop(handle)
-
-   END SUBROUTINE truncate_fm
+   END FUNCTION virt_of_ia
 
 ! **************************************************************************************************
-!> \brief ...
-!> \param fm_mat_S_bar_ia_bse ...
-!> \param fm_mat_S_bar_ij_bse ...
-!> \param fm_mat_S_trunc ...
-!> \param fm_mat_S_ij_trunc ...
-!> \param fm_mat_S_ab_trunc ...
-!> \param fm_mat_Q_static_bse_gemm ...
-!> \param mp2_env ...
+!> \brief The screened slabs \bar{B}^P_ij = sum_Q [1+Q(0)]^-1_PQ B^Q_ij and
+!>        \bar{B}^P_ia = sum_Q [1+Q(0)]^-1_PQ B^Q_ia, P, Q ≤ dimen_RI_red
+!> \param fm_eps_inv [1+Q(0)]^-1_PQ
+!> \param fm_S_ij B^P_ij of the window, dimen_RI x homo^2
+!> \param fm_S_ia B^P_ia of the window, dimen_RI x homo*virtual
+!> \param dimen_RI_red reduced RI dimension, the contraction length
+!> \param homo occupied levels in the window
+!> \param virtual virtual levels in the window
+!> \param fm_S_bar_ij \bar{B}^P_ij, created here on fm_S_ij's structure
+!> \param fm_S_bar_ia \bar{B}^P_ia, created here on fm_S_ia's structure for ABBA only
+!> \param do_abba whether the coupling matrix B needs the screened ia slab
 ! **************************************************************************************************
-   SUBROUTINE deallocate_matrices_bse(fm_mat_S_bar_ia_bse, fm_mat_S_bar_ij_bse, &
-                                      fm_mat_S_trunc, fm_mat_S_ij_trunc, fm_mat_S_ab_trunc, &
-                                      fm_mat_Q_static_bse_gemm, mp2_env)
+   SUBROUTINE screen_slabs(fm_eps_inv, fm_S_ij, fm_S_ia, dimen_RI_red, homo, virtual, &
+                           fm_S_bar_ij, fm_S_bar_ia, do_abba)
 
-      TYPE(cp_fm_type), INTENT(INOUT) :: fm_mat_S_bar_ia_bse, fm_mat_S_bar_ij_bse, fm_mat_S_trunc, &
-         fm_mat_S_ij_trunc, fm_mat_S_ab_trunc, fm_mat_Q_static_bse_gemm
-      TYPE(mp2_type)                                     :: mp2_env
+      TYPE(cp_fm_type), INTENT(IN)                       :: fm_eps_inv, fm_S_ij, fm_S_ia
+      INTEGER, INTENT(IN)                                :: dimen_RI_red, homo, virtual
+      TYPE(cp_fm_type), INTENT(OUT)                      :: fm_S_bar_ij, fm_S_bar_ia
+      LOGICAL, INTENT(IN)                                :: do_abba
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'deallocate_matrices_bse'
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'screen_slabs'
 
       INTEGER                                            :: handle
 
       CALL timeset(routineN, handle)
 
-      CALL cp_fm_release(fm_mat_S_bar_ia_bse)
-      CALL cp_fm_release(fm_mat_S_bar_ij_bse)
-      CALL cp_fm_release(fm_mat_S_trunc)
-      CALL cp_fm_release(fm_mat_S_ij_trunc)
-      CALL cp_fm_release(fm_mat_S_ab_trunc)
-      CALL cp_fm_release(fm_mat_Q_static_bse_gemm)
-      IF (mp2_env%bse%do_nto_analysis) THEN
-         DEALLOCATE (mp2_env%bse%bse_nto_state_list_final)
+      CALL cp_fm_create(fm_S_bar_ij, fm_S_ij%matrix_struct)
+      CALL cp_fm_set_all(fm_S_bar_ij, 0.0_dp)
+
+      ! \bar{B}^P_ij = sum_Q [1+Q(0)]^-1_PQ B^Q_ij
+      CALL parallel_gemm(transa="N", transb="N", m=dimen_RI_red, n=homo**2, k=dimen_RI_red, alpha=1.0_dp, &
+                         matrix_a=fm_eps_inv, matrix_b=fm_S_ij, beta=0.0_dp, matrix_c=fm_S_bar_ij)
+
+      IF (do_abba) THEN
+         CALL cp_fm_create(fm_S_bar_ia, fm_S_ia%matrix_struct)
+         CALL cp_fm_set_all(fm_S_bar_ia, 0.0_dp)
+         ! \bar{B}^P_ia = sum_Q [1+Q(0)]^-1_PQ B^Q_ia; fm_S_ia comes from RPA and has a different
+         ! blacs_env than fm_S_ij
+         CALL parallel_gemm(transa="N", transb="N", m=dimen_RI_red, n=homo*virtual, k=dimen_RI_red, alpha=1.0_dp, &
+                            matrix_a=fm_eps_inv, matrix_b=fm_S_ia, beta=0.0_dp, matrix_c=fm_S_bar_ia)
       END IF
 
       CALL timestop(handle)
 
-   END SUBROUTINE deallocate_matrices_bse
+   END SUBROUTINE screen_slabs
 
 ! **************************************************************************************************
 !> \brief Routine for computing the coefficients of the eigenvectors of the BSE matrix from a
@@ -843,20 +246,24 @@ CONTAINS
    END SUBROUTINE comp_eigvec_coeff_BSE
 
 ! **************************************************************************************************
-!> \brief ...
-!> \param idx_prim ...
-!> \param idx_sec ...
-!> \param eigvec_entries ...
+!> \brief Sorts excitation entries by ascending primary index, reordering the secondary index,
+!>        the eigenvector coefficients and - open shell - the spin index alongside
+!> \param idx_prim Primary index of each entry; sorted in place and used as the sort key
+!> \param idx_sec Secondary index of each entry, reordered to follow idx_prim
+!> \param eigvec_entries Eigenvector coefficients of each entry, reordered to follow idx_prim
+!> \param idx_spin Optional spin index of each entry (open shell), reordered to follow idx_prim
 ! **************************************************************************************************
-   SUBROUTINE sort_excitations(idx_prim, idx_sec, eigvec_entries)
+   SUBROUTINE sort_excitations(idx_prim, idx_sec, eigvec_entries, idx_spin)
 
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: idx_prim, idx_sec
       REAL(kind=dp), ALLOCATABLE, DIMENSION(:)           :: eigvec_entries
+      INTEGER, ALLOCATABLE, DIMENSION(:), OPTIONAL       :: idx_spin
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'sort_excitations'
 
       INTEGER                                            :: handle, ii, kk, num_entries, num_mults
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: idx_prim_work, idx_sec_work, tmp_index
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: idx_prim_work, idx_sec_work, &
+                                                            idx_spin_work, tmp_index
       LOGICAL                                            :: unique_entries
       REAL(kind=dp), ALLOCATABLE, DIMENSION(:)           :: eigvec_entries_work
 
@@ -870,10 +277,12 @@ CONTAINS
 
       ALLOCATE (idx_sec_work(num_entries))
       ALLOCATE (eigvec_entries_work(num_entries))
+      IF (PRESENT(idx_spin)) ALLOCATE (idx_spin_work(num_entries))
 
       DO ii = 1, num_entries
          idx_sec_work(ii) = idx_sec(tmp_index(ii))
          eigvec_entries_work(ii) = eigvec_entries(tmp_index(ii))
+         IF (PRESENT(idx_spin)) idx_spin_work(ii) = idx_spin(tmp_index(ii))
       END DO
 
       DEALLOCATE (tmp_index)
@@ -882,6 +291,10 @@ CONTAINS
 
       CALL MOVE_ALLOC(idx_sec_work, idx_sec)
       CALL MOVE_ALLOC(eigvec_entries_work, eigvec_entries)
+      IF (PRESENT(idx_spin)) THEN
+         DEALLOCATE (idx_spin)
+         CALL MOVE_ALLOC(idx_spin_work, idx_spin)
+      END IF
 
       !Now check for multiple entries in first idx to check necessity of sorting in second idx
       CALL sort_unique(idx_prim, unique_entries)
@@ -900,6 +313,10 @@ CONTAINS
                ALLOCATE (eigvec_entries_work(num_mults))
                idx_sec_work(:) = idx_sec(ii:ii + num_mults - 1)
                eigvec_entries_work(:) = eigvec_entries(ii:ii + num_mults - 1)
+               IF (PRESENT(idx_spin)) THEN
+                  ALLOCATE (idx_spin_work(num_mults))
+                  idx_spin_work(:) = idx_spin(ii:ii + num_mults - 1)
+               END IF
                ALLOCATE (tmp_index(num_mults))
                CALL sort(idx_sec_work, num_mults, tmp_index)
 
@@ -907,11 +324,13 @@ CONTAINS
                DO kk = ii, ii + num_mults - 1
                   idx_sec(kk) = idx_sec_work(kk - ii + 1)
                   eigvec_entries(kk) = eigvec_entries_work(tmp_index(kk - ii + 1))
+                  IF (PRESENT(idx_spin)) idx_spin(kk) = idx_spin_work(tmp_index(kk - ii + 1))
                END DO
                !Deallocate work arrays
                DEALLOCATE (tmp_index)
                DEALLOCATE (idx_sec_work)
                DEALLOCATE (eigvec_entries_work)
+               IF (PRESENT(idx_spin)) DEALLOCATE (idx_spin_work)
             END IF
             idx_prim_work(ii) = idx_prim(ii)
          END DO
@@ -924,39 +343,28 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Roughly estimates the needed runtime and memory during the BSE run
-!> \param homo_red ...
-!> \param virtual_red ...
+!> \param n_ov_joint ...
 !> \param unit_nr ...
 !> \param bse_abba ...
 !> \param para_env ...
 !> \param diag_runtime_est ...
 ! **************************************************************************************************
-   SUBROUTINE estimate_BSE_resources(homo_red, virtual_red, unit_nr, bse_abba, &
+   SUBROUTINE estimate_BSE_resources(n_ov_joint, unit_nr, bse_abba, &
                                      para_env, diag_runtime_est)
 
-      INTEGER                                            :: homo_red, virtual_red, unit_nr
+      INTEGER, INTENT(IN)                                :: n_ov_joint, unit_nr
       LOGICAL                                            :: bse_abba
       TYPE(mp_para_env_type), POINTER                    :: para_env
       REAL(KIND=dp)                                      :: diag_runtime_est
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'estimate_BSE_resources'
 
-      INTEGER                                            :: handle, num_BSE_matrices
-      INTEGER(KIND=int_8)                                :: full_dim
+      INTEGER                                            :: handle
       REAL(KIND=dp)                                      :: mem_est, mem_est_per_rank
 
       CALL timeset(routineN, handle)
 
-      ! Number of matrices with size of A in TDA is 2 (A itself and W_ijab)
-      num_BSE_matrices = 2
-      ! With the full diagonalization of ABBA, we need several auxiliary matrices in the process
-      ! The maximum number is 2 + 2 + 6 (additional B and C matrix as well as 6 matrices to create C)
-      IF (bse_abba) THEN
-         num_BSE_matrices = 10
-      END IF
-
-      full_dim = (INT(homo_red, KIND=int_8)**2*INT(virtual_red, KIND=int_8)**2)*INT(num_BSE_matrices, KIND=int_8)
-      mem_est = REAL(8*full_dim, KIND=dp)/REAL(1024**3, KIND=dp)
+      mem_est = fulldiag_memory_estimate_GB(n_ov_joint, bse_abba)
       mem_est_per_rank = REAL(mem_est/para_env%num_pe, KIND=dp)
 
       IF (unit_nr > 0) THEN
@@ -970,12 +378,37 @@ CONTAINS
       END IF
       ! Rough estimation of diagonalization runtimes. Baseline was a full BSE Naphthalene
       ! run with 11000x11000 entries in A/B/C, which took 10s on 32 ranks
-      diag_runtime_est = REAL(INT(homo_red, KIND=int_8)*INT(virtual_red, KIND=int_8)/11000_int_8, KIND=dp)**3* &
+      diag_runtime_est = REAL(INT(n_ov_joint, KIND=int_8)/11000_int_8, KIND=dp)**3* &
                          10*32/REAL(para_env%num_pe, KIND=dp)
 
       CALL timestop(handle)
 
    END SUBROUTINE estimate_BSE_resources
+
+! **************************************************************************************************
+!> \brief Peak memory of the full diagonalization in GB, all ranks together: n_ov^2 doubles times
+!>        the matrices held at once, 2 for TDA (A and W_ijab), 10 for ABBA (at most six are held
+!>        while C is formed; the margin covers eigensolver work space, GEMM buffers come on top)
+!> \param n_ov_joint transition pairs in the active window, summed over spins
+!> \param do_abba full problem, not TDA
+!> \return the estimate in GB
+! **************************************************************************************************
+   PURE FUNCTION fulldiag_memory_estimate_GB(n_ov_joint, do_abba) RESULT(mem_GB)
+
+      INTEGER, INTENT(IN)                                :: n_ov_joint
+      LOGICAL, INTENT(IN)                                :: do_abba
+      REAL(KIND=dp)                                      :: mem_GB
+
+      INTEGER                                            :: num_BSE_matrices
+      INTEGER(KIND=int_8)                                :: full_dim
+
+      num_BSE_matrices = 2
+      IF (do_abba) num_BSE_matrices = 10
+      full_dim = INT(n_ov_joint, KIND=int_8)**2*INT(num_BSE_matrices, KIND=int_8)
+      ! 1 GB = 1E9 B, the unit of the free-memory budget it is compared with
+      mem_GB = 8.0E-9_dp*REAL(full_dim, KIND=dp)
+
+   END FUNCTION fulldiag_memory_estimate_GB
 
 ! **************************************************************************************************
 !> \brief Filters eigenvector entries above a given threshold to describe excitations in the
@@ -987,27 +420,33 @@ CONTAINS
 !> \param i_exc ...
 !> \param virtual ...
 !> \param num_entries ...
-!> \param mp2_env ...
+!> \param bse_env the BSE environment (settings)
+!> \param offsets ...
+!> \param virtual_per_spin ...
+!> \param idx_spin ...
 ! **************************************************************************************************
    SUBROUTINE filter_eigvec_contrib(fm_eigvec, idx_homo, idx_virt, eigvec_entries, &
-                                    i_exc, virtual, num_entries, mp2_env)
+                                    i_exc, virtual, num_entries, bse_env, &
+                                    offsets, virtual_per_spin, idx_spin)
 
       TYPE(cp_fm_type), INTENT(IN)                       :: fm_eigvec
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: idx_homo, idx_virt
       REAL(kind=dp), ALLOCATABLE, DIMENSION(:)           :: eigvec_entries
       INTEGER                                            :: i_exc, virtual, num_entries
-      TYPE(mp2_type), INTENT(INOUT)                      :: mp2_env
+      TYPE(bse_env_type), INTENT(IN)                     :: bse_env
+      INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: offsets, virtual_per_spin
+      INTEGER, ALLOCATABLE, DIMENSION(:), OPTIONAL       :: idx_spin
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'filter_eigvec_contrib'
 
-      INTEGER                                            :: eigvec_idx, handle, ii, iproc, jj, kk, &
-                                                            ncol_local, nrow_local, &
-                                                            num_entries_local
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: num_entries_to_comm
+      INTEGER                                            :: eigvec_idx, handle, ii, iproc, isp, jj, &
+                                                            kk, ksp, ncol_local, nrow_local, &
+                                                            num_entries_local, r_local, v_local
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: displ, indx_all, indx_local, &
+                                                            num_entries_to_comm
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
       REAL(KIND=dp)                                      :: eigvec_entry
-      TYPE(integ_mat_buffer_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: buffer_entries
+      REAL(kind=dp), ALLOCATABLE, DIMENSION(:)           :: entries_local
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
       CALL timeset(routineN, handle)
@@ -1020,309 +459,317 @@ CONTAINS
                           row_indices=row_indices, &
                           col_indices=col_indices)
 
-      ALLOCATE (num_entries_to_comm(0:para_env%num_pe - 1))
-      num_entries_to_comm(:) = 0
-
+      ! the local entries of column i_exc above EPS_X: count, then collect with their (i, a, sigma)
+      num_entries_local = 0
       DO jj = 1, ncol_local
-         !First check if i is localized on this proc
-         IF (col_indices(jj) /= i_exc) THEN
-            CYCLE
-         END IF
+         IF (col_indices(jj) /= i_exc) CYCLE
          DO ii = 1, nrow_local
-            eigvec_idx = row_indices(ii)
-            eigvec_entry = fm_eigvec%local_data(ii, jj)
-            IF (ABS(eigvec_entry) > mp2_env%bse%eps_x) THEN
-               num_entries_to_comm(para_env%mepos) = num_entries_to_comm(para_env%mepos) + 1
-            END IF
+            IF (ABS(fm_eigvec%local_data(ii, jj)) > bse_env%eps_x) num_entries_local = num_entries_local + 1
          END DO
       END DO
-
-      !Gather number of entries of other processes
-      CALL para_env%sum(num_entries_to_comm)
-
-      num_entries_local = num_entries_to_comm(para_env%mepos)
-
-      ALLOCATE (buffer_entries(0:para_env%num_pe - 1))
-
-      DO iproc = 0, para_env%num_pe - 1
-         ALLOCATE (buffer_entries(iproc)%msg(num_entries_to_comm(iproc)))
-         ALLOCATE (buffer_entries(iproc)%indx(num_entries_to_comm(iproc), 2))
-         buffer_entries(iproc)%msg = 0.0_dp
-         buffer_entries(iproc)%indx = 0
-      END DO
-
-      kk = 1
+      ALLOCATE (entries_local(num_entries_local), indx_local(3*num_entries_local))
+      kk = 0
       DO jj = 1, ncol_local
-         !First check if i is localized on this proc
-         IF (col_indices(jj) /= i_exc) THEN
-            CYCLE
-         END IF
+         IF (col_indices(jj) /= i_exc) CYCLE
          DO ii = 1, nrow_local
             eigvec_idx = row_indices(ii)
             eigvec_entry = fm_eigvec%local_data(ii, jj)
-            IF (ABS(eigvec_entry) > mp2_env%bse%eps_x) THEN
-               buffer_entries(para_env%mepos)%indx(kk, 1) = (eigvec_idx - 1)/virtual + 1
-               buffer_entries(para_env%mepos)%indx(kk, 2) = MOD(eigvec_idx - 1, virtual) + 1
-               buffer_entries(para_env%mepos)%msg(kk) = eigvec_entry
+            IF (ABS(eigvec_entry) > bse_env%eps_x) THEN
+               ! Decode spin block from the joint row index (blocks are contiguous; sigma is the
+               ! largest offset strictly below eigvec_idx). offsets absent -> closed shell, sigma=1.
+               isp = 1
+               r_local = eigvec_idx
+               v_local = virtual
+               IF (PRESENT(offsets)) THEN
+                  DO ksp = SIZE(offsets), 1, -1
+                     IF (eigvec_idx > offsets(ksp)) THEN
+                        isp = ksp
+                        EXIT
+                     END IF
+                  END DO
+                  r_local = eigvec_idx - offsets(isp)
+                  v_local = virtual_per_spin(isp)
+               END IF
                kk = kk + 1
+               indx_local(3*kk - 2) = occ_of_ia(r_local, v_local)
+               indx_local(3*kk - 1) = virt_of_ia(r_local, v_local)
+               indx_local(3*kk) = isp
+               entries_local(kk) = eigvec_entry
             END IF
          END DO
       END DO
 
-      DO iproc = 0, para_env%num_pe - 1
-         CALL para_env%sum(buffer_entries(iproc)%msg)
-         CALL para_env%sum(buffer_entries(iproc)%indx)
+      ! one allgather of the counts, one allgatherv per array: every rank ends with the same
+      ! rank-ordered list
+      ALLOCATE (num_entries_to_comm(0:para_env%num_pe - 1), displ(0:para_env%num_pe - 1))
+      CALL para_env%allgather(num_entries_local, num_entries_to_comm)
+      displ(0) = 0
+      DO iproc = 1, para_env%num_pe - 1
+         displ(iproc) = displ(iproc - 1) + num_entries_to_comm(iproc - 1)
       END DO
-
-      !Now sum up gathered information
       num_entries = SUM(num_entries_to_comm)
-      ALLOCATE (idx_homo(num_entries))
-      ALLOCATE (idx_virt(num_entries))
-      ALLOCATE (eigvec_entries(num_entries))
+      ALLOCATE (eigvec_entries(num_entries), indx_all(3*num_entries))
+      CALL para_env%allgatherv(entries_local, eigvec_entries, num_entries_to_comm, displ)
+      CALL para_env%allgatherv(indx_local, indx_all, 3*num_entries_to_comm, 3*displ)
 
-      kk = 1
-      DO iproc = 0, para_env%num_pe - 1
-         IF (num_entries_to_comm(iproc) /= 0) THEN
-            DO ii = 1, num_entries_to_comm(iproc)
-               idx_homo(kk) = buffer_entries(iproc)%indx(ii, 1)
-               idx_virt(kk) = buffer_entries(iproc)%indx(ii, 2)
-               eigvec_entries(kk) = buffer_entries(iproc)%msg(ii)
-               kk = kk + 1
-            END DO
-         END IF
+      ALLOCATE (idx_homo(num_entries), idx_virt(num_entries))
+      IF (PRESENT(idx_spin)) ALLOCATE (idx_spin(num_entries))
+      DO kk = 1, num_entries
+         idx_homo(kk) = indx_all(3*kk - 2)
+         idx_virt(kk) = indx_all(3*kk - 1)
+         IF (PRESENT(idx_spin)) idx_spin(kk) = indx_all(3*kk)
       END DO
 
-      !Deallocate all the used arrays
-      DO iproc = 0, para_env%num_pe - 1
-         DEALLOCATE (buffer_entries(iproc)%msg)
-         DEALLOCATE (buffer_entries(iproc)%indx)
-      END DO
-      DEALLOCATE (buffer_entries)
-      DEALLOCATE (num_entries_to_comm)
+      DEALLOCATE (entries_local, indx_local, indx_all, num_entries_to_comm, displ)
       NULLIFY (row_indices)
       NULLIFY (col_indices)
 
       !Now sort the results according to the involved singleparticle orbitals
-      ! (homo first, then virtual)
-      CALL sort_excitations(idx_homo, idx_virt, eigvec_entries)
+      ! (homo first, then virtual). idx_spin is payload, permuted alongside the entries.
+      IF (PRESENT(idx_spin)) THEN
+         CALL sort_excitations(idx_homo, idx_virt, eigvec_entries, idx_spin)
+      ELSE
+         CALL sort_excitations(idx_homo, idx_virt, eigvec_entries)
+      END IF
 
       CALL timestop(handle)
 
    END SUBROUTINE filter_eigvec_contrib
 
 ! **************************************************************************************************
-!> \brief Reads cutoffs for BSE from mp2_env and compares to energies in Eigenval to extract
-!>        reduced homo/virtual and
-!> \param Eigenval array (1d) with energies, can be e.g. from GW or DFT
-!> \param homo Total number of occupied orbitals
-!> \param virtual Total number of unoccupied orbitals
-!> \param homo_red Total number of occupied orbitals to include after cutoff
-!> \param virt_red Total number of unoccupied orbitals to include after ctuoff
-!> \param homo_incl First occupied index to include after cutoff
-!> \param virt_incl Last unoccupied index to include after cutoff
-!> \param mp2_env ...
+!> \brief Spin-block layout for the open-shell (joint) BSE matrix: per-spin OV-pair counts and the
+!>        block offsets into the joint matrix of dimension n_ov_joint = sum_sigma homo*virtual.
+!> \param homo_red per-spin (reduced) number of occupied levels
+!> \param virt_red per-spin (reduced) number of virtual levels
+!> \param n_ov per-spin OV-pair count (OUT)
+!> \param offsets per-spin block offset into the joint matrix (OUT)
+!> \param n_ov_joint total joint dimension (OUT)
 ! **************************************************************************************************
-   SUBROUTINE determine_cutoff_indices(Eigenval, &
-                                       homo, virtual, &
-                                       homo_red, virt_red, &
-                                       homo_incl, virt_incl, &
-                                       mp2_env)
+   SUBROUTINE get_bse_spin_block_layout(homo_red, virt_red, n_ov, offsets, n_ov_joint)
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: homo_red, virt_red
+      INTEGER, DIMENSION(:), INTENT(OUT)                 :: n_ov, offsets
+      INTEGER, INTENT(OUT)                               :: n_ov_joint
 
-      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: Eigenval
-      INTEGER, INTENT(IN)                                :: homo, virtual
-      INTEGER, INTENT(OUT)                               :: homo_red, virt_red, homo_incl, virt_incl
-      TYPE(mp2_type), INTENT(INOUT)                      :: mp2_env
+      INTEGER                                            :: isp
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'determine_cutoff_indices'
+      n_ov_joint = 0
+      DO isp = 1, SIZE(homo_red)
+         offsets(isp) = n_ov_joint
+         n_ov(isp) = homo_red(isp)*virt_red(isp)
+         n_ov_joint = n_ov_joint + n_ov(isp)
+      END DO
 
-      INTEGER                                            :: handle, i_homo, j_virt
+   END SUBROUTINE get_bse_spin_block_layout
 
-      CALL timeset(routineN, handle)
-      ! Determine index in homo and virtual for truncation
-      ! Uses indices of outermost orbitals within energy range (-mp2_env%bse%bse_cutoff_occ,mp2_env%bse%bse_cutoff_empty)
-      IF (mp2_env%bse%bse_cutoff_occ > 0 .OR. mp2_env%bse%bse_cutoff_empty > 0) THEN
-         IF (-mp2_env%bse%bse_cutoff_occ < Eigenval(1) - Eigenval(homo) &
-             .OR. mp2_env%bse%bse_cutoff_occ < 0) THEN
-            homo_red = homo
-            homo_incl = 1
-         ELSE
-            homo_incl = 1
-            DO i_homo = 1, homo
-               IF (Eigenval(i_homo) - Eigenval(homo) > -mp2_env%bse%bse_cutoff_occ) THEN
-                  homo_incl = i_homo
-                  EXIT
-               END IF
-            END DO
-            homo_red = homo - homo_incl + 1
-         END IF
+! **************************************************************************************************
+!> \brief The active MO window on the DFT axis: one absolute MO range for every spin; when the spin
+!>        windows differ, the smallest range covering all of them
+!> \param eigenval_scf DFT eigenvalues (level, spin)
+!> \param n_mo number of MOs per spin
+!> \param homo occupied MOs per spin
+!> \param cutoff_occ ENERGY_CUTOFF_OCC in Hartree, zero or negative for no cutoff
+!> \param cutoff_empty ENERGY_CUTOFF_EMPTY in Hartree, zero or negative for no cutoff
+!> \param window first and last MO to keep
+!> \param warn warn when the spin windows differ; false for a second call in the same run
+! **************************************************************************************************
+   SUBROUTINE bse_window_from_dft(eigenval_scf, n_mo, homo, cutoff_occ, cutoff_empty, window, warn)
 
-         IF (mp2_env%bse%bse_cutoff_empty > Eigenval(homo + virtual) - Eigenval(homo + 1) &
-             .OR. mp2_env%bse%bse_cutoff_empty < 0) THEN
-            virt_red = virtual
-            virt_incl = virtual
-         ELSE
-            virt_incl = homo + 1
-            DO j_virt = 1, virtual
-               IF (Eigenval(homo + j_virt) - Eigenval(homo + 1) > mp2_env%bse%bse_cutoff_empty) THEN
-                  virt_incl = j_virt - 1
-                  EXIT
-               END IF
-            END DO
-            virt_red = virt_incl
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: eigenval_scf
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: n_mo, homo
+      REAL(KIND=dp), INTENT(IN)                          :: cutoff_occ, cutoff_empty
+      TYPE(mo_window_type), INTENT(OUT)                  :: window
+      LOGICAL, INTENT(IN)                                :: warn
+
+      INTEGER                                            :: ispin, nspins
+      LOGICAL                                            :: spins_differ
+      TYPE(mo_window_type), ALLOCATABLE, DIMENSION(:)    :: spin_windows
+
+      nspins = SIZE(homo)
+      ALLOCATE (spin_windows(nspins))
+      DO ispin = 1, nspins
+         CALL determine_mo_window(eigenval_scf(:, ispin), n_mo(ispin), homo(ispin), &
+                                  cutoff_occ, cutoff_empty, spin_windows(ispin))
+      END DO
+      IF (nspins > 1) THEN
+         CALL combine_mo_windows(spin_windows, window, spins_differ)
+         IF (spins_differ .AND. warn) THEN
+            CPWARN("BSE: spin-resolved active MO cutoff candidates differ; using combined window.")
          END IF
       ELSE
-         homo_red = homo
-         virt_red = virtual
-         homo_incl = 1
-         virt_incl = virtual
+         window = spin_windows(1)
       END IF
+      DEALLOCATE (spin_windows)
 
-      CALL timestop(handle)
+   END SUBROUTINE bse_window_from_dft
 
-   END SUBROUTINE determine_cutoff_indices
+! **************************************************************************************************
+!> \brief The active MO window of bse_window_from_dft, from the DFT eigenvalues of the MO sets
+!> \param mos MO sets per spin
+!> \param cutoff_occ ENERGY_CUTOFF_OCC in Hartree, zero or negative for no cutoff
+!> \param cutoff_empty ENERGY_CUTOFF_EMPTY in Hartree, zero or negative for no cutoff
+!> \param window first and last MO to keep, one absolute range for every spin
+!> \param warn warn when the spin windows differ
+! **************************************************************************************************
+   SUBROUTINE bse_window_from_mos(mos, cutoff_occ, cutoff_empty, window, warn)
+
+      TYPE(mo_set_type), DIMENSION(:), INTENT(IN)        :: mos
+      REAL(KIND=dp), INTENT(IN)                          :: cutoff_occ, cutoff_empty
+      TYPE(mo_window_type), INTENT(OUT)                  :: window
+      LOGICAL, INTENT(IN)                                :: warn
+
+      INTEGER                                            :: ispin, nspins
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: homo, n_mo
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: eigenval_dft
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues
+
+      nspins = SIZE(mos)
+      ALLOCATE (homo(nspins), n_mo(nspins))
+      DO ispin = 1, nspins
+         CALL get_mo_set(mos(ispin), nmo=n_mo(ispin), homo=homo(ispin), eigenvalues=eigenvalues)
+         IF (ispin == 1) ALLOCATE (eigenval_dft(n_mo(1), nspins))
+         eigenval_dft(:, ispin) = eigenvalues(1:n_mo(ispin))
+      END DO
+      CALL bse_window_from_dft(eigenval_dft, n_mo, homo, cutoff_occ, cutoff_empty, window, warn)
+      DEALLOCATE (homo, n_mo, eigenval_dft)
+
+   END SUBROUTINE bse_window_from_mos
 
 ! **************************************************************************************************
 !> \brief Determines indices within the given energy cutoffs and truncates Eigenvalues and matrices
-!> \param fm_mat_S_ia_bse ...
-!> \param fm_mat_S_ij_bse ...
-!> \param fm_mat_S_ab_bse ...
-!> \param fm_mat_S_trunc ...
-!> \param fm_mat_S_ij_trunc ...
-!> \param fm_mat_S_ab_trunc ...
+!> \param fm_S_ia_full ...
+!> \param fm_S_ij_full ...
+!> \param fm_S_ab_full ...
 !> \param Eigenval_scf ...
 !> \param Eigenval ...
-!> \param Eigenval_reduced ...
+!> \param Eigenval_reduced_scf DFT energies of the window, allocated here
+!> \param Eigenval_reduced_qp quasiparticle energies of the window, allocated here
 !> \param homo ...
 !> \param virtual ...
 !> \param dimen_RI ...
 !> \param unit_nr ...
-!> \param bse_lev_virt ...
-!> \param homo_red ...
-!> \param virt_red ...
-!> \param mp2_env ...
+!> \param ispin spin of the slabs, selects the GW-corrected virtual count
+!> \param bse_env the BSE environment (settings; the GW-corrected level counts); receives the
+!>        window's slabs fm_S_ia, fm_S_ij, fm_S_ab and its level counts homo_red, virt_red of spin ispin
+!> \param window Absolute MO window to retain.
+!> \param print_window Whether to print the cutoff summary.
 ! **************************************************************************************************
-   SUBROUTINE truncate_BSE_matrices(fm_mat_S_ia_bse, fm_mat_S_ij_bse, fm_mat_S_ab_bse, &
-                                    fm_mat_S_trunc, fm_mat_S_ij_trunc, fm_mat_S_ab_trunc, &
-                                    Eigenval_scf, Eigenval, Eigenval_reduced, &
+   SUBROUTINE truncate_BSE_matrices(fm_S_ia_full, fm_S_ij_full, fm_S_ab_full, &
+                                    Eigenval_scf, Eigenval, Eigenval_reduced_scf, Eigenval_reduced_qp, &
                                     homo, virtual, dimen_RI, unit_nr, &
-                                    bse_lev_virt, &
-                                    homo_red, virt_red, &
-                                    mp2_env)
+                                    ispin, &
+                                    bse_env, &
+                                    window, print_window)
 
-      TYPE(cp_fm_type), INTENT(IN)                       :: fm_mat_S_ia_bse, fm_mat_S_ij_bse, &
-                                                            fm_mat_S_ab_bse
-      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_mat_S_trunc, fm_mat_S_ij_trunc, &
-                                                            fm_mat_S_ab_trunc
+      TYPE(cp_fm_type), INTENT(IN)                       :: fm_S_ia_full, fm_S_ij_full, fm_S_ab_full
       REAL(KIND=dp), DIMENSION(:)                        :: Eigenval_scf, Eigenval
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: Eigenval_reduced
-      INTEGER, INTENT(IN)                                :: homo, virtual, dimen_RI, unit_nr, &
-                                                            bse_lev_virt
-      INTEGER, INTENT(OUT)                               :: homo_red, virt_red
-      TYPE(mp2_type), INTENT(INOUT)                      :: mp2_env
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: Eigenval_reduced_scf, Eigenval_reduced_qp
+      INTEGER, INTENT(IN)                                :: homo, virtual, dimen_RI, unit_nr, ispin
+      TYPE(bse_env_type), INTENT(INOUT)                  :: bse_env
+      TYPE(mo_window_type), INTENT(IN)                   :: window
+      LOGICAL, INTENT(IN)                                :: print_window
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'truncate_BSE_matrices'
 
-      INTEGER                                            :: handle, homo_incl, virt_incl
+      INTEGER                                            :: handle, homo_incl, homo_red, virt_incl, &
+                                                            virt_red
       TYPE(cp_blacs_env_type), POINTER                   :: context
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct_ab, fm_struct_ia, fm_struct_ij
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
       CALL timeset(routineN, handle)
 
-      ! Determine index in homo and virtual for truncation
-      ! Uses indices of outermost orbitals within energy range (-mp2_env%bse%bse_cutoff_occ,mp2_env%bse%bse_cutoff_empty)
+      homo_incl = window%first_mo
+      virt_incl = window%last_mo - homo
+      homo_red = homo - homo_incl + 1
+      virt_red = virt_incl
 
-      CALL determine_cutoff_indices(Eigenval_scf, &
-                                    homo, virtual, &
-                                    homo_red, virt_red, &
-                                    homo_incl, virt_incl, &
-                                    mp2_env)
-
-      IF (unit_nr > 0) THEN
-         IF (mp2_env%bse%bse_cutoff_occ > 0) THEN
+      IF (print_window .AND. unit_nr > 0) THEN
+         IF (bse_env%bse_cutoff_occ > 0) THEN
             WRITE (unit_nr, '(T2,A4,T7,A29,T71,F10.3)') 'BSE|', 'Cutoff occupied orbitals [eV]', &
-               mp2_env%bse%bse_cutoff_occ*evolt
+               bse_env%bse_cutoff_occ*evolt
          ELSE
             WRITE (unit_nr, '(T2,A4,T7,A37)') 'BSE|', 'No cutoff given for occupied orbitals'
          END IF
-         IF (mp2_env%bse%bse_cutoff_empty > 0) THEN
+         IF (bse_env%bse_cutoff_empty > 0) THEN
             WRITE (unit_nr, '(T2,A4,T7,A26,T71,F10.3)') 'BSE|', 'Cutoff empty orbitals [eV]', &
-               mp2_env%bse%bse_cutoff_empty*evolt
+               bse_env%bse_cutoff_empty*evolt
          ELSE
             WRITE (unit_nr, '(T2,A4,T7,A34)') 'BSE|', 'No cutoff given for empty orbitals'
          END IF
          WRITE (unit_nr, '(T2,A4,T7,A20,T71,I10)') 'BSE|', 'First occupied index', homo_incl
          WRITE (unit_nr, '(T2,A4,T7,A32,T71,I10)') 'BSE|', 'Last empty index (not MO index!)', virt_incl
-         WRITE (unit_nr, '(T2,A4,T7,A35,T71,F10.3)') 'BSE|', 'Energy of first occupied index [eV]', Eigenval(homo_incl)*evolt
-         WRITE (unit_nr, '(T2,A4,T7,A31,T71,F10.3)') 'BSE|', 'Energy of last empty index [eV]', Eigenval(homo + virt_incl)*evolt
-         WRITE (unit_nr, '(T2,A4,T7,A54,T71,F10.3)') 'BSE|', 'Energy difference of first occupied index to HOMO [eV]', &
+         WRITE (unit_nr, '(T2,A4,T7,A35,T71,F10.3)') 'BSE|', 'Energy of first occupied index [eV]', &
+            Eigenval(homo_incl)*evolt
+         WRITE (unit_nr, '(T2,A4,T7,A31,T71,F10.3)') 'BSE|', 'Energy of last empty index [eV]', &
+            Eigenval(homo + virt_incl)*evolt
+         WRITE (unit_nr, '(T2,A4,T7,A54,T71,F10.3)') 'BSE|', &
+            'Energy difference of first occupied index to HOMO [eV]', &
             -(Eigenval(homo_incl) - Eigenval(homo))*evolt
-         WRITE (unit_nr, '(T2,A4,T7,A50,T71,F10.3)') 'BSE|', 'Energy difference of last empty index to LUMO [eV]', &
+         WRITE (unit_nr, '(T2,A4,T7,A50,T71,F10.3)') 'BSE|', &
+            'Energy difference of last empty index to LUMO [eV]', &
             (Eigenval(homo + virt_incl) - Eigenval(homo + 1))*evolt
-         WRITE (unit_nr, '(T2,A4,T7,A35,T71,I10)') 'BSE|', 'Number of GW-corrected occupied MOs', mp2_env%ri_g0w0%corr_mos_occ
-         WRITE (unit_nr, '(T2,A4,T7,A32,T71,I10)') 'BSE|', 'Number of GW-corrected empty MOs', mp2_env%ri_g0w0%corr_mos_virt
+         WRITE (unit_nr, '(T2,A4,T7,A35,T71,I10)') 'BSE|', 'Number of GW-corrected occupied MOs', &
+            bse_env%gw_corr_lev_occ
+         WRITE (unit_nr, '(T2,A4,T7,A32,T71,I10)') 'BSE|', 'Number of GW-corrected empty MOs', &
+            bse_env%gw_corr_lev_virt(ispin)
          WRITE (unit_nr, '(T2,A4)') 'BSE|'
       END IF
       IF (unit_nr > 0) THEN
-         IF (homo - homo_incl + 1 > mp2_env%ri_g0w0%corr_mos_occ) THEN
+         IF (homo - homo_incl + 1 > bse_env%gw_corr_lev_occ) THEN
             CPABORT("Number of GW-corrected occupied MOs too small for chosen BSE cutoff")
          END IF
-         IF (virt_incl > mp2_env%ri_g0w0%corr_mos_virt) THEN
+         IF (virt_incl > bse_env%gw_corr_lev_virt(ispin)) THEN
             CPABORT("Number of GW-corrected virtual MOs too small for chosen BSE cutoff")
          END IF
       END IF
       !Truncate full fm_S matrices
       !Allocate new truncated matrices of proper size
-      para_env => fm_mat_S_ia_bse%matrix_struct%para_env
-      context => fm_mat_S_ia_bse%matrix_struct%context
+      para_env => fm_S_ia_full%matrix_struct%para_env
+      context => fm_S_ia_full%matrix_struct%context
 
       CALL cp_fm_struct_create(fm_struct_ia, para_env, context, dimen_RI, homo_red*virt_red)
       CALL cp_fm_struct_create(fm_struct_ij, para_env, context, dimen_RI, homo_red*homo_red)
       CALL cp_fm_struct_create(fm_struct_ab, para_env, context, dimen_RI, virt_red*virt_red)
 
-      CALL cp_fm_create(fm_mat_S_trunc, fm_struct_ia, name="fm_S_trunc", set_zero=.TRUE.)
-      CALL cp_fm_create(fm_mat_S_ij_trunc, fm_struct_ij, name="fm_S_ij_trunc", set_zero=.TRUE.)
-      CALL cp_fm_create(fm_mat_S_ab_trunc, fm_struct_ab, name="fm_S_ab_trunc", set_zero=.TRUE.)
+      CALL cp_fm_create(bse_env%fm_S_ia(ispin), fm_struct_ia, name="fm_S_trunc", set_zero=.TRUE.)
+      CALL cp_fm_create(bse_env%fm_S_ij(ispin), fm_struct_ij, name="fm_S_ij_trunc", set_zero=.TRUE.)
+      CALL cp_fm_create(bse_env%fm_S_ab(ispin), fm_struct_ab, name="fm_S_ab_trunc", set_zero=.TRUE.)
 
       !Copy parts of original matrices to truncated ones
-      IF (mp2_env%bse%bse_cutoff_occ > 0 .OR. mp2_env%bse%bse_cutoff_empty > 0) THEN
+      IF (bse_env%bse_cutoff_occ > 0 .OR. bse_env%bse_cutoff_empty > 0) THEN
          !Truncate eigenvals
-         ALLOCATE (Eigenval_reduced(homo_red + virt_red))
-         ! Include USE_KS_ENERGIES input
-         IF (mp2_env%bse%use_ks_energies) THEN
-            Eigenval_reduced(:) = Eigenval_scf(homo_incl:homo + virt_incl)
-         ELSE
-            Eigenval_reduced(:) = Eigenval(homo_incl:homo + virt_incl)
-         END IF
+         ALLOCATE (Eigenval_reduced_scf(homo_red + virt_red), Eigenval_reduced_qp(homo_red + virt_red))
+         Eigenval_reduced_scf(:) = Eigenval_scf(homo_incl:homo + virt_incl)
+         Eigenval_reduced_qp(:) = Eigenval(homo_incl:homo + virt_incl)
 
-         CALL truncate_fm(fm_mat_S_trunc, fm_mat_S_ia_bse, virtual, &
-                          homo_red, virt_red, unit_nr, mp2_env, &
-                          nrow_offset=homo_incl)
-         CALL truncate_fm(fm_mat_S_ij_trunc, fm_mat_S_ij_bse, homo, &
-                          homo_red, homo_red, unit_nr, mp2_env, &
-                          homo_incl, homo_incl)
-         CALL truncate_fm(fm_mat_S_ab_trunc, fm_mat_S_ab_bse, bse_lev_virt, &
-                          virt_red, virt_red, unit_nr, mp2_env)
+         CALL cp_fm_permute(bse_env%fm_S_ia(ispin), fm_S_ia_full, 1.0_dp, 1, virtual, 1, virt_red, [1, 2, 3, 4], &
+                            first_index=[1, 1, homo_incl, 1], &
+                            last_index=[dimen_RI, 1, (homo_incl) + homo_red - 1, virt_red])
+         CALL cp_fm_permute(bse_env%fm_S_ij(ispin), fm_S_ij_full, 1.0_dp, 1, homo, 1, homo_red, [1, 2, 3, 4], &
+                            first_index=[1, 1, homo_incl, homo_incl], &
+                            last_index=[dimen_RI, 1, (homo_incl) + homo_red - 1, (homo_incl) + homo_red - 1])
+         CALL cp_fm_permute(bse_env%fm_S_ab(ispin), fm_S_ab_full, 1.0_dp, 1, bse_env%gw_corr_lev_virt(ispin), 1, &
+                            virt_red, [1, 2, 3, 4], first_index=[1, 1, 1, 1], &
+                            last_index=[dimen_RI, 1, virt_red, virt_red])
 
       ELSE
          IF (unit_nr > 0) THEN
             WRITE (unit_nr, '(T2,A4,T7,A37)') 'BSE|', 'No truncation of BSE matrices applied'
             WRITE (unit_nr, '(T2,A4)') 'BSE|'
          END IF
-         ALLOCATE (Eigenval_reduced(homo_red + virt_red))
-         ! Include USE_KS_ENERGIES input
-         IF (mp2_env%bse%use_ks_energies) THEN
-            Eigenval_reduced(:) = Eigenval_scf(:)
-         ELSE
-            Eigenval_reduced(:) = Eigenval(:)
-         END IF
-         CALL cp_fm_to_fm_submat_general(fm_mat_S_ia_bse, fm_mat_S_trunc, dimen_RI, homo_red*virt_red, &
+         ALLOCATE (Eigenval_reduced_scf(homo_red + virt_red), Eigenval_reduced_qp(homo_red + virt_red))
+         Eigenval_reduced_scf(:) = Eigenval_scf(:)
+         Eigenval_reduced_qp(:) = Eigenval(:)
+         CALL cp_fm_to_fm_submat_general(fm_S_ia_full, bse_env%fm_S_ia(ispin), dimen_RI, homo_red*virt_red, &
                                          1, 1, 1, 1, context)
-         CALL cp_fm_to_fm_submat_general(fm_mat_S_ij_bse, fm_mat_S_ij_trunc, dimen_RI, homo_red*homo_red, &
+         CALL cp_fm_to_fm_submat_general(fm_S_ij_full, bse_env%fm_S_ij(ispin), dimen_RI, homo_red*homo_red, &
                                          1, 1, 1, 1, context)
-         CALL cp_fm_to_fm_submat_general(fm_mat_S_ab_bse, fm_mat_S_ab_trunc, dimen_RI, virt_red*virt_red, &
+         CALL cp_fm_to_fm_submat_general(fm_S_ab_full, bse_env%fm_S_ab(ispin), dimen_RI, virt_red*virt_red, &
                                          1, 1, 1, 1, context)
       END IF
+
+      bse_env%homo_red(ispin) = homo_red
+      bse_env%virt_red(ispin) = virt_red
 
       CALL cp_fm_struct_release(fm_struct_ia)
       CALL cp_fm_struct_release(fm_struct_ij)
@@ -1343,18 +790,13 @@ CONTAINS
 !> \param virtual ...
 !> \param n_exc ...
 !> \param do_transpose ...
-!> \param unit_nr ...
-!> \param mp2_env ...
 ! **************************************************************************************************
-   SUBROUTINE reshuffle_eigvec(fm_eigvec, fm_eigvec_reshuffled, homo, virtual, n_exc, do_transpose, &
-                               unit_nr, mp2_env)
+   SUBROUTINE reshuffle_eigvec(fm_eigvec, fm_eigvec_reshuffled, homo, virtual, n_exc, do_transpose)
 
       TYPE(cp_fm_type), INTENT(IN)                       :: fm_eigvec
       TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_eigvec_reshuffled
       INTEGER, INTENT(IN)                                :: homo, virtual, n_exc
       LOGICAL, INTENT(IN)                                :: do_transpose
-      INTEGER, INTENT(IN)                                :: unit_nr
-      TYPE(mp2_type), INTENT(INOUT)                      :: mp2_env
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'reshuffle_eigvec'
 
@@ -1397,10 +839,7 @@ CONTAINS
                               1, n_exc, &
                               1, 1)
       ! Reshuffle
-      CALL fm_general_add_bse(fm_eigvec_reshuffled, fm_eigvec_col, 1.0_dp, &
-                              virtual, 1, &
-                              1, 1, &
-                              unit_nr, reordering, mp2_env)
+      CALL cp_fm_permute(fm_eigvec_reshuffled, fm_eigvec_col, 1.0_dp, virtual, 1, 1, 1, reordering)
 
       CALL cp_fm_release(fm_eigvec_col)
       CALL cp_fm_struct_release(fm_struct_eigvec_col)
@@ -1412,7 +851,7 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Borrowed from the tddfpt module with slight adaptions
-!> \param qs_env ...
+!> \param bse_env the BSE environment (the QS objects the cube writer reads)
 !> \param mos ...
 !> \param istate ...
 !> \param info_approximation ...
@@ -1420,10 +859,10 @@ CONTAINS
 !> \param append_cube ...
 !> \param print_section ...
 ! **************************************************************************************************
-   SUBROUTINE print_bse_nto_cubes(qs_env, mos, istate, info_approximation, &
+   SUBROUTINE print_bse_nto_cubes(bse_env, mos, istate, info_approximation, &
                                   stride, append_cube, print_section)
 
-      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(bse_env_type), INTENT(IN)                     :: bse_env
       TYPE(mo_set_type), DIMENSION(:), INTENT(IN)        :: mos
       INTEGER, INTENT(IN)                                :: istate
       CHARACTER(LEN=10)                                  :: info_approximation
@@ -1455,12 +894,17 @@ CONTAINS
       logger => cp_get_default_logger()
       CALL timeset(routineN, handle)
 
-      CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, pw_env=pw_env)
+      dft_control => bse_env%dft_control
+      ! PROPERTIES%BSE runs after the GW released the grids; its requirement reader refuses cube files
+      IF (.NOT. ASSOCIATED(bse_env%pw_env)) THEN
+         CPABORT("NTO cube files need the SCF grids: set NTO_ANALYSIS%CUBE_FILES to F")
+      END IF
+      pw_env => bse_env%pw_env
       CALL pw_env_get(pw_env, auxbas_pw_pool=auxbas_pw_pool, pw_pools=pw_pools)
       CALL auxbas_pw_pool%create_pw(wf_r)
       CALL auxbas_pw_pool%create_pw(wf_g)
 
-      CALL get_qs_env(qs_env, subsys=subsys)
+      subsys => bse_env%subsys
       CALL qs_subsys_get(subsys, particles=particles)
 
       my_pos_cube = "REWIND"
@@ -1468,11 +912,8 @@ CONTAINS
          my_pos_cube = "APPEND"
       END IF
 
-      CALL get_qs_env(qs_env=qs_env, &
-                      atomic_kind_set=atomic_kind_set, &
-                      qs_kind_set=qs_kind_set, &
-                      cell=cell, &
-                      particle_set=particle_set)
+      CALL qs_subsys_get(subsys, atomic_kind_set=atomic_kind_set, qs_kind_set=qs_kind_set, &
+                         cell=cell, particle_set=particle_set)
 
       DO iset = 1, 2
          CALL get_mo_set(mo_set=mos(iset), mo_coeff=mo_coeff, nmo=nmo)
@@ -1481,7 +922,7 @@ CONTAINS
                                         cell, dft_control, particle_set, pw_env)
             IF (iset == 1) THEN
                WRITE (filename, '(A6,I3.3,A5,I2.2,a11)') "_NEXC_", istate, "_NTO_", i, "_Hole_State"
-            ELSEIF (iset == 2) THEN
+            ELSE IF (iset == 2) THEN
                WRITE (filename, '(A6,I3.3,A5,I2.2,a15)') "_NEXC_", istate, "_NTO_", i, "_Particle_State"
             END IF
             info_approx_trunc = TRIM(ADJUSTL(info_approximation))
@@ -1493,7 +934,7 @@ CONTAINS
                                                 log_filename=.FALSE., ignore_should_output=.TRUE., mpi_io=mpi_io)
             IF (iset == 1) THEN
                WRITE (title, *) "Natural Transition Orbital Hole State", i
-            ELSEIF (iset == 2) THEN
+            ELSE IF (iset == 2) THEN
                WRITE (title, *) "Natural Transition Orbital Particle State", i
             END IF
             CALL cp_pw_to_cube(wf_r, unit_nr_cube, title, particles=particles, stride=stride, mpi_io=mpi_io)
@@ -1513,36 +954,39 @@ CONTAINS
 !> \param homo ...
 !> \param virtual ...
 !> \param unit_nr ...
-!> \param mp2_env ...
-!> \param qs_env ...
+!> \param bse_env the BSE environment; the settings are normalised in place
 ! **************************************************************************************************
-   SUBROUTINE adapt_BSE_input_params(homo, virtual, unit_nr, mp2_env, qs_env)
+   SUBROUTINE adapt_BSE_input_params(homo, virtual, unit_nr, bse_env)
 
       INTEGER, INTENT(IN)                                :: homo, virtual, unit_nr
-      TYPE(mp2_type)                                     :: mp2_env
-      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(bse_env_type), INTENT(INOUT)                  :: bse_env
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'adapt_BSE_input_params'
 
-      INTEGER                                            :: handle, i, j, n, ndim_periodic_cell, &
+      INTEGER                                            :: handle, i, j, n, n_exc_max, &
+                                                            ndim_periodic_cell, &
                                                             ndim_periodic_poisson, &
                                                             num_state_list_exceptions
+      LOGICAL                                            :: explicit
       TYPE(cell_type), POINTER                           :: cell_ref
-      TYPE(pw_env_type), POINTER                         :: pw_env
-      TYPE(pw_poisson_type), POINTER                     :: poisson_env
 
       CALL timeset(routineN, handle)
-      ! Get environment infos for later usage
-      NULLIFY (pw_env, cell_ref, poisson_env)
-      CALL get_qs_env(qs_env, pw_env=pw_env, cell_ref=cell_ref)
-      CALL pw_env_get(pw_env, poisson_env=poisson_env)
-      ndim_periodic_poisson = COUNT(poisson_env%parameters%periodic == 1)
+      ! the Poisson periodicity was read from the input (finish_bse_env): the grids may be released
+      NULLIFY (cell_ref)
+      CALL qs_subsys_get(bse_env%subsys, cell_ref=cell_ref)
+      ndim_periodic_poisson = bse_env%n_periodic_poisson
       ndim_periodic_cell = SUM(cell_ref%perd(1:3)) ! Borrowed from cell_methods.F/write_cell_low
 
+      ! The iterative solver computes the NUM_EXC_EN lowest excitations only
+      n_exc_max = homo*virtual
+      IF (bse_env%bse_diag_method == bse_iterdiag) THEN
+         n_exc_max = MIN(n_exc_max, bse_env%num_exc_en)
+      END IF
+
       ! Handle negative NUM_PRINT_EXC
-      IF (mp2_env%bse%num_print_exc < 0 .OR. &
-          mp2_env%bse%num_print_exc > homo*virtual) THEN
-         mp2_env%bse%num_print_exc = homo*virtual
+      IF (bse_env%num_print_exc < 0 .OR. &
+          bse_env%num_print_exc > n_exc_max) THEN
+         bse_env%num_print_exc = n_exc_max
          IF (unit_nr > 0) THEN
             CALL cp_hint(__LOCATION__, &
                          "Keyword NUM_PRINT_EXC is either negative or too large. "// &
@@ -1556,9 +1000,9 @@ CONTAINS
       ! Logic: Explicit state list overrides NUM_PRINT_EXC_NTOS
       !        If only NUM_PRINT_EXC_NTOS is given, we write the array 1,...,NUM_PRINT_EXC_NTOS to
       !        bse_nto_state_list
-      IF (mp2_env%bse%do_nto_analysis) THEN
-         IF (mp2_env%bse%explicit_nto_list) THEN
-            IF (mp2_env%bse%num_print_exc_ntos > 0) THEN
+      IF (bse_env%do_nto_analysis) THEN
+         IF (bse_env%explicit_nto_list) THEN
+            IF (bse_env%num_print_exc_ntos > 0) THEN
                IF (unit_nr > 0) THEN
                   CALL cp_hint(__LOCATION__, &
                                "Keywords NUM_PRINT_EXC_NTOS and STATE_LIST are both given in input. "// &
@@ -1568,9 +1012,9 @@ CONTAINS
             ! Check if all states are within the range
             ! Count them and initialize new array afterwards
             num_state_list_exceptions = 0
-            DO i = 1, SIZE(mp2_env%bse%bse_nto_state_list)
-               IF (mp2_env%bse%bse_nto_state_list(i) < 1 .OR. &
-                   mp2_env%bse%bse_nto_state_list(i) > mp2_env%bse%num_print_exc) THEN
+            DO i = 1, SIZE(bse_env%bse_nto_state_list)
+               IF (bse_env%bse_nto_state_list(i) < 1 .OR. &
+                   bse_env%bse_nto_state_list(i) > bse_env%num_print_exc) THEN
                   num_state_list_exceptions = num_state_list_exceptions + 1
                END IF
             END DO
@@ -1581,91 +1025,65 @@ CONTAINS
                                "Ignoring these states.")
                END IF
             END IF
-            n = SIZE(mp2_env%bse%bse_nto_state_list) - num_state_list_exceptions
-            ALLOCATE (mp2_env%bse%bse_nto_state_list_final(n))
-            mp2_env%bse%bse_nto_state_list_final(:) = 0
+            n = SIZE(bse_env%bse_nto_state_list) - num_state_list_exceptions
+            ALLOCATE (bse_env%bse_nto_state_list_final(n))
+            bse_env%bse_nto_state_list_final(:) = 0
             i = 1
-            DO j = 1, SIZE(mp2_env%bse%bse_nto_state_list)
-               IF (mp2_env%bse%bse_nto_state_list(j) >= 1 .AND. &
-                   mp2_env%bse%bse_nto_state_list(j) <= mp2_env%bse%num_print_exc) THEN
-                  mp2_env%bse%bse_nto_state_list_final(i) = mp2_env%bse%bse_nto_state_list(j)
+            DO j = 1, SIZE(bse_env%bse_nto_state_list)
+               IF (bse_env%bse_nto_state_list(j) >= 1 .AND. &
+                   bse_env%bse_nto_state_list(j) <= bse_env%num_print_exc) THEN
+                  bse_env%bse_nto_state_list_final(i) = bse_env%bse_nto_state_list(j)
                   i = i + 1
                END IF
             END DO
 
-            mp2_env%bse%num_print_exc_ntos = SIZE(mp2_env%bse%bse_nto_state_list_final)
+            bse_env%num_print_exc_ntos = SIZE(bse_env%bse_nto_state_list_final)
          ELSE
-            IF (mp2_env%bse%num_print_exc_ntos > mp2_env%bse%num_print_exc .OR. &
-                mp2_env%bse%num_print_exc_ntos < 0) THEN
-               mp2_env%bse%num_print_exc_ntos = mp2_env%bse%num_print_exc
+            IF (bse_env%num_print_exc_ntos > bse_env%num_print_exc .OR. &
+                bse_env%num_print_exc_ntos < 0) THEN
+               bse_env%num_print_exc_ntos = bse_env%num_print_exc
             END IF
-            ALLOCATE (mp2_env%bse%bse_nto_state_list_final(mp2_env%bse%num_print_exc_ntos))
-            DO i = 1, mp2_env%bse%num_print_exc_ntos
-               mp2_env%bse%bse_nto_state_list_final(i) = i
+            ALLOCATE (bse_env%bse_nto_state_list_final(bse_env%num_print_exc_ntos))
+            DO i = 1, bse_env%num_print_exc_ntos
+               bse_env%bse_nto_state_list_final(i) = i
             END DO
          END IF
       END IF
 
       ! Takes care of triplet states, when oscillator strengths are 0
-      IF (mp2_env%bse%bse_spin_config /= 0 .AND. &
-          mp2_env%bse%eps_nto_osc_str > 0) THEN
+      IF (bse_env%bse_spin_config /= 0 .AND. &
+          bse_env%eps_nto_osc_str > 0) THEN
          IF (unit_nr > 0) THEN
             CALL cp_warn(__LOCATION__, &
                          "Cannot apply EPS_OSC_STR for Triplet excitations. "// &
                          "Resetting EPS_OSC_STR to default.")
          END IF
-         mp2_env%bse%eps_nto_osc_str = -1.0_dp
+         bse_env%eps_nto_osc_str = -1.0_dp
       END IF
 
       ! Take care of number for computed exciton descriptors
-      IF (mp2_env%bse%num_print_exc_descr < 0 .OR. &
-          mp2_env%bse%num_print_exc_descr > mp2_env%bse%num_print_exc) THEN
+      IF (bse_env%num_print_exc_descr < 0 .OR. &
+          bse_env%num_print_exc_descr > bse_env%num_print_exc) THEN
          IF (unit_nr > 0) THEN
             CALL cp_hint(__LOCATION__, &
                          "Keyword NUM_PRINT_EXC_DESCR is either negative or too large. "// &
                          "Printing exciton descriptors up to NUM_PRINT_EXC.")
          END IF
-         mp2_env%bse%num_print_exc_descr = mp2_env%bse%num_print_exc
+         bse_env%num_print_exc_descr = bse_env%num_print_exc
       END IF
 
-      ! Handle screening factor options
-      IF (mp2_env%BSE%screening_factor > 0.0_dp) THEN
-         IF (mp2_env%BSE%screening_method /= bse_screening_alpha) THEN
-            IF (unit_nr > 0) THEN
-               CALL cp_warn(__LOCATION__, &
-                            "Screening factor is only supported for &SCREENING_IN_W ALPHA. "// &
-                            "Resetting SCREENING_IN_W to ALPHA.")
-            END IF
-            mp2_env%BSE%screening_method = bse_screening_alpha
-         END IF
-         IF (mp2_env%BSE%screening_factor > 1.0_dp) THEN
-            IF (unit_nr > 0) THEN
-               CALL cp_warn(__LOCATION__, &
-                            "Screening factor is larger than 1.0. ")
-            END IF
-         END IF
-      END IF
-
-      IF (mp2_env%BSE%screening_factor < 0.0_dp .AND. &
-          mp2_env%BSE%screening_method == bse_screening_alpha) THEN
+      ! the keyword defaults to true, so only an explicit request is worth a warning
+      CALL section_vals_val_get(bse_env%bse_section, "PRINT_DIRECTIONAL_CROSSCORRELATION", explicit=explicit)
+      IF (explicit .AND. bse_env%print_directional_crosscorrelation .AND. &
+          .NOT. bse_env%print_directional_exc_descr) THEN
          IF (unit_nr > 0) THEN
             CALL cp_warn(__LOCATION__, &
-                         "Screening factor is negative. Defaulting to 0.25")
+                         "PRINT_DIRECTIONAL_CROSSCORRELATION has no effect without PRINT_DIRECTIONAL_EXC_DESCR.")
          END IF
-         mp2_env%BSE%screening_factor = 0.25_dp
-      END IF
-
-      IF (mp2_env%BSE%screening_factor == 0.0_dp) THEN
-         ! Use RPA internally in this case
-         mp2_env%BSE%screening_method = bse_screening_rpa
-      END IF
-      IF (mp2_env%BSE%screening_factor == 1.0_dp) THEN
-         ! Use TDHF internally in this case
-         mp2_env%BSE%screening_method = bse_screening_tdhf
       END IF
 
       ! Add warning for usage of KS energies
-      IF (mp2_env%bse%use_ks_energies) THEN
+      IF (bse_env%use_ks_energies) THEN
          IF (unit_nr > 0) THEN
             CALL cp_warn(__LOCATION__, &
                          "Using KS energies for BSE calculations. Therefore, no quantities "// &
@@ -1695,86 +1113,110 @@ CONTAINS
    END SUBROUTINE adapt_BSE_input_params
 
 ! **************************************************************************************************
+!> \brief Resolve SCREENING_IN_W and its factor before constructing the dielectric matrix or slabs.
+!> \param bse_env screening method and factor, normalised in place
+!> \param unit_nr output unit, positive on the writing rank only
+! **************************************************************************************************
+   SUBROUTINE adapt_BSE_screening(bse_env, unit_nr)
+      TYPE(bse_env_type), INTENT(INOUT)                  :: bse_env
+      INTEGER, INTENT(IN)                                :: unit_nr
+
+      ! Handle screening factor options
+      IF (bse_env%screening_factor > 0.0_dp) THEN
+         IF (bse_env%screening_method /= bse_screening_alpha) THEN
+            IF (unit_nr > 0) THEN
+               CALL cp_warn(__LOCATION__, &
+                            "Screening factor is only supported for &SCREENING_IN_W ALPHA. "// &
+                            "Resetting SCREENING_IN_W to ALPHA.")
+            END IF
+            bse_env%screening_method = bse_screening_alpha
+         END IF
+         IF (bse_env%screening_factor > 1.0_dp) THEN
+            IF (unit_nr > 0) THEN
+               CALL cp_warn(__LOCATION__, &
+                            "Screening factor is larger than 1.0. ")
+            END IF
+         END IF
+      END IF
+
+      IF (bse_env%screening_factor < 0.0_dp .AND. &
+          bse_env%screening_method == bse_screening_alpha) THEN
+         IF (unit_nr > 0) THEN
+            CALL cp_warn(__LOCATION__, &
+                         "Screening factor is negative. Defaulting to 0.25")
+         END IF
+         bse_env%screening_factor = 0.25_dp
+      END IF
+
+      IF (bse_env%screening_factor == 0.0_dp) THEN
+         ! Use RPA internally in this case
+         bse_env%screening_method = bse_screening_rpa
+      END IF
+      IF (bse_env%screening_factor == 1.0_dp) THEN
+         ! Use TDHF internally in this case
+         bse_env%screening_method = bse_screening_tdhf
+      END IF
+
+   END SUBROUTINE adapt_BSE_screening
 
 ! **************************************************************************************************
-!> \brief ...
-!> \param fm_multipole_ai_trunc ...
-!> \param fm_multipole_ij_trunc ...
-!> \param fm_multipole_ab_trunc ...
-!> \param qs_env ...
-!> \param mo_coeff ...
-!> \param rpoint ...
-!> \param n_moments ...
-!> \param homo_red ...
-!> \param virtual_red ...
+
+! **************************************************************************************************
+!> \brief The multipoles in the MO window, D^k_pq = sum_µν C_µp M^k_µν C_νq, cut to the ai, ij and ab
+!>        blocks of the window; M^k_µν are the AO multipoles of get_multipoles_ao
+!> \param fm_multipole_ai_trunc D^k_ai, one entry per component k
+!> \param fm_multipole_ij_trunc D^k_ij
+!> \param fm_multipole_ab_trunc D^k_ab
+!> \param matrix_multipole M^k_µν, one entry per component k (x, y, z, then xx, xy, xz, yy, yz, zz)
+!> \param mos MO sets of the reference, for the AO layout and the occupied count
+!> \param mo_coeff C_µp of the spin
+!> \param homo_red occupied levels in the window
+!> \param virtual_red virtual levels in the window
 !> \param context_BSE ...
+!> \param ispin spin channel whose mo_set supplies homo/nao (default 1); open-shell beta needs 2
 ! **************************************************************************************************
    SUBROUTINE get_multipoles_mo(fm_multipole_ai_trunc, fm_multipole_ij_trunc, fm_multipole_ab_trunc, &
-                                qs_env, mo_coeff, rpoint, n_moments, &
-                                homo_red, virtual_red, context_BSE)
+                                matrix_multipole, mos, mo_coeff, &
+                                homo_red, virtual_red, context_BSE, ispin)
 
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:), &
          INTENT(INOUT)                                   :: fm_multipole_ai_trunc, &
                                                             fm_multipole_ij_trunc, &
                                                             fm_multipole_ab_trunc
-      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:), INTENT(IN)       :: matrix_multipole
+      TYPE(mo_set_type), DIMENSION(:), INTENT(IN)        :: mos
       TYPE(cp_fm_type), DIMENSION(:), INTENT(IN)         :: mo_coeff
-      REAL(dp), ALLOCATABLE, DIMENSION(:), INTENT(INOUT) :: rpoint
-      INTEGER, INTENT(IN)                                :: n_moments, homo_red, virtual_red
+      INTEGER, INTENT(IN)                                :: homo_red, virtual_red
       TYPE(cp_blacs_env_type), POINTER                   :: context_BSE
+      INTEGER, INTENT(IN), OPTIONAL                      :: ispin
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'get_multipoles_mo'
 
-      INTEGER                                            :: handle, idir, n_multipole, n_occ, &
-                                                            n_virt, nao, nmo_mp2
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
+      INTEGER                                            :: handle, idir, my_ispin, n_multipole, &
+                                                            n_occ, n_virt, nao, nmo_mp2
       TYPE(cp_fm_struct_type), POINTER :: fm_struct_mp_ab_trunc, fm_struct_mp_ai_trunc, &
          fm_struct_mp_ij_trunc, fm_struct_multipoles_ao, fm_struct_nao_nmo, fm_struct_nmo_nmo
       TYPE(cp_fm_type)                                   :: fm_work
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_multipole_per_dir
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_multipole, matrix_s
-      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
       TYPE(mp_para_env_type), POINTER                    :: para_env_BSE
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_orb
 
       CALL timeset(routineN, handle)
 
-      !First, we calculate the AO dipoles
-      NULLIFY (sab_orb, matrix_s)
-      CALL get_qs_env(qs_env, &
-                      mos=mos, &
-                      matrix_s=matrix_s, &
-                      sab_orb=sab_orb)
+      my_ispin = 1
+      IF (PRESENT(ispin)) my_ispin = ispin
 
       ! Use the same blacs environment as for the MO coefficients to ensure correct multiplication dbcsr x fm later on
-      fm_struct_multipoles_ao => mos(1)%mo_coeff%matrix_struct
+      fm_struct_multipoles_ao => mos(my_ispin)%mo_coeff%matrix_struct
       ! BSE has different contexts and blacsenvs
       para_env_BSE => context_BSE%para_env
-      ! Get size of multipole tensor
-      n_multipole = (6 + 11*n_moments + 6*n_moments**2 + n_moments**3)/6 - 1
-      NULLIFY (matrix_multipole)
-      CALL dbcsr_allocate_matrix_set(matrix_multipole, n_multipole)
+      n_multipole = SIZE(matrix_multipole)
       ALLOCATE (fm_multipole_per_dir(n_multipole))
-      DO idir = 1, n_multipole
-         CALL dbcsr_init_p(matrix_multipole(idir)%matrix)
-         CALL dbcsr_create(matrix_multipole(idir)%matrix, name="ao_multipole", &
-                           template=matrix_s(1)%matrix, matrix_type=dbcsr_type_symmetric)
-         CALL cp_dbcsr_alloc_block_from_nbl(matrix_multipole(idir)%matrix, sab_orb)
-         CALL dbcsr_set(matrix_multipole(idir)%matrix, 0._dp)
-      END DO
-
-      CALL get_reference_point(rpoint, qs_env=qs_env, reference=use_mom_ref_coac, ref_point=ref_point)
-
-      CALL build_local_moment_matrix(qs_env, matrix_multipole, n_moments, ref_point=rpoint)
-
-      NULLIFY (sab_orb)
 
       ! Now we transform them to MO
       ! n_occ is the number of occupied MOs, nao the number of all AOs
       ! Writing homo to n_occ instead if nmo,
       ! takes care of ADDED_MOS, which would overwrite nmo of qs_env-mos, if invoked
-      CALL get_mo_set(mo_set=mos(1), homo=n_occ, nao=nao)
+      CALL get_mo_set(mo_set=mos(my_ispin), homo=n_occ, nao=nao)
       ! Takes into account removed nullspace values from SVD
       nmo_mp2 = mo_coeff(1)%matrix_struct%ncol_global
       n_virt = nmo_mp2 - n_occ
@@ -1876,7 +1318,6 @@ CONTAINS
       END DO
       DEALLOCATE (fm_multipole_per_dir)
       CALL cp_fm_release(fm_work)
-      CALL dbcsr_deallocate_matrix_set(matrix_multipole)
 
       CALL timestop(handle)
 
@@ -1922,5 +1363,33 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE trace_exciton_descr
+
+! **************************************************************************************************
+!> \brief Column-concatenate per-spin ia-slabs into the joint dimen_RI x n_ov_joint slab.
+!>   Sigma-block of spin isp occupies columns offsets(isp)+1 .. offsets(isp)+n_ov(isp).
+!>   fm_S_joint must be pre-created and zeroed by the caller.
+!> \param fm_S_ia per-spin ia-slabs, shape (dimen_RI, n_ov(isp)) per spin
+!> \param offsets per-spin column offsets into fm_S_joint (0-based)
+!> \param n_ov per-spin OV-pair counts
+!> \param dimen_RI RI auxiliary basis dimension (row count)
+!> \param fm_S_joint pre-created output slab (dimen_RI x n_ov_joint)
+! **************************************************************************************************
+   SUBROUTINE assemble_joint_ov_slab(fm_S_ia, offsets, n_ov, dimen_RI, fm_S_joint)
+      TYPE(cp_fm_type), DIMENSION(:), INTENT(IN)         :: fm_S_ia
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: offsets, n_ov
+      INTEGER, INTENT(IN)                                :: dimen_RI
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_S_joint
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'assemble_joint_ov_slab'
+
+      INTEGER                                            :: handle, isp
+
+      CALL timeset(routineN, handle)
+      DO isp = 1, SIZE(fm_S_ia)
+         CALL cp_fm_to_fm_submat(fm_S_ia(isp), fm_S_joint, dimen_RI, n_ov(isp), 1, 1, 1, offsets(isp) + 1)
+      END DO
+      CALL timestop(handle)
+
+   END SUBROUTINE assemble_joint_ov_slab
 
 END MODULE bse_util

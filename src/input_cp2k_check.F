@@ -12,7 +12,9 @@
 !> \author fawzi
 ! **************************************************************************************************
 MODULE input_cp2k_check
+   USE cell_types,                      ONLY: use_perd_none
    USE cp_log_handling,                 ONLY: cp_to_string
+   USE cp_output_handling,              ONLY: debug_print_level
    USE cp_parser_types,                 ONLY: cp_parser_type,&
                                               parser_create,&
                                               parser_release
@@ -22,9 +24,10 @@ MODULE input_cp2k_check
    USE input_constants,                 ONLY: &
         do_qs, do_region_global, do_thermo_al, do_thermo_csvr, do_thermo_gle, do_thermo_nose, &
         do_thermo_same_as_part, mimic_run, negf_run, npt_f_ensemble, npt_i_ensemble, &
-        npt_ia_ensemble, vdw_nl_LMKLL, xc_funct_b3lyp, xc_funct_beefvdw, xc_funct_blyp, &
-        xc_funct_bp, xc_funct_hcth120, xc_funct_no_shortcut, xc_funct_olyp, xc_funct_pade, &
-        xc_funct_pbe, xc_funct_pbe0, xc_funct_tpss, xc_funct_xwpbe, xc_none, xc_vdw_fun_nonloc
+        npt_ia_ensemble, rtp_method_bse, rtp_method_bse_linearized, vdw_nl_LMKLL, xc_funct_b3lyp, &
+        xc_funct_beefvdw, xc_funct_blyp, xc_funct_bp, xc_funct_hcth120, xc_funct_no_shortcut, &
+        xc_funct_olyp, xc_funct_pade, xc_funct_pbe, xc_funct_pbe0, xc_funct_tpss, xc_funct_xwpbe, &
+        xc_none, xc_vdw_fun_nonloc
    USE input_keyword_types,             ONLY: keyword_type
    USE input_parsing,                   ONLY: section_vals_parse
    USE input_section_types,             ONLY: &
@@ -80,8 +83,9 @@ CONTAINS
       CPASSERT(ASSOCIATED(input_file))
       CPASSERT(input_file%ref_count > 0)
       ! ext_restart
-      IF (PRESENT(output_unit)) &
+      IF (PRESENT(output_unit)) THEN
          CALL handle_ext_restart(input_declaration, input_file, para_env, output_unit)
+      END IF
 
       ! checks on force_eval section
       sections => section_vals_get_subs_vals(input_file, "FORCE_EVAL")
@@ -129,6 +133,7 @@ CONTAINS
          section1 => section_vals_get_subs_vals(section, "ACTIVE_SPACE%XC")
          section2 => section_vals_get_subs_vals(section, "ACTIVE_SPACE%XC%XC_FUNCTIONAL")
          CALL xc_functionals_expand(section2, section1)
+         CALL check_properties_bse(sections, iforce_eval)
       END DO
 
       ! additional checks for a MiMiC run
@@ -146,17 +151,92 @@ CONTAINS
          ! do not allow the use of external potential
          section => section_vals_get_subs_vals(sections, "DFT%EXTERNAL_POTENTIAL")
          CALL section_vals_get(section, explicit=apply_ext_potential)
-         IF (apply_ext_potential) &
+         IF (apply_ext_potential) THEN
             CPABORT("The EXTERNAL_POTENTIAL section is not allowed for the MiMiC runtype.")
+         END IF
 
          ! force eval methods supported with MiMiC
          CALL section_vals_val_get(sections, "METHOD", i_val=force_eval_method)
-         IF (force_eval_method /= do_qs) &
+         IF (force_eval_method /= do_qs) THEN
             CPABORT("At the moment, only Quickstep method is supported with MiMiC.")
+         END IF
       END IF
 
       CALL timestop(handle)
    END SUBROUTINE check_cp2k_input
+
+! **************************************************************************************************
+!> \brief Refuses, before the SCF, the input combinations PROPERTIES%BSE cannot run: no GW in
+!>        PROPERTIES%BANDSTRUCTURE, its RI_RS, a periodic cell, k-points beyond Gamma, an RTBSE in the
+!>        same run, NTO cubes (the GW releases the SCF grids they are collocated on)
+!> \param force_env_sections the FORCE_EVAL sections
+!> \param iforce_eval the repetition checked
+! **************************************************************************************************
+   SUBROUTINE check_properties_bse(force_env_sections, iforce_eval)
+      TYPE(section_vals_type), POINTER                   :: force_env_sections
+      INTEGER, INTENT(IN)                                :: iforce_eval
+
+      INTEGER                                            :: n_special_kp, periodic, print_level_nto, &
+                                                            rtp_method
+      INTEGER, DIMENSION(:), POINTER                     :: nkp_grid_dos
+      LOGICAL                                            :: cube_files, do_bse, do_gw, do_ri_rs
+      TYPE(section_vals_type), POINTER                   :: bs_sec, bse_sec, dft_sec, gw_sec, &
+                                                            properties_sec, subsys_sec
+
+      NULLIFY (bs_sec, bse_sec, dft_sec, gw_sec, nkp_grid_dos, properties_sec, subsys_sec)
+      properties_sec => section_vals_get_subs_vals3(force_env_sections, "PROPERTIES", i_rep_section=iforce_eval)
+      bse_sec => section_vals_get_subs_vals(properties_sec, "BSE")
+      CALL section_vals_get(bse_sec, explicit=do_bse)
+      IF (.NOT. do_bse) RETURN
+
+      bs_sec => section_vals_get_subs_vals(properties_sec, "BANDSTRUCTURE")
+      gw_sec => section_vals_get_subs_vals(bs_sec, "GW")
+      CALL section_vals_get(gw_sec, explicit=do_gw)
+      IF (.NOT. do_gw) CPABORT("PROPERTIES%BSE needs PROPERTIES%BANDSTRUCTURE%GW")
+      ! the BSE kernel is built from the three-center RI integrals, which RI_RS replaces by a grid
+      CALL section_vals_val_get(gw_sec, "RI_RS%_SECTION_PARAMETERS_", l_val=do_ri_rs)
+      IF (do_ri_rs) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "PROPERTIES%BSE needs the three-center RI integrals of the GW: remove the "// &
+                       "RI_RS subsection from PROPERTIES%BANDSTRUCTURE%GW")
+      END IF
+      subsys_sec => section_vals_get_subs_vals3(force_env_sections, "SUBSYS", i_rep_section=iforce_eval)
+      CALL section_vals_val_get(subsys_sec, "CELL%PERIODIC", i_val=periodic)
+      IF (periodic /= use_perd_none) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "The BSE treats non-periodic systems only: PROPERTIES%BSE needs "// &
+                       "PERIODIC NONE in the CELL section")
+      END IF
+      ! the BSE reads the MOs and the GW energies at the Gamma point, the only k-point of a
+      ! non-periodic run unless a band path or a DOS k-grid adds more
+      CALL section_vals_val_get(bs_sec, "BANDSTRUCTURE_PATH%SPECIAL_POINT", n_rep_val=n_special_kp)
+      CALL section_vals_val_get(bs_sec, "DOS%KPOINTS", i_vals=nkp_grid_dos)
+      IF (n_special_kp > 0 .OR. ANY(nkp_grid_dos > 1)) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "PROPERTIES%BSE needs the Gamma point only: remove BANDSTRUCTURE_PATH and "// &
+                       "DOS%KPOINTS from PROPERTIES%BANDSTRUCTURE")
+      END IF
+      ! both read the W(0) and the neighbour list the GW keeps, and PROPERTIES%BSE frees them
+      dft_sec => section_vals_get_subs_vals3(force_env_sections, "DFT", i_rep_section=iforce_eval)
+      CALL section_vals_val_get(dft_sec, "REAL_TIME_PROPAGATION%RTBSE%_SECTION_PARAMETERS_", i_val=rtp_method)
+      IF (rtp_method == rtp_method_bse .OR. rtp_method == rtp_method_bse_linearized) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "PROPERTIES%BSE and DFT%REAL_TIME_PROPAGATION%RTBSE may not share a run: "// &
+                       "remove one of the two sections")
+      END IF
+      ! the GW releases the SCF grids at its init; the NTO cube writer collocates on them
+      ! (CUBE_FILES defaults to true; the print key's level is the switch, OFF encoded as
+      ! debug_print_level + 1, read as read_bse_section reads it)
+      CALL section_vals_val_get(bse_sec, "NTO_ANALYSIS%_SECTION_PARAMETERS_", i_val=print_level_nto)
+      CALL section_vals_val_get(bse_sec, "NTO_ANALYSIS%CUBE_FILES", l_val=cube_files)
+      IF (print_level_nto /= debug_print_level + 1 .AND. cube_files) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "PROPERTIES%BSE runs after the GW released the SCF grids: set "// &
+                       "NTO_ANALYSIS%CUBE_FILES to F, or write the cubes from the BSE of "// &
+                       "XC%WF_CORRELATION%RI_RPA%GW")
+      END IF
+
+   END SUBROUTINE check_properties_bse
 
 ! **************************************************************************************************
 !> \brief expand a shortcutted functional section
@@ -431,29 +511,33 @@ CONTAINS
                      IF (flag) THEN
                         section => section_vals_get_subs_vals(section1, "SHELL_COORD")
                         CALL section_vals_set_subs_vals(section2, "SHELL_COORD", section)
-                        IF (check_restart(section1, section2, "SHELL_COORD")) &
+                        IF (check_restart(section1, section2, "SHELL_COORD")) THEN
                            CALL set_restart_info("SHELL COORDINATES", restarted_infos)
+                        END IF
                      END IF
                      CALL section_vals_val_get(r_section, "RESTART_CORE_POS", l_val=flag)
                      IF (flag) THEN
                         section => section_vals_get_subs_vals(section1, "CORE_COORD")
                         CALL section_vals_set_subs_vals(section2, "CORE_COORD", section)
-                        IF (check_restart(section1, section2, "CORE_COORD")) &
+                        IF (check_restart(section1, section2, "CORE_COORD")) THEN
                            CALL set_restart_info("CORE COORDINATES", restarted_infos)
+                        END IF
                      END IF
                      CALL section_vals_val_get(r_section, "RESTART_SHELL_VELOCITY", l_val=flag)
                      IF (flag) THEN
                         section => section_vals_get_subs_vals(section1, "SHELL_VELOCITY")
                         CALL section_vals_set_subs_vals(section2, "SHELL_VELOCITY", section)
-                        IF (check_restart(section1, section2, "SHELL_VELOCITY")) &
+                        IF (check_restart(section1, section2, "SHELL_VELOCITY")) THEN
                            CALL set_restart_info("SHELL VELOCITIES", restarted_infos)
+                        END IF
                      END IF
                      CALL section_vals_val_get(r_section, "RESTART_CORE_VELOCITY", l_val=flag)
                      IF (flag) THEN
                         section => section_vals_get_subs_vals(section1, "CORE_VELOCITY")
                         CALL section_vals_set_subs_vals(section2, "CORE_VELOCITY", section)
-                        IF (check_restart(section1, section2, "CORE_VELOCITY")) &
+                        IF (check_restart(section1, section2, "CORE_VELOCITY")) THEN
                            CALL set_restart_info("CORE VELOCITIES", restarted_infos)
+                        END IF
                      END IF
                   END IF
                ELSE
@@ -500,6 +584,31 @@ CONTAINS
                   CALL section_vals_val_get(restart_file, "MOTION%MD%ECONS_START_VAL", r_val=myt)
                   CALL section_vals_val_set(input_file, "MOTION%MD%ECONS_START_VAL", r_val=myt)
                   CALL set_restart_info("MD COUNTERS", restarted_infos)
+               END IF
+               !
+               ! Electronic extended variable (&MOTION&MD&ELECTRONS): q, p and the potentiostat
+               ! state belong to the trajectory, so they are restored together with the MD counters.
+               ! Without this a continued run silently restarts from the input deck's Q_INIT/P_INIT.
+               ! check_restart requires the section in BOTH decks, so inputs without &ELECTRONS
+               ! are unaffected.
+               IF (check_restart(input_file, restart_file, "MOTION%MD%ELECTRONS")) THEN
+                  CALL section_vals_val_get(restart_file, "MOTION%MD%ELECTRONS%Q_INIT", r_val=myt)
+                  CALL section_vals_val_set(input_file, "MOTION%MD%ELECTRONS%Q_INIT", r_val=myt)
+                  CALL section_vals_val_get(restart_file, "MOTION%MD%ELECTRONS%P_INIT", r_val=myt)
+                  CALL section_vals_val_set(input_file, "MOTION%MD%ELECTRONS%P_INIT", r_val=myt)
+                  CALL section_vals_val_get(restart_file, "MOTION%MD%ELECTRONS%POTENTIOSTAT_ENERGY", &
+                                            r_val=myt)
+                  CALL section_vals_val_set(input_file, "MOTION%MD%ELECTRONS%POTENTIOSTAT_ENERGY", &
+                                            r_val=myt)
+                  CALL section_vals_val_get(restart_file, "MOTION%MD%ELECTRONS%CURRENT_FERMI_LEVEL", &
+                                            r_val=myt)
+                  CALL section_vals_val_set(input_file, "MOTION%MD%ELECTRONS%CURRENT_FERMI_LEVEL", &
+                                            r_val=myt)
+                  CALL section_vals_val_get(restart_file, "MOTION%MD%ELECTRONS%CURRENT_WORKFUNCTION", &
+                                            r_val=myt)
+                  CALL section_vals_val_set(input_file, "MOTION%MD%ELECTRONS%CURRENT_WORKFUNCTION", &
+                                            r_val=myt)
+                  CALL set_restart_info("ELECTRONIC POTENTIOSTAT STATE", restarted_infos)
                END IF
                !
                IF (check_restart(input_file, restart_file, "MOTION%GEO_OPT")) THEN
@@ -977,18 +1086,20 @@ CONTAINS
                CALL section_vals_set_subs_vals(input_file, TRIM(path)//"%AD_LANGEVIN%MASS", section)
             END SELECT
          ELSE
-            IF (input_type /= restart_type) &
+            IF (input_type /= restart_type) THEN
                CALL cp_warn(__LOCATION__, &
                             "Requested to restart thermostat: "//TRIM(path)//". The thermostat "// &
                             "specified in the input file and the information present in the restart "// &
                             "file do not match the same type of thermostat! Restarting is not possible! "// &
                             "Thermostat will not be restarted! ")
-            IF (input_region /= restart_region) &
+            END IF
+            IF (input_region /= restart_region) THEN
                CALL cp_warn(__LOCATION__, &
                             "Requested to restart thermostat: "//TRIM(path)//". The thermostat "// &
                             "specified in the input file and the information present in the restart "// &
                             "file do not match the same type of REGION! Restarting is not possible! "// &
                             "Thermostat will not be restarted! ")
+            END IF
          END IF
       END IF
    END SUBROUTINE restart_thermostat

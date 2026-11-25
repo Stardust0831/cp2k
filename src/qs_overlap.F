@@ -235,7 +235,7 @@ CONTAINS
          dokp = .FALSE.
          use_cell_mapping = .FALSE.
          nimg = dft_control%nimages
-      ELSEIF (PRESENT(matrixkp_s)) THEN
+      ELSE IF (PRESENT(matrixkp_s)) THEN
          dokp = .TRUE.
          IF (PRESENT(ext_kpoints)) THEN
             IF (ASSOCIATED(ext_kpoints)) THEN
@@ -868,7 +868,7 @@ CONTAINS
       IF (PRESENT(matrix_p)) THEN
          dokp = .FALSE.
          use_cell_mapping = .FALSE.
-      ELSEIF (PRESENT(matrixkp_p)) THEN
+      ELSE IF (PRESENT(matrixkp_p)) THEN
          dokp = .TRUE.
          CALL get_ks_env(ks_env=ks_env, kpoints=kpoints)
          CALL get_kpoint_info(kpoint=kpoints, cell_to_index=cell_to_index)
@@ -1071,7 +1071,7 @@ CONTAINS
       CHARACTER(LEN=32)                                  :: symmetry_string
       CHARACTER(LEN=default_string_length)               :: mname, name
       INTEGER                                            :: i, maxs, natom
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_sizes, row_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_sizes, row_blk_sizes
       TYPE(dbcsr_distribution_type), POINTER             :: dbcsr_dist
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
@@ -1174,7 +1174,7 @@ CONTAINS
       CHARACTER(LEN=32)                                  :: symmetry_string
       CHARACTER(LEN=default_string_length)               :: mname, name
       INTEGER                                            :: i1, i2, natom
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_sizes, row_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_sizes, row_blk_sizes
       LOGICAL                                            :: my_lcart
       TYPE(dbcsr_distribution_type), POINTER             :: dbcsr_dist
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set

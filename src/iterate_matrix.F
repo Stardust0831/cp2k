@@ -1177,8 +1177,9 @@ CONTAINS
          END IF
       END DO
 
-      IF (.NOT. converged) &
+      IF (.NOT. converged) THEN
          CPABORT("dense_matrix_sign_Newton_Schulz did not converge within 100 iterations")
+      END IF
 
       DEALLOCATE (tmp1)
       DEALLOCATE (tmp2)
@@ -1214,7 +1215,7 @@ CONTAINS
       ALLOCATE (eigvals(N))
 
       ! symmetrize sm
-      eigvecs(:, :) = 0.5*(sm + TRANSPOSE(sm))
+      eigvecs(:, :) = 0.5_dp*(sm + TRANSPOSE(sm))
 
       ! probe optimal sizes for WORK and IWORK
       LWORK = -1
@@ -1262,11 +1263,11 @@ CONTAINS
       DO i = 1, N
          modified_eigval = eigvals(i) - mu_correction
          IF (modified_eigval > 0) THEN
-            sm_sign(i, i) = 1.0
+            sm_sign(i, i) = 1.0_dp
          ELSE IF (modified_eigval < 0) THEN
-            sm_sign(i, i) = -1.0
+            sm_sign(i, i) = -1.0_dp
          ELSE
-            sm_sign(i, i) = 0.0
+            sm_sign(i, i) = 0.0_dp
          END IF
       END DO
 
@@ -1307,11 +1308,11 @@ CONTAINS
       DO i = 1, sm_size
          modified_eigval = eigvals(i) - mu_correction
          IF (modified_eigval > 0) THEN
-            mapped_eigvals(i) = 1.0
+            mapped_eigvals(i) = 1.0_dp
          ELSE IF (modified_eigval < 0) THEN
-            mapped_eigvals(i) = -1.0
+            mapped_eigvals(i) = -1.0_dp
          ELSE
-            mapped_eigvals(i) = 0.0
+            mapped_eigvals(i) = 0.0_dp
          END IF
       END DO
 
@@ -1396,7 +1397,7 @@ CONTAINS
       CALL dissection%init(matrix)
       CALL dissection%get_sm_ids_for_rank(myrank, my_sms)
 
-      !$OMP PARALLEL DEFAULT(OMP_DEFAULT_NONE_WITH_OOP) &
+      !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP          PRIVATE(sm, sm_sign, sm_size) &
       !$OMP          SHARED(dissection, myrank, my_sms, order, submatrix_sign_method, threshold, unit_nr)
       !$OMP DO SCHEDULE(GUIDED)
@@ -1478,7 +1479,7 @@ CONTAINS
 
       trace = 0.0_dp
 
-      !$OMP PARALLEL DEFAULT(OMP_DEFAULT_NONE_WITH_OOP) &
+      !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP          PRIVATE(sm, sm_sign, sm_size, sm_firstcol, sm_lastcol, j, tmp) &
       !$OMP          SHARED(dissection, myrank, my_sms, unit_nr, eigbufs, threshold, variant) &
       !$OMP          REDUCTION(+:trace)
@@ -1539,7 +1540,7 @@ CONTAINS
          END IF
 
          trace = 0
-         !$OMP PARALLEL DEFAULT(OMP_DEFAULT_NONE_WITH_OOP) &
+         !$OMP PARALLEL DEFAULT(NONE) &
          !$OMP          PRIVATE(i, sm_sign, tmp, sm_size, sm_firstcol, sm_lastcol) &
          !$OMP          SHARED(dissection, my_sms, unit_nr, eigbufs, mu, new_mu, nelectron) &
          !$OMP          REDUCTION(+:trace)
@@ -1555,7 +1556,7 @@ CONTAINS
 
       ! Finalize sign matrix from eigendecompositions if we kept all eigenvectors
       IF (variant == ls_scf_submatrix_sign_direct_muadj) THEN
-         !$OMP PARALLEL DEFAULT(OMP_DEFAULT_NONE_WITH_OOP) &
+         !$OMP PARALLEL DEFAULT(NONE) &
          !$OMP          PRIVATE(sm, sm_sign, sm_size, sm_firstcol, sm_lastcol, j) &
          !$OMP          SHARED(dissection, myrank, my_sms, unit_nr, eigbufs, mu, new_mu)
          !$OMP DO SCHEDULE(GUIDED)
@@ -1575,7 +1576,7 @@ CONTAINS
 
       ! If we only stored parts of the eigenvectors and mu has changed, we need to recompute sm_sign
       IF ((variant == ls_scf_submatrix_sign_direct_muadj_lowmem) .AND. (mu /= new_mu)) THEN
-         !$OMP PARALLEL DEFAULT(OMP_DEFAULT_NONE_WITH_OOP) &
+         !$OMP PARALLEL DEFAULT(NONE) &
          !$OMP          PRIVATE(sm, sm_sign, sm_size, sm_firstcol, sm_lastcol, j) &
          !$OMP          SHARED(dissection, myrank, my_sms, unit_nr, eigbufs, mu, new_mu)
          !$OMP DO SCHEDULE(GUIDED)
@@ -1807,8 +1808,9 @@ CONTAINS
             CALL m_flush(unit_nr)
          END IF
 
-         IF (abnormal_value(conv)) &
+         IF (abnormal_value(conv)) THEN
             CPABORT("conv is an abnormal value (NaN/Inf).")
+         END IF
 
          ! conv < SQRT(threshold)
          IF ((conv*conv) < threshold) THEN
@@ -2028,8 +2030,9 @@ CONTAINS
             CALL m_flush(unit_nr)
          END IF
 
-         IF (abnormal_value(conv)) &
+         IF (abnormal_value(conv)) THEN
             CPABORT("conv is an abnormal value (NaN/Inf).")
+         END IF
 
          ! conv < SQRT(threshold)
          IF ((conv*conv) < threshold) THEN

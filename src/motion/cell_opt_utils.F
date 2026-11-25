@@ -6,156 +6,50 @@
 !--------------------------------------------------------------------------------------------------!
 
 ! **************************************************************************************************
-!> \brief contains a functional that calculates the energy and its derivatives
-!>      for the geometry optimizer
+!> \brief Parse CELL_OPT constraints, build symmetry constraint rows, and
+!>        compute the cell enthalpy gradient.
 !> \par History
 !>      03.2008 - Teodoro Laino [tlaino] - University of Zurich - Cell Optimization
 ! **************************************************************************************************
 MODULE cell_opt_utils
+   USE cell_manifold_utils,             ONLY: &
+        comp_ax, comp_bx, comp_by, comp_cx, comp_cy, comp_cz, geom_a, geom_alpha, geom_b, &
+        geom_beta, geom_c, geom_gamma, gfix_alpha, gfix_beta, gfix_gamma, mask_a, mask_all, &
+        mask_b, mask_c, mask_x, mask_xy, mask_xz, mask_y, mask_yz, mask_z, min_cell_length, &
+        n_geom, n_slot, slot_ax, slot_bx, slot_by, slot_cx, slot_cy, slot_cz
    USE cell_types,                      ONLY: &
         cell_sym_cubic, cell_sym_hexagonal_gamma_120, cell_sym_hexagonal_gamma_60, &
-        cell_sym_monoclinic, cell_sym_monoclinic_gamma_ab, cell_sym_orthorhombic, &
+        cell_sym_monoclinic, cell_sym_monoclinic_gamma_ab, cell_sym_none, cell_sym_orthorhombic, &
         cell_sym_rhombohedral, cell_sym_tetragonal_ab, cell_sym_tetragonal_ac, &
         cell_sym_tetragonal_bc, cell_sym_triclinic, cell_type
-   USE cp_files,                        ONLY: close_file,&
-                                              open_file
-   USE cp_log_handling,                 ONLY: cp_get_default_logger,&
-                                              cp_logger_create,&
-                                              cp_logger_get_default_unit_nr,&
-                                              cp_logger_release,&
-                                              cp_logger_set,&
-                                              cp_logger_type,&
-                                              cp_to_string
-   USE input_constants,                 ONLY: fix_none,&
-                                              fix_x,&
-                                              fix_xy,&
-                                              fix_xz,&
-                                              fix_y,&
-                                              fix_yz,&
-                                              fix_z
-   USE input_cp2k_global,               ONLY: create_global_section
-   USE input_enumeration_types,         ONLY: enum_i2c,&
-                                              enumeration_type
-   USE input_keyword_types,             ONLY: keyword_get,&
-                                              keyword_type
-   USE input_section_types,             ONLY: section_get_keyword,&
-                                              section_release,&
-                                              section_type,&
-                                              section_vals_type,&
-                                              section_vals_val_get,&
-                                              section_vals_val_set
-   USE kinds,                           ONLY: default_path_length,&
-                                              default_string_length,&
+   USE input_constants,                 ONLY: fix_none
+   USE input_section_types,             ONLY: section_vals_type,&
+                                              section_vals_val_get
+   USE kinds,                           ONLY: default_string_length,&
                                               dp
-   USE mathconstants,                   ONLY: sqrt3
-   USE mathlib,                         ONLY: angle,&
-                                              det_3x3
-   USE message_passing,                 ONLY: mp_para_env_type
+   USE mathconstants,                   ONLY: pi,&
+                                              sqrt3
+   USE space_groups_types,              ONLY: spgr_type
+   USE string_utilities,                ONLY: uppercase
 #include "../base/base_uses.f90"
 
    IMPLICIT NONE
    PRIVATE
 
-   LOGICAL, PRIVATE, PARAMETER :: debug_this_module = .TRUE.
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'cell_opt_utils'
 
-   PUBLIC :: get_dg_dh, gopt_new_logger_create, &
-             gopt_new_logger_release, read_external_press_tensor, &
-             apply_cell_constraints, rescale_new_cell_volume
+   PUBLIC :: cell_opt_constraint_label, &
+             comp_ax, comp_bx, comp_by, comp_cx, comp_cy, comp_cz, &
+             get_dg_dh, &
+             gfix_alpha, gfix_beta, gfix_gamma, &
+             mask_a, mask_all, mask_b, mask_c, mask_x, mask_xy, mask_xz, mask_y, mask_yz, mask_z, &
+             parse_cell_constraint, &
+             parse_token, &
+             read_external_press_tensor, &
+             spgr_point_group_symmetry_id, &
+             symmetry_constraint_rows
 
 CONTAINS
-
-! **************************************************************************************************
-!> \brief creates a new logger used for cell optimization algorithm
-!> \param new_logger ...
-!> \param root_section ...
-!> \param para_env ...
-!> \param project_name ...
-!> \param id_run ...
-!> \author Teodoro Laino [tlaino] - University of Zurich - 03.2008
-! **************************************************************************************************
-   SUBROUTINE gopt_new_logger_create(new_logger, root_section, para_env, project_name, &
-                                     id_run)
-      TYPE(cp_logger_type), POINTER                      :: new_logger
-      TYPE(section_vals_type), POINTER                   :: root_section
-      TYPE(mp_para_env_type), POINTER                    :: para_env
-      CHARACTER(len=default_string_length), INTENT(OUT)  :: project_name
-      INTEGER, INTENT(IN)                                :: id_run
-
-      CHARACTER(len=default_path_length)                 :: c_val, input_file_path, output_file_path
-      CHARACTER(len=default_string_length)               :: label
-      INTEGER                                            :: i, lp, unit_nr
-      TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(enumeration_type), POINTER                    :: enum
-      TYPE(keyword_type), POINTER                        :: keyword
-      TYPE(section_type), POINTER                        :: section
-
-      NULLIFY (new_logger, logger, enum, keyword, section)
-      logger => cp_get_default_logger()
-
-      CALL create_global_section(section)
-      keyword => section_get_keyword(section, "RUN_TYPE")
-      CALL keyword_get(keyword, enum=enum)
-      label = TRIM(enum_i2c(enum, id_run))
-      CALL section_release(section)
-
-      ! Redirecting output of the sub_calculation to a different file
-      CALL section_vals_val_get(root_section, "GLOBAL%PROJECT_NAME", c_val=project_name)
-      input_file_path = TRIM(project_name)
-      lp = LEN_TRIM(input_file_path)
-      i = logger%iter_info%iteration(logger%iter_info%n_rlevel)
-      input_file_path(lp + 1:LEN(input_file_path)) = "-"//TRIM(label)//"-"//ADJUSTL(cp_to_string(i))
-      lp = LEN_TRIM(input_file_path)
-      CALL section_vals_val_set(root_section, "GLOBAL%PROJECT_NAME", c_val=input_file_path(1:lp))
-      CALL section_vals_val_set(root_section, "GLOBAL%RUN_TYPE", i_val=id_run)
-
-      ! Redirecting output into a new file
-      output_file_path = input_file_path(1:lp)//".out"
-      IF (para_env%is_source()) THEN
-         CALL open_file(file_name=output_file_path, file_status="UNKNOWN", &
-                        file_action="WRITE", file_position="APPEND", unit_number=unit_nr)
-      ELSE
-         unit_nr = -1
-      END IF
-      CALL cp_logger_create(new_logger, para_env=para_env, default_global_unit_nr=unit_nr, &
-                            close_global_unit_on_dealloc=.FALSE.)
-      CALL section_vals_val_get(root_section, "GLOBAL%PROJECT", c_val=c_val)
-      IF (c_val /= "") THEN
-         CALL cp_logger_set(new_logger, local_filename=TRIM(c_val)//"_localLog")
-      END IF
-      new_logger%iter_info%project_name = TRIM(c_val)
-      CALL section_vals_val_get(root_section, "GLOBAL%PRINT_LEVEL", &
-                                i_val=new_logger%iter_info%print_level)
-
-   END SUBROUTINE gopt_new_logger_create
-
-! **************************************************************************************************
-!> \brief releases a new logger used for cell optimization algorithm
-!> \param new_logger ...
-!> \param root_section ...
-!> \param para_env ...
-!> \param project_name ...
-!> \param id_run ...
-!> \author Teodoro Laino [tlaino] - University of Zurich - 03.2008
-! **************************************************************************************************
-   SUBROUTINE gopt_new_logger_release(new_logger, root_section, para_env, project_name, id_run)
-      TYPE(cp_logger_type), POINTER                      :: new_logger
-      TYPE(section_vals_type), POINTER                   :: root_section
-      TYPE(mp_para_env_type), POINTER                    :: para_env
-      CHARACTER(len=default_string_length), INTENT(IN)   :: project_name
-      INTEGER, INTENT(IN)                                :: id_run
-
-      INTEGER                                            :: unit_nr
-
-      IF (para_env%is_source()) THEN
-         unit_nr = cp_logger_get_default_unit_nr(new_logger)
-         CALL close_file(unit_number=unit_nr)
-      END IF
-      CALL cp_logger_release(new_logger)
-      CALL section_vals_val_set(root_section, "GLOBAL%RUN_TYPE", i_val=id_run)
-      CALL section_vals_val_set(root_section, "GLOBAL%PROJECT_NAME", c_val=project_name)
-
-   END SUBROUTINE gopt_new_logger_release
 
 ! **************************************************************************************************
 !> \brief Reads the external pressure tensor
@@ -163,15 +57,17 @@ CONTAINS
 !> \param cell ...
 !> \param pres_ext ...
 !> \param mtrx ...
-!> \param rot ...
+!> \param input_to_opt rotation from the input Cartesian frame to the optimization frame
 !> \author Teodoro Laino [tlaino] - University of Zurich - 03.2008
 ! **************************************************************************************************
-   SUBROUTINE read_external_press_tensor(geo_section, cell, pres_ext, mtrx, rot)
+   SUBROUTINE read_external_press_tensor(geo_section, cell, pres_ext, mtrx, input_to_opt)
       TYPE(section_vals_type), POINTER                   :: geo_section
       TYPE(cell_type), POINTER                           :: cell
       REAL(KIND=dp), INTENT(OUT)                         :: pres_ext
       REAL(KIND=dp), DIMENSION(3, 3), INTENT(OUT)        :: mtrx
-      REAL(KIND=dp), DIMENSION(3, 3), INTENT(IN)         :: rot
+      REAL(KIND=dp), DIMENSION(3, 3), INTENT(IN)         :: input_to_opt
+
+      REAL(KIND=dp), PARAMETER                           :: eps_aniso_press = 1.0E-5_dp
 
       INTEGER                                            :: i, ind, j
       LOGICAL                                            :: check
@@ -184,8 +80,9 @@ CONTAINS
       pres_ext = 0.0_dp
       CALL section_vals_val_get(geo_section, "EXTERNAL_PRESSURE", r_vals=pvals)
       check = (SIZE(pvals) == 1) .OR. (SIZE(pvals) == 9)
-      IF (.NOT. check) &
+      IF (.NOT. check) THEN
          CPABORT("EXTERNAL_PRESSURE can have 1 or 9 components only!")
+      END IF
 
       IF (SIZE(pvals) == 9) THEN
          ind = 0
@@ -195,9 +92,9 @@ CONTAINS
                pres_ext_tens(j, i) = pvals(ind)
             END DO
          END DO
-         ! Also the pressure tensor must be oriented in the same canonical directions
-         ! of the simulation cell
-         pres_ext_tens = MATMUL(TRANSPOSE(rot), pres_ext_tens)
+         ! Express the pressure tensor in the canonical optimization frame.
+         pres_ext_tens = MATMUL(input_to_opt, &
+                                MATMUL(pres_ext_tens, TRANSPOSE(input_to_opt)))
          DO i = 1, 3
             pres_ext = pres_ext + pres_ext_tens(i, i)
          END DO
@@ -209,52 +106,400 @@ CONTAINS
          pres_ext = pvals(1)
       END IF
 
-      IF (ANY(pres_ext_tens > 1.0E-5_dp)) THEN
+      IF (ANY(ABS(pres_ext_tens) > eps_aniso_press)) THEN
          mtrx = cell%deth*MATMUL(cell%h_inv, MATMUL(pres_ext_tens, TRANSPOSE(cell%h_inv)))
       END IF
 
    END SUBROUTINE read_external_press_tensor
 
 ! **************************************************************************************************
+!> \brief Parses the tokens of the CONSTRAINT keyword into a cell component mask
+!> \param constraint_tokens value tokens of the CONSTRAINT keyword (char_t list)
+!> \param cell simulation cell (only the periodicity is used)
+!> \param explicit whether the CONSTRAINT keyword was given explicitly
+!> \param mask union of the fixed cell components (comp_* and mask_* bits)
+! **************************************************************************************************
+   SUBROUTINE parse_cell_constraint(constraint_tokens, cell, explicit, mask)
+      CHARACTER(LEN=*), DIMENSION(:), INTENT(IN)         :: constraint_tokens
+      TYPE(cell_type), POINTER                           :: cell
+      LOGICAL, INTENT(IN)                                :: explicit
+      INTEGER, INTENT(OUT)                               :: mask
+
+      CHARACTER(LEN=default_string_length)               :: reject_reason, token
+      INTEGER                                            :: axis_index, nonperiodic_axis, overlap, &
+                                                            required_mask, tok_index, tok_mask
+      LOGICAL                                            :: accepted
+
+      ! The input tokenizer delivers a bare keyword as one blank token.
+      IF (SIZE(constraint_tokens) == 0 .OR. &
+          (SIZE(constraint_tokens) == 1 .AND. LEN_TRIM(constraint_tokens(1)) == 0)) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "CELL_OPT CONSTRAINT requires a value.")
+      END IF
+
+      mask = 0
+      DO tok_index = 1, SIZE(constraint_tokens)
+         token = ADJUSTL(constraint_tokens(tok_index))
+         CALL uppercase(token)
+         IF (token == "NONE") THEN
+            ! NONE must be the first and only token: leftover tokens on the
+            ! line or an already-accumulated mask mean it is being combined.
+            IF (tok_index < SIZE(constraint_tokens) .OR. mask /= 0) THEN
+               CALL cp_abort(__LOCATION__, &
+                             "CELL_OPT CONSTRAINT NONE cannot be combined "// &
+                             "with other tokens.")
+            END IF
+            mask = 0
+            CYCLE
+         END IF
+         CALL parse_token(token, accepted, tok_mask, reject_reason)
+         IF (.NOT. accepted) THEN
+            CALL cp_abort(__LOCATION__, TRIM(reject_reason))
+         END IF
+         overlap = IAND(tok_mask, mask)
+         IF (overlap == tok_mask) THEN
+            CALL cp_warn(__LOCATION__, &
+                         "Redundant CELL_OPT CONSTRAINT token: "//TRIM(token)// &
+                         " (already constrained: "// &
+                         TRIM(ADJUSTL(cell_opt_constraint_label(overlap)))//").")
+         ELSE IF (overlap /= 0) THEN
+            CALL cp_warn(__LOCATION__, &
+                         "CELL_OPT CONSTRAINT token "//TRIM(token)//" partially overlaps: "// &
+                         "already constrained "// &
+                         TRIM(ADJUSTL(cell_opt_constraint_label(overlap)))// &
+                         ", newly fixed "// &
+                         TRIM(ADJUSTL(cell_opt_constraint_label(IAND(NOT(mask), tok_mask))))//".")
+         END IF
+         mask = IOR(mask, tok_mask)
+      END DO
+
+      ! For 2D periodicity the non-periodic cell direction must be constrained.
+      ! Complete the constraint automatically if the keyword was not given.
+      IF (COUNT(cell%perd /= 0) == 2) THEN
+         nonperiodic_axis = 0
+         DO axis_index = 1, 3
+            IF (cell%perd(axis_index) == 0) nonperiodic_axis = axis_index
+         END DO
+         required_mask = 0
+         SELECT CASE (nonperiodic_axis)
+         CASE (1)
+            required_mask = mask_x
+         CASE (2)
+            required_mask = mask_y
+         CASE (3)
+            required_mask = mask_z
+         END SELECT
+         IF (.NOT. explicit .AND. mask == 0) THEN
+            mask = required_mask
+            CALL cp_warn(__LOCATION__, &
+                         "2D CELL_OPT: constraining non-periodic cell direction.")
+         ELSE IF (IAND(mask, required_mask) /= required_mask) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "2D CELL_OPT needs constrained non-periodic cell direction.")
+         END IF
+      END IF
+
+   END SUBROUTINE parse_cell_constraint
+
+! **************************************************************************************************
+!> \brief Returns the label of the cell constraint mask
+!> \param mask bit mask of fixed cell components (comp_*, mask_*)
+!> \return 4-character legacy label or space-separated component names
+! **************************************************************************************************
+   PURE FUNCTION cell_opt_constraint_label(mask) RESULT(label)
+      INTEGER, INTENT(IN)                                :: mask
+      CHARACTER(LEN=default_string_length)               :: label
+
+      SELECT CASE (mask)
+      CASE (fix_none)
+         label = "NONE"
+      CASE (mask_x)
+         label = "   X"
+      CASE (mask_y)
+         label = "   Y"
+      CASE (mask_z)
+         label = "   Z"
+      CASE (mask_xy)
+         label = "  XY"
+      CASE (mask_xz)
+         label = "  XZ"
+      CASE (mask_yz)
+         label = "  YZ"
+      CASE DEFAULT
+         ! Composite constraint: spell out the fixed components
+         label = ""
+         IF (IAND(mask, comp_ax) /= 0) label = TRIM(label)//" AX"
+         IF (IAND(mask, comp_bx) /= 0) label = TRIM(label)//" BX"
+         IF (IAND(mask, comp_by) /= 0) label = TRIM(label)//" BY"
+         IF (IAND(mask, comp_cx) /= 0) label = TRIM(label)//" CX"
+         IF (IAND(mask, comp_cy) /= 0) label = TRIM(label)//" CY"
+         IF (IAND(mask, comp_cz) /= 0) label = TRIM(label)//" CZ"
+         IF (IAND(mask, gfix_alpha) /= 0) label = TRIM(label)//" ALPHA"
+         IF (IAND(mask, gfix_beta) /= 0) label = TRIM(label)//" BETA"
+         IF (IAND(mask, gfix_gamma) /= 0) label = TRIM(label)//" GAMMA"
+         label = ADJUSTL(label)
+      END SELECT
+
+   END FUNCTION cell_opt_constraint_label
+
+! **************************************************************************************************
+!> \brief Translate a crystal system into cell constraint rows.
+!> \param symmetry_id crystal system of the canonical cell
+!> \param mask comp_* bits for canonical entries fixed to zero by symmetry
+!> \param lin_w linear coupling normals, one normal per column
+!> \param n_lin_rows number of active columns in lin_w
+!> \param eq_pair index pairs [m, n] in 1..6 for geometric equalities, one pair per column
+!> \param n_eq_rows number of active columns in eq_pair
+!> \note Rhombohedral (a = b = c, alpha = beta = gamma) and monoclinic_gamma_ab
+!>       (a = b with free gamma) produce curved geometric equalities. All other
+!>       crystal systems produce constant linear rows with zero curvature.
+! **************************************************************************************************
+   SUBROUTINE symmetry_constraint_rows(symmetry_id, mask, lin_w, n_lin_rows, eq_pair, n_eq_rows)
+      INTEGER, INTENT(IN)                                :: symmetry_id
+      INTEGER, INTENT(OUT)                               :: mask
+      REAL(KIND=dp), DIMENSION(n_slot, n_slot), &
+         INTENT(OUT)                                     :: lin_w
+      INTEGER, INTENT(OUT)                               :: n_lin_rows
+      INTEGER, DIMENSION(2, n_geom), INTENT(OUT)         :: eq_pair
+      INTEGER, INTENT(OUT)                               :: n_eq_rows
+
+      REAL(KIND=dp), PARAMETER                           :: half_sqrt3 = 0.5_dp*sqrt3
+
+      mask = 0
+      lin_w = 0.0_dp
+      n_lin_rows = 0
+      eq_pair = 0
+      n_eq_rows = 0
+
+      SELECT CASE (symmetry_id)
+      CASE (cell_sym_orthorhombic)
+         mask = comp_bx + comp_cx + comp_cy
+      CASE (cell_sym_tetragonal_ab)
+         mask = comp_bx + comp_cx + comp_cy
+         n_lin_rows = 1
+         lin_w(slot_ax, 1) = 1.0_dp
+         lin_w(slot_by, 1) = -1.0_dp
+      CASE (cell_sym_tetragonal_ac)
+         mask = comp_bx + comp_cx + comp_cy
+         n_lin_rows = 1
+         lin_w(slot_ax, 1) = 1.0_dp
+         lin_w(slot_cz, 1) = -1.0_dp
+      CASE (cell_sym_tetragonal_bc)
+         mask = comp_bx + comp_cx + comp_cy
+         n_lin_rows = 1
+         lin_w(slot_by, 1) = 1.0_dp
+         lin_w(slot_cz, 1) = -1.0_dp
+      CASE (cell_sym_cubic)
+         mask = comp_bx + comp_cx + comp_cy
+         n_lin_rows = 2
+         lin_w(slot_ax, 1) = 1.0_dp
+         lin_w(slot_by, 1) = -1.0_dp
+         lin_w(slot_by, 2) = 1.0_dp
+         lin_w(slot_cz, 2) = -1.0_dp
+      CASE (cell_sym_hexagonal_gamma_60)
+         mask = comp_cx + comp_cy
+         n_lin_rows = 2
+         lin_w(slot_ax, 1) = -0.5_dp
+         lin_w(slot_bx, 1) = 1.0_dp
+         lin_w(slot_ax, 2) = -half_sqrt3
+         lin_w(slot_by, 2) = 1.0_dp
+      CASE (cell_sym_hexagonal_gamma_120)
+         mask = comp_cx + comp_cy
+         n_lin_rows = 2
+         lin_w(slot_ax, 1) = 0.5_dp
+         lin_w(slot_bx, 1) = 1.0_dp
+         lin_w(slot_ax, 2) = -half_sqrt3
+         lin_w(slot_by, 2) = 1.0_dp
+      CASE (cell_sym_rhombohedral)
+         n_eq_rows = 4
+         eq_pair(:, 1) = [geom_a, geom_b]
+         eq_pair(:, 2) = [geom_b, geom_c]
+         eq_pair(:, 3) = [geom_alpha, geom_beta]
+         eq_pair(:, 4) = [geom_beta, geom_gamma]
+      CASE (cell_sym_monoclinic)
+         mask = comp_bx + comp_cy
+      CASE (cell_sym_monoclinic_gamma_ab)
+         mask = comp_cx + comp_cy
+         n_eq_rows = 1
+         eq_pair(:, 1) = [geom_a, geom_b]
+      CASE (cell_sym_none, cell_sym_triclinic)
+         CONTINUE
+      CASE DEFAULT
+         CPABORT("Unknown cell symmetry_id")
+      END SELECT
+
+   END SUBROUTINE symmetry_constraint_rows
+
+! **************************************************************************************************
+!> \brief Identify the canonical crystal system preserved by a space group's point group.
+!> \param spgr space group with integer lattice rotations in rotations_subset
+!> \param cell symmetric start cell in the canonical frame
+!> \return symmetry_id of the invariant metric form, or cell_sym_triclinic when
+!>         the setting adds no canonical cell constraints
+!> \note Averaging the metric G = hmat^T hmat over the point group produces the
+!>       invariant metric form {G : R G R^T = G for all R}. Classifying the lengths
+!>       and angles of this averaged metric maps the point group to the row sets of
+!>       symmetry_constraint_rows. Non-canonical settings (such as a monoclinic
+!>       unique axis along a or c) return cell_sym_triclinic and add zero cell rows.
+! **************************************************************************************************
+   FUNCTION spgr_point_group_symmetry_id(spgr, cell) RESULT(symmetry_id)
+      TYPE(spgr_type), INTENT(IN), POINTER               :: spgr
+      TYPE(cell_type), POINTER                           :: cell
+      INTEGER                                            :: symmetry_id
+
+      REAL(KIND=dp), PARAMETER :: ang_120 = 2.0_dp*pi/3.0_dp, ang_60 = pi/3.0_dp, &
+         ang_90 = 0.5_dp*pi, eq_angle_tol = 1.0E-6_dp, rel_len_tol = 1.0E-6_dp, &
+         special_ang_tol = 1.0E-5_dp
+
+      INTEGER                                            :: ir, n90, nop
+      REAL(KIND=dp)                                      :: ang(3), gsym(3, 3), len_tol, lens(3), &
+                                                            metric(3, 3), rot(3, 3)
+
+      symmetry_id = cell_sym_triclinic
+      nop = spgr%n_operations_subset
+      IF (nop == 0) RETURN
+
+      metric = MATMUL(TRANSPOSE(cell%hmat), cell%hmat)
+      gsym = 0.0_dp
+      DO ir = 1, nop
+         ! rotations_subset stores R_frac^T (r_out = rot^T r_in in spgr_apply_rotations_coord),
+         ! so R_frac^T G R_frac takes the form rot * metric * rot^T.
+         rot = REAL(spgr%rotations_subset(:, :, ir), dp)
+         gsym = gsym + MATMUL(rot, MATMUL(metric, TRANSPOSE(rot)))
+      END DO
+      gsym = gsym/REAL(nop, dp)
+
+      lens = [SQRT(gsym(1, 1)), SQRT(gsym(2, 2)), SQRT(gsym(3, 3))]
+      IF (MINVAL(lens) < min_cell_length) RETURN
+      len_tol = rel_len_tol*MAXVAL(lens)
+      ang(1) = ACOS(MAX(-1.0_dp, MIN(1.0_dp, gsym(2, 3)/(lens(2)*lens(3)))))
+      ang(2) = ACOS(MAX(-1.0_dp, MIN(1.0_dp, gsym(1, 3)/(lens(1)*lens(3)))))
+      ang(3) = ACOS(MAX(-1.0_dp, MIN(1.0_dp, gsym(1, 2)/(lens(1)*lens(2)))))
+      n90 = COUNT(ABS(ang - ang_90) < special_ang_tol)
+
+      IF (n90 == 3) THEN
+         IF (ABS(lens(1) - lens(2)) < len_tol .AND. ABS(lens(2) - lens(3)) < len_tol) THEN
+            symmetry_id = cell_sym_cubic
+         ELSE IF (ABS(lens(1) - lens(2)) < len_tol) THEN
+            symmetry_id = cell_sym_tetragonal_ab
+         ELSE IF (ABS(lens(1) - lens(3)) < len_tol) THEN
+            symmetry_id = cell_sym_tetragonal_ac
+         ELSE IF (ABS(lens(2) - lens(3)) < len_tol) THEN
+            symmetry_id = cell_sym_tetragonal_bc
+         ELSE
+            symmetry_id = cell_sym_orthorhombic
+         END IF
+      ELSE IF (n90 == 2) THEN
+         IF (ABS(ang(2) - ang_90) >= special_ang_tol) THEN
+            ! CP2K monoclinic convention places the unique axis along b (beta /= 90 deg).
+            symmetry_id = cell_sym_monoclinic
+         ELSE IF (ABS(ang(3) - ang_90) >= special_ang_tol .AND. &
+                  ABS(lens(1) - lens(2)) < len_tol) THEN
+            IF (ABS(ang(3) - ang_120) < special_ang_tol) THEN
+               symmetry_id = cell_sym_hexagonal_gamma_120
+            ELSE IF (ABS(ang(3) - ang_60) < special_ang_tol) THEN
+               symmetry_id = cell_sym_hexagonal_gamma_60
+            ELSE
+               symmetry_id = cell_sym_monoclinic_gamma_ab
+            END IF
+         END IF
+      ELSE
+         IF (ABS(ang(1) - ang(2)) < eq_angle_tol .AND. ABS(ang(2) - ang(3)) < eq_angle_tol .AND. &
+             ABS(ang(1) - ang_90) >= special_ang_tol .AND. &
+             ABS(lens(1) - lens(2)) < len_tol .AND. ABS(lens(2) - lens(3)) < len_tol) THEN
+            symmetry_id = cell_sym_rhombohedral
+         END IF
+      END IF
+
+   END FUNCTION spgr_point_group_symmetry_id
+
+! **************************************************************************************************
+!> \brief Classify one CONSTRAINT token without aborting (decision half of the parser)
+!> \param token one upper-case token of the CONSTRAINT value line
+!> \param accepted .TRUE. when the token contributes a mask
+!> \param token_mask the constraint mask contributed by an accepted token
+!> \param reject_reason empty for accepted tokens, or the abort message otherwise
+!> \note parse_cell_constraint applies this classification and turns a rejection
+!>       into a cp_abort. Keeping the decision here keeps it unit-testable:
+!>       the unit test checks the classification table without triggering aborts.
+! **************************************************************************************************
+   PURE SUBROUTINE parse_token(token, accepted, token_mask, reject_reason)
+      CHARACTER(LEN=*), INTENT(IN)                       :: token
+      LOGICAL, INTENT(OUT)                               :: accepted
+      INTEGER, INTENT(OUT)                               :: token_mask
+      CHARACTER(LEN=default_string_length), INTENT(OUT)  :: reject_reason
+
+      accepted = .TRUE.
+      token_mask = 0
+      reject_reason = ""
+      SELECT CASE (token)
+      CASE ("A", "AX")
+         token_mask = mask_a
+      CASE ("B")
+         token_mask = mask_b
+      CASE ("BX")
+         token_mask = comp_bx
+      CASE ("BY")
+         token_mask = comp_by
+      CASE ("C", "Z")
+         token_mask = mask_c
+      CASE ("CX")
+         token_mask = comp_cx
+      CASE ("CY")
+         token_mask = comp_cy
+      CASE ("CZ")
+         token_mask = comp_cz
+      CASE ("X")
+         token_mask = mask_x
+      CASE ("Y")
+         token_mask = mask_y
+      CASE ("XY")
+         token_mask = mask_xy
+      CASE ("XZ")
+         token_mask = mask_xz
+      CASE ("YZ")
+         token_mask = mask_yz
+      CASE ("ALPHA")
+         token_mask = gfix_alpha
+      CASE ("BETA")
+         token_mask = gfix_beta
+      CASE ("GAMMA")
+         token_mask = gfix_gamma
+      CASE ("AY", "AZ", "BZ")
+         accepted = .FALSE.
+         reject_reason = "CELL_OPT CONSTRAINT token "//TRIM(token)//" is always zero in "// &
+                         "the cell convention (a lies along x, b lies in the xy plane) "// &
+                         "and cannot be constrained."
+      CASE DEFAULT
+         accepted = .FALSE.
+         reject_reason = "Unknown CELL_OPT CONSTRAINT token: "//TRIM(token)// &
+                         ". Accepted tokens: NONE, the directions X, Y, Z,"// &
+                         " XY, XZ, YZ, the vectors A, B, C, the components"// &
+                         " AX, BX, BY, CX, CY, CZ, and the angles ALPHA, BETA, GAMMA."
+      END SELECT
+   END SUBROUTINE parse_token
+
+! **************************************************************************************************
 !> \brief Computes the derivatives for the cell
-!> \param gradient ...
+!> \param gradient enthalpy gradient +d(E + pres_ext*V)/dq in the six canonical components
 !> \param av_ptens ...
 !> \param pres_ext ...
 !> \param cell ...
 !> \param mtrx ...
-!> \param keep_angles ...
-!> \param keep_symmetry ...
 !> \param pres_int ...
-!> \param pres_constr ...
-!> \param constraint_id ...
 !> \author Teodoro Laino [tlaino] - University of Zurich - 03.2008
 ! **************************************************************************************************
-   SUBROUTINE get_dg_dh(gradient, av_ptens, pres_ext, cell, mtrx, keep_angles, &
-                        keep_symmetry, pres_int, pres_constr, constraint_id)
+   SUBROUTINE get_dg_dh(gradient, av_ptens, pres_ext, cell, mtrx, pres_int)
 
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: gradient
+      REAL(KIND=dp), DIMENSION(n_slot), INTENT(OUT)      :: gradient
       REAL(KIND=dp), DIMENSION(3, 3), INTENT(IN)         :: av_ptens
       REAL(KIND=dp), INTENT(IN)                          :: pres_ext
       TYPE(cell_type), POINTER                           :: cell
       REAL(KIND=dp), DIMENSION(3, 3), INTENT(IN)         :: mtrx
-      LOGICAL, INTENT(IN), OPTIONAL                      :: keep_angles, keep_symmetry
-      REAL(KIND=dp), INTENT(OUT)                         :: pres_int, pres_constr
-      INTEGER, INTENT(IN), OPTIONAL                      :: constraint_id
+      REAL(KIND=dp), INTENT(OUT)                         :: pres_int
 
-      INTEGER                                            :: i, my_constraint_id
-      LOGICAL                                            :: my_keep_angles, my_keep_symmetry
+      INTEGER                                            :: i
       REAL(KIND=dp), DIMENSION(3, 3)                     :: correction, pten_hinv_old, ptens
-
-      my_keep_angles = .FALSE.
-      IF (PRESENT(keep_angles)) my_keep_angles = keep_angles
-      my_keep_symmetry = .FALSE.
-      IF (PRESENT(keep_symmetry)) my_keep_symmetry = keep_symmetry
-      gradient = 0.0_dp
-      IF (PRESENT(constraint_id)) THEN
-         my_constraint_id = constraint_id
-      ELSE
-         my_constraint_id = fix_none
-      END IF
 
       gradient = 0.0_dp
 
@@ -267,23 +512,6 @@ CONTAINS
       END DO
       pres_int = pres_int/3.0_dp
 
-      SELECT CASE (my_constraint_id)
-      CASE (fix_x)
-         pres_constr = 0.5_dp*(ptens(2, 2) + ptens(3, 3))
-      CASE (fix_y)
-         pres_constr = 0.5_dp*(ptens(1, 1) + ptens(3, 3))
-      CASE (fix_z)
-         pres_constr = 0.5_dp*(ptens(1, 1) + ptens(2, 2))
-      CASE (fix_xy)
-         pres_constr = ptens(3, 3)
-      CASE (fix_xz)
-         pres_constr = ptens(2, 2)
-      CASE (fix_yz)
-         pres_constr = ptens(1, 1)
-      CASE (fix_none)
-         pres_constr = (ptens(1, 1) + ptens(2, 2) + ptens(3, 3))/3.0_dp
-      END SELECT
-
       ptens(1, 1) = av_ptens(1, 1) - pres_ext
       ptens(2, 2) = av_ptens(2, 2) - pres_ext
       ptens(3, 3) = av_ptens(3, 3) - pres_ext
@@ -291,213 +519,15 @@ CONTAINS
       pten_hinv_old = cell%deth*MATMUL(cell%h_inv, ptens)
       correction = MATMUL(mtrx, cell%hmat)
 
-      gradient(1) = pten_hinv_old(1, 1) - correction(1, 1)
-      gradient(2) = pten_hinv_old(2, 1) - correction(2, 1)
-      gradient(3) = pten_hinv_old(2, 2) - correction(2, 2)
-      gradient(4) = pten_hinv_old(3, 1) - correction(3, 1)
-      gradient(5) = pten_hinv_old(3, 2) - correction(3, 2)
-      gradient(6) = pten_hinv_old(3, 3) - correction(3, 3)
-
-      CALL apply_cell_constraints(gradient, cell, my_keep_angles, my_keep_symmetry, my_constraint_id)
+      gradient(slot_ax) = pten_hinv_old(1, 1) - correction(1, 1)
+      gradient(slot_bx) = pten_hinv_old(2, 1) - correction(2, 1)
+      gradient(slot_by) = pten_hinv_old(2, 2) - correction(2, 2)
+      gradient(slot_cx) = pten_hinv_old(3, 1) - correction(3, 1)
+      gradient(slot_cy) = pten_hinv_old(3, 2) - correction(3, 2)
+      gradient(slot_cz) = pten_hinv_old(3, 3) - correction(3, 3)
 
       gradient = -gradient
 
    END SUBROUTINE get_dg_dh
-
-! **************************************************************************************************
-!> \brief Apply cell constraints
-!> \param gradient ...
-!> \param cell ...
-!> \param keep_angles ...
-!> \param keep_symmetry ...
-!> \param constraint_id ...
-!> \author Matthias Krack (October 26, 2017, MK)
-! **************************************************************************************************
-   SUBROUTINE apply_cell_constraints(gradient, cell, keep_angles, keep_symmetry, constraint_id)
-
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: gradient
-      TYPE(cell_type), POINTER                           :: cell
-      LOGICAL, INTENT(IN)                                :: keep_angles, keep_symmetry
-      INTEGER, INTENT(IN)                                :: constraint_id
-
-      REAL(KIND=dp)                                      :: a, a_length, ab_length, b_length, cosa, &
-                                                            cosah, cosg, deriv_gamma, g, gamma, &
-                                                            norm, norm_b, norm_c, sina, sinah, sing
-
-      IF (keep_angles) THEN
-         ! If we want to keep the angles constant we have to project out the
-         ! components of the cell angles
-         norm_b = DOT_PRODUCT(cell%hmat(:, 2), cell%hmat(:, 2))
-         norm = DOT_PRODUCT(cell%hmat(1:2, 2), gradient(2:3))
-         gradient(2:3) = cell%hmat(1:2, 2)/norm_b*norm
-         norm_c = DOT_PRODUCT(cell%hmat(:, 3), cell%hmat(:, 3))
-         norm = DOT_PRODUCT(cell%hmat(1:3, 3), gradient(4:6))
-         gradient(4:6) = cell%hmat(1:3, 3)/norm_c*norm
-         ! Retain an exact orthorhombic cell
-         ! (off-diagonal elements must remain zero identically to keep QS fast)
-         IF (cell%orthorhombic) THEN
-            gradient(2) = 0.0_dp
-            gradient(4) = 0.0_dp
-            gradient(5) = 0.0_dp
-         END IF
-      END IF
-
-      IF (keep_symmetry) THEN
-         SELECT CASE (cell%symmetry_id)
-         CASE (cell_sym_cubic, &
-               cell_sym_tetragonal_ab, &
-               cell_sym_tetragonal_ac, &
-               cell_sym_tetragonal_bc, &
-               cell_sym_orthorhombic)
-            SELECT CASE (cell%symmetry_id)
-            CASE (cell_sym_cubic)
-               g = (gradient(1) + gradient(3) + gradient(6))/3.0_dp
-               gradient(1) = g
-               gradient(3) = g
-               gradient(6) = g
-            CASE (cell_sym_tetragonal_ab, &
-                  cell_sym_tetragonal_ac, &
-                  cell_sym_tetragonal_bc)
-               SELECT CASE (cell%symmetry_id)
-               CASE (cell_sym_tetragonal_ab)
-                  g = 0.5_dp*(gradient(1) + gradient(3))
-                  gradient(1) = g
-                  gradient(3) = g
-               CASE (cell_sym_tetragonal_ac)
-                  g = 0.5_dp*(gradient(1) + gradient(6))
-                  gradient(1) = g
-                  gradient(6) = g
-               CASE (cell_sym_tetragonal_bc)
-                  g = 0.5_dp*(gradient(3) + gradient(6))
-                  gradient(3) = g
-                  gradient(6) = g
-               END SELECT
-            CASE (cell_sym_orthorhombic)
-               ! Nothing else to do
-            END SELECT
-            gradient(2) = 0.0_dp
-            gradient(4) = 0.0_dp
-            gradient(5) = 0.0_dp
-         CASE (cell_sym_hexagonal_gamma_60)
-            g = 0.5_dp*(gradient(1) + 0.5_dp*(gradient(2) + sqrt3*gradient(3)))
-            gradient(1) = g
-            gradient(2) = 0.5_dp*g
-            gradient(3) = sqrt3*gradient(2)
-            gradient(4) = 0.0_dp
-            gradient(5) = 0.0_dp
-         CASE (cell_sym_hexagonal_gamma_120)
-            g = 0.5_dp*(gradient(1) - 0.5_dp*(gradient(2) - sqrt3*gradient(3)))
-            gradient(1) = g
-            gradient(2) = -0.5_dp*g
-            gradient(3) = -sqrt3*gradient(2)
-            gradient(4) = 0.0_dp
-            gradient(5) = 0.0_dp
-         CASE (cell_sym_rhombohedral)
-            a = (angle(cell%hmat(:, 3), cell%hmat(:, 2)) + &
-                 angle(cell%hmat(:, 1), cell%hmat(:, 3)) + &
-                 angle(cell%hmat(:, 1), cell%hmat(:, 2)))/3.0_dp
-            cosa = COS(a)
-            sina = SIN(a)
-            cosah = COS(0.5_dp*a)
-            sinah = SIN(0.5_dp*a)
-            norm = cosa/cosah
-            norm_c = SQRT(1.0_dp - norm*norm)
-            g = (gradient(1) + gradient(2)*cosa + gradient(3)*sina + &
-                 gradient(4)*cosah*norm + gradient(5)*sinah*norm + gradient(6)*norm_c)/3.0_dp
-            gradient(1) = g
-            gradient(2) = g*cosa
-            gradient(3) = g*sina
-            gradient(4) = g*cosah*norm
-            gradient(5) = g*sinah*norm
-            gradient(6) = g*norm_c
-         CASE (cell_sym_monoclinic)
-            gradient(2) = 0.0_dp
-            gradient(5) = 0.0_dp
-         CASE (cell_sym_monoclinic_gamma_ab)
-            ! Cell symmetry with a = b, alpha = beta = 90 degree and gammma not equal 90 degree
-            a_length = SQRT(cell%hmat(1, 1)*cell%hmat(1, 1) + &
-                            cell%hmat(2, 1)*cell%hmat(2, 1) + &
-                            cell%hmat(3, 1)*cell%hmat(3, 1))
-            b_length = SQRT(cell%hmat(1, 2)*cell%hmat(1, 2) + &
-                            cell%hmat(2, 2)*cell%hmat(2, 2) + &
-                            cell%hmat(3, 2)*cell%hmat(3, 2))
-            ab_length = 0.5_dp*(a_length + b_length)
-            gamma = angle(cell%hmat(:, 1), cell%hmat(:, 2))
-            cosg = COS(gamma)
-            sing = SIN(gamma)
-            ! Here, g is the average derivative of the cell vector length ab_length, and deriv_gamma is the derivative of the angle gamma
-            g = 0.5_dp*(gradient(1) + cosg*gradient(2) + sing*gradient(3))
-            deriv_gamma = (gradient(3)*cosg - gradient(2)*sing)/b_length
-            gradient(1) = g
-            gradient(2) = g*cosg - ab_length*sing*deriv_gamma
-            gradient(3) = g*sing + ab_length*cosg*deriv_gamma
-            gradient(4) = 0.0_dp
-            gradient(5) = 0.0_dp
-         CASE (cell_sym_triclinic)
-            ! Nothing to do
-         END SELECT
-      END IF
-
-      SELECT CASE (constraint_id)
-      CASE (fix_x)
-         gradient(1:2) = 0.0_dp
-         gradient(4) = 0.0_dp
-      CASE (fix_y)
-         gradient(2:3) = 0.0_dp
-         gradient(5) = 0.0_dp
-      CASE (fix_z)
-         gradient(4:6) = 0.0_dp
-      CASE (fix_xy)
-         gradient(1:5) = 0.0_dp
-      CASE (fix_xz)
-         gradient(1:2) = 0.0_dp
-         gradient(4:6) = 0.0_dp
-      CASE (fix_yz)
-         gradient(2:6) = 0.0_dp
-      CASE (fix_none)
-         ! Nothing to do
-      END SELECT
-
-   END SUBROUTINE apply_cell_constraints
-
-! **************************************************************************************************
-!> \brief Rescale x(idg+1:idg+6) according to vol
-!> \param vol ...
-!> \param x ...
-!> \param idg ...
-! **************************************************************************************************
-   SUBROUTINE rescale_new_cell_volume(vol, x, idg)
-
-      REAL(KIND=dp), INTENT(IN)                          :: vol
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: x
-      INTEGER, INTENT(IN)                                :: idg
-
-      INTEGER                                            :: i, j, my_idg
-      REAL(KIND=dp)                                      :: ratio
-      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat_tmp
-
-      CPASSERT((SIZE(x) == idg + 6))
-      my_idg = idg
-
-      hmat_tmp(:, :) = 0.0_dp
-      DO i = 1, 3
-         DO j = 1, i
-            my_idg = my_idg + 1
-            hmat_tmp(j, i) = x(my_idg)
-         END DO
-      END DO
-
-      ratio = vol/ABS(det_3x3(hmat_tmp))
-      ratio = ratio**(1.0_dp/3.0_dp) ! no need to use EXP(LOG(ratio)/3) for cube root
-
-      my_idg = idg
-      DO i = 1, 3
-         DO j = 1, i
-            my_idg = my_idg + 1
-            x(my_idg) = x(my_idg)*ratio
-         END DO
-      END DO
-
-   END SUBROUTINE rescale_new_cell_volume
 
 END MODULE cell_opt_utils

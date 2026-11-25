@@ -71,12 +71,9 @@ CONTAINS
          END IF
       END DO loop1
 
-      !open (unit=1,file='scfunction',status='unknown')
       DO i = 0, nd
          a(i) = 1._dp*i*ni/nd - (.5_dp*ni - 1._dp)
-         !write(1,*) 1._dp*i*ni/nd-(.5_dp*ni-1._dp),x(i)
       END DO
-      !close(1)
       DEALLOCATE (ch, cg, cgt, cht)
       DEALLOCATE (y)
    END SUBROUTINE scaling_function
@@ -128,9 +125,7 @@ CONTAINS
       !open (unit=1,file='wavelet',status='unknown')
       DO i = 0, nd - 1
          a(i) = 1._dp*i*ni/nd - (.5_dp*ni - .5_dp)
-         !write(1,*) 1._dp*i*ni/nd-(.5_dp*ni-.5_dp),x(i)
       END DO
-      !close(1)
       DEALLOCATE (ch, cg, cgt, cht)
       DEALLOCATE (y)
 
@@ -145,7 +140,7 @@ CONTAINS
 !> \param kernel_scf ...
 !> \param kern_1_scf ...
 ! **************************************************************************************************
-   SUBROUTINE scf_recursion(itype, n_iter, n_range, kernel_scf, kern_1_scf)
+   PURE SUBROUTINE scf_recursion(itype, n_iter, n_range, kernel_scf, kern_1_scf)
       INTEGER, INTENT(in)                                :: itype, n_iter, n_range
       REAL(KIND=dp), INTENT(inout)                       :: kernel_scf(-n_range:n_range)
       REAL(KIND=dp), INTENT(out)                         :: kern_1_scf(-n_range:n_range)
@@ -166,7 +161,7 @@ CONTAINS
 !> \param n ...
 !> \param x ...
 ! **************************************************************************************************
-   SUBROUTINE zero(n, x)
+   PURE SUBROUTINE zero(n, x)
       INTEGER, INTENT(in)                                :: n
       REAL(KIND=dp), INTENT(out)                         :: x(n)
 
@@ -191,11 +186,11 @@ CONTAINS
 !> \param cgt ...
 !> \param cht ...
 ! **************************************************************************************************
-   SUBROUTINE for_trans(nd, nt, x, y, m, cgt, cht)
+   PURE SUBROUTINE for_trans(nd, nt, x, y, m, cgt, cht)
       INTEGER, INTENT(in)                                :: nd, nt
       REAL(KIND=dp), INTENT(in)                          :: x(0:nd - 1)
       REAL(KIND=dp), INTENT(out)                         :: y(0:nd - 1)
-      INTEGER                                            :: m
+      INTEGER, INTENT(in)                                :: m
       REAL(KIND=dp), DIMENSION(:), POINTER               :: cgt, cht
 
       INTEGER                                            :: i, ind, j
@@ -239,7 +234,7 @@ CONTAINS
 !> \param ch ...
 !> \param cg ...
 ! **************************************************************************************************
-   SUBROUTINE back_trans(nd, nt, x, y, m, ch, cg)
+   PURE SUBROUTINE back_trans(nd, nt, x, y, m, ch, cg)
       ! backward wavelet transform
       ! nd: length of data set
       ! nt length of data in data set to be transformed
@@ -248,7 +243,7 @@ CONTAINS
       INTEGER, INTENT(in)                                :: nd, nt
       REAL(KIND=dp), INTENT(in)                          :: x(0:nd - 1)
       REAL(KIND=dp), INTENT(out)                         :: y(0:nd - 1)
-      INTEGER                                            :: m
+      INTEGER, INTENT(in)                                :: m
       REAL(KIND=dp), DIMENSION(:), POINTER               :: ch, cg
 
       INTEGER                                            :: i, ind, j
@@ -284,61 +279,6 @@ CONTAINS
    END SUBROUTINE back_trans
 
 ! **************************************************************************************************
-!> \brief Tests the 4 orthogonality relations of the filters
-!> \param m ...
-!> \param ch ...
-!> \param cg ...
-!> \param cgt ...
-!> \param cht ...
-! **************************************************************************************************
-   SUBROUTINE ftest(m, ch, cg, cgt, cht)
-      INTEGER                                            :: m
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: ch, cg, cgt, cht
-
-      CHARACTER(len=*), PARAMETER                        :: fmt22 = "(a,i3,i4,4(e17.10))"
-
-      INTEGER                                            :: i, j, l
-      REAL(KIND=dp)                                      :: eps, t1, t2, t3, t4
-
-! do i=-m,m
-! WRITE(*,*) i,ch(i),cg(i)
-! end do
-
-      DO i = -m, m
-         DO j = -m, m
-            t1 = 0._dp
-            t2 = 0._dp
-            t3 = 0._dp
-            t4 = 0._dp
-            DO l = -3*m, 3*m
-               IF (l - 2*i >= -m .AND. l - 2*i <= m .AND. &
-                   l - 2*j >= -m .AND. l - 2*j <= m) THEN
-                  t1 = t1 + ch(l - 2*i)*cht(l - 2*j)
-                  t2 = t2 + cg(l - 2*i)*cgt(l - 2*j)
-                  t3 = t3 + ch(l - 2*i)*cgt(l - 2*j)
-                  t4 = t4 + cht(l - 2*i)*cg(l - 2*j)
-               END IF
-            END DO
-            eps = 1.e-10_dp
-            IF (i == j) THEN
-               IF (ABS(t1 - 1._dp) > eps .OR. ABS(t2 - 1._dp) > eps .OR. &
-                   ABS(t3) > eps .OR. ABS(t4) > eps) THEN
-                  WRITE (*, fmt22) 'Orthogonality ERROR', i, j, t1, t2, t3, t4
-               END IF
-            ELSE
-               IF (ABS(t1) > eps .OR. ABS(t2) > eps .OR. &
-                   ABS(t3) > eps .OR. ABS(t4) > eps) THEN
-                  WRITE (*, fmt22) 'Orthogonality ERROR', i, j, t1, t2, t3, t4
-               END IF
-            END IF
-         END DO
-      END DO
-
-      WRITE (*, *) 'FILTER TEST PASSED'
-
-   END SUBROUTINE ftest
-
-! **************************************************************************************************
 !> \brief Do iterations to go from p0gauss to pgauss
 !>    8th-order interpolating scaling function
 !> \param n_iter ...
@@ -348,11 +288,11 @@ CONTAINS
 !> \param m ...
 !> \param ch ...
 ! **************************************************************************************************
-   SUBROUTINE scf_recurs(n_iter, n_range, kernel_scf, kern_1_scf, m, ch)
+   PURE SUBROUTINE scf_recurs(n_iter, n_range, kernel_scf, kern_1_scf, m, ch)
       INTEGER, INTENT(in)                                :: n_iter, n_range
       REAL(KIND=dp), INTENT(inout)                       :: kernel_scf(-n_range:n_range)
       REAL(KIND=dp), INTENT(out)                         :: kern_1_scf(-n_range:n_range)
-      INTEGER                                            :: m
+      INTEGER, INTENT(in)                                :: m
       REAL(KIND=dp), DIMENSION(:), POINTER               :: ch
 
       INTEGER                                            :: i, i_iter, ind, j

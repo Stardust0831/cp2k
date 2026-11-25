@@ -66,9 +66,9 @@ CONTAINS
       CALL section_vals_val_get(se_section, "COULOMB%CUTOFF", explicit=explicit1)
       CALL section_vals_val_get(se_section, "COULOMB%RC_TAPER", explicit=explicit2)
       IF ((.NOT. explicit1) .AND. se_control%do_ewald_gks) THEN
-         rc = MAX(0.5*plane_distance(1, 0, 0, cell), &
-                  0.5*plane_distance(0, 1, 0, cell), &
-                  0.5*plane_distance(0, 0, 1, cell))
+         rc = MAX(0.5_dp*plane_distance(1, 0, 0, cell), &
+                  0.5_dp*plane_distance(0, 1, 0, cell), &
+                  0.5_dp*plane_distance(0, 0, 1, cell))
          IF (rc /= se_control%cutoff_cou) THEN
             IF (output_unit > 0) THEN
                WRITE (output_unit, *)
@@ -305,10 +305,11 @@ CONTAINS
       END IF
 
       ! Check if the element has been defined..
-      IF (.NOT. sep%defined) &
+      IF (.NOT. sep%defined) THEN
          CALL cp_abort(__LOCATION__, &
                        "Semiempirical type ("//TRIM(sep%name)//") cannot be defined for "// &
                        "the requested parameterization.")
+      END IF
 
       ! Fill 1 center - 2 electron integrals
       CALL setup_1c_2el_int(sep)

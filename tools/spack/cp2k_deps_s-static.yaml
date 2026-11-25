@@ -7,7 +7,7 @@ spack:
     unify: true
 
   config:
-    connect_timeout: 30
+    connect_timeout: 240
     install_tree:
       padded_length: 128
       root: /opt/spack
@@ -35,6 +35,11 @@ spack:
         - "+static"
         - "build_type=Release"
 
+    # Build tools
+    cmake:
+      prefer:
+        - "@4"
+
     # ScaLAPACK, LAPACK, BLAS
     blas:
       require:
@@ -49,14 +54,11 @@ spack:
         - "+fortran"
         - "~shared"
 
-    libxsmm:
-      require:
-        - "+fortran"
-
     openblas:
       require:
         - "+fortran"
         - "threads=openmp"
+        - "build_system=makefile"
 
     # Libraries needed by CP2K
     dbcsr:
@@ -90,13 +92,17 @@ spack:
         - "+kxc"
         - "~shared"
 
+    libwignernj:
+      require:
+        - "~shared"
+
     spglib:
       require:
         - "~shared"
 
   repos:
     builtin:
-      commit: fc7222b5b8ababa8588be2e23ff39b33ecc9ce12 # 2026-07-09
+      commit: 04ec59ab6f4327a17a986a2a83e4a521fbead3ef # 2026-11-23
 
   specs:
     # Build tools
@@ -106,20 +112,21 @@ spack:
     - "ninja@1.13"
     - "python@3.11:"
     # CP2K
-    - "dbcsr@2.10.0"
-#   - "dftd4@4.0.2"
+    - "dbcsr@git.8e8c7d469419a587bd4e597c4118557632991d8e=develop"
+#   - "dftd4@4.2.0"
     - "fftw@3.3.11"
-#   - "hdf5@2.1.0"
-    - "libfci@0.1.0"
-    - "libint@2.13.1-cp2k-lmax-5"
+#   - "hdf5@2.2.0"
+    - "libfci@0.1.1"
+    - "libint@2.14.1-cp2k-lmax-5"
     - "libvori@220621"
-    - "libxc@7.0.0"
-    - "libxs@1.0.0"
-    - "libxsmm@2.0.0"
-    - "openblas@0.3.33"
+    - "libwignernj@0.8.0"
+    - "libxc@7.1.2"
+    - "libxs@git.cc9188afc9422fda96c9fa0199ea89c49fd78995=main"
+    - "libxsmm@git.5fdf801e9c2bf91a929018ade31ebf1c24235f0a=main"
+    - "openblas@0.3.34"
     - "pace@2025.12.4.1"
-    - "spglib@2.7.0"
-    - "tblite@0.6.0"
+    - "spglib@2.8.0"
+    - "tblite@0.8.0"
 
   view:
     default:

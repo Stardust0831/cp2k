@@ -27,8 +27,8 @@ MODULE colvar_methods
         hydronium_dist_colvar_id, hydronium_shell_colvar_id, mindist_colvar_id, plane_def_atoms, &
         plane_def_vec, plane_distance_colvar_id, plane_plane_angle_colvar_id, &
         population_colvar_id, qparm_colvar_id, reaction_path_colvar_id, ring_puckering_colvar_id, &
-        rmsd_colvar_id, rotation_colvar_id, torsion_colvar_id, u_colvar_id, xyz_diag_colvar_id, &
-        xyz_outerdiag_colvar_id
+        rmsd_colvar_id, rotation_colvar_id, torsion_colvar_id, u_colvar_id, voronoiipz_colvar_id, &
+        xyz_diag_colvar_id, xyz_outerdiag_colvar_id
    USE constraint_fxd,                  ONLY: check_fixed_atom_cns_colv
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_io_unit,&
@@ -48,13 +48,13 @@ MODULE colvar_methods
    USE force_env_types,                 ONLY: force_env_get,&
                                               force_env_type,&
                                               use_mixed_force
-   USE force_fields_util,               ONLY: get_generic_info
    USE fparser,                         ONLY: EvalErrType,&
                                               evalf,&
                                               evalfd,&
                                               finalizef,&
                                               initf,&
                                               parsef
+   USE generic_function_input,          ONLY: parse_function_section
    USE input_constants,                 ONLY: rmsd_all,&
                                               rmsd_list,&
                                               rmsd_weightlist
@@ -142,8 +142,8 @@ CONTAINS
                                                             nr_frame, v_count
       INTEGER, DIMENSION(:), POINTER                     :: iatms
       INTEGER, DIMENSION(:, :), POINTER                  :: p_bounds
-      LOGICAL                                            :: check, use_mixed_energy
-      LOGICAL, DIMENSION(26)                             :: my_subsection
+      LOGICAL                                            :: use_mixed_energy
+      LOGICAL, DIMENSION(27)                             :: my_subsection
       REAL(dp), DIMENSION(:), POINTER                    :: s1, wei, weights
       REAL(dp), DIMENSION(:, :), POINTER                 :: p_range, s1v
       REAL(KIND=dp), DIMENSION(1)                        :: my_val
@@ -160,8 +160,8 @@ CONTAINS
          path_section, plane_dist_section, plane_plane_angle_section, plane_sections, &
          point_section, population_section, qparm_section, reaction_path_section, &
          ring_puckering_section, rmsd_section, rotation_section, torsion_section, u_section, &
-         Wc_section, wrk_section
-      TYPE(section_vals_type), POINTER :: xyz_diag_section, xyz_outerdiag_section
+         voronoiipz_section, Wc_section
+      TYPE(section_vals_type), POINTER :: wrk_section, xyz_diag_section, xyz_outerdiag_section
 
       CALL timeset(routineN, handle)
       NULLIFY (logger, c_kinds, iatms)
@@ -181,6 +181,8 @@ CONTAINS
       hydronium_shell_section => section_vals_get_subs_vals(colvar_section, "HYDRONIUM_SHELL", i_rep_section=icol)
       hydronium_dist_section => section_vals_get_subs_vals(colvar_section, "HYDRONIUM_DISTANCE", i_rep_section=icol)
       acid_hyd_dist_section => section_vals_get_subs_vals(colvar_section, "ACID_HYDRONIUM_DISTANCE", i_rep_section=icol)
+      voronoiipz_section => section_vals_get_subs_vals(colvar_section, "VORONOIIPZ", i_rep_section=icol)
+
       acid_hyd_shell_section &
          => section_vals_get_subs_vals(colvar_section, "ACID_HYDRONIUM_SHELL", i_rep_section=icol)
       reaction_path_section => section_vals_get_subs_vals(colvar_section, "REACTION_PATH", i_rep_section=icol, &
@@ -239,6 +241,7 @@ CONTAINS
       CALL section_vals_get(acid_hyd_dist_section, explicit=my_subsection(24))
       CALL section_vals_get(acid_hyd_shell_section, explicit=my_subsection(25))
       CALL section_vals_get(hydronium_dist_section, explicit=my_subsection(26))
+      CALL section_vals_get(voronoiipz_section, explicit=my_subsection(27))
 
       ! Only one colvar can be present
       CPASSERT(COUNT(my_subsection) == 1)
@@ -536,8 +539,14 @@ CONTAINS
             ALLOCATE (colvar%reaction_path_param%f_vals(ncol, istart:iend))
             CALL section_vals_val_get(path_section, "VARIABLE", c_vals=my_par, i_rep_val=1)
             CALL section_vals_val_get(path_section, "FUNCTION", n_rep_val=ncol)
-            check = (ncol == SIZE(colvar%reaction_path_param%colvar_p))
-            CPASSERT(check)
+            ! Check that the number of COLVAR provided is equal to the number of functions..
+            IF (SIZE(colvar%reaction_path_param%colvar_p) /= ncol) THEN
+               CALL cp_abort(__LOCATION__, &
+                             "Number of defined COLVAR for REACTION_PATH or DISTANCE_FROM_PATH "// &
+                             "is different from the number of functions! It is not possible "// &
+                             "to define COLVARs in a REACTION_PATH or DISTANCE_FROM_PATH type "// &
+                             "COLVAR and omit the corresponding functions!")
+            END IF
             CALL initf(ncol)
             DO i = 1, ncol
                CALL section_vals_val_get(path_section, "FUNCTION", c_val=path_function, i_rep_val=i)
@@ -618,11 +627,12 @@ CONTAINS
          ALLOCATE (colvar%combine_cvs_param%variables(SIZE(my_par)))
          colvar%combine_cvs_param%variables = my_par
          ! Check that the number of COLVAR provided is equal to the number of variables..
-         IF (SIZE(my_par) /= ncol) &
+         IF (SIZE(my_par) /= ncol) THEN
             CALL cp_abort(__LOCATION__, &
                           "Number of defined COLVAR for COMBINE_COLVAR is different from the "// &
                           "number of variables! It is not possible to define COLVARs in a COMBINE_COLVAR "// &
-                          "and avoid their usage in the combininig function!")
+                          "and avoid their usage in the combining function!")
+         END IF
          ! Parameters
          ALLOCATE (colvar%combine_cvs_param%c_parameters(0))
          CALL section_vals_val_get(combine_section, "PARAMETERS", n_rep_val=ncol)
@@ -726,8 +736,9 @@ CONTAINS
          ! Read the specification of the two planes
          plane_sections => section_vals_get_subs_vals(plane_plane_angle_section, "PLANE")
          CALL section_vals_get(plane_sections, n_repetition=n_var)
-         IF (n_var /= 2) &
+         IF (n_var /= 2) THEN
             CPABORT("PLANE_PLANE_ANGLE Colvar section: Two PLANE sections must be provided!")
+         END IF
          ! Plane 1
          CALL section_vals_val_get(plane_sections, "DEF_TYPE", i_rep_section=1, &
                                    i_val=colvar%plane_plane_angle_param%plane1%type_of_def)
@@ -736,8 +747,9 @@ CONTAINS
                                       r_vals=s1)
             colvar%plane_plane_angle_param%plane1%normal_vec = s1
             IF (PRESENT(cell)) THEN
-               IF (ASSOCIATED(cell)) &
+               IF (ASSOCIATED(cell)) THEN
                   CALL cell_transform_input_cartesian(cell, colvar%plane_plane_angle_param%plane1%normal_vec)
+               END IF
             END IF
          ELSE
             CALL section_vals_val_get(plane_sections, "ATOMS", i_rep_section=1, &
@@ -753,8 +765,9 @@ CONTAINS
                                       r_vals=s1)
             colvar%plane_plane_angle_param%plane2%normal_vec = s1
             IF (PRESENT(cell)) THEN
-               IF (ASSOCIATED(cell)) &
+               IF (ASSOCIATED(cell)) THEN
                   CALL cell_transform_input_cartesian(cell, colvar%plane_plane_angle_param%plane2%normal_vec)
+               END IF
             END IF
          ELSE
             CALL section_vals_val_get(plane_sections, "ATOMS", i_rep_section=2, &
@@ -863,9 +876,10 @@ CONTAINS
                   weights(ndim + 1:ndim + SIZE(wei)) = wei
                   ndim = ndim + SIZE(wei)
                END DO
-               IF (ndim /= colvar%rmsd_param%n_atoms) &
+               IF (ndim /= colvar%rmsd_param%n_atoms) THEN
                   CALL cp_abort(__LOCATION__, "CV RMSD: list of atoms and list of "// &
                                 "weights need to contain same number of entries. ")
+               END IF
                DO i = 1, ndim
                   ii = colvar%rmsd_param%i_rmsd(i)
                   colvar%rmsd_param%weights(ii) = weights(i)
@@ -947,11 +961,13 @@ CONTAINS
                                    i_val=colvar%ring_puckering_param%iq)
          ! test the validity of the parameters
          ndim = colvar%ring_puckering_param%nring
-         IF (ndim <= 3) &
+         IF (ndim <= 3) THEN
             CPABORT("CV Ring Puckering: Ring size has to be 4 or larger. ")
+         END IF
          ii = colvar%ring_puckering_param%iq
-         IF (ABS(ii) == 1 .OR. ii < -(ndim - 1)/2 .OR. ii > ndim/2) &
+         IF (ABS(ii) == 1 .OR. ii < -(ndim - 1)/2 .OR. ii > ndim/2) THEN
             CPABORT("CV Ring Puckering: Invalid coordinate number.")
+         END IF
       ELSE IF (my_subsection(23)) THEN
          ! Minimum Distance
          wrk_section => mindist_section
@@ -1065,6 +1081,10 @@ CONTAINS
                                      colvar%hydronium_dist_param%n_hydrogens, &
                                      colvar%hydronium_dist_param%i_oxygens, &
                                      colvar%hydronium_dist_param%i_hydrogens)
+      ELSE IF (my_subsection(27)) THEN
+         CALL colvar_create(colvar, voronoiipz_colvar_id)
+         CPASSERT(ASSOCIATED(voronoiipz_section))
+         CALL read_voronoiipz_colvars(voronoiipz_section, colvar)
       END IF
       CALL colvar_setup(colvar)
 
@@ -1326,7 +1346,7 @@ CONTAINS
             IF (colvar%ring_puckering_param%iq == 0) THEN
                WRITE (iw, '( A,T40,A)') ' COLVARS| Ring Puckering      >>> coordinate', &
                   ' Total Puckering Amplitude'
-            ELSEIF (colvar%ring_puckering_param%iq > 0) THEN
+            ELSE IF (colvar%ring_puckering_param%iq > 0) THEN
                WRITE (iw, '( A,T35,A,T57,I8)') ' COLVARS| Ring Puckering      >>> coordinate', &
                   ' Puckering Amplitude', &
                   colvar%ring_puckering_param%iq
@@ -1720,6 +1740,8 @@ CONTAINS
       CASE (HBP_colvar_id)
          !!! FIXME this is rubbish at the moment as we have no force to be computed on this
          CALL HBP_colvar(colvar, cell, particles=particles)
+      CASE (voronoiipz_colvar_id)
+         CALL colvar_eval_voronoiipz(colvar, cell, particles=particles)
       CASE DEFAULT
          CPABORT("Unknown colvar type for colvar_eval_mol_f")
       END SELECT
@@ -1808,6 +1830,8 @@ CONTAINS
          CALL ring_puckering_colvar(colvar, cell, subsys=subsys)
       CASE (mindist_colvar_id)
          CALL mindist_colvar(colvar, cell, subsys=subsys)
+      CASE (voronoiipz_colvar_id)
+         CALL colvar_eval_voronoiipz(colvar, cell, subsys=subsys)
       CASE DEFAULT
          CPABORT("Unknown colvar type for colvar_eval_glob_f")
       END SELECT
@@ -1880,6 +1904,8 @@ CONTAINS
          CALL Wc_colvar(colvar, cell, particles=particles)
       CASE (HBP_colvar_id)
          CALL HBP_colvar(colvar, cell, particles=particles)
+      CASE (voronoiipz_colvar_id)
+         CALL colvar_eval_voronoiipz(colvar, cell, particles=particles)
       CASE DEFAULT
          CPABORT("Unknown colvar type for colvar_recursive_eval")
       END SELECT
@@ -2145,19 +2171,19 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE u_colvar(colvar, force_env)
       TYPE(colvar_type), POINTER                         :: colvar
-      TYPE(force_env_type), OPTIONAL, POINTER            :: force_env
+      TYPE(force_env_type), POINTER                      :: force_env
 
       CHARACTER(LEN=default_path_length)                 :: coupling_function
       CHARACTER(LEN=default_string_length)               :: def_error, this_error
       CHARACTER(LEN=default_string_length), &
-         DIMENSION(:), POINTER                           :: parameters
+         ALLOCATABLE, DIMENSION(:)                       :: parameters
       INTEGER                                            :: iatom, iforce_eval, iparticle, &
                                                             jparticle, natom, natom_iforce, &
                                                             nforce_eval
       INTEGER, DIMENSION(:), POINTER                     :: glob_natoms, map_index
       REAL(dp)                                           :: dedf, dx, err, fi(3), lerr, &
                                                             potential_energy
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: values
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: values
       TYPE(cp_subsys_p_type), DIMENSION(:), POINTER      :: subsystems
       TYPE(cp_subsys_type), POINTER                      :: subsys_main
       TYPE(mixed_force_type), DIMENSION(:), POINTER      :: global_forces
@@ -2166,138 +2192,135 @@ CONTAINS
       TYPE(section_vals_type), POINTER                   :: force_env_section, mapping_section, &
                                                             wrk_section
 
-      IF (PRESENT(force_env)) THEN
-         NULLIFY (particles_main, subsys_main)
-         CALL force_env_get(force_env=force_env, subsys=subsys_main)
-         CALL cp_subsys_get(subsys=subsys_main, particles=particles_main)
-         natom = SIZE(particles_main%els)
-         colvar%n_atom_s = natom
-         colvar%u_param%natom = natom
-         CALL reallocate(colvar%i_atom, 1, natom)
-         CALL reallocate(colvar%dsdr, 1, 3, 1, natom)
+      NULLIFY (particles_main, subsys_main)
+      CALL force_env_get(force_env=force_env, subsys=subsys_main)
+      CALL cp_subsys_get(subsys=subsys_main, particles=particles_main)
+      natom = SIZE(particles_main%els)
+      colvar%n_atom_s = natom
+      colvar%u_param%natom = natom
+      CALL reallocate(colvar%i_atom, 1, natom)
+      CALL reallocate(colvar%dsdr, 1, 3, 1, natom)
+      DO iatom = 1, natom
+         colvar%i_atom(iatom) = iatom
+      END DO
+
+      IF (.NOT. ASSOCIATED(colvar%u_param%mixed_energy_section)) THEN
+         CALL force_env_get(force_env, potential_energy=potential_energy)
+         colvar%ss = potential_energy
+
          DO iatom = 1, natom
-            colvar%i_atom(iatom) = iatom
+            ! store derivative
+            fi(:) = -particles_main%els(iatom)%f
+            CALL put_derivative(colvar, iatom, fi)
+         END DO
+      ELSE
+         IF (force_env%in_use /= use_mixed_force) THEN
+            CALL cp_abort(__LOCATION__, &
+                          'ASSERTION (cond) failed at line '//cp_to_string(__LINE__)// &
+                          ' A combination of mixed force_eval energies has been requested as '// &
+                          ' collective variable, but the MIXED env is not in use! Aborting.')
+         END IF
+         CALL force_env_get(force_env, force_env_section=force_env_section)
+         mapping_section => section_vals_get_subs_vals(force_env_section, "MIXED%MAPPING")
+         NULLIFY (subsystems, particles, global_forces, map_index, glob_natoms)
+         nforce_eval = SIZE(force_env%sub_force_env)
+         ALLOCATE (glob_natoms(nforce_eval))
+         ALLOCATE (subsystems(nforce_eval))
+         ALLOCATE (particles(nforce_eval))
+         ! Local Info to sync
+         ALLOCATE (global_forces(nforce_eval))
+
+         glob_natoms = 0
+         DO iforce_eval = 1, nforce_eval
+            NULLIFY (subsystems(iforce_eval)%subsys, particles(iforce_eval)%list)
+            IF (.NOT. ASSOCIATED(force_env%sub_force_env(iforce_eval)%force_env)) CYCLE
+            ! Get all available subsys
+            CALL force_env_get(force_env=force_env%sub_force_env(iforce_eval)%force_env, &
+                               subsys=subsystems(iforce_eval)%subsys)
+            ! Get available particles
+            CALL cp_subsys_get(subsys=subsystems(iforce_eval)%subsys, &
+                               particles=particles(iforce_eval)%list)
+
+            ! Get Mapping index array
+            natom_iforce = SIZE(particles(iforce_eval)%list%els)
+
+            ! Only the rank 0 process collect info for each computation
+            IF (force_env%sub_force_env(iforce_eval)%force_env%para_env%is_source()) THEN
+               glob_natoms(iforce_eval) = natom_iforce
+            END IF
          END DO
 
-         IF (.NOT. ASSOCIATED(colvar%u_param%mixed_energy_section)) THEN
-            CALL force_env_get(force_env, potential_energy=potential_energy)
-            colvar%ss = potential_energy
+         ! Handling Parallel execution
+         CALL force_env%para_env%sync()
+         CALL force_env%para_env%sum(glob_natoms)
 
-            DO iatom = 1, natom
-               ! store derivative
-               fi(:) = -particles_main%els(iatom)%f
-               CALL put_derivative(colvar, iatom, fi)
-            END DO
-         ELSE
-            IF (force_env%in_use /= use_mixed_force) &
-               CALL cp_abort(__LOCATION__, &
-                             'ASSERTION (cond) failed at line '//cp_to_string(__LINE__)// &
-                             ' A combination of mixed force_eval energies has been requested as '// &
-                             ' collective variable, but the MIXED env is not in use! Aborting.')
-            CALL force_env_get(force_env, force_env_section=force_env_section)
-            mapping_section => section_vals_get_subs_vals(force_env_section, "MIXED%MAPPING")
-            NULLIFY (values, parameters, subsystems, particles, global_forces, map_index, glob_natoms)
-            nforce_eval = SIZE(force_env%sub_force_env)
-            ALLOCATE (glob_natoms(nforce_eval))
-            ALLOCATE (subsystems(nforce_eval))
-            ALLOCATE (particles(nforce_eval))
-            ! Local Info to sync
-            ALLOCATE (global_forces(nforce_eval))
-
-            glob_natoms = 0
-            DO iforce_eval = 1, nforce_eval
-               NULLIFY (subsystems(iforce_eval)%subsys, particles(iforce_eval)%list)
-               IF (.NOT. ASSOCIATED(force_env%sub_force_env(iforce_eval)%force_env)) CYCLE
-               ! Get all available subsys
-               CALL force_env_get(force_env=force_env%sub_force_env(iforce_eval)%force_env, &
-                                  subsys=subsystems(iforce_eval)%subsys)
-               ! Get available particles
-               CALL cp_subsys_get(subsys=subsystems(iforce_eval)%subsys, &
-                                  particles=particles(iforce_eval)%list)
-
-               ! Get Mapping index array
-               natom_iforce = SIZE(particles(iforce_eval)%list%els)
-
-               ! Only the rank 0 process collect info for each computation
+         ! Transfer forces
+         DO iforce_eval = 1, nforce_eval
+            ALLOCATE (global_forces(iforce_eval)%forces(3, glob_natoms(iforce_eval)))
+            global_forces(iforce_eval)%forces = 0.0_dp
+            IF (ASSOCIATED(force_env%sub_force_env(iforce_eval)%force_env)) THEN
                IF (force_env%sub_force_env(iforce_eval)%force_env%para_env%is_source()) THEN
-                  glob_natoms(iforce_eval) = natom_iforce
+                  ! Forces
+                  DO iparticle = 1, glob_natoms(iforce_eval)
+                     global_forces(iforce_eval)%forces(:, iparticle) = &
+                        particles(iforce_eval)%list%els(iparticle)%f
+                  END DO
                END IF
+            END IF
+            CALL force_env%para_env%sum(global_forces(iforce_eval)%forces)
+         END DO
+
+         wrk_section => colvar%u_param%mixed_energy_section
+         ! Support any number of force_eval sections
+         CALL parse_function_section(wrk_section, "ENERGY_FUNCTION", coupling_function, &
+                                     parameters, values, var_values=force_env%mixed_env%energies, &
+                                     dx=dx, error_limit=lerr)
+         CALL initf(1)
+         CALL parsef(1, TRIM(coupling_function), parameters)
+         ! Store the value of the COLVAR
+         colvar%ss = evalf(1, values)
+         CPASSERT(EvalErrType <= 0)
+
+         DO iforce_eval = 1, nforce_eval
+            dedf = evalfd(1, iforce_eval, values, dx, err)
+            IF (ABS(err) > lerr) THEN
+               WRITE (this_error, "(A,G12.6,A)") "(", err, ")"
+               WRITE (def_error, "(A,G12.6,A)") "(", lerr, ")"
+               CALL compress(this_error, .TRUE.)
+               CALL compress(def_error, .TRUE.)
+               CALL cp_warn(__LOCATION__, &
+                            'ASSERTION (cond) failed at line '//cp_to_string(__LINE__)// &
+                            ' Error '//TRIM(this_error)//' in computing numerical derivatives larger than'// &
+                            TRIM(def_error)//' .')
+            END IF
+            ! General Mapping of forces...
+            ! First: Get Mapping index array
+            CALL get_subsys_map_index(mapping_section, glob_natoms(iforce_eval), iforce_eval, &
+                                      nforce_eval, map_index)
+
+            ! Second: store derivatives
+            DO iparticle = 1, glob_natoms(iforce_eval)
+               jparticle = map_index(iparticle)
+               fi = -dedf*global_forces(iforce_eval)%forces(:, iparticle)
+               CALL put_derivative(colvar, jparticle, fi)
             END DO
-
-            ! Handling Parallel execution
-            CALL force_env%para_env%sync()
-            CALL force_env%para_env%sum(glob_natoms)
-
-            ! Transfer forces
-            DO iforce_eval = 1, nforce_eval
-               ALLOCATE (global_forces(iforce_eval)%forces(3, glob_natoms(iforce_eval)))
-               global_forces(iforce_eval)%forces = 0.0_dp
-               IF (ASSOCIATED(force_env%sub_force_env(iforce_eval)%force_env)) THEN
-                  IF (force_env%sub_force_env(iforce_eval)%force_env%para_env%is_source()) THEN
-                     ! Forces
-                     DO iparticle = 1, glob_natoms(iforce_eval)
-                        global_forces(iforce_eval)%forces(:, iparticle) = &
-                           particles(iforce_eval)%list%els(iparticle)%f
-                     END DO
-                  END IF
-               END IF
-               CALL force_env%para_env%sum(global_forces(iforce_eval)%forces)
-            END DO
-
-            wrk_section => colvar%u_param%mixed_energy_section
-            ! Support any number of force_eval sections
-            CALL get_generic_info(wrk_section, "ENERGY_FUNCTION", coupling_function, parameters, &
-                                  values, force_env%mixed_env%energies)
-            CALL initf(1)
-            CALL parsef(1, TRIM(coupling_function), parameters)
-            ! Store the value of the COLVAR
-            colvar%ss = evalf(1, values)
-            CPASSERT(EvalErrType <= 0)
-
-            DO iforce_eval = 1, nforce_eval
-               CALL section_vals_val_get(wrk_section, "DX", r_val=dx)
-               CALL section_vals_val_get(wrk_section, "ERROR_LIMIT", r_val=lerr)
-               dedf = evalfd(1, iforce_eval, values, dx, err)
-               IF (ABS(err) > lerr) THEN
-                  WRITE (this_error, "(A,G12.6,A)") "(", err, ")"
-                  WRITE (def_error, "(A,G12.6,A)") "(", lerr, ")"
-                  CALL compress(this_error, .TRUE.)
-                  CALL compress(def_error, .TRUE.)
-                  CALL cp_warn(__LOCATION__, &
-                               'ASSERTION (cond) failed at line '//cp_to_string(__LINE__)// &
-                               ' Error '//TRIM(this_error)//' in computing numerical derivatives larger then'// &
-                               TRIM(def_error)//' .')
-               END IF
-               ! General Mapping of forces...
-               ! First: Get Mapping index array
-               CALL get_subsys_map_index(mapping_section, glob_natoms(iforce_eval), iforce_eval, &
-                                         nforce_eval, map_index)
-
-               ! Second: store derivatives
-               DO iparticle = 1, glob_natoms(iforce_eval)
-                  jparticle = map_index(iparticle)
-                  fi = -dedf*global_forces(iforce_eval)%forces(:, iparticle)
-                  CALL put_derivative(colvar, jparticle, fi)
-               END DO
-               ! Deallocate map_index array
-               IF (ASSOCIATED(map_index)) THEN
-                  DEALLOCATE (map_index)
-               END IF
-            END DO
-            CALL finalizef()
-            DO iforce_eval = 1, nforce_eval
-               DEALLOCATE (global_forces(iforce_eval)%forces)
-            END DO
-            DEALLOCATE (glob_natoms)
-            DEALLOCATE (values)
-            DEALLOCATE (parameters)
-            DEALLOCATE (global_forces)
-            DEALLOCATE (subsystems)
-            DEALLOCATE (particles)
-         END IF
-      ELSE
-         CPABORT("need force_env!")
+            ! Deallocate map_index array
+            IF (ASSOCIATED(map_index)) THEN
+               DEALLOCATE (map_index)
+            END IF
+         END DO
+         CALL finalizef()
+         DO iforce_eval = 1, nforce_eval
+            DEALLOCATE (global_forces(iforce_eval)%forces)
+         END DO
+         DEALLOCATE (glob_natoms)
+         DEALLOCATE (values)
+         DEALLOCATE (parameters)
+         DEALLOCATE (global_forces)
+         DEALLOCATE (subsystems)
+         DEALLOCATE (particles)
       END IF
+
    END SUBROUTINE u_colvar
 
 ! **************************************************************************************************
@@ -2683,8 +2706,8 @@ CONTAINS
       ss = ss - NINT(ss)
       xkj = MATMUL(cell%hmat, ss)
       ! evaluation of the angle..
-      a = SQRT(DOT_PRODUCT(xij, xij))
-      b = SQRT(DOT_PRODUCT(xkj, xkj))
+      a = NORM2(xij)
+      b = NORM2(xkj)
       t0 = 1.0_dp/(a*b)
       t1 = 1.0_dp/(a**3.0_dp*b)
       t2 = 1.0_dp/(a*b**3.0_dp)
@@ -2834,8 +2857,8 @@ CONTAINS
       ss = ss - NINT(ss)
       xkj = MATMUL(cell%hmat, ss)
       ! Evaluation of the angle..
-      a = SQRT(DOT_PRODUCT(xij, xij))
-      b = SQRT(DOT_PRODUCT(xkj, xkj))
+      a = NORM2(xij)
+      b = NORM2(xkj)
       t0 = 1.0_dp/(a*b)
       t1 = 1.0_dp/(a**3.0_dp*b)
       t2 = 1.0_dp/(a*b**3.0_dp)
@@ -3137,10 +3160,6 @@ CONTAINS
       TYPE(particle_list_type), POINTER                  :: particles_i
       TYPE(particle_type), DIMENSION(:), POINTER         :: my_particles
 
-      ! settings for numerical derivatives
-      !REAL(KIND=dp) :: ri_step, dx_bond_j, dy_bond_j, dz_bond_j
-      !INTEGER :: idel
-
       n_atoms_to = colvar%qparm_param%n_atoms_to
       n_atoms_from = colvar%qparm_param%n_atoms_from
       rcut = colvar%qparm_param%rcut
@@ -3158,10 +3177,6 @@ CONTAINS
       END IF
       CPASSERT(r1cut < rcut)
       denominator_tolerance = 1.0E-8_dp
-
-      !ri_step=0.1
-      !DO idel=-50, 50
-      !ftmp(:) = 0.0_dp
 
       qparm = 0.0_dp
       inv_n_atoms_from = 1.0_dp/REAL(n_atoms_from, KIND=dp)
@@ -3200,11 +3215,10 @@ CONTAINS
                      shift(:) = 0.0_dp
                      shift(idim) = 1.0_dp
                      xij_shift = MATMUL(cell%hmat, shift)
-                     rij_shift = SQRT(DOT_PRODUCT(xij_shift, xij_shift))
-                     ncells(idim) = FLOOR(rcut/rij_shift - 0.5)
+                     rij_shift = NORM2(xij_shift)
+                     ncells(idim) = FLOOR(rcut/rij_shift - 0.5_dp)
                   END DO !idim
 
-                  !IF (mm.eq.0) WRITE(*,'(A8,3I3,A3,I10)') "Ncells:", ncells, "J:", j
                   shift(1:3) = 0.0_dp
                   DO aa = -ncells(1), ncells(1)
                      DO bb = -ncells(2), ncells(2)
@@ -3215,12 +3229,7 @@ CONTAINS
                            shift(2) = REAL(bb, KIND=dp)
                            shift(3) = REAL(cc, KIND=dp)
                            xij = MATMUL(cell%hmat, ss0(:) + shift(:))
-                           rij = SQRT(DOT_PRODUCT(xij, xij))
-                           !IF (rij > rcut) THEN
-                           !   IF (mm==0) WRITE(*,'(A8,4F10.5)') " --", shift, rij
-                           !ELSE
-                           !   IF (mm==0) WRITE(*,'(A8,4F10.5)') " ++", shift, rij
-                           !ENDIF
+                           rij = NORM2(xij)
                            IF (rij > rcut) CYCLE
 
                            ! update qlm
@@ -3236,7 +3245,7 @@ CONTAINS
 
                   IF (i == j) CYCLE jloop
                   xij(:) = xpj(:) - xpi(:)
-                  rij = SQRT(DOT_PRODUCT(xij, xij))
+                  rij = NORM2(xij)
                   IF (rij > rcut) CYCLE jloop
 
                   ! update qlm
@@ -3251,11 +3260,6 @@ CONTAINS
             ! this factor is necessary if one whishes to sum over m=0,L
             ! instead of m=-L,+L. This is off now because it is cheap and safe
             fact = 1.0_dp
-            !IF (ABS(mm) > 0) THEN
-            !   fact = 2.0_dp
-            !ELSE
-            !   fact = 1.0_dp
-            !ENDIF
 
             IF (nbond < denominator_tolerance) THEN
                CPWARN("QPARM: number of neighbors is very close to zero!")
@@ -3274,7 +3278,6 @@ CONTAINS
          END DO ! loop over m
 
          pre_fac = (4.0_dp*pi)/(2.0_dp*l + 1)
-         !WRITE(*,'(A8,2F10.5)') "  si = ", SQRT(pre_fac*ql)
          qparm = qparm + SQRT(pre_fac*ql)
          ftmp(:) = 0.5_dp*SQRT(pre_fac/ql)*d_ql_dxi(:)
          ! multiply by -1 because aparently we have to save the force, not the gradient
@@ -3286,10 +3289,6 @@ CONTAINS
 
       colvar%ss = qparm*inv_n_atoms_from
       colvar%dsdr(:, :) = colvar%dsdr(:, :)*inv_n_atoms_from
-
-      !WRITE(*,'(A15,3E20.10)') "COLVAR+DER = ", ri_step*idel, colvar%ss, -ftmp(1)
-
-      !ENDDO ! numercal derivative
 
    END SUBROUTINE qparm_colvar
 
@@ -3323,7 +3322,6 @@ CONTAINS
                                                             exp_fac, fi, plm, pre_fac, sqrt_c1
       REAL(KIND=dp), DIMENSION(3)                        :: dcosTheta, dfi
 
-      !bond = 1.0_dp/(1.0_dp+EXP(alpha*(rij-rcut)))
       ! RZK: infinitely differentiable smooth cutoff function
       ! that is precisely 1.0 below r1cut and precisely 0.0 above rcut
       IF (rij > rcut) THEN
@@ -3366,17 +3364,9 @@ CONTAINS
       sqrt_c1 = SQRT(((2*ll + 1)*fac(ll - ABS(mm)))/(4*pi*fac(ll + ABS(mm))))
       pre_fac = bond*sqrt_c1
       dylm = pre_fac*dplm
-      !WHY? IF (plm < 0.0_dp) THEN
-      !WHY?    dylm = -pre_fac*dplm
-      !WHY? ELSE
-      !WHY?    dylm = pre_fac*dplm
-      !WHY? ENDIF
 
       re_qlm = re_qlm + pre_fac*plm*COS(mm*fi)
       im_qlm = im_qlm + pre_fac*plm*SIN(mm*fi)
-
-      !WRITE(*,'(A8,2I4,F10.5)') "  Qlm = ", mm, j, bond
-      !WRITE(*,'(A8,2I4,2F10.5)') "  Qlm = ", mm, j, re_qlm, im_qlm
 
       dcosTheta(:) = xij(:)*xij(3)/(rij**3)
       dcosTheta(3) = dcosTheta(3) - 1.0_dp/rij
@@ -4533,7 +4523,7 @@ CONTAINS
             CALL compress(def_error, .TRUE.)
             CALL cp_warn(__LOCATION__, &
                          'ASSERTION (cond) failed at line '//cp_to_string(__LINE__)// &
-                         ' Error '//TRIM(this_error)//' in computing numerical derivatives larger then'// &
+                         ' Error '//TRIM(this_error)//' in computing numerical derivatives larger than'// &
                          TRIM(def_error)//' . ')
          END IF
       END DO
@@ -4595,7 +4585,7 @@ CONTAINS
 
       IF (colvar%reaction_path_param%dist_rmsd) THEN
          CALL rpath_dist_rmsd(colvar, my_particles)
-      ELSEIF (colvar%reaction_path_param%rmsd) THEN
+      ELSE IF (colvar%reaction_path_param%rmsd) THEN
          CALL rpath_rmsd(colvar, my_particles)
       ELSE
          CALL rpath_colvar(colvar, cell, my_particles)
@@ -4948,7 +4938,7 @@ CONTAINS
 
       IF (colvar%reaction_path_param%dist_rmsd) THEN
          CALL dpath_dist_rmsd(colvar, my_particles)
-      ELSEIF (colvar%reaction_path_param%rmsd) THEN
+      ELSE IF (colvar%reaction_path_param%rmsd) THEN
          CALL dpath_rmsd(colvar, my_particles)
       ELSE
          CALL dpath_colvar(colvar, cell, my_particles)
@@ -5864,11 +5854,12 @@ CONTAINS
                DO j = 1, natom
                   ! Atom coordinates
                   CALL parser_get_next_line(parser, 1, at_end=my_end)
-                  IF (my_end) &
+                  IF (my_end) THEN
                      CALL cp_abort(__LOCATION__, &
                                    "Number of lines in XYZ format not equal to the number of atoms."// &
                                    " Error in XYZ format for COORD_A (CV rmsd). Very probably the"// &
                                    " line with title is missing or is empty. Please check the XYZ file and rerun your job!")
+                  END IF
                   READ (parser%input_line, *) dummy_char, rptr(1:3)
                   r_ref((j - 1)*3 + 1, i) = cp_unit_to_cp2k(rptr(1), "angstrom")
                   r_ref((j - 1)*3 + 2, i) = cp_unit_to_cp2k(rptr(2), "angstrom")
@@ -5966,12 +5957,7 @@ CONTAINS
             iamin = wcai(i)
          END IF
       END DO
-!     zero=0.0_dp
-!     CALL put_derivative(colvar, 1, zero)
-!     CALL put_derivative(colvar, 2,zero)
-!     CALL put_derivative(colvar, 3, zero)
 
-!     write(*,'(2(i0,1x),4(f16.8,1x))')idmin,iamin,wc(1)%WannierHamDiag(idmin),wc(1)%WannierHamDiag(iamin),dmin,amin
       colvar%ss = wc(1)%WannierHamDiag(idmin) - wc(1)%WannierHamDiag(iamin)
       DEALLOCATE (wcai)
       DEALLOCATE (wcdi)
@@ -5988,7 +5974,7 @@ CONTAINS
          s = MATMUL(cell%h_inv, rij)
          s = s - NINT(s)
          xv = MATMUL(cell%hmat, s)
-         distance = SQRT(DOT_PRODUCT(xv, xv))
+         distance = NORM2(xv)
       END FUNCTION distance
 
    END SUBROUTINE Wc_colvar
@@ -6007,8 +5993,8 @@ CONTAINS
       TYPE(cell_type), POINTER                 :: cell
       TYPE(cp_subsys_type), OPTIONAL, POINTER  :: subsys
       TYPE(particle_type), DIMENSION(:), &
-         OPTIONAL, POINTER                      :: particles
-      TYPE(qs_environment_type), POINTER, OPTIONAL       :: qs_env ! optional just because I am lazy... but I should get rid of it...
+         OPTIONAL, POINTER                     :: particles
+      TYPE(qs_environment_type), OPTIONAL, POINTER       :: qs_env
 
       INTEGER                                  :: Od, H, Oa
       REAL(dp)                                 :: rOd(3), rOa(3), rH(3), &
@@ -6105,9 +6091,211 @@ CONTAINS
          s = MATMUL(cell%h_inv, rij)
          s = s - NINT(s)
          xv = MATMUL(cell%hmat, s)
-         distance = SQRT(DOT_PRODUCT(xv, xv))
+         distance = NORM2(xv)
       END FUNCTION distance
 
    END SUBROUTINE HBP_colvar
+
+! **************************************************************************************************
+!> \brief Evaluate the absolute location of a hydronium ion using Voronoi weights
+!> \param colvar the collective variable
+!> \param cell the simulation cell
+!> \param subsys the simulation subsystem
+!> \param particles the particles, when evaluated for a molecule
+! **************************************************************************************************
+   SUBROUTINE colvar_eval_voronoiipz(colvar, cell, subsys, particles)
+      TYPE(colvar_type), POINTER                         :: colvar
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(cp_subsys_type), OPTIONAL, POINTER            :: subsys
+      TYPE(particle_type), DIMENSION(:), OPTIONAL, &
+         POINTER                                         :: particles
+
+      INTEGER                                            :: i, iatom, j, jatom, n_atoms_a, &
+                                                            n_atoms_o, n_atoms_b, zidx
+      REAL(KIND=dp)                                      :: charge_deriv, cutoff, denominator, &
+                                                            distance, exponent_max, factor, ion_z, &
+                                                            lambda, weighted_charge_deriv, zdist, zmid
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: charge, charge_factor
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: inv_distance, weight
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: distance_vector
+      TYPE(particle_type), DIMENSION(:), POINTER         :: my_particles
+
+      CPASSERT(colvar%type_id == voronoiipz_colvar_id)
+      IF (PRESENT(particles)) THEN
+         my_particles => particles
+      ELSE
+         CPASSERT(PRESENT(subsys))
+         my_particles => subsys%particles%els
+      END IF
+
+      n_atoms_a = SIZE(colvar%voronoiipz_params%group_a)
+      n_atoms_b = SIZE(colvar%voronoiipz_params%group_b)
+      n_atoms_o = n_atoms_a - colvar%voronoiipz_params%nrx
+      cutoff = colvar%voronoiipz_params%nl_cutoff
+      lambda = colvar%voronoiipz_params%lambda
+      zidx = colvar%voronoiipz_params%zidx
+      zmid = colvar%voronoiipz_params%zmid
+
+      ALLOCATE (charge(n_atoms_a), charge_factor(n_atoms_a))
+      ALLOCATE (distance_vector(3, n_atoms_a, n_atoms_b))
+      ALLOCATE (inv_distance(n_atoms_a, n_atoms_b), weight(n_atoms_a, n_atoms_b))
+      charge = 0.0_dp
+      charge_factor = 0.0_dp
+      distance_vector = 0.0_dp
+      inv_distance = 0.0_dp
+      weight = 0.0_dp
+
+      ! Each hydrogen is assigned continuously to all oxygen sites within the cutoff.
+      ! Subtracting the largest exponent makes the softmax stable for either sign of lambda.
+      DO j = 1, n_atoms_b
+         jatom = colvar%voronoiipz_params%group_b(j)
+         exponent_max = -HUGE(0.0_dp)
+         DO i = 1, n_atoms_a
+            iatom = colvar%voronoiipz_params%group_a(i)
+            distance_vector(:, i, j) = pbc(my_particles(iatom)%r, my_particles(jatom)%r, cell)
+            distance = NORM2(distance_vector(:, i, j))
+            IF (distance <= cutoff) THEN
+               IF (distance <= EPSILON(0.0_dp)) THEN
+                  CPABORT("VORONOIIPZ is undefined for coincident GROUPA and GROUPB atoms")
+               END IF
+               inv_distance(i, j) = 1.0_dp/distance
+               weight(i, j) = lambda*distance
+               exponent_max = MAX(exponent_max, weight(i, j))
+            END IF
+         END DO
+
+         denominator = 0.0_dp
+         DO i = 1, n_atoms_a
+            IF (inv_distance(i, j) > 0.0_dp) THEN
+               weight(i, j) = EXP(weight(i, j) - exponent_max)
+               denominator = denominator + weight(i, j)
+            END IF
+         END DO
+         IF (denominator <= 0.0_dp) THEN
+            CPABORT("VORONOIIPZ found a GROUPB atom without a GROUPA neighbor inside NL_CUTOFF")
+         END IF
+         weight(:, j) = weight(:, j)/denominator
+      END DO
+
+      charge(:) = SUM(weight, DIM=2)
+      DO i = 1, n_atoms_a
+         IF (i <= n_atoms_o) THEN
+            charge(i) = charge(i) - colvar%voronoiipz_params%d0
+         ELSE
+            SELECT CASE (i - n_atoms_o)
+            CASE (1)
+               charge(i) = charge(i) - colvar%voronoiipz_params%d1
+            CASE (2)
+               charge(i) = charge(i) - colvar%voronoiipz_params%d2
+            CASE (3)
+               charge(i) = charge(i) - colvar%voronoiipz_params%d3
+            END SELECT
+         END IF
+      END DO
+
+      ion_z = 0.0_dp
+      DO i = 1, n_atoms_o
+         IF (charge(i) > 0.0_dp) THEN
+            iatom = colvar%voronoiipz_params%group_a(i)
+            zdist = my_particles(iatom)%r(zidx) - zmid
+            ion_z = ion_z + ABS(zdist)*charge(i)**2
+            charge_factor(i) = 2.0_dp*ABS(zdist)*charge(i)
+            IF (zdist > 0.0_dp) THEN
+               colvar%dsdr(zidx, i) = colvar%dsdr(zidx, i) + charge(i)**2
+            ELSE IF (zdist < 0.0_dp) THEN
+               colvar%dsdr(zidx, i) = colvar%dsdr(zidx, i) - charge(i)**2
+            END IF
+         END IF
+      END DO
+
+      ! ds/d(r_ij) = lambda*w_ij*(ds/dq_i - sum_k(w_kj*ds/dq_k)).
+      DO j = 1, n_atoms_b
+         weighted_charge_deriv = SUM(weight(:, j)*charge_factor)
+         DO i = 1, n_atoms_a
+            IF (weight(i, j) > 0.0_dp) THEN
+               charge_deriv = charge_factor(i) - weighted_charge_deriv
+               factor = lambda*weight(i, j)*charge_deriv*inv_distance(i, j)
+               colvar%dsdr(:, i) = colvar%dsdr(:, i) - factor*distance_vector(:, i, j)
+               colvar%dsdr(:, n_atoms_a + j) = colvar%dsdr(:, n_atoms_a + j) + &
+                                               factor*distance_vector(:, i, j)
+            END IF
+         END DO
+      END DO
+
+      colvar%ss = ion_z
+      DEALLOCATE (charge, charge_factor, distance_vector, inv_distance, weight)
+
+   END SUBROUTINE colvar_eval_voronoiipz
+
+! **************************************************************************************************
+!> \brief Read and validate the VORONOIIPZ collective variable
+!> \param voronoiipz_section the input section
+!> \param colvar the collective variable
+! **************************************************************************************************
+   SUBROUTINE read_voronoiipz_colvars(voronoiipz_section, colvar)
+      TYPE(section_vals_type), POINTER                   :: voronoiipz_section
+      TYPE(colvar_type), POINTER                         :: colvar
+
+      INTEGER                                            :: i, j, n_atoms_a
+      INTEGER, DIMENSION(:), POINTER                     :: atom_list
+
+      CALL section_vals_val_get(voronoiipz_section, "LAMBDA", r_val=colvar%voronoiipz_params%lambda)
+      CALL section_vals_val_get(voronoiipz_section, "ZIDX", i_val=colvar%voronoiipz_params%zidx)
+      CALL section_vals_val_get(voronoiipz_section, "NRX", i_val=colvar%voronoiipz_params%nrx)
+      CALL section_vals_val_get(voronoiipz_section, "ZMID", r_val=colvar%voronoiipz_params%zmid)
+      CALL section_vals_val_get(voronoiipz_section, "D_0", r_val=colvar%voronoiipz_params%d0)
+      CALL section_vals_val_get(voronoiipz_section, "D_1", r_val=colvar%voronoiipz_params%d1)
+      CALL section_vals_val_get(voronoiipz_section, "D_2", r_val=colvar%voronoiipz_params%d2)
+      CALL section_vals_val_get(voronoiipz_section, "D_3", r_val=colvar%voronoiipz_params%d3)
+      CALL section_vals_val_get(voronoiipz_section, "NL_CUTOFF", r_val=colvar%voronoiipz_params%nl_cutoff)
+
+      NULLIFY (atom_list)
+      CALL section_vals_val_get(voronoiipz_section, "GROUPA", i_vals=atom_list)
+      IF (.NOT. ASSOCIATED(atom_list)) THEN
+         CPABORT("VORONOIIPZ requires a non-empty GROUPA")
+      END IF
+      IF (SIZE(atom_list) == 0) CPABORT("VORONOIIPZ requires a non-empty GROUPA")
+      ALLOCATE (colvar%voronoiipz_params%group_a(SIZE(atom_list)))
+      colvar%voronoiipz_params%group_a = atom_list
+
+      NULLIFY (atom_list)
+      CALL section_vals_val_get(voronoiipz_section, "GROUPB", i_vals=atom_list)
+      IF (.NOT. ASSOCIATED(atom_list)) THEN
+         CPABORT("VORONOIIPZ requires a non-empty GROUPB")
+      END IF
+      IF (SIZE(atom_list) == 0) CPABORT("VORONOIIPZ requires a non-empty GROUPB")
+      ALLOCATE (colvar%voronoiipz_params%group_b(SIZE(atom_list)))
+      colvar%voronoiipz_params%group_b = atom_list
+
+      n_atoms_a = SIZE(colvar%voronoiipz_params%group_a)
+      IF (colvar%voronoiipz_params%zidx < 1 .OR. colvar%voronoiipz_params%zidx > 3) THEN
+         CPABORT("VORONOIIPZ ZIDX must be 1, 2, or 3")
+      END IF
+      IF (colvar%voronoiipz_params%nrx < 0 .OR. colvar%voronoiipz_params%nrx > 3 .OR. &
+          colvar%voronoiipz_params%nrx >= n_atoms_a) THEN
+         CPABORT("VORONOIIPZ NRX must be between zero and three and smaller than the size of GROUPA")
+      END IF
+      IF (colvar%voronoiipz_params%nl_cutoff <= 0.0_dp) THEN
+         CPABORT("VORONOIIPZ NL_CUTOFF must be positive")
+      END IF
+      IF (ANY(colvar%voronoiipz_params%group_a <= 0) .OR. &
+          ANY(colvar%voronoiipz_params%group_b <= 0)) THEN
+         CPABORT("VORONOIIPZ atom indices must be positive")
+      END IF
+      DO i = 1, n_atoms_a
+         IF (ANY(colvar%voronoiipz_params%group_a(i) == colvar%voronoiipz_params%group_a(i + 1:))) THEN
+            CPABORT("VORONOIIPZ GROUPA contains duplicate atom indices")
+         END IF
+         IF (ANY(colvar%voronoiipz_params%group_a(i) == colvar%voronoiipz_params%group_b)) THEN
+            CPABORT("VORONOIIPZ GROUPA and GROUPB must be disjoint")
+         END IF
+      END DO
+      DO j = 1, SIZE(colvar%voronoiipz_params%group_b)
+         IF (ANY(colvar%voronoiipz_params%group_b(j) == colvar%voronoiipz_params%group_b(j + 1:))) THEN
+            CPABORT("VORONOIIPZ GROUPB contains duplicate atom indices")
+         END IF
+      END DO
+
+   END SUBROUTINE read_voronoiipz_colvars
 
 END MODULE colvar_methods

@@ -54,9 +54,10 @@ MODULE pair_potential_types
                                  gal21_type = 18, &
                                  tab_type = 19, &
                                  deepmd_type = 20, &
-                                 ace_type = 21
+                                 ace_type = 21, &
+                                 mace_type = 22
 
-   INTEGER, PUBLIC, PARAMETER, DIMENSION(21) :: list_pot = [nn_type, &
+   INTEGER, PUBLIC, PARAMETER, DIMENSION(22) :: list_pot = [nn_type, &
                                                             lj_type, &
                                                             lj_charmm_type, &
                                                             ft_type, &
@@ -76,7 +77,8 @@ MODULE pair_potential_types
                                                             gal21_type, &
                                                             tab_type, &
                                                             deepmd_type, &
-                                                            ace_type]
+                                                            ace_type, &
+                                                            mace_type]
 
    ! Shell model
    INTEGER, PUBLIC, PARAMETER :: nosh_nosh = 0, &
@@ -230,11 +232,11 @@ MODULE pair_potential_types
 ! **************************************************************************************************
    TYPE gp_pot_type
       INTEGER                                   :: myid = 0
-      CHARACTER(LEN=default_path_length)       :: potential = ""
+      CHARACTER(LEN=default_path_length)        :: potential = ""
       CHARACTER(LEN=default_string_length), &
-         POINTER, DIMENSION(:)                   :: parameters => NULL(), units => NULL()
-      CHARACTER(LEN=default_string_length)     :: variables = ""
-      REAL(KIND=dp), DIMENSION(:), POINTER      :: values => NULL()
+         ALLOCATABLE, DIMENSION(:)              :: parameters
+      CHARACTER(LEN=default_string_length)      :: variables = ""
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE  :: values
    END TYPE gp_pot_type
 
 ! **************************************************************************************************
@@ -468,7 +470,7 @@ CONTAINS
          CASE (deepmd_type)
             IF ((pot1%set(i)%deepmd%deepmd_file_name == pot2%set(i)%deepmd%deepmd_file_name) .AND. &
                 (pot1%set(i)%deepmd%atom_deepmd_type == pot2%set(i)%deepmd%atom_deepmd_type)) mycompare = .TRUE.
-         CASE (nequip_type, allegro_type)
+         CASE (nequip_type, allegro_type, mace_type)
             IF ((pot1%set(i)%nequip%pot_file_name == pot2%set(i)%nequip%pot_file_name) .AND. &
                 (pot1%set(i)%nequip%unit_length == pot2%set(i)%nequip%unit_length) .AND. &
                 (pot1%set(i)%nequip%unit_forces == pot2%set(i)%nequip%unit_forces) .AND. &
@@ -567,7 +569,26 @@ CONTAINS
                 (pot1%set(i)%gal21%express .EQV. &
                  pot2%set(i)%gal21%express) .AND. &
                 (pot1%set(i)%gal21%rcutsq == pot2%set(i)%gal21%rcutsq)) mycompare = .TRUE.
-
+         CASE (gp_type)
+            ! The original logic in get_nonbond_storage of pair_potential.F checks
+            ! only the parameters and values and returns true unless some different
+            ! value is found; in fact the potential and variables should also be
+            ! checked for matching strings
+            mycompare = .TRUE.
+            IF (ALLOCATED(pot1%set(i)%gp%parameters) .AND. ALLOCATED(pot2%set(i)%gp%parameters)) THEN
+               IF (SIZE(pot1%set(i)%gp%parameters) == SIZE(pot2%set(i)%gp%parameters)) THEN
+                  IF (ANY(pot1%set(i)%gp%parameters /= pot2%set(i)%gp%parameters)) THEN
+                     mycompare = .FALSE.
+                  END IF
+               END IF
+            END IF
+            IF (ALLOCATED(pot1%set(i)%gp%values) .AND. ALLOCATED(pot2%set(i)%gp%values)) THEN
+               IF (SIZE(pot1%set(i)%gp%values) == SIZE(pot2%set(i)%gp%values)) THEN
+                  IF (ANY(pot1%set(i)%gp%values /= pot2%set(i)%gp%values)) THEN
+                     mycompare = .FALSE.
+                  END IF
+               END IF
+            END IF
          END SELECT
          mycompare = mycompare .AND. &
                      (pot1%set(i)%rmin == pot2%set(i)%rmin) .AND. (pot1%set(i)%rmax == pot2%set(i)%rmax)
@@ -641,10 +662,12 @@ CONTAINS
       potparm%at1 = 'NULL'
       potparm%at2 = 'NULL'
       potparm%rcutsq = 0.0_dp
-      IF (ASSOCIATED(potparm%pair_spline_data)) &
+      IF (ASSOCIATED(potparm%pair_spline_data)) THEN
          CALL spline_data_p_release(potparm%pair_spline_data)
-      IF (ASSOCIATED(potparm%spl_f)) &
+      END IF
+      IF (ASSOCIATED(potparm%spl_f)) THEN
          CALL spline_factor_release(potparm%spl_f)
+      END IF
 
       DO i = 1, SIZE(potparm%type)
          potparm%set(i)%rmin = not_initialized
@@ -1049,8 +1072,9 @@ CONTAINS
       IF (PRESENT(istart)) l_start = istart
       IF (PRESENT(iend)) l_end = iend
       DO i = l_start, l_end
-         IF (.NOT. ASSOCIATED(source%pot(i)%pot)) &
+         IF (.NOT. ASSOCIATED(source%pot(i)%pot)) THEN
             CALL pair_potential_single_create(source%pot(i)%pot)
+         END IF
          CALL pair_potential_single_copy(source%pot(i)%pot, dest%pot(i)%pot)
       END DO
    END SUBROUTINE pair_potential_p_copy
@@ -1286,7 +1310,7 @@ CONTAINS
             CALL pair_potential_goodwin_create(p%pot(i)%pot%set(std_dim)%goodwin)
          CASE (ea_type)
             CALL pair_potential_eam_create(p%pot(i)%pot%set(std_dim)%eam)
-         CASE (nequip_type, allegro_type)
+         CASE (nequip_type, allegro_type, mace_type)
             CALL pair_potential_nequip_create(p%pot(i)%pot%set(std_dim)%nequip)
          CASE (ace_type)
             CALL pair_potential_ace_create(p%pot(i)%pot%set(std_dim)%ace)
@@ -1332,8 +1356,6 @@ CONTAINS
 
       CPASSERT(.NOT. ASSOCIATED(gp))
       ALLOCATE (gp)
-      NULLIFY (gp%parameters)
-      NULLIFY (gp%values)
       CALL pair_potential_gp_clean(gp)
    END SUBROUTINE pair_potential_gp_create
 
@@ -1354,15 +1376,15 @@ CONTAINS
       gp_dest%myid = gp_source%myid
       gp_dest%potential = gp_source%potential
       gp_dest%variables = gp_source%variables
-      IF (ASSOCIATED(gp_source%parameters)) THEN
+      IF (ALLOCATED(gp_source%parameters)) THEN
          idim = SIZE(gp_source%parameters)
          ALLOCATE (gp_dest%parameters(idim))
-         gp_dest%parameters = gp_source%parameters
+         gp_dest%parameters(:) = gp_source%parameters
       END IF
-      IF (ASSOCIATED(gp_source%values)) THEN
+      IF (ALLOCATED(gp_source%values)) THEN
          idim = SIZE(gp_source%values)
          ALLOCATE (gp_dest%values(idim))
-         gp_dest%values = gp_source%values
+         gp_dest%values(:) = gp_source%values
       END IF
    END SUBROUTINE pair_potential_gp_copy
 
@@ -1378,10 +1400,10 @@ CONTAINS
       gp%myid = 0
       gp%potential = ""
       gp%variables = ""
-      IF (ASSOCIATED(gp%values)) THEN
+      IF (ALLOCATED(gp%values)) THEN
          DEALLOCATE (gp%values)
       END IF
-      IF (ASSOCIATED(gp%parameters)) THEN
+      IF (ALLOCATED(gp%parameters)) THEN
          DEALLOCATE (gp%parameters)
       END IF
    END SUBROUTINE pair_potential_gp_clean
@@ -1395,10 +1417,10 @@ CONTAINS
       TYPE(gp_pot_type), POINTER                         :: gp
 
       IF (ASSOCIATED(gp)) THEN
-         IF (ASSOCIATED(gp%parameters)) THEN
+         IF (ALLOCATED(gp%parameters)) THEN
             DEALLOCATE (gp%parameters)
          END IF
-         IF (ASSOCIATED(gp%values)) THEN
+         IF (ALLOCATED(gp%values)) THEN
             DEALLOCATE (gp%values)
          END IF
          DEALLOCATE (gp)

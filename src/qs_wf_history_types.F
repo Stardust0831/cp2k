@@ -35,9 +35,29 @@ MODULE qs_wf_history_types
    LOGICAL, PRIVATE, PARAMETER :: debug_this_module = .TRUE.
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_wf_history_types'
 
-   PUBLIC :: qs_wf_snapshot_type, &
+   PUBLIC :: qs_wf_mo_state_type, qs_wf_snapshot_type, &
              qs_wf_history_type, qs_wf_history_p_type
    PUBLIC :: wfi_retain, wfi_release, wfi_clear, wfi_get_snapshot
+
+! **************************************************************************************************
+!> \brief stores scalar and occupation metadata for an MO set snapshot
+!> \param eigenvalues MO eigenvalues
+!> \param occupation_numbers MO occupation numbers
+!> \param homo index of highest occupied MO
+!> \param lfomo index of lowest fractional/empty MO
+!> \param uniform_occupation whether orbitals 1..homo share uniform occupation
+!> \param kTS electronic entropic energy contribution
+!> \param mu Fermi energy / chemical potential
+! **************************************************************************************************
+   TYPE qs_wf_mo_state_type
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: eigenvalues
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: occupation_numbers
+      INTEGER :: homo = -1
+      INTEGER :: lfomo = -1
+      LOGICAL :: uniform_occupation = .FALSE.
+      REAL(KIND=dp) :: kTS = 0.0_dp
+      REAL(KIND=dp) :: mu = 0.0_dp
+   END TYPE qs_wf_mo_state_type
 
 ! **************************************************************************************************
 !> \brief represent a past snapshot of the wavefunction.
@@ -46,12 +66,14 @@ MODULE qs_wf_history_types
 !> \param wf the wavefunctions
 !> \param rho_r the density in r space
 !> \param rho_g the density in g space
-!> \param rho_ao the density in ao space
+!> \param rho_ao the AO density matrices indexed by spin and real-space image
 !> \param overlap the overlap matrix
+!> \param wf_kp real k-point MO snapshots
+!> \param wf_kp_cfm complex k-point MO snapshots
 !> \param rho_frozen the frozen density structure
+!> \param mo_state Gamma-point MO eigenvalues and occupations per spin
+!> \param mo_state_kp k-point MO eigenvalues and occupations per local k-point and spin
 !> \param dt the time of the snapshot (wrf to te previous snapshot!)
-!> \note
-!>      keep track also of occupation numbers and energies?
 !> \par History
 !>      02.2003 created [fawzi]
 !>      02.2005 wf_mol added [MI]
@@ -61,13 +83,15 @@ MODULE qs_wf_history_types
       TYPE(cp_fm_type), DIMENSION(:), POINTER :: wf => NULL()
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER :: rho_r => NULL()
       TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER :: rho_g => NULL()
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER :: rho_ao => NULL()
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER :: rho_ao_kp => NULL()
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER :: rho_ao => NULL()
       TYPE(dbcsr_type), POINTER :: overlap => NULL()
-      TYPE(cp_fm_type), DIMENSION(:, :, :), POINTER :: wf_kp => NULL()
+      TYPE(cp_fm_type), DIMENSION(:, :), POINTER :: wf_kp => NULL()
+      TYPE(cp_cfm_type), DIMENSION(:, :), POINTER :: wf_kp_cfm => NULL()
       TYPE(cp_cfm_type), DIMENSION(:), POINTER :: overlap_cfm_kp => NULL()
       INTEGER, DIMENSION(:, :), POINTER :: kp_pbc_shift => NULL()
       TYPE(qs_rho_type), POINTER :: rho_frozen => NULL()
+      TYPE(qs_wf_mo_state_type), DIMENSION(:), ALLOCATABLE :: mo_state
+      TYPE(qs_wf_mo_state_type), DIMENSION(:, :), ALLOCATABLE :: mo_state_kp
       REAL(KIND=dp) :: dt = 0.0_dp
    END TYPE qs_wf_snapshot_type
 
@@ -104,7 +128,7 @@ MODULE qs_wf_history_types
       INTEGER :: ref_count = -1, memory_depth = -1, last_state_index = -1, &
                  interpolation_method_nr = -1, snapshot_count = -1
       LOGICAL :: store_wf = .FALSE., store_rho_r = .FALSE., store_rho_g = .FALSE., &
-                 store_rho_ao = .FALSE., store_rho_ao_kp = .FALSE., &
+                 store_rho_ao = .FALSE., &
                  store_overlap = .FALSE., store_wf_kp = .FALSE., store_overlap_kp = .FALSE., &
                  store_frozen_density = .FALSE.
       TYPE(qs_wf_snapshot_p_type), DIMENSION(:), POINTER :: past_states => NULL()
@@ -132,7 +156,7 @@ CONTAINS
    SUBROUTINE wfs_release(snapshot)
       TYPE(qs_wf_snapshot_type), INTENT(INOUT)           :: snapshot
 
-      INTEGER                                            :: i, ic, ikp, ispin
+      INTEGER                                            :: i, ikp, ispin
 
       CALL cp_fm_release(snapshot%wf)
       ! snapshot%rho_r & snapshot%rho_g is deallocated in wfs_update
@@ -140,21 +164,19 @@ CONTAINS
       IF (ASSOCIATED(snapshot%rho_ao)) THEN
          CALL dbcsr_deallocate_matrix_set(snapshot%rho_ao)
       END IF
-      IF (ASSOCIATED(snapshot%rho_ao_kp)) THEN
-         CALL dbcsr_deallocate_matrix_set(snapshot%rho_ao_kp)
-      END IF
       IF (ASSOCIATED(snapshot%overlap)) THEN
          CALL dbcsr_deallocate_matrix(snapshot%overlap)
       END IF
       IF (ASSOCIATED(snapshot%wf_kp)) THEN
-         DO ikp = 1, SIZE(snapshot%wf_kp, 1)
-            DO ic = 1, SIZE(snapshot%wf_kp, 2)
-               DO ispin = 1, SIZE(snapshot%wf_kp, 3)
-                  CALL cp_fm_release(snapshot%wf_kp(ikp, ic, ispin))
-               END DO
+         CALL cp_fm_release(snapshot%wf_kp)
+      END IF
+      IF (ASSOCIATED(snapshot%wf_kp_cfm)) THEN
+         DO ikp = 1, SIZE(snapshot%wf_kp_cfm, 1)
+            DO ispin = 1, SIZE(snapshot%wf_kp_cfm, 2)
+               CALL cp_cfm_release(snapshot%wf_kp_cfm(ikp, ispin))
             END DO
          END DO
-         DEALLOCATE (snapshot%wf_kp)
+         DEALLOCATE (snapshot%wf_kp_cfm)
       END IF
       IF (ASSOCIATED(snapshot%overlap_cfm_kp)) THEN
          DO i = 1, SIZE(snapshot%overlap_cfm_kp)
@@ -168,6 +190,12 @@ CONTAINS
       IF (ASSOCIATED(snapshot%rho_frozen)) THEN
          CALL qs_rho_release(snapshot%rho_frozen)
          DEALLOCATE (snapshot%rho_frozen)
+      END IF
+      IF (ALLOCATED(snapshot%mo_state)) THEN
+         DEALLOCATE (snapshot%mo_state)
+      END IF
+      IF (ALLOCATED(snapshot%mo_state_kp)) THEN
+         DEALLOCATE (snapshot%mo_state_kp)
       END IF
 
    END SUBROUTINE wfs_release

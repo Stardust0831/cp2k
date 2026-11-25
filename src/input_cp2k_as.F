@@ -13,35 +13,36 @@
 !> \author fawzi
 ! **************************************************************************************************
 MODULE input_cp2k_as
-   USE cp_output_handling,              ONLY: cp_print_key_section_create,&
-                                              debug_print_level,&
-                                              high_print_level,&
-                                              low_print_level,&
-                                              medium_print_level,&
-                                              silent_print_level
-   USE input_constants,                 ONLY: &
-        casci_canonical, eri_method_full_gpw, eri_method_gpw_ht, eri_operator_coulomb, &
-        eri_operator_erf, eri_operator_erfc, eri_operator_gaussian, eri_operator_lr_trunc, &
-        eri_operator_trunc, eri_operator_yukawa, fci_solver, gaussian, manual_selection, &
-        mao_projection, no_solver, qiskit_solver, wannier_projection
-   USE input_cp2k_loc,                  ONLY: create_localize_section
-   USE input_cp2k_xc,                   ONLY: create_xc_section
-   USE input_keyword_types,             ONLY: keyword_create,&
-                                              keyword_release,&
-                                              keyword_type
-   USE input_section_types,             ONLY: section_add_keyword,&
-                                              section_add_subsection,&
-                                              section_create,&
-                                              section_release,&
-                                              section_type
-   USE input_val_types,                 ONLY: char_t,&
-                                              integer_t,&
-                                              lchar_t,&
-                                              logical_t,&
-                                              real_t
-   USE kinds,                           ONLY: dp
-   USE qs_density_mixing_types,         ONLY: create_mixing_section
-   USE string_utilities,                ONLY: s2a
+   USE cp_output_handling, ONLY: cp_print_key_section_create, &
+                                 debug_print_level, &
+                                 high_print_level, &
+                                 low_print_level, &
+                                 medium_print_level, &
+                                 silent_print_level
+   USE input_constants, ONLY: &
+      casci_canonical, eri_method_full_gpw, eri_method_gpw_ht, eri_operator_coulomb, &
+      eri_operator_erf, eri_operator_erfc, eri_operator_gaussian, eri_operator_lr_trunc, &
+      eri_operator_trunc, eri_operator_yukawa, fci_solver, gaussian, gto_cartesian, &
+      gto_spherical, manual_selection, mao_projection, no_solver, qiskit_solver, &
+      wannier_projection
+   USE input_cp2k_loc, ONLY: create_localize_section
+   USE input_cp2k_xc, ONLY: create_xc_section
+   USE input_keyword_types, ONLY: keyword_create, &
+                                  keyword_release, &
+                                  keyword_type
+   USE input_section_types, ONLY: section_add_keyword, &
+                                  section_add_subsection, &
+                                  section_create, &
+                                  section_release, &
+                                  section_type
+   USE input_val_types, ONLY: char_t, &
+                              integer_t, &
+                              lchar_t, &
+                              logical_t, &
+                              real_t
+   USE kinds, ONLY: dp
+   USE qs_density_mixing_types, ONLY: create_mixing_section
+   USE string_utilities, ONLY: s2a
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -99,7 +100,11 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="ACTIVE_ORBITAL_INDICES", &
                           description="The indices of the active orbitals. Requires ORBITAL_SELECTION MANUAL! "// &
                           "Need to be as many indices as active orbitals times the number of spin "// &
-                          "channels (2 if ROKS or UKS/LSD else 1).", &
+                          "channels (2 if ROKS or UKS/LSD else 1). The indices refer to the canonical "// &
+                          "SCF orbitals ordered by energy: if the SCF orbitals are not canonical (e.g. OT), "// &
+                          "they are first rotated into canonical orbitals, so the indices do not refer to "// &
+                          "the original OT orbitals. With OT%ON_THE_FLY_LOC the indices refer to the "// &
+                          "localized orbitals.", &
                           usage="ACTIVE_ORBITAL_INDICES 2 3 {...}", n_var=-1, default_i_vals=[-1], &
                           type_of_var=integer_t)
       CALL section_add_keyword(section, keyword)
@@ -111,16 +116,74 @@ CONTAINS
       CALL section_add_subsection(section, print_key)
       CALL section_release(print_key)
 
+      CALL cp_print_key_section_create(print_key, __LOCATION__, "MOLDEN", &
+                                       description="Writes the orbitals of the active space Hamiltonian in "// &
+                                       "Molden format: the inactive orbitals first, then the active orbitals "// &
+                                       "in the orbital order of the FCIDUMP file. These are exactly the "// &
+                                       "orbitals used for the integrals, also for ORBITAL_SELECTION MANUAL.", &
+                                       print_level=high_print_level, filename="ACTIVE_SPACE")
+      CALL keyword_create(keyword, __LOCATION__, name="UNIT", &
+                          description="Unit for coordinates and cell in the MOLDEN file.", &
+                          usage="UNIT ANGSTROM", &
+                          enum_c_vals=s2a("BOHR", "ANGSTROM"), &
+                          enum_desc=s2a("Write in Bohr (AU)", "Write in Angstrom"), &
+                          enum_i_vals=[1, 2], &
+                          default_i_val=1)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WRITE_CELL", &
+                          description="Controls whether the [Cell] block is written to the MOLDEN file.", &
+                          usage="WRITE_CELL T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WRITE_PSEUDO", &
+                          description="Controls whether the [Pseudo] block is written to the MOLDEN file.", &
+                          usage="WRITE_PSEUDO T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="MARK_GHOST", &
+                          description="Controls whether ghost atoms are marked in the [Atoms] block by "// &
+                          "setting their atomic number to zero.", &
+                          usage="MARK_GHOST T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="NDIGITS", &
+                          description="Specifies the number of significant digits retained. "// &
+                          "The default keeps full precision for use in other programs.", &
+                          usage="NDIGITS {int}", &
+                          default_i_val=15)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="GTO_KIND", &
+                          description="Representation of Gaussian-type orbitals", &
+                          default_i_val=gto_spherical, &
+                          enum_c_vals=s2a("CARTESIAN", "SPHERICAL"), &
+                          enum_desc=s2a( &
+                          "Cartesian Gaussian orbitals. Use with caution", &
+                          "Spherical Gaussian orbitals. Incompatible with VMD"), &
+                          enum_i_vals=[gto_cartesian, gto_spherical])
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL section_add_subsection(section, print_key)
+      CALL section_release(print_key)
+
       CALL keyword_create(keyword, __LOCATION__, name="ORBITAL_SELECTION", &
-                          description="Method used to select active space orbitals.", &
+                          description="Method used to select active space orbitals. CANONICAL and MANUAL "// &
+                          "use the canonical SCF orbitals unchanged; non-canonical SCF orbitals (e.g. "// &
+                          "from OT) are first rotated once into canonical orbitals, separately within the "// &
+                          "occupied and the unoccupied orbitals. Not done for ROKS and for OT%ON_THE_FLY_LOC, "// &
+                          "where CANONICAL is not possible.", &
                           usage="ORBITAL_SELECTION CANONICAL", &
                           default_i_val=casci_canonical, &
                           enum_c_vals=s2a("CANONICAL", "WANNIER_PROJECTION", "MAO", "MANUAL"), &
                           enum_i_vals=[casci_canonical, wannier_projection, mao_projection, manual_selection], &
-                          enum_desc=s2a("Select orbitals using energy ordering of canoncial orbitals", &
+                          enum_desc=s2a("Select orbitals using energy ordering of canonical orbitals", &
                                         "Select orbitals from projected Wannier functions", &
                                         "Select orbitals from modified atomic orbitals", &
-                                        "Select orbitals manually via ACTIVE_ORBITAL_INDICES"))
+                                        "Select canonical orbitals by their indices given in ACTIVE_ORBITAL_INDICES"))
 
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -165,6 +228,14 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="EPS_FCI", &
+                          description="Squared residual norm (energy variance) threshold, in hartree squared, "// &
+                          "for AS_SOLVER FCI. This controls the inner FCI solver, not the embedding iterations. "// &
+                          "Loose values can give inaccurate one-particle density matrices.", &
+                          usage="EPS_FCI 1.0E-20", type_of_var=real_t, default_r_val=1.0E-20_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="EPS_ITER", &
                           description="Energy convergence threshold of the DFT embedding scheme.", &
                           usage="EPS_ITER 1.0E-6 ", type_of_var=real_t, &
@@ -203,7 +274,7 @@ CONTAINS
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
-      CALL create_mixing_section(subsection)
+      CALL create_mixing_section(subsection, active_space=.TRUE.)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
@@ -342,13 +413,14 @@ CONTAINS
                           enum_i_vals=[eri_operator_coulomb, eri_operator_yukawa, &
                                        eri_operator_erf, eri_operator_erfc, eri_operator_gaussian, &
                                        eri_operator_trunc, eri_operator_lr_trunc], &
-                          enum_desc=s2a("Coulomb operator: 1/r", &
-                                        "Yukawa operator: exp(-omega*R)/R", &
-                                        "Longrange operator: erf(omega*R)/R", &
-                                        "Shortrange operator: erfc(omega*R)/R", &
+                          enum_desc=s2a("Coulomb operator: $\frac{1}{r}$", &
+                                        "Yukawa operator: $\frac{\exp{(-\omega \cdot r)}}{r}$", &
+                                        "Longrange operator: $\frac{\mathrm{erf}(\omega \cdot r)}{r}$", &
+                                        "Shortrange operator: $\frac{\mathrm{erfc}(\omega \cdot r)}{r}$", &
                                         "Gaussian operator: exp(-omega*R2)/R", &
-                                        "Truncated Coulomb operator: if (R < R_c) 1/R else 0)", &
-                                        "Truncated longrange operator: if (R < R_c) erf(omega*R)/R else 0"), &
+                                        "Truncated Coulomb operator: $\frac{1}{r} \text{ if } (r \lt R_c) \text{ else } 0$", &
+                                        "Truncated longrange operator: "// &
+                                        "$\frac{\mathrm{erf}(\omega \cdot r)}{r} \text{ if } (r \lt R_c) \text{ else } 0$"), &
                           default_i_val=eri_operator_coulomb)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -361,15 +433,15 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="OMEGA", &
-                          description="Range-separation parameter for ERI operator.", &
+                          description="Range-separation parameter $\omega$ for ERI operator.", &
                           usage="OMEGA 0.25", type_of_var=real_t, &
                           default_r_val=0.4_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="CUTOFF_RADIUS", &
-                          description="Cutoff radius (in Angstroms) for the truncated 1/r and "// &
-                          "longrange potentials. "// &
+                          description="Cutoff radius (in Angstroms) $R_c$ for the truncated "// &
+                          "$\frac{1}{r}$ and longrange potentials. "// &
                           "Only valid when doing truncated calculations.", &
                           usage="CUTOFF_RADIUS 10.0", type_of_var=real_t, &
                           unit_str="angstrom", default_r_val=0.0_dp)

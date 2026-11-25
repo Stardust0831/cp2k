@@ -47,6 +47,8 @@ MODULE smearing_utils
    ! Unified interface (method as parameter)
    PUBLIC :: SmearOcc, SmearFixed, SmearFixedDeriv, SmearFixedDerivMV
    PUBLIC :: Smearkp, Smearkp2
+   PUBLIC :: smearing_response_weight
+   PUBLIC :: smearing_separate_spin, smearing_spin_targets
    PRIVATE :: cite_smearing
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'smearing_utils'
@@ -56,6 +58,38 @@ MODULE smearing_utils
    REAL(KIND=dp), PARAMETER, PRIVATE                     :: MPMV_MAX_NEWTON_STEP = 2.0_dp
 
 CONTAINS
+! **************************************************************************************************
+!> \brief Whether a smearing constraint fixes the separate spin populations.
+!> \param fixed_mag_mom Requested spin difference, or a negative constraint selector.
+!> \return True for a prescribed moment or the integer-population selector -1.
+! **************************************************************************************************
+   PURE LOGICAL FUNCTION smearing_separate_spin(fixed_mag_mom)
+      REAL(KIND=dp), INTENT(IN)                          :: fixed_mag_mom
+
+      smearing_separate_spin = fixed_mag_mom >= 0.0_dp .OR. fixed_mag_mom == -1.0_dp
+   END FUNCTION smearing_separate_spin
+
+! **************************************************************************************************
+!> \brief Resolve real-valued spin targets without rounding a prescribed moment.
+!> \param nelectron Initial integer spin populations.
+!> \param fixed_mag_mom Prescribed difference, or a negative constraint selector.
+!> \return Target populations. Negative selectors preserve the initial populations.
+! **************************************************************************************************
+   PURE FUNCTION smearing_spin_targets(nelectron, fixed_mag_mom) RESULT(targets)
+      INTEGER, DIMENSION(2), INTENT(IN)                  :: nelectron
+      REAL(KIND=dp), INTENT(IN)                          :: fixed_mag_mom
+      REAL(KIND=dp), DIMENSION(2)                        :: targets
+
+      REAL(KIND=dp)                                      :: total
+
+      targets(:) = REAL(nelectron, dp)
+      IF (fixed_mag_mom >= 0.0_dp) THEN
+         total = SUM(targets)
+         targets(1) = 0.5_dp*(total + fixed_mag_mom)
+         targets(2) = 0.5_dp*(total - fixed_mag_mom)
+      END IF
+   END FUNCTION smearing_spin_targets
+
 ! **************************************************************************************************
 !> \brief   Citation of Smearing methods
 !> \param method ...
@@ -390,7 +424,8 @@ CONTAINS
          DO iter = 1, NEWTON_MAX_ITER
             res_now = ABS(N_now - N)
             IF (res_now < N*1.0e-12_dp) EXIT
-            CALL compute_gvec(gvec, f, e, mu, sigma, maxocc, Nstate, method, my_estate, my_festate)
+            CALL smearing_response_weight( &
+               gvec, f, e, mu, sigma, maxocc, Nstate, method, my_estate, my_festate)
             Gsum = accurate_sum(gvec)
             IF (ABS(Gsum) < EPSILON(Gsum)) EXIT
 
@@ -776,7 +811,7 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief   Computes the smearing weight vector g_i = -df_i/de_i with mu held
-!>          fixed (module-private helper for the analytical Jacobian routines).
+!>          fixed.
 !>
 !>          Fermi-Dirac:  g_i = occ * f_norm * (1 - f_norm) / sigma
 !>                        where f_norm = f_i/occ_i  (overflow-safe, uses
@@ -801,7 +836,8 @@ CONTAINS
 !> \param estate  excited state index (optional)
 !> \param festate occupation of the excited state (optional)
 ! **************************************************************************************************
-   SUBROUTINE compute_gvec(gvec, f, e, mu, sigma, maxocc, Nstate, method, estate, festate)
+   SUBROUTINE smearing_response_weight( &
+      gvec, f, e, mu, sigma, maxocc, Nstate, method, estate, festate)
 
       REAL(KIND=dp), INTENT(OUT)                         :: gvec(:)
       REAL(KIND=dp), INTENT(IN)                          :: f(:), e(:), mu, sigma, maxocc
@@ -851,7 +887,7 @@ CONTAINS
          END SELECT
       END DO
 
-   END SUBROUTINE compute_gvec
+   END SUBROUTINE smearing_response_weight
 
 ! **************************************************************************************************
 !> \brief   Analytical Jacobian df_i/de_j for any smearing method under the
@@ -904,7 +940,7 @@ CONTAINS
       ! Step 2: build g vector
       Nstate = SIZE(e)
       ALLOCATE (gvec(Nstate))
-      CALL compute_gvec(gvec, f, e, mu, sigma, maxocc, Nstate, method, estate, festate)
+      CALL smearing_response_weight(gvec, f, e, mu, sigma, maxocc, Nstate, method, estate, festate)
       Gsum = accurate_sum(gvec)
 
       ! Step 3: assemble dfde(i,j) = -delta_{ij}*g_i + g_i*g_j/G
@@ -978,7 +1014,7 @@ CONTAINS
       ! Step 2: build g vector
       Nstate = SIZE(e)
       ALLOCATE (gvec(Nstate))
-      CALL compute_gvec(gvec, f, e, mu, sigma, maxocc, Nstate, method, estate, festate)
+      CALL smearing_response_weight(gvec, f, e, mu, sigma, maxocc, Nstate, method, estate, festate)
       Gsum = accurate_sum(gvec)
 
       ! Step 3: RESULT_j = g_j * (g.v / G - v_j)

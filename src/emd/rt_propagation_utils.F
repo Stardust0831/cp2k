@@ -13,15 +13,17 @@
 MODULE rt_propagation_utils
    USE atomic_kind_types,               ONLY: atomic_kind_type
    USE cell_types,                      ONLY: cell_type
+   USE cp_array_utils,                  ONLY: cp_1d_r_p_type
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_control_types,                ONLY: dft_control_type,&
                                               rtp_control_type
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_add, dbcsr_binary_read, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, &
-        dbcsr_desymmetrize, dbcsr_distribution_type, dbcsr_filter, dbcsr_get_info, &
-        dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
-        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_p_type, dbcsr_scale, dbcsr_set, dbcsr_type
+        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
+        dbcsr_distribution_type, dbcsr_filter, dbcsr_get_info, dbcsr_iterator_blocks_left, &
+        dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
+        dbcsr_p_type, dbcsr_scale, dbcsr_set, dbcsr_type
    USE cp_dbcsr_contrib,                ONLY: dbcsr_checksum
+   USE cp_dbcsr_io,                     ONLY: dbcsr_binary_read
    USE cp_dbcsr_operations,             ONLY: cp_dbcsr_plus_fm_fm_t,&
                                               dbcsr_deallocate_matrix_set
    USE cp_files,                        ONLY: close_file,&
@@ -80,6 +82,13 @@ MODULE rt_propagation_utils
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE qs_ks_types,                     ONLY: qs_ks_did_change,&
                                               qs_ks_env_type
+   USE qs_loc_states,                   ONLY: get_localization_info
+   USE qs_loc_types,                    ONLY: qs_loc_env_create,&
+                                              qs_loc_env_release,&
+                                              qs_loc_env_type
+   USE qs_loc_utils,                    ONLY: loc_set_mo_coeff,&
+                                              qs_loc_control_init,&
+                                              qs_loc_init
    USE qs_mo_io,                        ONLY: read_mo_set_from_restart,&
                                               read_rt_mos_from_restart,&
                                               write_mo_set_to_output_unit
@@ -94,6 +103,7 @@ MODULE rt_propagation_utils
    USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_set,&
                                               qs_rho_type
+   USE qs_scf_post_gpw,                 ONLY: get_effective_core_charges
    USE qs_scf_wfn_mix,                  ONLY: wfn_mix
    USE qs_subsys_types,                 ONLY: qs_subsys_get,&
                                               qs_subsys_type
@@ -105,6 +115,7 @@ MODULE rt_propagation_utils
    PRIVATE
 
    PUBLIC :: get_restart_wfn, &
+             rt_localize_initial_mos, &
              calc_S_derivs, &
              calc_update_rho, &
              calc_update_rho_sparse, &
@@ -120,6 +131,88 @@ MODULE rt_propagation_utils
 CONTAINS
 
 ! **************************************************************************************************
+!> \brief Replaces the occupied orbitals of the initial wavefunction by the localized orbitals
+!>        defined in DFT%LOCALIZE (REAL_TIME_PROPAGATION%LOCALIZE_INITIAL_WFN).
+!>        The density matrix is unchanged, only the orbital representation differs.
+!> \param qs_env ...
+!> \param mo_array the MOs of qs_env, overwritten by the localized ones
+! **************************************************************************************************
+   SUBROUTINE rt_localize_initial_mos(qs_env, mo_array)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(mo_set_type), DIMENSION(:), INTENT(INOUT)     :: mo_array
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'rt_localize_initial_mos'
+
+      INTEGER                                            :: handle, ispin, output_unit
+      INTEGER, DIMENSION(:, :, :), POINTER               :: marked_states
+      TYPE(cp_1d_r_p_type), DIMENSION(:), POINTER        :: occupied_evals
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: mo_localized, occupied_orbs
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(particle_list_type), POINTER                  :: particles
+      TYPE(pw_c1d_gs_type)                               :: wf_g
+      TYPE(pw_env_type), POINTER                         :: pw_env
+      TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool
+      TYPE(pw_r3d_rs_type)                               :: wf_r
+      TYPE(qs_loc_env_type), POINTER                     :: qs_loc_env
+      TYPE(qs_subsys_type), POINTER                      :: subsys
+      TYPE(section_vals_type), POINTER                   :: input, loc_section
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (auxbas_pw_pool, input, loc_section, marked_states, occupied_evals, particles, &
+               pw_env, qs_loc_env, subsys)
+      logger => cp_get_default_logger()
+      output_unit = cp_logger_get_default_io_unit(logger)
+
+      CALL get_qs_env(qs_env, input=input, pw_env=pw_env, subsys=subsys)
+      CALL qs_subsys_get(subsys, particles=particles)
+      loc_section => section_vals_get_subs_vals(input, "DFT%LOCALIZE")
+
+      IF (output_unit > 0) THEN
+         WRITE (UNIT=output_unit, FMT="(/,T2,A)") &
+            "RTP| Localizing the occupied orbitals of the initial wavefunction"
+      END IF
+
+      ALLOCATE (occupied_orbs(SIZE(mo_array)), mo_localized(SIZE(mo_array)))
+      ALLOCATE (occupied_evals(SIZE(mo_array)))
+      DO ispin = 1, SIZE(mo_array)
+         occupied_orbs(ispin) = mo_array(ispin)%mo_coeff
+         occupied_evals(ispin)%array => mo_array(ispin)%eigenvalues
+         CALL cp_fm_create(mo_localized(ispin), mo_array(ispin)%mo_coeff%matrix_struct)
+         CALL cp_fm_to_fm(mo_array(ispin)%mo_coeff, mo_localized(ispin))
+      END DO
+
+      ALLOCATE (qs_loc_env)
+      CALL qs_loc_env_create(qs_loc_env)
+      CALL qs_loc_control_init(qs_loc_env, loc_section, do_homo=.TRUE.)
+      IF (.NOT. qs_loc_env%do_localize) THEN
+         CALL cp_abort(__LOCATION__, "LOCALIZE_INITIAL_WFN requires the DFT%LOCALIZE section "// &
+                       "with a localization METHOD")
+      END IF
+      CALL qs_loc_init(qs_env, qs_loc_env, loc_section, mo_localized, do_homo=.TRUE., &
+                       do_mo_cubes=.FALSE.)
+
+      CALL pw_env_get(pw_env, auxbas_pw_pool=auxbas_pw_pool)
+      CALL auxbas_pw_pool%create_pw(wf_r)
+      CALL auxbas_pw_pool%create_pw(wf_g)
+      CALL get_localization_info(qs_env, qs_loc_env, loc_section, mo_localized, wf_r, wf_g, &
+                                 particles, occupied_orbs, occupied_evals, marked_states)
+      CALL auxbas_pw_pool%give_back_pw(wf_r)
+      CALL auxbas_pw_pool%give_back_pw(wf_g)
+
+      CALL loc_set_mo_coeff(qs_env, qs_loc_env, mo_array, mo_localized)
+
+      CALL cp_fm_release(mo_localized)
+      DEALLOCATE (occupied_orbs, occupied_evals)
+      CALL qs_loc_env_release(qs_loc_env)
+      DEALLOCATE (qs_loc_env)
+      IF (ASSOCIATED(marked_states)) DEALLOCATE (marked_states)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE rt_localize_initial_mos
+
+! **************************************************************************************************
 !> \brief Calculates dS/dR respectily the velocity weighted derivatves
 !>        only needed for ehrenfest MD.
 !>
@@ -133,11 +226,11 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'calc_S_derivs'
+      INTEGER, DIMENSION(3, 3), PARAMETER :: ider = RESHAPE([4, 5, 6, 5, 7, 8, 6, 8, 9], [3, 3])
       REAL(KIND=dp), PARAMETER                           :: one = 1.0_dp, zero = 0.0_dp
 
-      INTEGER                                            :: col_atom, handle, i, j, m, maxder, n, &
-                                                            nder, row_atom
-      INTEGER, DIMENSION(6, 2)                           :: c_map_mat
+      INTEGER                                            :: col_atom, handle, i, k, m, maxder, nder, &
+                                                            row_atom
       LOGICAL                                            :: return_s_derivatives
       REAL(dp), DIMENSION(:, :), POINTER                 :: block_values
       TYPE(dbcsr_iterator_type)                          :: iter
@@ -220,38 +313,22 @@ CONTAINS
          CALL dbcsr_add(B_mat, tmp_mat, one, one)
       END DO
       CALL dbcsr_filter(B_mat, rtp%filter_eps)
-      !calculate C matrix: v(Rb)*<d/dRa alpha| d/dRb beta>
-
-      c_map_mat = 0
-      n = 0
-      DO j = 1, 3
-         DO m = j, 3
-            n = n + 1
-            c_map_mat(n, 1) = j
-            IF (m == j) CYCLE
-            c_map_mat(n, 2) = m
-         END DO
-      END DO
+      !calculate C matrix: C(i) = <d/dt alpha| d/dRb_i beta> = sum_k v_k(Ra)*<d/dRa_k alpha| d/dRb_i beta>
+      ! with alpha on atom a (row) and beta on atom b (column)
 
       DO i = 1, 3
          CALL dbcsr_set(C_mat(i)%matrix, zero)
-      END DO
-      DO m = 1, 6
-         CALL dbcsr_copy(tmp_mat, S_der(m + 3)%matrix)
-         DO j = 1, 2
-            IF (c_map_mat(m, j) == 0) CYCLE
-            CALL dbcsr_add(C_mat(c_map_mat(m, j))%matrix, tmp_mat, one, one)
+         DO k = 1, 3
+            CALL dbcsr_copy(tmp_mat, S_der(ider(i, k))%matrix)
+            CALL dbcsr_iterator_start(iter, tmp_mat)
+            DO WHILE (dbcsr_iterator_blocks_left(iter))
+               CALL dbcsr_iterator_next_block(iter, row_atom, col_atom, block_values)
+               block_values = block_values*particle_set(row_atom)%v(k)
+            END DO
+            CALL dbcsr_iterator_stop(iter)
+            CALL dbcsr_add(C_mat(i)%matrix, tmp_mat, one, one)
          END DO
-      END DO
-
-      DO m = 1, 3
-         CALL dbcsr_iterator_start(iter, C_mat(m)%matrix)
-         DO WHILE (dbcsr_iterator_blocks_left(iter))
-            CALL dbcsr_iterator_next_block(iter, row_atom, col_atom, block_values)
-            block_values = block_values*particle_set(row_atom)%v(m)
-         END DO
-         CALL dbcsr_iterator_stop(iter)
-         CALL dbcsr_filter(C_mat(m)%matrix, rtp%filter_eps)
+         CALL dbcsr_filter(C_mat(i)%matrix, rtp%filter_eps)
       END DO
 
       CALL dbcsr_deallocate_matrix(tmp_mat)
@@ -318,9 +395,15 @@ CONTAINS
                                        dft_section=dft_section)
          CALL set_uniform_occupation_mo_array(mo_array, nspin)
 
-         IF (dft_control%rtp_control%apply_wfn_mix_init_restart) &
+         ! localize before WFN_MIX, which then acts on the localized orbitals
+         IF (dft_control%rtp_control%localize_initial_wfn .AND. .NOT. rtp%linear_scaling) THEN
+            CALL rt_localize_initial_mos(qs_env, mo_array)
+         END IF
+
+         IF (dft_control%rtp_control%apply_wfn_mix_init_restart) THEN
             CALL wfn_mix(mo_array, particle_set, dft_section, qs_kind_set, para_env, output_unit, &
                          for_rtp=.TRUE.)
+         END IF
 
          DO ispin = 1, nspin
             CALL calculate_density_matrix(mo_array(ispin), p_rmpv(ispin)%matrix)
@@ -421,10 +504,11 @@ CONTAINS
       DO ispin = 1, nspin
          is_uniform = .TRUE.
          DO mo = 1, mo_array(ispin)%nmo
-            IF (mo_array(ispin)%occupation_numbers(mo) /= 0.0 .AND. &
-                mo_array(ispin)%occupation_numbers(mo) /= 1.0 .AND. &
-                mo_array(ispin)%occupation_numbers(mo) /= 2.0) &
+            IF (mo_array(ispin)%occupation_numbers(mo) /= 0.0_dp .AND. &
+                mo_array(ispin)%occupation_numbers(mo) /= 1.0_dp .AND. &
+                mo_array(ispin)%occupation_numbers(mo) /= 2.0_dp) THEN
                is_uniform = .FALSE.
+            END IF
          END DO
          mo_array(ispin)%uniform_occupation = is_uniform
       END DO
@@ -741,6 +825,7 @@ CONTAINS
                                                             rt_time_step, unit_nr
       INTEGER, DIMENSION(:), POINTER                     :: list, list_index
       LOGICAL                                            :: append_cube, do_kpoints, mpi_io
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: zcharge
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
@@ -794,6 +879,7 @@ CONTAINS
                       particle_set=particle_set, &
                       dft_control=dft_control)
       CALL qs_subsys_get(subsys, particles=particles)
+      CALL get_effective_core_charges(qs_env, zcharge)
 
       nspins = dft_control%nspins
       rt_time_step = qs_env%sim_step
@@ -868,7 +954,7 @@ CONTAINS
                                            middle_name=TRIM(filename), file_position=my_pos_cube, log_filename=.FALSE., &
                                            mpi_io=mpi_io)
             WRITE (title, *) "DENSITY ", ivector, " spin ", ispin, " i.e. HOMO - ", ivector - homo
-            CALL cp_pw_to_cube(density_r, unit_nr, title, particles=particles, &
+            CALL cp_pw_to_cube(density_r, unit_nr, title, particles=particles, zeff=zcharge, &
                                stride=section_get_ivals(dft_section, "PRINT%MO_CUBES%STRIDE"), mpi_io=mpi_io)
             CALL cp_print_key_finished_output(unit_nr, logger, input, "DFT%PRINT%MO_CUBES", mpi_io=mpi_io)
          END DO
@@ -879,6 +965,7 @@ CONTAINS
       CALL auxbas_pw_pool%give_back_pw(wf_r)
       CALL auxbas_pw_pool%give_back_pw(wf_g)
       CALL auxbas_pw_pool%give_back_pw(density_r)
+      DEALLOCATE (zcharge)
 
       CALL timestop(handle)
 

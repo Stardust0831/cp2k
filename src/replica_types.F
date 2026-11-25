@@ -91,12 +91,14 @@ MODULE replica_types
 !> \param wf_history wavefunction history for the owned replicas
 !> \param keep_wf_history if the wavefunction history for the owned replicas
 !>        should be kept
+!> \param n_wf_history number of wavefunction history slots owned by this group
 !> \author fawzi
 ! **************************************************************************************************
    TYPE replica_env_type
       INTEGER                                           :: ref_count = -1, id_nr = -1, f_env_id = -1, &
                                                            nrep = -1, ndim = -1, nparticle = -1, &
-                                                           my_rep_group = -1, force_dim = -1
+                                                           my_rep_group = -1, force_dim = -1, &
+                                                           n_wf_history = -1
       REAL(kind=dp), DIMENSION(:, :), POINTER            :: r => NULL(), v => NULL(), f => NULL()
       LOGICAL                                           :: sync_v = .FALSE., keep_wf_history = .FALSE.
       CHARACTER(LEN=default_path_length)                :: original_project_name = ""
@@ -206,12 +208,12 @@ CONTAINS
       TYPE(replica_env_type), POINTER                    :: rep_env
 
       rep_env => rep_envs_get_rep_env(rep_env_id, ierr=stat)
-      IF (.NOT. ASSOCIATED(rep_env)) &
+      IF (.NOT. ASSOCIATED(rep_env)) THEN
          CPABORT("could not find rep_env with id_nr"//cp_to_string(rep_env_id))
+      END IF
       CALL f_env_add_defaults(f_env_id=rep_env%f_env_id, f_env=f_env)
       logger => cp_get_default_logger()
-      CALL cp_rm_iter_level(iteration_info=logger%iter_info, &
-                            level_name="REPLICA_EVAL")
+      CALL cp_rm_iter_level(logger, "REPLICA_EVAL")
       CALL f_env_rm_defaults(f_env, ierr)
       CPASSERT(ierr == 0)
    END SUBROUTINE rep_env_destroy_low

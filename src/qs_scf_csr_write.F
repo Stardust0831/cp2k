@@ -13,13 +13,17 @@
 ! **************************************************************************************************
 MODULE qs_scf_csr_write
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_convert_dbcsr_to_csr, dbcsr_copy, dbcsr_create, &
-        dbcsr_csr_create_and_convert_complex, dbcsr_csr_create_from_dbcsr, &
-        dbcsr_csr_dbcsr_blkrow_dist, dbcsr_csr_destroy, dbcsr_csr_type, dbcsr_csr_write, &
-        dbcsr_desymmetrize, dbcsr_finalize, dbcsr_get_block_p, dbcsr_has_symmetry, dbcsr_p_type, &
-        dbcsr_put_block, dbcsr_release, dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, &
-        dbcsr_type_no_symmetry, dbcsr_type_symmetric
+        dbcsr_copy, dbcsr_create, dbcsr_desymmetrize, dbcsr_finalize, dbcsr_get_block_p, &
+        dbcsr_has_symmetry, dbcsr_p_type, dbcsr_put_block, dbcsr_release, dbcsr_set, dbcsr_type, &
+        dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, dbcsr_type_symmetric
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
+   USE cp_dbcsr_csr,                    ONLY: dbcsr_convert_dbcsr_to_csr,&
+                                              dbcsr_csr_create_and_convert_complex,&
+                                              dbcsr_csr_create_from_dbcsr,&
+                                              dbcsr_csr_dbcsr_blkrow_dist,&
+                                              dbcsr_csr_destroy,&
+                                              dbcsr_csr_type,&
+                                              dbcsr_csr_write
    USE cp_dbcsr_operations,             ONLY: dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
@@ -426,9 +430,8 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'write_matrix_kp_csr'
 
       CHARACTER(LEN=default_path_length)                 :: file_name, fileformat, subs_string
-      INTEGER                                            :: handle, igroup, ik, ikp, ispin, kplocal, &
+      INTEGER                                            :: handle, igroup, ik, ikp, ispin, kpmax, &
                                                             nkp_groups, output_unit, unit_nr
-      INTEGER, DIMENSION(2)                              :: kp_range
       INTEGER, DIMENSION(:, :), POINTER                  :: kp_dist
       LOGICAL                                            :: bin, uptr, use_real_wfn
       REAL(KIND=dp)                                      :: thld
@@ -461,7 +464,7 @@ CONTAINS
       NULLIFY (sab_nl)
 
       !  Calculate the Hamiltonian at the k-points
-      CALL get_kpoint_info(kpoints, xkp=xkp, use_real_wfn=use_real_wfn, kp_range=kp_range, &
+      CALL get_kpoint_info(kpoints, xkp=xkp, use_real_wfn=use_real_wfn, &
                            nkp_groups=nkp_groups, kp_dist=kp_dist, sab_nl=sab_nl)
 
       ALLOCATE (rmatrix)
@@ -483,12 +486,13 @@ CONTAINS
          CALL cp_dbcsr_alloc_block_from_nbl(imatrix_nosym, sab_nl)
       END IF
 
-      kplocal = kp_range(2) - kp_range(1) + 1
-      DO ikp = 1, kplocal
+      kpmax = MAXVAL(kp_dist(2, :) - kp_dist(1, :) + 1)
+      DO ikp = 1, kpmax
          DO ispin = 1, SIZE(mat, 1)
             DO igroup = 1, nkp_groups
                ! number of current kpoint
                ik = kp_dist(1, igroup) + ikp - 1
+               IF (ik > kp_dist(2, igroup)) CYCLE
                CALL dbcsr_set(rmatrix, 0.0_dp)
                IF (use_real_wfn) THEN
                   ! FT of the matrix
@@ -594,8 +598,9 @@ CONTAINS
       nomirror = 0
       DO ic = 1, ncell
          cell = i2c(:, ic)
-         IF (cell_to_index(-cell(1), -cell(2), -cell(3)) == 0) &
+         IF (cell_to_index(-cell(1), -cell(2), -cell(3)) == 0) THEN
             nomirror = nomirror + 1
+         END IF
       END DO
 
       ! create the mirror imgs

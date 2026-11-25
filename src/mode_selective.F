@@ -18,6 +18,8 @@
 !> \author Florian Schiffmann 08.2006
 ! **************************************************************************************************
 MODULE mode_selective
+   USE bfgs_optimizer,                  ONLY: bfgs_read_restart_header
+   USE cell_types,                      ONLY: cell_type
    USE cp_files,                        ONLY: close_file,&
                                               open_file
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
@@ -27,7 +29,10 @@ MODULE mode_selective
                                               cp_print_key_unit_nr
    USE cp_result_methods,               ONLY: get_results
    USE global_types,                    ONLY: global_environment_type
-   USE input_constants,                 ONLY: ms_guess_atomic,&
+   USE ieee_arithmetic,                 ONLY: ieee_is_finite
+   USE input_constants,                 ONLY: bfgs_direct,&
+                                              bfgs_inverse,&
+                                              ms_guess_atomic,&
                                               ms_guess_bfgs,&
                                               ms_guess_molden,&
                                               ms_guess_restart,&
@@ -36,6 +41,7 @@ MODULE mode_selective
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
+   USE iso_fortran_env,                 ONLY: iostat_end
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp,&
@@ -58,6 +64,7 @@ MODULE mode_selective
    PRIVATE
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'mode_selective'
    LOGICAL, PARAMETER                   :: debug_this_module = .FALSE.
+   REAL(KIND=dp), PARAMETER             :: bfgs_guess_degeneracy_tol = 1.0E-8_dp
 
    TYPE ms_vib_type
       INTEGER                                  :: mat_size = -1
@@ -96,10 +103,11 @@ CONTAINS
 !> \param dx ...
 !> \param output_unit ...
 !> \param logger ...
+!> \param cell simulation cell
 !> \author Teodoro Laino 08.2006
 ! **************************************************************************************************
    SUBROUTINE ms_vb_anal(input, rep_env, para_env, globenv, particles, &
-                         nrep, calc_intens, dx, output_unit, logger)
+                         nrep, calc_intens, dx, output_unit, logger, cell)
       TYPE(section_vals_type), POINTER                   :: input
       TYPE(replica_env_type), POINTER                    :: rep_env
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -110,6 +118,7 @@ CONTAINS
       REAL(KIND=dp)                                      :: dx
       INTEGER                                            :: output_unit
       TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(cell_type), POINTER                           :: cell
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ms_vb_anal'
 
@@ -203,7 +212,7 @@ CONTAINS
                                   mass, &
                                   converged, &
                                   dx, calc_intens, &
-                                  output_unit, logger)
+                                  output_unit, logger, cell)
          IF (converged) EXIT
          IF (calc_intens) THEN
             ALLOCATE (tmp_deriv(3, ms_vib%mat_size))
@@ -330,8 +339,9 @@ CONTAINS
             END IF
          END IF
       END IF
-      IF (ms_vib%select_id == 0) &
+      IF (ms_vib%select_id == 0) THEN
          CPABORT("no frequency, range or involved atoms specified ")
+      END IF
       ionode = para_env%is_source()
       SELECT CASE (guess)
       CASE (ms_guess_atomic)
@@ -374,7 +384,7 @@ CONTAINS
                   ms_vib%b_vec(jj, i) = ABS(globenv%gaussian_rng_stream%next())
                END DO
             END DO
-            norm = SQRT(DOT_PRODUCT(ms_vib%b_vec(:, i), ms_vib%b_vec(:, i)))
+            norm = NORM2(ms_vib%b_vec(:, i))
             ms_vib%b_vec(:, i) = ms_vib%b_vec(:, i)/norm
          END DO
 
@@ -386,7 +396,7 @@ CONTAINS
                         ms_vib%b_vec(:, j) = &
                            ms_vib%b_vec(:, j) - DOT_PRODUCT(ms_vib%b_vec(:, j), ms_vib%b_vec(:, i))*ms_vib%b_vec(:, i)
                         ms_vib%b_vec(:, j) = &
-                           ms_vib%b_vec(:, j)/SQRT(DOT_PRODUCT(ms_vib%b_vec(:, j), ms_vib%b_vec(:, j)))
+                           ms_vib%b_vec(:, j)/NORM2(ms_vib%b_vec(:, j))
                      END IF
                   END DO
                END DO
@@ -424,12 +434,102 @@ CONTAINS
       CALL para_env%bcast(ms_vib%b_vec)
       CALL para_env%bcast(ms_vib%delta_vec)
       DO i = 1, nrep
-         ms_vib%step_r(i) = dx/SQRT(DOT_PRODUCT(ms_vib%delta_vec(:, i), ms_vib%delta_vec(:, i)))
-         ms_vib%step_b(i) = SQRT(DOT_PRODUCT(ms_vib%step_r(i)*ms_vib%b_vec(:, i), ms_vib%step_r(i)*ms_vib%b_vec(:, i)))
+         ms_vib%step_r(i) = dx/NORM2(ms_vib%delta_vec(:, i))
+         ms_vib%step_b(i) = NORM2(ms_vib%step_r(i)*ms_vib%b_vec(:, i))
       END DO
       CALL timestop(handle)
 
    END SUBROUTINE MS_initial_moves
+
+! **************************************************************************************************
+!> \brief Read a legacy or tagged BFGS restart as a direct ionic Hessian.
+!> \param unit File unit
+!> \param ncoord Number of ionic coordinates needed by mode-selective analysis
+!> \param hessian Direct ionic Hessian
+! **************************************************************************************************
+   SUBROUTINE read_bfgs_guess_hessian(unit, ncoord, hessian)
+      INTEGER, INTENT(IN)                                :: unit, ncoord
+      REAL(KIND=dp), DIMENSION(ncoord, ncoord), &
+         INTENT(OUT)                                     :: hessian
+
+      INTEGER                                            :: i, ios, stored_method, stored_ndf, &
+                                                            stored_type
+      LOGICAL                                            :: tagged
+      REAL(KIND=dp)                                      :: extra
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: column, eigenvalues
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: stored_matrix
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: cell_frame, reference_cell
+
+      CALL bfgs_read_restart_header(unit, stored_method, stored_ndf, stored_type, tagged, &
+                                    reference_cell, cell_frame)
+
+      IF (.NOT. tagged) THEN
+         ! Legacy restart: preserve the historical behaviour. Reading ncoord values from
+         ! the first ncoord records also extracts the ionic block from a CELL_OPT Hessian.
+         DO i = 1, ncoord
+            READ (unit, IOSTAT=ios) hessian(:, i)
+            IF (ios /= 0) CPABORT("Error while reading legacy BFGS Hessian")
+         END DO
+         RETURN
+      END IF
+
+      IF (stored_ndf < ncoord) THEN
+         CPABORT("BFGS restart matrix is smaller than the mode-selective ionic Hessian")
+      END IF
+
+      SELECT CASE (stored_method)
+      CASE (bfgs_direct)
+         ALLOCATE (column(stored_ndf))
+         DO i = 1, stored_ndf
+            READ (unit, IOSTAT=ios) column(:)
+            IF (ios /= 0) CPABORT("Truncated BFGS restart matrix")
+            IF (.NOT. ALL(ieee_is_finite(column(:)))) CPABORT("Non-finite BFGS restart matrix")
+            IF (i <= ncoord) hessian(:, i) = column(1:ncoord)
+         END DO
+         DEALLOCATE (column)
+
+      CASE (bfgs_inverse)
+         ALLOCATE (stored_matrix(stored_ndf, stored_ndf), eigenvalues(stored_ndf))
+         DO i = 1, stored_ndf
+            READ (unit, IOSTAT=ios) stored_matrix(:, i)
+            IF (ios /= 0) CPABORT("Truncated inverse BFGS restart matrix")
+         END DO
+         IF (.NOT. ALL(ieee_is_finite(stored_matrix(:, :)))) THEN
+            CPABORT("Non-finite inverse BFGS restart matrix")
+         END IF
+
+         ! Invert the complete matrix before taking the ionic block. For CELL_OPT,
+         ! inverse(H_RR) is not in general equal to the RR block of inverse(H).
+         CALL diamat_all(stored_matrix, eigenvalues)
+         IF (.NOT. ALL(ieee_is_finite(eigenvalues(:)))) THEN
+            CPABORT("Non-finite inverse BFGS restart spectrum")
+         END IF
+         IF (MINVAL(eigenvalues(:)) <= 0.0_dp) THEN
+            CPABORT("Inverse BFGS restart matrix is not positive definite")
+         END IF
+         eigenvalues(:) = 1.0_dp/eigenvalues(:)
+         IF (.NOT. ALL(ieee_is_finite(eigenvalues(:)))) THEN
+            CPABORT("Unrepresentable inverse BFGS restart matrix")
+         END IF
+         DO i = 1, stored_ndf
+            stored_matrix(1:ncoord, i) = &
+               SQRT(eigenvalues(i))*stored_matrix(1:ncoord, i)
+         END DO
+         hessian(:, :) = MATMUL(stored_matrix(1:ncoord, :), &
+                                TRANSPOSE(stored_matrix(1:ncoord, :)))
+         DEALLOCATE (stored_matrix, eigenvalues)
+
+      CASE DEFAULT
+         CPABORT("Unknown matrix representation in BFGS restart")
+      END SELECT
+
+      ! Tagged files have a known matrix dimension, so reject trailing/corrupt data.
+      READ (unit, IOSTAT=ios) extra
+      IF (ios /= iostat_end) CPABORT("Extra data in BFGS restart matrix")
+      MARK_USED(stored_type)
+      MARK_USED(reference_cell)
+      MARK_USED(cell_frame)
+   END SUBROUTINE read_bfgs_guess_hessian
 
 ! **************************************************************************************************
 !> \brief ...
@@ -452,7 +552,7 @@ CONTAINS
 
       CHARACTER(LEN=default_path_length)                 :: hes_filename
       INTEGER                                            :: hesunit, i, j, jj, k, natoms, ncoord, &
-                                                            output_unit, stat
+                                                            output_unit
       INTEGER, DIMENSION(:), POINTER                     :: tmplist
       REAL(KIND=dp)                                      :: my_val, norm
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: tmp
@@ -475,18 +575,11 @@ CONTAINS
          ALLOCATE (tmp(ncoord))
          ALLOCATE (tmplist(ncoord))
 
-         ! should use the cp_fm_read_unformatted...
-         DO i = 1, ncoord
-            READ (UNIT=hesunit, IOSTAT=stat) ms_vib%hes_bfgs(:, i)
-         END DO
+         CALL read_bfgs_guess_hessian(hesunit, ncoord, ms_vib%hes_bfgs)
          CALL close_file(hesunit)
          IF (output_unit > 0) THEN
-            IF (stat /= 0) THEN
-               WRITE (output_unit, FMT="(/,T2,A)") "**  Error while reading HESSIAN **"
-            ELSE
-               WRITE (output_unit, FMT="(/,T2,A)") &
-                  "*** Initial Hessian has been read successfully ***"
-            END IF
+            WRITE (output_unit, FMT="(/,T2,A)") &
+               "*** Initial Hessian has been read successfully ***"
          END IF
          DO i = 1, ncoord
             DO j = 1, ncoord
@@ -503,6 +596,7 @@ CONTAINS
                tmp(i) = ABS(my_val - ms_vib%eig_bfgs(i))
             END DO
          ELSE IF (ms_vib%select_id == 3) THEN
+            CALL bfgs_canonicalize_degenerate_modes(ms_vib%hes_bfgs, ms_vib%eig_bfgs)
             DO i = 1, ncoord
                DO j = 1, SIZE(ms_vib%inv_atoms)
                   DO k = 1, 3
@@ -517,7 +611,7 @@ CONTAINS
          CALL sort(tmp, ncoord, tmplist)
          DO i = 1, nrep
             ms_vib%b_vec(:, i) = ms_vib%hes_bfgs(:, tmplist(i))
-            norm = SQRT(DOT_PRODUCT(ms_vib%b_vec(:, i), ms_vib%b_vec(:, i)))
+            norm = NORM2(ms_vib%b_vec(:, i))
             ms_vib%b_vec(:, i) = ms_vib%b_vec(:, i)/norm
          END DO
          DO i = 1, SIZE(ms_vib%b_vec, 1)
@@ -535,6 +629,86 @@ CONTAINS
       ms_vib%mat_size = 0
 
    END SUBROUTINE bfgs_guess
+
+! **************************************************************************************************
+!> \brief Replace arbitrary bases of near-degenerate BFGS eigenspaces by deterministic ones.
+!>        This leaves the existing involved-atom scoring and mode ordering unchanged.
+!> \param modes Orthonormal Hessian eigenvectors
+!> \param eigenvalues Ascending Hessian eigenvalues
+! **************************************************************************************************
+   SUBROUTINE bfgs_canonicalize_degenerate_modes(modes, eigenvalues)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: modes
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: eigenvalues
+
+      INTEGER                                            :: first, last, n
+      REAL(KIND=dp)                                      :: cutoff, scale
+
+      n = SIZE(eigenvalues)
+      CPASSERT(SIZE(modes, 1) == n .AND. SIZE(modes, 2) == n)
+      cutoff = (400.0_dp/vibfac)**2/massunit
+
+      first = 1
+      DO WHILE (first <= n)
+         IF (eigenvalues(first) <= cutoff) THEN
+            first = first + 1
+            CYCLE
+         END IF
+         last = first
+         DO WHILE (last < n)
+            scale = MAX(ABS(eigenvalues(first)), ABS(eigenvalues(last + 1)))
+            IF (eigenvalues(last + 1) - eigenvalues(first) > bfgs_guess_degeneracy_tol*scale) EXIT
+            last = last + 1
+         END DO
+         IF (last > first) CALL bfgs_canonical_modes(modes(:, first:last))
+         first = last + 1
+      END DO
+   END SUBROUTINE bfgs_canonicalize_degenerate_modes
+
+! **************************************************************************************************
+!> \brief Fix a subspace basis using projections of Cartesian coordinate axes.
+!> \param modes Orthonormal basis, replaced by a deterministic orthonormal basis
+! **************************************************************************************************
+   SUBROUTINE bfgs_canonical_modes(modes)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(INOUT)      :: modes
+
+      INTEGER                                            :: i, j, k, m, n, pass, pivot
+      REAL(KIND=dp)                                      :: maximum, norm
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: norms, projection, vector
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: residual, rotation
+
+      n = SIZE(modes, 1)
+      m = SIZE(modes, 2)
+      ALLOCATE (residual(n, m), rotation(m, m), norms(n), projection(n), vector(m))
+      residual(:, :) = modes(:, :)
+      rotation(:, :) = 0.0_dp
+      DO j = 1, m
+         norms(:) = SUM(residual(:, :)**2, DIM=2)
+         maximum = MAXVAL(norms)
+         pivot = 1
+         DO i = 1, n
+            IF (norms(i) >= maximum*(1.0_dp - bfgs_guess_degeneracy_tol)) THEN
+               pivot = i
+               EXIT
+            END IF
+         END DO
+         vector(:) = residual(pivot, :)
+         DO pass = 1, 2
+            DO k = 1, j - 1
+               vector(:) = vector(:) - DOT_PRODUCT(rotation(:, k), vector)*rotation(:, k)
+            END DO
+         END DO
+         norm = NORM2(vector)
+         CPASSERT(norm > SQRT(EPSILON(1.0_dp)))
+         rotation(:, j) = vector(:)/norm
+         projection(:) = MATMUL(residual, rotation(:, j))
+         DO k = 1, m
+            residual(:, k) = residual(:, k) - projection(:)*rotation(k, j)
+         END DO
+      END DO
+      residual(:, :) = MATMUL(modes, rotation)
+      modes(:, :) = residual(:, :)
+      DEALLOCATE (residual, rotation, norms, projection, vector)
+   END SUBROUTINE bfgs_canonical_modes
 
 ! **************************************************************************************************
 !> \brief ...
@@ -597,18 +771,19 @@ CONTAINS
       END IF
       IF (ionode) THEN
          statint = 0
-         READ (UNIT=hesunit, IOSTAT=stat) ms_vib%b_mat
+         READ (UNIT=hesunit) ms_vib%b_mat
          READ (UNIT=hesunit, IOSTAT=stat) ms_vib%s_mat
-         IF (calc_intens) READ (UNIT=hesunit, IOSTAT=statint) ms_vib%dip_deriv(:, 1:ms_vib%mat_size)
-         IF (statint /= 0 .AND. output_unit > 0) WRITE (output_unit, FMT="(/,T2,A)") "**  Error while reading MS_RESTART,", &
-            "intensities are requested but not present in restart file **"
+         IF (stat /= 0 .AND. output_unit > 0) THEN
+            WRITE (output_unit, FMT="(/,T2,A)") "**  Error while reading MS_RESTART **"
+         END IF
+         IF (calc_intens) THEN
+            READ (UNIT=hesunit, IOSTAT=statint) ms_vib%dip_deriv(:, 1:ms_vib%mat_size)
+            IF (statint /= 0 .AND. output_unit > 0) WRITE (output_unit, FMT="(/,T2,A)") "**  Error while reading MS_RESTART,", &
+               "intensities are requested but not present in restart file **"
+         END IF
          CALL close_file(hesunit)
-         IF (output_unit > 0) THEN
-            IF (stat /= 0) THEN
-               WRITE (output_unit, FMT="(/,T2,A)") "**  Error while reading MS_RESTART **"
-            ELSE
-               WRITE (output_unit, FMT="(/,T2,A)") "*** RESTART has been read successfully ***"
-            END IF
+         IF (stat == 0 .AND. statint == 0 .AND. output_unit > 0) THEN
+            WRITE (output_unit, FMT="(/,T2,A)") "*** MS_RESTART has been read successfully ***"
          END IF
       END IF
       CALL para_env%bcast(ms_vib%b_mat)
@@ -630,7 +805,7 @@ CONTAINS
             DO j = 1, ms_vib%mat_size
                ms_vib%b_vec(:, i) = ms_vib%b_vec(:, i) + approx_H(j, ind(i))*ms_vib%b_mat(:, j)
             END DO
-            ms_vib%b_vec(:, i) = ms_vib%b_vec(:, i)/SQRT(DOT_PRODUCT(ms_vib%b_vec(:, i), ms_vib%b_vec(:, i)))
+            ms_vib%b_vec(:, i) = ms_vib%b_vec(:, i)/NORM2(ms_vib%b_vec(:, i))
          END DO
 
          DEALLOCATE (ms_vib%s_mat)
@@ -700,8 +875,8 @@ CONTAINS
                            unit_number=iw)
          END IF
          info = ""
-         READ (iw, *, IOSTAT=stat) info
-         READ (iw, *, IOSTAT=stat) info
+         READ (iw, *) info
+         READ (iw, *) info
          istat = 0
          nvibs = 0
          reading_vib = .FALSE.
@@ -784,7 +959,7 @@ CONTAINS
          CALL sort(tmp, nvibs, tmplist)
          DO i = 1, nrep
             ms_vib%b_vec(:, i) = modes(:, tmplist(i))*mass(:)
-            norm = SQRT(DOT_PRODUCT(ms_vib%b_vec(:, i), ms_vib%b_vec(:, i)))
+            norm = NORM2(ms_vib%b_vec(:, i))
             ms_vib%b_vec(:, i) = ms_vib%b_vec(:, i)/norm
          END DO
          DO i = 1, nrep
@@ -818,13 +993,14 @@ CONTAINS
 !> \param calc_intens ...
 !> \param output_unit_ms ...
 !> \param logger ...
+!> \param cell simulation cell
 !> \author Florian Schiffmann 11.2007
 ! **************************************************************************************************
    SUBROUTINE evaluate_H_update_b(rep_env, ms_vib, input, nrep, &
                                   particles, &
                                   mass, &
                                   converged, dx, &
-                                  calc_intens, output_unit_ms, logger)
+                                  calc_intens, output_unit_ms, logger, cell)
       TYPE(replica_env_type), POINTER                    :: rep_env
       TYPE(ms_vib_type)                                  :: ms_vib
       TYPE(section_vals_type), POINTER                   :: input
@@ -836,6 +1012,7 @@ CONTAINS
       LOGICAL                                            :: calc_intens
       INTEGER                                            :: output_unit_ms
       TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(cell_type), POINTER                           :: cell
 
       INTEGER                                            :: i, j, jj, k, natoms, ncoord
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: ind
@@ -920,8 +1097,8 @@ CONTAINS
       END DO
 
       DO i = 1, nrep
-         ms_vib%step_r(i) = dx/SQRT(DOT_PRODUCT(ms_vib%delta_vec(:, i), ms_vib%delta_vec(:, i)))
-         ms_vib%step_b(i) = SQRT(DOT_PRODUCT(ms_vib%step_r(i)*ms_vib%b_vec(:, i), ms_vib%step_r(i)*ms_vib%b_vec(:, i)))
+         ms_vib%step_r(i) = dx/NORM2(ms_vib%delta_vec(:, i))
+         ms_vib%step_b(i) = NORM2(ms_vib%step_r(i)*ms_vib%b_vec(:, i))
       END DO
       converged = .FALSE.
       IF (MAXVAL(criteria(1, :)) <= ms_vib%eps(1) .AND. MAXVAL(criteria(2, :)) &
@@ -946,14 +1123,14 @@ CONTAINS
             DO j = 1, ms_vib%mat_size
                tmp_b(:, i) = tmp_b(:, i) + approx_H(j, i)*ms_vib%b_mat(:, j)/mass(:)
             END DO
-            tmp_b(:, i) = tmp_b(:, i)/SQRT(DOT_PRODUCT(tmp_b(:, i), tmp_b(:, i)))
+            tmp_b(:, i) = tmp_b(:, i)/NORM2(tmp_b(:, i))
          END DO
          IF (calc_intens) THEN
             DO i = 1, ms_vib%mat_size
                DO j = 1, ms_vib%mat_size
                   tmp_s(:, i) = tmp_s(:, i) + ms_vib%dip_deriv(:, j)*approx_H(j, i)
                END DO
-               IF (calc_intens) intensities(i) = SQRT(DOT_PRODUCT(tmp_s(:, i), tmp_s(:, i)))
+               IF (calc_intens) intensities(i) = NORM2(tmp_s(:, i))
             END DO
          END IF
          IF (calc_intens) THEN
@@ -966,7 +1143,7 @@ CONTAINS
          END IF
          dump_only_positive = ms_vib%low_freq > 0.0_dp
          CALL write_vibrations_molden(input, particles, eigenval, tmp_b, intensities, calc_intens, &
-                                      dump_only_positive=dump_only_positive, logger=logger)
+                                      dump_only_positive=dump_only_positive, logger=logger, cell=cell)
          IF (calc_intens) THEN
             DEALLOCATE (intensities)
          END IF
@@ -1041,7 +1218,7 @@ CONTAINS
             DO j = 1, ms_vib%mat_size
                tmp_b(:, i) = tmp_b(:, i) + approx_H(j, i)*ms_vib%b_mat(:, j)/mass(:)
             END DO
-            tmp_b(:, i) = tmp_b(:, i)/SQRT(DOT_PRODUCT(tmp_b(:, i), tmp_b(:, i)))
+            tmp_b(:, i) = tmp_b(:, i)/NORM2(tmp_b(:, i))
          END DO
          tmp = 0._dp
          DO i = 1, ms_vib%mat_size
@@ -1078,12 +1255,12 @@ CONTAINS
       IF (PRESENT(criteria)) THEN
          DO i = 1, nrep
             criteria(1, i) = MAXVAL((residuum(:, i)))
-            criteria(2, i) = SQRT(DOT_PRODUCT(residuum(:, i), residuum(:, i)))
+            criteria(2, i) = NORM2(residuum(:, i))
          END DO
       END IF
 
       DO i = 1, nrep
-         norm = SQRT(DOT_PRODUCT(residuum(:, i), residuum(:, i)))
+         norm = NORM2(residuum(:, i))
          residuum(:, i) = residuum(:, i)/norm
       END DO
 
@@ -1091,13 +1268,13 @@ CONTAINS
          DO j = 1, nrep
             DO i = 1, ms_vib%mat_size
                residuum(:, j) = residuum(:, j) - DOT_PRODUCT(residuum(:, j), ms_vib%b_mat(:, i))*ms_vib%b_mat(:, i)
-               residuum(:, j) = residuum(:, j)/SQRT(DOT_PRODUCT(residuum(:, j), residuum(:, j)))
+               residuum(:, j) = residuum(:, j)/NORM2(residuum(:, j))
             END DO
             IF (nrep > 1) THEN
                DO i = 1, nrep
                   IF (i /= j) THEN
                      residuum(:, j) = residuum(:, j) - DOT_PRODUCT(residuum(:, j), residuum(:, i))*residuum(:, i)
-                     residuum(:, j) = residuum(:, j)/SQRT(DOT_PRODUCT(residuum(:, j), residuum(:, j)))
+                     residuum(:, j) = residuum(:, j)/NORM2(residuum(:, j))
                   END IF
                END DO
             END IF
@@ -1139,7 +1316,10 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), OPTIONAL              :: intensities
       TYPE(cp_logger_type), POINTER                      :: logger
 
-      INTEGER                                            :: i, j, msunit, stat
+      REAL(KIND=dp), PARAMETER                           :: eps_criter1 = 1.0E-07_dp, &
+                                                            eps_criter2 = 1.0E-06_dp
+
+      INTEGER                                            :: i, j, msunit
       REAL(KIND=dp)                                      :: crit_a, crit_b, fint, gintval
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: residuum
       TYPE(section_vals_type), POINTER                   :: ms_vib_section
@@ -1172,7 +1352,7 @@ CONTAINS
                   residuum(:) = residuum(:) - DOT_PRODUCT(residuum(:), ms_vib%b_mat(:, j))*ms_vib%b_mat(:, j)
                END DO
                crit_a = MAXVAL(residuum(:))
-               crit_b = SQRT(DOT_PRODUCT(residuum, residuum))
+               crit_b = NORM2(residuum)
                IF (PRESENT(intensities)) THEN
                   gintval = fint*intensities(i)**2
                   IF (crit_a <= ms_vib%eps(1) .AND. crit_b <= ms_vib%eps(2)) THEN
@@ -1200,10 +1380,10 @@ CONTAINS
                                           file_action="WRITE")
 
             IF (msunit > 0) THEN
-               WRITE (UNIT=msunit, IOSTAT=stat) ms_vib%mat_size
-               WRITE (UNIT=msunit, IOSTAT=stat) ms_vib%b_mat
-               WRITE (UNIT=msunit, IOSTAT=stat) ms_vib%s_mat
-               IF (calc_intens) WRITE (UNIT=msunit, IOSTAT=stat) ms_vib%dip_deriv
+               WRITE (UNIT=msunit) ms_vib%mat_size
+               WRITE (UNIT=msunit) ms_vib%b_mat
+               WRITE (UNIT=msunit) ms_vib%s_mat
+               IF (calc_intens) WRITE (UNIT=msunit) ms_vib%dip_deriv
             END IF
 
             CALL cp_print_key_finished_output(msunit, logger, ms_vib_section, &
@@ -1217,10 +1397,10 @@ CONTAINS
                                           file_action="WRITE")
 
             IF (msunit > 0) THEN
-               WRITE (UNIT=msunit, IOSTAT=stat) ms_vib%mat_size
-               WRITE (UNIT=msunit, IOSTAT=stat) ms_vib%b_mat
-               WRITE (UNIT=msunit, IOSTAT=stat) ms_vib%s_mat
-               IF (calc_intens) WRITE (UNIT=msunit, IOSTAT=stat) ms_vib%dip_deriv
+               WRITE (UNIT=msunit) ms_vib%mat_size
+               WRITE (UNIT=msunit) ms_vib%b_mat
+               WRITE (UNIT=msunit) ms_vib%s_mat
+               IF (calc_intens) WRITE (UNIT=msunit) ms_vib%dip_deriv
             END IF
 
             CALL cp_print_key_finished_output(msunit, logger, ms_vib_section, &
@@ -1228,7 +1408,7 @@ CONTAINS
 
             WRITE (iw, '(T2,A,3X,I6)') "MS| ITERATION STEP", ms_vib%mat_size/nrep
             DO i = 1, nrep
-               IF (criter(1, i) <= 1E-7 .AND. (criter(2, i)) <= 1E-6) THEN
+               IF (criter(1, i) <= eps_criter1 .AND. (criter(2, i)) <= eps_criter2) THEN
                   WRITE (iw, '(T2,A,3X,F12.6,A)') "MS| TRACKED MODE ", freq(i), "cm-1  IS  CONVERGED"
                ELSE
                   WRITE (iw, '(T2,A,3X,F12.6,A)') "MS| TRACKED MODE ", freq(i), "cm-1  NOT  CONVERGED"

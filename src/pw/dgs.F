@@ -420,7 +420,7 @@ CONTAINS
          IF (ii < 0) THEN
             rs%px(ia) = ii + rs%npts_local(1) + 1
             folded = .TRUE.
-         ELSEIF (ii >= rs%npts_local(1)) THEN
+         ELSE IF (ii >= rs%npts_local(1)) THEN
             rs%px(ia) = ii - rs%npts_local(1) + 1
             folded = .TRUE.
          ELSE
@@ -433,7 +433,7 @@ CONTAINS
          IF (ii < 0) THEN
             rs%py(ia) = ii + rs%npts_local(2) + 1
             folded = .TRUE.
-         ELSEIF (ii >= rs%npts_local(2)) THEN
+         ELSE IF (ii >= rs%npts_local(2)) THEN
             rs%py(ia) = ii - rs%npts_local(2) + 1
             folded = .TRUE.
          ELSE
@@ -446,7 +446,7 @@ CONTAINS
          IF (ii < 0) THEN
             rs%pz(ia) = ii + rs%npts_local(3) + 1
             folded = .TRUE.
-         ELSEIF (ii >= rs%npts_local(3)) THEN
+         ELSE IF (ii >= rs%npts_local(3)) THEN
             rs%pz(ia) = ii - rs%npts_local(3) + 1
             folded = .TRUE.
          ELSE
@@ -495,7 +495,7 @@ CONTAINS
          IF (ii < 0) THEN
             rs%px(ia) = ii + rs%npts_local(1) + 1
             folded = .TRUE.
-         ELSEIF (ii >= rs%npts_local(1)) THEN
+         ELSE IF (ii >= rs%npts_local(1)) THEN
             rs%px(ia) = ii - rs%npts_local(1) + 1
             folded = .TRUE.
          ELSE
@@ -508,7 +508,7 @@ CONTAINS
          IF (ii < 0) THEN
             rs%py(ia) = ii + rs%npts_local(2) + 1
             folded = .TRUE.
-         ELSEIF (ii >= rs%npts_local(2)) THEN
+         ELSE IF (ii >= rs%npts_local(2)) THEN
             rs%py(ia) = ii - rs%npts_local(2) + 1
             folded = .TRUE.
          ELSE
@@ -521,7 +521,7 @@ CONTAINS
          IF (ii < 0) THEN
             rs%pz(ia) = ii + rs%npts_local(3) + 1
             folded = .TRUE.
-         ELSEIF (ii >= rs%npts_local(3)) THEN
+         ELSE IF (ii >= rs%npts_local(3)) THEN
             rs%pz(ia) = ii - rs%npts_local(3) + 1
             folded = .TRUE.
          ELSE
@@ -572,7 +572,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot(1)%px(ia) = ii + drpot(1)%npts_local(1) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot(1)%npts_local(1)) THEN
+         ELSE IF (ii >= drpot(1)%npts_local(1)) THEN
             drpot(1)%px(ia) = ii - drpot(1)%npts_local(1) + 1
             folded = .TRUE.
          ELSE
@@ -585,7 +585,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot(1)%py(ia) = ii + drpot(1)%npts_local(2) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot(1)%npts_local(2)) THEN
+         ELSE IF (ii >= drpot(1)%npts_local(2)) THEN
             drpot(1)%py(ia) = ii - drpot(1)%npts_local(2) + 1
             folded = .TRUE.
          ELSE
@@ -598,7 +598,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot(1)%pz(ia) = ii + drpot(1)%npts_local(3) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot(1)%npts_local(3)) THEN
+         ELSE IF (ii >= drpot(1)%npts_local(3)) THEN
             drpot(1)%pz(ia) = ii - drpot(1)%npts_local(3) + 1
             folded = .TRUE.
          ELSE
@@ -651,7 +651,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot%px(ia) = ii + drpot%npts_local(1) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot%desc%npts(1)) THEN
+         ELSE IF (ii >= drpot%desc%npts(1)) THEN
             drpot%px(ia) = ii - drpot%npts_local(1) + 1
             folded = .TRUE.
          ELSE
@@ -664,7 +664,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot%py(ia) = ii + drpot%npts_local(2) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot%desc%npts(2)) THEN
+         ELSE IF (ii >= drpot%desc%npts(2)) THEN
             drpot%py(ia) = ii - drpot%npts_local(2) + 1
             folded = .TRUE.
          ELSE
@@ -677,7 +677,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot%pz(ia) = ii + drpot%npts_local(3) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot%desc%npts(3)) THEN
+         ELSE IF (ii >= drpot%desc%npts(3)) THEN
             drpot%pz(ia) = ii - drpot%npts_local(3) + 1
             folded = .TRUE.
          ELSE
@@ -724,7 +724,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot(1)%px(ia) = ii + drpot(1)%desc%npts(1) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot(1)%desc%npts(1)) THEN
+         ELSE IF (ii >= drpot(1)%desc%npts(1)) THEN
             drpot(1)%px(ia) = ii - drpot(1)%desc%npts(1) + 1
             folded = .TRUE.
          ELSE
@@ -737,7 +737,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot(1)%py(ia) = ii + drpot(1)%desc%npts(2) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot(1)%desc%npts(2)) THEN
+         ELSE IF (ii >= drpot(1)%desc%npts(2)) THEN
             drpot(1)%py(ia) = ii - drpot(1)%desc%npts(2) + 1
             folded = .TRUE.
          ELSE
@@ -750,7 +750,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot(1)%pz(ia) = ii + drpot(1)%desc%npts(3) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot(1)%desc%npts(3)) THEN
+         ELSE IF (ii >= drpot(1)%desc%npts(3)) THEN
             drpot(1)%pz(ia) = ii - drpot(1)%desc%npts(3) + 1
             folded = .TRUE.
          ELSE
@@ -798,7 +798,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot%px(ia) = ii + drpot%desc%npts(1) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot%desc%npts(1)) THEN
+         ELSE IF (ii >= drpot%desc%npts(1)) THEN
             drpot%px(ia) = ii - drpot%desc%npts(1) + 1
             folded = .TRUE.
          ELSE
@@ -811,7 +811,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot%py(ia) = ii + drpot%desc%npts(2) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot%desc%npts(2)) THEN
+         ELSE IF (ii >= drpot%desc%npts(2)) THEN
             drpot%py(ia) = ii - drpot%desc%npts(2) + 1
             folded = .TRUE.
          ELSE
@@ -824,7 +824,7 @@ CONTAINS
          IF (ii < 0) THEN
             drpot%pz(ia) = ii + drpot%desc%npts(3) + 1
             folded = .TRUE.
-         ELSEIF (ii >= drpot%desc%npts(3)) THEN
+         ELSE IF (ii >= drpot%desc%npts(3)) THEN
             drpot%pz(ia) = ii - drpot%desc%npts(3) + 1
             folded = .TRUE.
          ELSE
@@ -1158,13 +1158,12 @@ CONTAINS
       COMPLEX(KIND=dp), DIMENSION(:), INTENT(IN)         :: ex, ey, ez
       COMPLEX(KIND=dp), DIMENSION(:), INTENT(INOUT)      :: scr
 
-      INTEGER                                            :: n2, n3
+      INTEGER                                            :: n2
 
       n2 = n(1)*n(2)
-      n3 = n2*n(3)
       scr(1:n2) = z_zero
       CALL zgeru(n(1), n(2), zb, ex, 1, ey, 1, scr, n(1))
-      CALL zscal(n3, za, cmat, 1)
+      cmat(1:n(1), 1:n(2), 1:n(3)) = za*cmat(1:n(1), 1:n(2), 1:n(3))
       CALL zgeru(n2, n(3), z_one, scr, 1, ez, 1, cmat, n2)
 
    END SUBROUTINE rankup

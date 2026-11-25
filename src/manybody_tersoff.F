@@ -346,7 +346,7 @@ CONTAINS
       lambda3 = tersoff%lambda3
       rab2_max = rcutsq
       rij(:) = r_last_update_pbc(jparticle)%r(:) - r_last_update_pbc(iparticle)%r(:) + cell_v
-      drij = SQRT(DOT_PRODUCT(rij, rij))
+      drij = NORM2(rij)
       ter_zeta_ij = 0.0_dp
       DO ilist = 1, n_loc_size
          kparticle = full_loc_list(2, ilist)
@@ -413,7 +413,7 @@ CONTAINS
       rab2_max = rcutsq
 
       rij(:) = r_last_update_pbc(jparticle)%r(:) - r_last_update_pbc(iparticle)%r(:) + cell_v
-      drij = SQRT(DOT_PRODUCT(rij, rij))
+      drij = NORM2(rij)
       rij_hat(:) = rij(:)/drij
 
       nparticle = SIZE(r_last_update_pbc)
@@ -518,7 +518,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: costheta
       REAL(KIND=dp)                                      :: ter_g_d
 
-      REAL(KIND=dp)                                      :: c, c2, d, d2, h, hc, sintheta
+      REAL(KIND=dp)                                      :: c, c2, d, d2, h, hc
 
       c = tersoff%c
       d = tersoff%d
@@ -526,8 +526,6 @@ CONTAINS
       c2 = c*c
       d2 = d*d
       hc = h - costheta
-
-      sintheta = SQRT(1.0 - costheta**2)
 
       ter_g_d = 0.0_dp
       ! Still need d(costheta)/dR
@@ -576,7 +574,7 @@ CONTAINS
 
       CALL timeset(routineN, handle)
       rij(:) = r_last_update_pbc(jparticle)%r(:) - r_last_update_pbc(iparticle)%r(:) + cell_v
-      drij = SQRT(DOT_PRODUCT(rij, rij))
+      drij = NORM2(rij)
       rij_hat(:) = rij(:)/drij
 
       fac = -0.5_dp

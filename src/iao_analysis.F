@@ -1179,7 +1179,7 @@ CONTAINS
          WRITE (filename, '(A18,I1.1)') "IBO_CENTERS_SPREAD"
          iw = cp_print_key_unit_nr(logger, print_section, "", extension=".csp", &
                                    middle_name=TRIM(filename), file_position="REWIND", log_filename=.FALSE.)
-      ELSEIF (PRESENT(iounit)) THEN
+      ELSE IF (PRESENT(iounit)) THEN
          iw = iounit
       ELSE
          iw = -1
@@ -1327,7 +1327,6 @@ CONTAINS
             NULLIFY (op_sm_set(j, i)%matrix)
             ALLOCATE (op_sm_set(j, i)%matrix)
             CALL dbcsr_copy(op_sm_set(j, i)%matrix, matrix_s(1)%matrix)
-            CALL dbcsr_set(op_sm_set(j, i)%matrix, 0.0_dp)
          END DO
       END DO
       CALL initialize_weights(cell, weights)
@@ -1422,7 +1421,7 @@ CONTAINS
                                                             iset, ishell, ispin, l, m, maxl, n, &
                                                             natom, nkind, noce, ns, nset, nsgf, &
                                                             nspin
-      INTEGER, DIMENSION(:), POINTER                     :: iao_blk_sizes, nshell, oce_blk_sizes, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: iao_blk_sizes, nshell, oce_blk_sizes, &
                                                             orb_blk_sizes
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgf, last_sgf, lval
       LOGICAL                                            :: found
@@ -1702,7 +1701,7 @@ CONTAINS
                   IF (order == 2) THEN
                      aij = aij + 4._dp*mij**2 - (mii - mjj)**2
                      bij = bij + 4._dp*mij*(mii - mjj)
-                  ELSEIF (order == 4) THEN
+                  ELSE IF (order == 4) THEN
                      aij = aij - mii**4 - mjj**4 + 6._dp*(mii**2 + mjj**2)*mij**2 + &
                            mii**3*mjj + mii*mjj**3
                      bij = bij + 4._dp*mij*(mii**3 - mjj**3)

@@ -26,13 +26,13 @@ MODULE f77_interface
    USE cell_methods,                    ONLY: init_cell
    USE cell_types,                      ONLY: cell_type
    USE cp2k_info,                       ONLY: get_runtime_info
+   USE cp_blacs_types,                  ONLY: cp_blacs_exit
    USE cp_dbcsr_api,                    ONLY: dbcsr_finalize_lib,&
                                               dbcsr_init_lib
    USE cp_dlaf_utils_api,               ONLY: cp_dlaf_finalize,&
                                               cp_dlaf_free_all_grids
    USE cp_error_handling,               ONLY: cp_error_handling_setup
-   USE cp_files,                        ONLY: init_preconnection_list,&
-                                              open_file
+   USE cp_files,                        ONLY: open_file
    USE cp_log_handling,                 ONLY: &
         cp_add_default_logger, cp_default_logger_stack_size, cp_failure_level, &
         cp_get_default_logger, cp_logger_create, cp_logger_release, cp_logger_retain, &
@@ -48,6 +48,8 @@ MODULE f77_interface
                                               unpack_subsys_particles
    USE dbm_api,                         ONLY: dbm_library_finalize,&
                                               dbm_library_init
+   USE dbt_api,                         ONLY: dbt_library_finalize,&
+                                              dbt_library_init
    USE eip_environment,                 ONLY: eip_init
    USE eip_environment_types,           ONLY: eip_env_create,&
                                               eip_environment_type
@@ -93,6 +95,8 @@ MODULE f77_interface
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
+   USE libint_wrapper,                  ONLY: cp_libint_static_cleanup,&
+                                              cp_libint_static_init
    USE machine,                         ONLY: default_output_unit,&
                                               m_chdir,&
                                               m_getcwd,&
@@ -101,8 +105,10 @@ MODULE f77_interface
                                               mp_comm_world,&
                                               mp_para_env_release,&
                                               mp_para_env_type,&
+                                              mp_query_thread_level,&
                                               mp_world_finalize,&
-                                              mp_world_init
+                                              mp_world_init,&
+                                              mp_world_owns_mpi
    USE metadynamics_types,              ONLY: meta_env_type
    USE metadynamics_utils,              ONLY: metadyn_read
    USE mixed_environment_types,         ONLY: mixed_environment_type
@@ -115,14 +121,11 @@ MODULE f77_interface
                                               rm_mp_perf_env
    USE nnp_environment,                 ONLY: nnp_init
    USE nnp_environment_types,           ONLY: nnp_type
-   USE offload_api,                     ONLY: offload_get_device_count,&
+   USE offload_api,                     ONLY: offload_get_chosen_device,&
+                                              offload_get_device_count,&
                                               offload_init,&
                                               offload_set_chosen_device
    USE periodic_table,                  ONLY: init_periodic_table
-   USE pw_fpga,                         ONLY: pw_fpga_finalize,&
-                                              pw_fpga_init
-   USE pw_gpu,                          ONLY: pw_gpu_finalize,&
-                                              pw_gpu_init
    USE pwdft_environment,               ONLY: pwdft_init
    USE pwdft_environment_types,         ONLY: pwdft_env_create,&
                                               pwdft_environment_type
@@ -134,10 +137,12 @@ MODULE f77_interface
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_env_create,&
                                               qs_environment_type
+   USE r12_fundamentals,                ONLY: r12_fundamentals_cleanup
    USE reference_manager,               ONLY: remove_all_references
    USE sirius_interface,                ONLY: cp_sirius_finalize,&
                                               cp_sirius_init,&
                                               cp_sirius_is_initialized
+   USE skala_gpw_functional,            ONLY: skala_gpw_release_caches
    USE string_table,                    ONLY: string_table_allocate,&
                                               string_table_deallocate
    USE timings,                         ONLY: add_timer_env,&
@@ -152,6 +157,7 @@ MODULE f77_interface
                                               gauxc_check_status,&
                                               gauxc_finalize,&
                                               gauxc_init
+   USE xc_libxc,                        ONLY: libxc_release_workers
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -168,6 +174,7 @@ MODULE f77_interface
 ! **************************************************************************************************
    TYPE f_env_type
       INTEGER :: id_nr = 0
+      LOGICAL :: is_dirty = .TRUE.
       TYPE(force_env_type), POINTER      :: force_env => NULL()
       TYPE(cp_logger_type), POINTER      :: logger => NULL()
       TYPE(timer_env_type), POINTER      :: timer_env => NULL()
@@ -181,7 +188,7 @@ MODULE f77_interface
    INTEGER, SAVE :: last_f_env_id = 0, n_f_envs = 0
 
    PUBLIC :: default_para_env
-   PUBLIC :: init_cp2k, finalize_cp2k
+   PUBLIC :: init_cp2k, finalize_cp2k, configure_dbcsr
    PUBLIC :: create_force_env, destroy_force_env, set_pos, get_pos, &
              get_force, calc_energy_force, get_energy, get_stress_tensor, &
              calc_energy, calc_force, check_input, get_natom, get_nparticle, &
@@ -227,9 +234,8 @@ CONTAINS
       INTEGER, INTENT(out)                               :: ierr
       TYPE(mp_comm_type), INTENT(in), OPTIONAL           :: mpi_comm
 
-      INTEGER                                            :: offload_device_count, unit_nr
-      INTEGER, POINTER                                   :: active_device_id
-      INTEGER, TARGET                                    :: offload_chosen_device
+      INTEGER                                            :: offload_chosen_device, &
+                                                            offload_device_count, unit_nr
       TYPE(cp_gauxc_status_type)                         :: gauxc_status
       TYPE(cp_logger_type), POINTER                      :: logger
 
@@ -239,9 +245,6 @@ CONTAINS
 
          ! install timming handler hooks
          CALL timings_register_hooks()
-
-         ! Initialise preconnection list
-         CALL init_preconnection_list()
 
          ! get runtime information
          CALL get_runtime_info()
@@ -256,6 +259,7 @@ CONTAINS
             ! get the default system wide communicator
             CALL mp_world_init(default_para_env)
          ELSE
+            CALL mp_query_thread_level()
             IF (PRESENT(mpi_comm)) THEN
                default_para_env = mpi_comm
             ELSE
@@ -290,31 +294,27 @@ CONTAINS
          ! Init the bibliography
          CALL add_all_references()
 
-         NULLIFY (active_device_id)
          offload_device_count = offload_get_device_count()
 
          ! Select active offload device when available.
          IF (offload_device_count > 0) THEN
             offload_chosen_device = MOD(default_para_env%mepos, offload_device_count)
             CALL offload_set_chosen_device(offload_chosen_device)
-            active_device_id => offload_chosen_device
          END IF
 
-         ! Initialize the DBCSR configuration
-         ! Attach the time handler hooks to DBCSR
-         CALL dbcsr_init_lib(default_para_env%get_handle(), timeset_hook, timestop_hook, &
-                             cp_abort_hook, cp_warn_hook, io_unit=unit_nr, &
-                             accdrv_active_device_id=active_device_id)
+         CALL configure_dbcsr(default_para_env, unit_nr)
 #if defined(__parallel)
          CALL gauxc_init(default_para_env%get_handle(), gauxc_status)
 #else
          CALL gauxc_init(status=gauxc_status)
 #endif
          CALL gauxc_check_status(gauxc_status)
-         CALL pw_fpga_init()
-         CALL pw_gpu_init()
          CALL grid_library_init()
          CALL dbm_library_init()
+         CALL dbt_library_init()
+#if defined(__LIBINT)
+         CALL cp_libint_static_init()
+#endif
       ELSE
          ierr = cp_failure_level
       END IF
@@ -323,6 +323,31 @@ CONTAINS
       CALL m_memory()
 
    END SUBROUTINE init_cp2k
+
+! **************************************************************************************************
+!> \brief Configure DBCSR with CP2K's hooks and selected accelerator device.
+!>        For an active library the DBCSR API only updates the output unit.
+!>        Initialization belongs to init_cp2k, except for FARMING which must
+!>        temporarily initialize DBCSR on each job's own MPI communicator.
+!> \param mpi_comm communicator for initialization (ignored if already initialized)
+!> \param output_unit diagnostic output unit, negative on non-I/O ranks
+! **************************************************************************************************
+   SUBROUTINE configure_dbcsr(mpi_comm, output_unit)
+      CLASS(mp_comm_type), INTENT(IN)                    :: mpi_comm
+      INTEGER, INTENT(IN)                                :: output_unit
+
+      INTEGER, POINTER                                   :: active_device_id
+      INTEGER, TARGET                                    :: chosen_device
+
+      NULLIFY (active_device_id)
+      IF (offload_get_device_count() > 0) THEN
+         chosen_device = offload_get_chosen_device()
+         active_device_id => chosen_device
+      END IF
+      CALL dbcsr_init_lib(mpi_comm%get_handle(), timeset_hook, timestop_hook, &
+                          cp_abort_hook, cp_warn_hook, io_unit=output_unit, &
+                          accdrv_active_device_id=active_device_id)
+   END SUBROUTINE configure_dbcsr
 
 ! **************************************************************************************************
 !> \brief cleanup after you have finished using this interface
@@ -349,12 +374,21 @@ CONTAINS
             CPASSERT(ierr == 0)
          END DO
          DEALLOCATE (f_envs)
+         CALL r12_fundamentals_cleanup()
+
+#if defined(__LIBINT)
+         CALL cp_libint_static_cleanup()
+#endif
+
+         ! Release the cached LibXC workers, because their device buffers are
+         ! owned by the offload memory pool which is cleared below
+         CALL libxc_release_workers()
+         CALL skala_gpw_release_caches()
 
          ! Finalize libraries (Offload)
+         CALL dbt_library_finalize()
          CALL dbm_library_finalize()
          CALL grid_library_finalize()
-         CALL pw_gpu_finalize()
-         CALL pw_fpga_finalize()
          IF (cp_sirius_is_initialized()) CALL cp_sirius_finalize()
          CALL gauxc_finalize(gauxc_status)
          CALL gauxc_check_status(gauxc_status)
@@ -375,6 +409,8 @@ CONTAINS
          CALL string_table_deallocate(0)
          CALL cp_openpmd_output_finalize()
          IF (finalize_mpi) THEN
+            ! Release BLACS resources (e.g. pending send requests) before MPI is finalized
+            IF (mp_world_owns_mpi()) CALL cp_blacs_exit()
             CALL mp_world_finalize()
          END IF
 
@@ -755,11 +791,12 @@ CONTAINS
             ! Check that the order of the force_eval is the correct one
             CALL section_vals_val_get(force_env_sections, "METHOD", i_val=method_name_id, &
                                       i_rep_section=i_force_eval(1))
-            IF ((method_name_id /= do_mixed) .AND. (method_name_id /= do_embed)) &
+            IF ((method_name_id /= do_mixed) .AND. (method_name_id /= do_embed)) THEN
                CALL cp_abort(__LOCATION__, &
                              "In case of multiple force_eval the MAIN force_eval (the first in the list of FORCE_EVAL_ORDER or "// &
                              "the one omitted from that order list) must be a MIXED_ENV type calculation. Please check your "// &
                              "input file and possibly correct the MULTIPLE_FORCE_EVAL%FORCE_EVAL_ORDER. ")
+            END IF
 
             IF (method_name_id == do_mixed) THEN
                check = ASSOCIATED(force_env%mixed_env%sub_para_env)
@@ -807,8 +844,9 @@ CONTAINS
          IF (method_name_id == do_qmmm) THEN
             qmmmx_section => section_vals_get_subs_vals(force_env_section, "QMMM%FORCE_MIXING")
             CALL section_vals_get(qmmmx_section, explicit=do_qmmm_force_mixing)
-            IF (do_qmmm_force_mixing) &
-               method_name_id = do_qmmmx ! QMMM Force-Mixing has its own (hidden) method_id
+            IF (do_qmmm_force_mixing) THEN
+               method_name_id = do_qmmmx
+            END IF ! QMMM Force-Mixing has its own (hidden) method_id
          END IF
 
          SELECT CASE (method_name_id)
@@ -943,8 +981,9 @@ CONTAINS
          ! Release force_env_section
          IF (nforce_eval > 1) CALL section_vals_release(force_env_section)
       END DO
-      IF (use_multiple_para_env) &
+      IF (use_multiple_para_env) THEN
          CALL cp_rm_default_logger()
+      END IF
       DEALLOCATE (group_distribution)
       DEALLOCATE (i_force_eval)
       timer_env => get_timer_env()
@@ -1193,13 +1232,15 @@ CONTAINS
 !> \param env_id id of the force_env
 !> \param stress_tensor the array where to write the stress tensor
 !> \param ierr will return a number different from 0 if there was an error
+!> \param available whether the potential stress was calculated
 !> \author Ole Schuett
 ! **************************************************************************************************
-   SUBROUTINE get_stress_tensor(env_id, stress_tensor, ierr)
+   SUBROUTINE get_stress_tensor(env_id, stress_tensor, ierr, available)
 
       INTEGER, INTENT(IN)                                :: env_id
       REAL(KIND=dp), DIMENSION(3, 3), INTENT(OUT)        :: stress_tensor
       INTEGER, INTENT(OUT)                               :: ierr
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: available
 
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_subsys_type), POINTER                      :: subsys
@@ -1212,6 +1253,7 @@ CONTAINS
       CALL f_env_add_defaults(env_id, f_env)
       CALL force_env_get(f_env%force_env, subsys=subsys, cell=cell)
       CALL cp_subsys_get(subsys, virial=virial)
+      IF (PRESENT(available)) available = virial%pv_availability
       IF (virial%pv_availability) THEN
          stress_tensor(:, :) = virial%pv_virial(:, :)/cell%deth
       END IF
@@ -1286,6 +1328,7 @@ CONTAINS
 
       NULLIFY (f_env, cell, subsys)
       CALL f_env_add_defaults(env_id, f_env)
+      f_env%is_dirty = .TRUE.
       NULLIFY (cell)
       CALL force_env_get(f_env%force_env, cell=cell)
       CPASSERT(ASSOCIATED(cell))
@@ -1320,6 +1363,7 @@ CONTAINS
       NULLIFY (subsys)
       CALL force_env_get(f_env%force_env, subsys=subsys)
       CALL unpack_subsys_particles(subsys=subsys, r=new_pos)
+      f_env%is_dirty = .TRUE.
       CALL f_env_rm_defaults(f_env, ierr)
 
    END SUBROUTINE set_pos
@@ -1347,6 +1391,7 @@ CONTAINS
       NULLIFY (subsys)
       CALL force_env_get(f_env%force_env, subsys=subsys)
       CALL unpack_subsys_particles(subsys=subsys, v=new_vel)
+      f_env%is_dirty = .TRUE.
       CALL f_env_rm_defaults(f_env, ierr)
 
    END SUBROUTINE set_vel
@@ -1372,7 +1417,9 @@ CONTAINS
       CALL f_env_add_defaults(env_id, f_env)
       logger => cp_get_default_logger()
       CALL cp_iterate(logger%iter_info) ! add one to the iteration count
+      f_env%is_dirty = .TRUE.
       CALL force_env_calc_energy_force(f_env%force_env, calc_force=calc_force)
+      f_env%is_dirty = .FALSE.
       CALL f_env_rm_defaults(f_env, ierr)
 
    END SUBROUTINE calc_energy_force

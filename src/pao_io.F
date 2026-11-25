@@ -14,11 +14,19 @@ MODULE pao_io
                                               get_atomic_kind
    USE basis_set_types,                 ONLY: gto_basis_set_type
    USE cell_types,                      ONLY: cell_type
-   USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_convert_dbcsr_to_csr, dbcsr_copy, dbcsr_csr_create_from_dbcsr, &
-        dbcsr_csr_dbcsr_blkrow_dist, dbcsr_csr_destroy, dbcsr_csr_type, dbcsr_csr_write, &
-        dbcsr_desymmetrize, dbcsr_get_block_p, dbcsr_get_info, dbcsr_has_symmetry, dbcsr_release, &
-        dbcsr_type
+   USE cp_dbcsr_api,                    ONLY: dbcsr_copy,&
+                                              dbcsr_desymmetrize,&
+                                              dbcsr_get_block_p,&
+                                              dbcsr_get_info,&
+                                              dbcsr_has_symmetry,&
+                                              dbcsr_release,&
+                                              dbcsr_type
+   USE cp_dbcsr_csr,                    ONLY: dbcsr_convert_dbcsr_to_csr,&
+                                              dbcsr_csr_create_from_dbcsr,&
+                                              dbcsr_csr_dbcsr_blkrow_dist,&
+                                              dbcsr_csr_destroy,&
+                                              dbcsr_csr_type,&
+                                              dbcsr_csr_write
    USE cp_files,                        ONLY: close_file,&
                                               open_file
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
@@ -88,6 +96,9 @@ CONTAINS
       TYPE(pao_env_type), POINTER                        :: pao
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
+      REAL(KIND=dp), PARAMETER                           :: eps_cell = 1.0E-10_dp, &
+                                                            eps_pos = 1.0E-10_dp
+
       CHARACTER(LEN=default_string_length)               :: param
       INTEGER                                            :: iatom, ikind, natoms
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom2kind
@@ -116,13 +127,14 @@ CONTAINS
          CALL pao_read_raw(pao%restart_file, param, hmat, kinds, atom2kind, positions, xblocks)
 
          ! check cell
-         IF (MAXVAL(ABS(hmat - cell%hmat)) > 1e-10) THEN
+         IF (MAXVAL(ABS(hmat - cell%hmat)) > eps_cell) THEN
             CPWARN("Restarting from different cell")
          END IF
 
          ! check parametrization
-         IF (TRIM(param) /= TRIM(ADJUSTL(id2str(pao%parameterization)))) &
+         IF (TRIM(param) /= TRIM(ADJUSTL(id2str(pao%parameterization)))) THEN
             CPABORT("Restart PAO parametrization does not match")
+         END IF
 
          ! check kinds
          DO ikind = 1, SIZE(kinds)
@@ -130,13 +142,15 @@ CONTAINS
          END DO
 
          ! check number of atoms
-         IF (SIZE(positions, 1) /= natoms) &
+         IF (SIZE(positions, 1) /= natoms) THEN
             CPABORT("Number of atoms do not match")
+         END IF
 
          ! check atom2kind
          DO iatom = 1, natoms
-            IF (atom2kind(iatom) /= particle_set(iatom)%atomic_kind%kind_number) &
+            IF (atom2kind(iatom) /= particle_set(iatom)%atomic_kind%kind_number) THEN
                CPABORT("Restart atomic kinds do not match.")
+            END IF
          END DO
 
          ! check positions, warning only
@@ -144,7 +158,7 @@ CONTAINS
          DO iatom = 1, natoms
             diff = MAX(diff, MAXVAL(ABS(positions(iatom, :) - particle_set(iatom)%r)))
          END DO
-         CPWARN_IF(diff > 1e-10, "Restarting from different atom positions")
+         CPWARN_IF(diff > eps_pos, "Restarting from different atom positions")
 
       END IF
 
@@ -160,8 +174,9 @@ CONTAINS
          END IF
          CALL para_env%bcast(buffer)
          CALL dbcsr_get_block_p(matrix=pao%matrix_X, row=iatom, col=iatom, block=block_X, found=found)
-         IF (ASSOCIATED(block_X)) &
+         IF (ASSOCIATED(block_X)) THEN
             block_X = buffer
+         END IF
          DEALLOCATE (buffer)
       END DO
 
@@ -212,8 +227,9 @@ CONTAINS
 
       ! check if file starts with proper header !TODO: introduce a more unique header
       READ (unit_nr, fmt=*) label, i1
-      IF (TRIM(label) /= "Version") &
+      IF (TRIM(label) /= "Version") THEN
          CPABORT("PAO restart file appears to be corrupted.")
+      END IF
       IF (i1 /= file_format_version) CPABORT("Restart PAO file format version is wrong")
 
       DO WHILE (.TRUE.)
@@ -340,8 +356,9 @@ CONTAINS
                       atomic_kind_set=atomic_kind_set, &
                       qs_kind_set=qs_kind_set)
 
-      IF (ikind > SIZE(atomic_kind_set) .OR. ikind > SIZE(qs_kind_set)) &
+      IF (ikind > SIZE(atomic_kind_set) .OR. ikind > SIZE(qs_kind_set)) THEN
          CPABORT("Some kinds are missing.")
+      END IF
 
       CALL get_atomic_kind(atomic_kind_set(ikind), z=z, name=name)
       CALL get_qs_kind(qs_kind_set(ikind), &
@@ -350,20 +367,27 @@ CONTAINS
                        pao_potentials=pao_potentials)
       CALL pao_param_count(pao, qs_env, ikind=ikind, nparams=nparams)
 
-      IF (pao_kind%nparams /= nparams) &
+      IF (pao_kind%nparams /= nparams) THEN
          CPABORT("Number of parameters do not match")
-      IF (TRIM(pao_kind%name) /= TRIM(name)) &
+      END IF
+      IF (TRIM(pao_kind%name) /= TRIM(name)) THEN
          CPABORT("Kind names do not match")
-      IF (pao_kind%z /= z) &
+      END IF
+      IF (pao_kind%z /= z) THEN
          CPABORT("Atomic numbers do not match")
-      IF (TRIM(pao_kind%prim_basis_name) /= TRIM(basis_set%name)) &
+      END IF
+      IF (TRIM(pao_kind%prim_basis_name) /= TRIM(basis_set%name)) THEN
          CPABORT("Primary Basis-set name does not match")
-      IF (pao_kind%prim_basis_size /= basis_set%nsgf) &
+      END IF
+      IF (pao_kind%prim_basis_size /= basis_set%nsgf) THEN
          CPABORT("Primary Basis-set size does not match")
-      IF (pao_kind%pao_basis_size /= pao_basis_size) &
+      END IF
+      IF (pao_kind%pao_basis_size /= pao_basis_size) THEN
          CPABORT("PAO basis size does not match")
-      IF (SIZE(pao_kind%pao_potentials) /= SIZE(pao_potentials)) &
+      END IF
+      IF (SIZE(pao_kind%pao_potentials) /= SIZE(pao_potentials)) THEN
          CPABORT("Number of PAO_POTENTIALS does not match")
+      END IF
 
       DO ipot = 1, SIZE(pao_potentials)
          IF (pao_kind%pao_potentials(ipot)%maxl /= pao_potentials(ipot)%maxl) THEN
@@ -421,8 +445,9 @@ CONTAINS
       CALL para_env%max(unit_max)
       IF (unit_max > 0) THEN
          IF (pao%iw > 0) WRITE (pao%iw, '(A,A)') " PAO| Writing restart file."
-         IF (unit_nr > 0) &
+         IF (unit_nr > 0) THEN
             CALL write_restart_header(pao, qs_env, energy, unit_nr)
+         END IF
 
          CALL pao_write_diagonal_blocks(para_env, pao%matrix_X, "Xblock", unit_nr)
 
@@ -463,8 +488,10 @@ CONTAINS
          NULLIFY (local_block)
          CALL dbcsr_get_block_p(matrix=matrix, row=iatom, col=iatom, block=local_block, found=found)
          IF (ASSOCIATED(local_block)) THEN
-            IF (SIZE(local_block) > 0) & ! catch corner-case
+            IF (SIZE(local_block) > 0) THEN
+               ! catch corner-case
                mpi_buffer(:, :) = local_block(:, :)
+            END IF
          ELSE
             mpi_buffer(:, :) = 0.0_dp
          END IF

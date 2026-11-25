@@ -19,10 +19,13 @@ MODULE geo_opt
                                               cp_logger_type
    USE cp_output_handling,              ONLY: cp_add_iter_level,&
                                               cp_iterate,&
+                                              cp_print_key_finished_output,&
+                                              cp_print_key_unit_nr,&
                                               cp_rm_iter_level
    USE force_env_types,                 ONLY: force_env_type
    USE global_types,                    ONLY: global_environment_type
-   USE gopt_f_methods,                  ONLY: gopt_f_create_x0
+   USE gopt_f_methods,                  ONLY: gopt_f_create_x0,&
+                                              gopt_f_space_group_show
    USE gopt_f_types,                    ONLY: gopt_f_create,&
                                               gopt_f_release,&
                                               gopt_f_type
@@ -44,7 +47,7 @@ MODULE geo_opt
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'geo_opt'
 
-   PUBLIC :: cp_geo_opt, cp_rot_opt
+   PUBLIC :: cp_geo_opt, gopt_dispatch_optimizer
 
 CONTAINS
 
@@ -91,20 +94,22 @@ CONTAINS
       CALL gopt_param_read(gopt_param, geo_section)
       CALL gopt_f_create(gopt_env, gopt_param, force_env=force_env, globenv=globenv, &
                          geo_opt_section=geo_section, eval_opt_geo=eval_opt_geo)
+      gopt_env%dimer_rotation_optimizer => cp_rot_opt
       CALL gopt_f_create_x0(gopt_env, x0)
 
       CALL section_vals_val_get(geo_section, "STEP_START_VAL", i_val=step_start_val)
-      CALL cp_add_iter_level(logger%iter_info, "GEO_OPT")
+      CALL cp_add_iter_level(logger, "GEO_OPT")
       CALL cp_iterate(logger%iter_info, iter_nr=step_start_val)
-      CALL cp_geo_opt_low(force_env, globenv, gopt_param, gopt_env, &
-                          geo_section, x0)
-      CALL cp_rm_iter_level(logger%iter_info, "GEO_OPT")
+      CALL gopt_dispatch_optimizer(force_env, globenv, gopt_param, gopt_env, &
+                                   geo_section, x0)
+      CALL cp_rm_iter_level(logger, "GEO_OPT")
 
       ! Reset counter for next iteration, unless rm_restart_info==.FALSE.
       my_rm_restart_info = .TRUE.
       IF (PRESENT(rm_restart_info)) my_rm_restart_info = rm_restart_info
-      IF (my_rm_restart_info) &
+      IF (my_rm_restart_info) THEN
          CALL section_vals_val_set(geo_section, "STEP_START_VAL", i_val=0)
+      END IF
 
       DEALLOCATE (x0)
       CALL gopt_f_release(gopt_env)
@@ -138,11 +143,11 @@ CONTAINS
       CPASSERT(ASSOCIATED(gopt_env%globenv))
 
       CALL section_vals_val_get(geo_section, "STEP_START_VAL", i_val=step_start_val)
-      CALL cp_add_iter_level(logger%iter_info, "ROT_OPT")
+      CALL cp_add_iter_level(logger, "ROT_OPT")
       CALL cp_iterate(logger%iter_info, iter_nr=step_start_val)
-      CALL cp_geo_opt_low(gopt_env%force_env, gopt_env%globenv, gopt_param, gopt_env, &
-                          geo_section, x0)
-      CALL cp_rm_iter_level(logger%iter_info, "ROT_OPT")
+      CALL gopt_dispatch_optimizer(gopt_env%force_env, gopt_env%globenv, gopt_param, gopt_env, &
+                                   geo_section, x0)
+      CALL cp_rm_iter_level(logger, "ROT_OPT")
 
       ! Reset counter for next iteration
       CALL section_vals_val_set(geo_section, "STEP_START_VAL", i_val=0)
@@ -151,7 +156,7 @@ CONTAINS
    END SUBROUTINE cp_rot_opt
 
 ! **************************************************************************************************
-!> \brief call to low level geometry optimizers
+!> \brief dispatch to the selected optimizer (BFGS, L-BFGS or CG)
 !> \param force_env ...
 !> \param globenv ...
 !> \param gopt_param ...
@@ -159,14 +164,17 @@ CONTAINS
 !> \param geo_section ...
 !> \param x0 ...
 ! **************************************************************************************************
-   SUBROUTINE cp_geo_opt_low(force_env, globenv, gopt_param, gopt_env, &
-                             geo_section, x0)
+   SUBROUTINE gopt_dispatch_optimizer(force_env, globenv, gopt_param, gopt_env, &
+                                      geo_section, x0)
       TYPE(force_env_type), POINTER                      :: force_env
       TYPE(global_environment_type), POINTER             :: globenv
       TYPE(gopt_param_type), POINTER                     :: gopt_param
       TYPE(gopt_f_type), POINTER                         :: gopt_env
       TYPE(section_vals_type), POINTER                   :: geo_section
       REAL(KIND=dp), DIMENSION(:), POINTER               :: x0
+
+      INTEGER                                            :: output_unit
+      TYPE(cp_logger_type), POINTER                      :: logger
 
       CPASSERT(ASSOCIATED(force_env))
       CPASSERT(ASSOCIATED(globenv))
@@ -189,6 +197,16 @@ CONTAINS
          CPABORT("Invalid or not yet implemented method for optimization")
       END SELECT
 
-   END SUBROUTINE cp_geo_opt_low
+      IF ((.NOT. gopt_env%dimer_rotation) .AND. gopt_env%spgr%show_space_group) THEN
+         NULLIFY (logger)
+         logger => cp_get_default_logger()
+         output_unit = cp_print_key_unit_nr(logger, geo_section, "PRINT%PROGRAM_RUN_INFO", &
+                                            extension=".geoLog")
+         CALL gopt_f_space_group_show(gopt_env, geo_section, output_unit)
+         CALL cp_print_key_finished_output(output_unit, logger, geo_section, &
+                                           "PRINT%PROGRAM_RUN_INFO")
+      END IF
+
+   END SUBROUTINE gopt_dispatch_optimizer
 
 END MODULE geo_opt

@@ -6,7 +6,7 @@
 !--------------------------------------------------------------------------------------------------!
 
 ! **************************************************************************************************
-!> \brief Utility routines for GW with imaginary time
+!> \brief Utility routines for RPA and GW with imaginary time
 !> \par History
 !>      06.2019 split from rpa_im_time.F [Frederick Stein]
 ! **************************************************************************************************
@@ -16,21 +16,26 @@ MODULE rpa_gw_im_time_util
    USE basis_set_types,                 ONLY: gto_basis_set_p_type
    USE cell_types,                      ONLY: cell_type,&
                                               pbc
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_column_scale
+   USE cp_cfm_types,                    ONLY: cp_cfm_get_info,&
+                                              cp_cfm_set_all,&
+                                              cp_cfm_type
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_create, dbcsr_distribution_get, dbcsr_distribution_new, dbcsr_distribution_release, &
-        dbcsr_distribution_type, dbcsr_filter, dbcsr_get_info, dbcsr_get_stored_coordinates, &
-        dbcsr_init_p, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
-        dbcsr_iterator_readonly_start, dbcsr_iterator_start, dbcsr_iterator_stop, &
-        dbcsr_iterator_type, dbcsr_multiply, dbcsr_p_type, dbcsr_release, dbcsr_release_p, &
-        dbcsr_type, dbcsr_type_no_symmetry
+        dbcsr_distribution_type, dbcsr_filter, dbcsr_get_info, dbcsr_init_p, dbcsr_multiply, &
+        dbcsr_p_type, dbcsr_release, dbcsr_release_p, dbcsr_type, dbcsr_type_no_symmetry
    USE cp_dbcsr_contrib,                ONLY: dbcsr_add_on_diag,&
                                               dbcsr_get_diag,&
                                               dbcsr_reserve_all_blocks,&
                                               dbcsr_set_diag
    USE cp_dbcsr_operations,             ONLY: copy_fm_to_dbcsr,&
                                               cp_dbcsr_m_by_n_from_row_template
+   USE cp_dbcsr_redistribution,         ONLY: cp_dbcsr_from_subgroups
+   USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale
    USE cp_fm_types,                     ONLY: cp_fm_create,&
+                                              cp_fm_get_info,&
                                               cp_fm_release,&
+                                              cp_fm_set_all,&
                                               cp_fm_set_element,&
                                               cp_fm_to_fm,&
                                               cp_fm_type
@@ -42,11 +47,12 @@ MODULE rpa_gw_im_time_util
                                               hfx_compression_type
    USE kinds,                           ONLY: dp,&
                                               int_8
-   USE mathconstants,                   ONLY: twopi
+   USE mathconstants,                   ONLY: twopi,&
+                                              z_one,&
+                                              z_zero
    USE message_passing,                 ONLY: mp_dims_create,&
-                                              mp_para_env_type,&
-                                              mp_request_type
-   USE mp2_types,                       ONLY: integ_mat_buffer_type
+                                              mp_para_env_type
+   USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_methods,                ONLY: get_particle_set
    USE particle_types,                  ONLY: particle_type
    USE qs_environment_types,            ONLY: get_qs_env,&
@@ -60,7 +66,6 @@ MODULE rpa_gw_im_time_util
                                               create_3c_tensor,&
                                               pgf_block_sizes,&
                                               split_block_sizes
-   USE rpa_communication,               ONLY: communicate_buffer
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -70,8 +75,78 @@ MODULE rpa_gw_im_time_util
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'rpa_gw_im_time_util'
 
    PUBLIC :: get_tensor_3c_overl_int_gw, compute_weight_re_im, get_atom_index_from_basis_function_index
+   PUBLIC :: build_ao_propagator
+
+   INTERFACE build_ao_propagator
+      MODULE PROCEDURE build_ao_propagator_fm, build_ao_propagator_cfm
+   END INTERFACE build_ao_propagator
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Builds G = X X^T, where X is the selected, column-scaled MO window.
+!>        Only the selected workspace columns are overwritten; coefficients are unchanged.
+!> \param coefficients AO-by-MO coefficient matrix
+!> \param column_factors factors for consecutive MOs starting at first_mo
+!> \param first_mo first global MO column in the window
+!> \param work coefficient workspace with the same shape and distribution as coefficients
+!> \param propagator AO-by-AO output matrix
+! **************************************************************************************************
+   SUBROUTINE build_ao_propagator_fm(coefficients, column_factors, first_mo, work, propagator)
+      TYPE(cp_fm_type), INTENT(IN)                       :: coefficients
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: column_factors
+      INTEGER, INTENT(IN)                                :: first_mo
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: work, propagator
+
+      INTEGER                                            :: nao, nmo
+
+      IF (SIZE(column_factors) == 0) THEN
+         CALL cp_fm_set_all(propagator, 0.0_dp)
+         RETURN
+      END IF
+
+      CALL cp_fm_get_info(coefficients, nrow_global=nao, ncol_global=nmo)
+      CPASSERT(first_mo + SIZE(column_factors) - 1 <= nmo)
+
+      CALL cp_fm_column_scale(work, column_factors, first_col=first_mo, source=coefficients)
+
+      CALL parallel_gemm("N", "T", nao, nao, SIZE(column_factors), 1.0_dp, work, work, 0.0_dp, propagator, &
+                         a_first_col=first_mo, b_first_col=first_mo)
+
+   END SUBROUTINE build_ao_propagator_fm
+
+! **************************************************************************************************
+!> \brief Builds G = X X^H, where X is the selected, column-scaled MO window.
+!>        Only the selected workspace columns are overwritten; coefficients are unchanged.
+!> \param coefficients complex AO-by-MO coefficient matrix
+!> \param column_factors real factors for consecutive MOs starting at first_mo
+!> \param first_mo first global MO column in the window
+!> \param work coefficient workspace with the same shape and distribution as coefficients
+!> \param propagator complex AO-by-AO output matrix
+! **************************************************************************************************
+   SUBROUTINE build_ao_propagator_cfm(coefficients, column_factors, first_mo, work, propagator)
+      TYPE(cp_cfm_type), INTENT(IN)                      :: coefficients
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: column_factors
+      INTEGER, INTENT(IN)                                :: first_mo
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: work, propagator
+
+      INTEGER                                            :: nao, nmo
+
+      IF (SIZE(column_factors) == 0) THEN
+         CALL cp_cfm_set_all(propagator, z_zero)
+         RETURN
+      END IF
+
+      CALL cp_cfm_get_info(coefficients, nrow_global=nao, ncol_global=nmo)
+      CPASSERT(first_mo + SIZE(column_factors) - 1 <= nmo)
+
+      CALL cp_cfm_column_scale(work, CMPLX(column_factors, 0.0_dp, KIND=dp), &
+                               first_col=first_mo, source=coefficients)
+
+      CALL parallel_gemm("N", "C", nao, nao, SIZE(column_factors), z_one, work, work, z_zero, propagator, &
+                         a_first_col=first_mo, b_first_col=first_mo)
+
+   END SUBROUTINE build_ao_propagator_cfm
 
 ! **************************************************************************************************
 !> \brief ...
@@ -139,12 +214,12 @@ CONTAINS
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: dist1, dist2, dist3, sizes_AO, &
                                                             sizes_AO_split, sizes_MO, sizes_MO_1, &
                                                             sizes_RI, sizes_RI_split, tmp
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: distp_1, distp_2, sizes_MO_blocked, &
+                                                            sizes_MO_p1, sizes_MO_p2
       INTEGER, DIMENSION(2)                              :: pdims_2d
       INTEGER, DIMENSION(2, 1)                           :: bounds
       INTEGER, DIMENSION(2, 3)                           :: ibounds
       INTEGER, DIMENSION(3)                              :: bounds_3c, pdims
-      INTEGER, DIMENSION(:), POINTER                     :: distp_1, distp_2, sizes_MO_blocked, &
-                                                            sizes_MO_p1, sizes_MO_p2
       LOGICAL                                            :: memory_info, my_do_alpha
       REAL(dp)                                           :: compression_factor, memory_3c, occ
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: norm
@@ -417,7 +492,7 @@ CONTAINS
                               qs_env%mp2_env%ri_rpa_im_time%eps_compress, memory_3c)
 
          CALL para_env%sum(memory_3c)
-         compression_factor = REAL(nze, dp)*1.0E-06*8.0_dp/memory_3c
+         compression_factor = REAL(nze, dp)*1.0E-06_dp*8.0_dp/memory_3c
 
          IF (unit_nr > 0) THEN
             WRITE (UNIT=unit_nr, FMT="((T3,A,T66,F11.2,A4))") &
@@ -458,22 +533,15 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'reflect_mat_row'
 
-      INTEGER :: block, block_size, col, col_rec, col_size, handle, i_atom, i_block, imepos, &
-         j_atom, natom, nblkcols_total, nblkrows_total, offset, row, row_rec, row_reflected, &
-         row_size
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: block_counter, entry_counter, image_atom, &
-         num_blocks_rec, num_blocks_send, num_entries_rec, num_entries_send, sizes_rec, sizes_send
+      INTEGER                                            :: handle, i_atom, j_atom, natom, &
+                                                            nblkcols_total, nblkrows_total
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: image_atom
       INTEGER, DIMENSION(:), POINTER                     :: col_blk_sizes, row_blk_sizes
       LOGICAL                                            :: found_image_atom
       REAL(KIND=dp)                                      :: avg_z_dist, delta, eps_dist2, &
                                                             min_z_dist, ra(3), rb(3), sum_z, &
                                                             z_reflection
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: data_block
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(dbcsr_iterator_type)                          :: iter
-      TYPE(integ_mat_buffer_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: buffer_rec, buffer_send
-      TYPE(mp_request_type), DIMENSION(:, :), POINTER    :: req_array
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
 
       CALL timeset(routineN, handle)
@@ -572,162 +640,7 @@ CONTAINS
 
       END DO
 
-      ALLOCATE (buffer_rec(0:para_env%num_pe - 1))
-      ALLOCATE (buffer_send(0:para_env%num_pe - 1))
-
-      ALLOCATE (num_entries_rec(0:para_env%num_pe - 1), SOURCE=0)
-      ALLOCATE (num_blocks_rec(0:para_env%num_pe - 1), SOURCE=0)
-      ALLOCATE (num_entries_send(0:para_env%num_pe - 1), SOURCE=0)
-      ALLOCATE (num_blocks_send(0:para_env%num_pe - 1), SOURCE=0)
-
-      CALL dbcsr_iterator_readonly_start(iter, mat_orig)
-      DO WHILE (dbcsr_iterator_blocks_left(iter))
-
-         CALL dbcsr_iterator_next_block(iter, row, col, row_size=row_size, col_size=col_size)
-
-         row_reflected = image_atom(row)
-
-         CALL dbcsr_get_stored_coordinates(mat_reflected, row_reflected, col, imepos)
-
-         num_entries_send(imepos) = num_entries_send(imepos) + row_size*col_size
-         num_blocks_send(imepos) = num_blocks_send(imepos) + 1
-
-      END DO
-
-      CALL dbcsr_iterator_stop(iter)
-
-      IF (para_env%num_pe > 1) THEN
-
-         ALLOCATE (sizes_rec(0:2*para_env%num_pe - 1))
-         ALLOCATE (sizes_send(0:2*para_env%num_pe - 1))
-
-         DO imepos = 0, para_env%num_pe - 1
-
-            sizes_send(2*imepos) = num_entries_send(imepos)
-            sizes_send(2*imepos + 1) = num_blocks_send(imepos)
-
-         END DO
-
-         CALL para_env%alltoall(sizes_send, sizes_rec, 2)
-
-         DO imepos = 0, para_env%num_pe - 1
-            num_entries_rec(imepos) = sizes_rec(2*imepos)
-            num_blocks_rec(imepos) = sizes_rec(2*imepos + 1)
-         END DO
-
-         DEALLOCATE (sizes_rec, sizes_send)
-
-      ELSE
-
-         num_entries_rec(0) = num_entries_send(0)
-         num_blocks_rec(0) = num_blocks_send(0)
-
-      END IF
-
-      ! allocate data message and corresponding indices
-      DO imepos = 0, para_env%num_pe - 1
-
-         ALLOCATE (buffer_rec(imepos)%msg(num_entries_rec(imepos)))
-         buffer_rec(imepos)%msg = 0.0_dp
-
-         ALLOCATE (buffer_send(imepos)%msg(num_entries_send(imepos)))
-         buffer_send(imepos)%msg = 0.0_dp
-
-         ALLOCATE (buffer_rec(imepos)%indx(num_blocks_rec(imepos), 3))
-         buffer_rec(imepos)%indx = 0
-
-         ALLOCATE (buffer_send(imepos)%indx(num_blocks_send(imepos), 3))
-         buffer_send(imepos)%indx = 0
-
-      END DO
-
-      ALLOCATE (block_counter(0:para_env%num_pe - 1))
-      block_counter(:) = 0
-
-      ALLOCATE (entry_counter(0:para_env%num_pe - 1))
-      entry_counter(:) = 0
-
-      CALL dbcsr_iterator_readonly_start(iter, mat_orig)
-      DO WHILE (dbcsr_iterator_blocks_left(iter))
-
-         CALL dbcsr_iterator_next_block(iter, row, col, data_block, &
-                                        row_size=row_size, col_size=col_size)
-
-         row_reflected = image_atom(row)
-
-         CALL dbcsr_get_stored_coordinates(mat_reflected, row_reflected, col, imepos)
-
-         block_size = row_size*col_size
-
-         offset = entry_counter(imepos)
-
-         buffer_send(imepos)%msg(offset + 1:offset + block_size) = &
-            RESHAPE(data_block(1:row_size, 1:col_size), [block_size])
-
-         block = block_counter(imepos) + 1
-
-         buffer_send(imepos)%indx(block, 1) = row_reflected
-         buffer_send(imepos)%indx(block, 2) = col
-         buffer_send(imepos)%indx(block, 3) = offset
-
-         entry_counter(imepos) = entry_counter(imepos) + block_size
-
-         block_counter(imepos) = block_counter(imepos) + 1
-
-      END DO
-
-      CALL dbcsr_iterator_stop(iter)
-
-      ALLOCATE (req_array(1:para_env%num_pe, 4))
-
-      CALL communicate_buffer(para_env, num_entries_rec, num_entries_send, buffer_rec, buffer_send, req_array)
-
-      DEALLOCATE (req_array)
-
-      ! fill the reflected matrix
-      DO imepos = 0, para_env%num_pe - 1
-
-         DO i_block = 1, num_blocks_rec(imepos)
-
-            row_rec = buffer_rec(imepos)%indx(i_block, 1)
-            col_rec = buffer_rec(imepos)%indx(i_block, 2)
-
-            CALL dbcsr_iterator_start(iter, mat_reflected)
-            DO WHILE (dbcsr_iterator_blocks_left(iter))
-
-               CALL dbcsr_iterator_next_block(iter, row, col, data_block, &
-                                              row_size=row_size, col_size=col_size)
-
-               IF (row_rec == row .AND. col_rec == col) THEN
-
-                  offset = buffer_rec(imepos)%indx(i_block, 3)
-
-                  data_block(:, :) = RESHAPE(buffer_rec(imepos)%msg(offset + 1:offset + row_size*col_size), &
-                                             [row_size, col_size])
-
-               END IF
-
-            END DO
-
-            CALL dbcsr_iterator_stop(iter)
-
-         END DO
-
-      END DO
-
-      DO imepos = 0, para_env%num_pe - 1
-         DEALLOCATE (buffer_rec(imepos)%msg)
-         DEALLOCATE (buffer_rec(imepos)%indx)
-         DEALLOCATE (buffer_send(imepos)%msg)
-         DEALLOCATE (buffer_send(imepos)%indx)
-      END DO
-
-      DEALLOCATE (buffer_rec, buffer_send)
-      DEALLOCATE (block_counter, entry_counter)
-      DEALLOCATE (num_entries_rec)
-      DEALLOCATE (num_blocks_rec)
-      DEALLOCATE (num_entries_send)
-      DEALLOCATE (num_blocks_send)
+      CALL cp_dbcsr_from_subgroups(mat_orig, mat_reflected, para_env, row_mapping=image_atom, copy_only=.TRUE.)
 
       CALL timestop(handle)
 

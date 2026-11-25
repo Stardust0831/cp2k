@@ -167,11 +167,11 @@ CONTAINS
       INTEGER, INTENT(IN), OPTIONAL                      :: ndim
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'setup_gamma'
-      REAL(KIND=dp), PARAMETER                           :: rsmooth = 1.0_dp
+      REAL(KIND=dp), PARAMETER                           :: eps_dr = 1.0E-06_dp, rsmooth = 1.0_dp
 
       INTEGER                                            :: handle, i, iatom, icol, ikind, imat, &
                                                             irow, jatom, jkind, natom, nmat
-      INTEGER, DIMENSION(:), POINTER                     :: row_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: row_blk_sizes
       LOGICAL                                            :: found
       REAL(KIND=dp)                                      :: dfcut, dgb, dr, eta, fcut, r, rcut, &
                                                             rcuta, rcutb, x
@@ -249,10 +249,10 @@ CONTAINS
 
          !>   Computes the short-range gamma parameter from
          !>   Nataga-Mishimoto-Ohno-Klopman formula equivalently as it is done for xTB
-         IF (dr < 1.e-6) THEN
+         IF (dr < eps_dr) THEN
             ! on site terms
             gblock(:, :) = gblock(:, :) + eta
-         ELSEIF (dr > rcut) THEN
+         ELSE IF (dr > rcut) THEN
             ! do nothing
          ELSE
             IF (dr < rcut - rsmooth) THEN
@@ -271,7 +271,7 @@ CONTAINS
             !>   Computes the short-range gamma parameter from
             !>   Nataga-Mishimoto-Ohno-Klopman formula equivalently as it is done for xTB
             !>   Derivatives
-            IF (dr < 1.e-6 .OR. dr > rcut) THEN
+            IF (dr < eps_dr .OR. dr > rcut) THEN
                ! on site terms or beyond cutoff
                dgb = 0.0_dp
             ELSE
@@ -296,7 +296,7 @@ CONTAINS
                CALL dbcsr_get_block_p(matrix=gamma_matrix(imat)%matrix, &
                                       row=irow, col=icol, BLOCK=dgblock, found=found)
                IF (found) THEN
-                  IF (dr > 1.e-6) THEN
+                  IF (dr > eps_dr) THEN
                      i = imat - 1
                      IF (irow == iatom) THEN
                         dgblock(:, :) = dgblock(:, :) + dgb*rij(i)/dr
@@ -408,10 +408,11 @@ CONTAINS
          CALL cp_fm_struct_release(fmstruct=fmstruct)
          CALL copy_dbcsr_to_fm(sm_s, fm_s_half)
          CALL cp_fm_power(fm_s_half, fm_work1, 0.5_dp, scf_control%eps_eigval, ndep)
-         IF (ndep /= 0) &
+         IF (ndep /= 0) THEN
             CALL cp_warn(__LOCATION__, &
                          "Overlap matrix exhibits linear dependencies. At least some "// &
                          "eigenvalues have been quenched.")
+         END IF
          CALL copy_fm_to_dbcsr(fm_s_half, sm_h)
          CALL cp_fm_release(fm_s_half)
          CALL cp_fm_release(fm_work1)
@@ -518,6 +519,7 @@ CONTAINS
       TYPE(cp_fm_type), DIMENSION(:), INTENT(INOUT)      :: res
 
       CHARACTER(len=*), PARAMETER :: routineN = 'stda_calculate_kernel'
+      REAL(KIND=dp), PARAMETER                           :: eps_dr = 1.0E-06_dp
 
       INTEGER                                            :: ewald_type, handle, ia, iatom, ikind, &
                                                             is, ispin, jatom, jkind, jspin, natom, &
@@ -713,7 +715,7 @@ CONTAINS
                IF (hfx > 0.0_dp) THEN
                   gabr = (1._dp/(rbeta + (hfx*eta)**(-bp)))**(1._dp/bp)
                ELSE
-                  IF (dr < 1.e-6) THEN
+                  IF (dr < eps_dr) THEN
                      gabr = 0.0_dp
                   ELSE
                      gabr = 1._dp/dr

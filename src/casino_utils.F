@@ -15,9 +15,13 @@ MODULE casino_utils
    USE atomic_kind_types,               ONLY: get_atomic_kind
    USE basis_set_types,                 ONLY: get_gto_basis_set,&
                                               gto_basis_set_type
-   USE cell_types,                      ONLY: cell_type
+   USE cell_types,                      ONLY: cell_type,&
+                                              pbc,&
+                                              pbc_stable,&
+                                              real_to_scaled
    USE cp2k_info,                       ONLY: cp2k_version
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
+   USE cp_cfm_types,                    ONLY: cp_cfm_to_fm
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm
@@ -38,7 +42,10 @@ MODULE casino_utils
    USE external_potential_types,        ONLY: get_potential,&
                                               gth_potential_type,&
                                               sgp_potential_type
-   USE input_section_types,             ONLY: section_vals_type,&
+   USE input_constants,                 ONLY: xc_none
+   USE input_section_types,             ONLY: section_vals_get,&
+                                              section_vals_get_subs_vals,&
+                                              section_vals_type,&
                                               section_vals_val_get
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
@@ -54,7 +61,8 @@ MODULE casino_utils
                                               kpoint_env_p_type,&
                                               kpoint_release,&
                                               kpoint_type
-   USE mathconstants,                   ONLY: pi
+   USE mathconstants,                   ONLY: pi,&
+                                              rootpi
    USE message_passing,                 ONLY: mp_para_env_type
    USE orbital_pointers,                ONLY: nso
    USE particle_types,                  ONLY: particle_type
@@ -99,40 +107,43 @@ CONTAINS
       INTEGER :: ao_num, col_offset, handle, iao, iatom, ikind, ikp, ikp_loc, ikp_out, imo, ipgf, &
          iset, ishell, ishell_loc, ispin, iw, k, l, mo_num, nao_shell, natoms, nel_tot, &
          ngth_pseudo, nkp, nkp_mo, nkp_out, nmo, npseudo_atoms, nreal_k, nset, nsgf, nsgp_pseudo, &
-         nspins, output_unit, periodicity, prim_num, shell_num, zatom
+         nspins, output_unit, periodicity, prim_num, shell_num, xc_shortcut, zatom
       INTEGER, ALLOCATABLE, DIMENSION(:) :: agauge, ao_to_atom, atomic_number, cp2k_to_casino_ao, &
          first_shell, kp_order, prim_per_shell, shell_ang_mom, shell_type
       INTEGER, DIMENSION(2)                              :: kp_range, nmo_spin
       INTEGER, DIMENSION(:), POINTER                     :: npgf, nshell
       INTEGER, DIMENSION(:, :), POINTER                  :: l_shell_set
-      LOGICAL                                            :: casino_kpoints_created, do_kpoints, &
-                                                            ionode, periodic, use_real_wfn, &
+      LOGICAL                                            :: casino_kpoints_created, do_hf, &
+                                                            do_kpoints, ghost_kind, ionode, &
+                                                            periodic, pure_hf, use_real_wfn, &
                                                             write_pseudos
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: kp_real
-      REAL(KIND=dp)                                      :: cval, e_nn, eps_kpoint_real, kdotg, &
-                                                            pseudo_tol, sval, zeff
+      REAL(KIND=dp)                                      :: cval, e_nn, eps_kpoint_real, &
+                                                            hf_fraction, kdotg, pseudo_tol, sval, &
+                                                            zeff
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: coefficients, exponents, mo_scale, &
                                                             valence_charge
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: coord, kvec, mo_energy, mos_sgf, &
                                                             mos_sgf_im, shell_position
-      REAL(KIND=dp), DIMENSION(3)                        :: scoord
+      REAL(KIND=dp), DIMENSION(3)                        :: r_pbc, scoord, scoord_pbc
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp, zetas
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: gcc
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
-      TYPE(cp_fm_type)                                   :: fm_dummy, fm_mo_coeff, fm_mo_coeff_im
+      TYPE(cp_fm_type)                                   :: fm_dummy, fm_mo_coeff, fm_mo_coeff_im, &
+                                                            kp_coeff_im, kp_coeff_re
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gth_potential_type), POINTER                  :: gth_potential
       TYPE(gto_basis_set_type), POINTER                  :: basis_set
       TYPE(kpoint_env_p_type), DIMENSION(:), POINTER     :: kp_env
       TYPE(kpoint_type), POINTER                         :: casino_kpoints, kpoints
-      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
-      TYPE(mo_set_type), DIMENSION(:, :), POINTER        :: mos_kp
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos, mos_kp
       TYPE(mp_para_env_type), POINTER                    :: para_env, para_env_inter_kp
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: kind_set
+      TYPE(section_vals_type), POINTER                   :: hf_section, input, xc_section
       TYPE(sgp_potential_type), POINTER                  :: sgp_potential
 
       CALL timeset(routineN, handle)
@@ -164,6 +175,16 @@ CONTAINS
       nspins = dft_control%nspins
       IF (nspins > 2) CPABORT("CASINO gwfn.data supports at most two spin channels.")
 
+      ! label the reference method in the header: pure Hartree-Fock or DFT
+      CALL get_qs_env(qs_env, input=input)
+      xc_section => section_vals_get_subs_vals(input, "DFT%XC")
+      hf_section => section_vals_get_subs_vals(xc_section, "HF")
+      CALL section_vals_get(hf_section, explicit=do_hf)
+      hf_fraction = 0.0_dp
+      IF (do_hf) CALL section_vals_val_get(hf_section, "FRACTION", r_val=hf_fraction)
+      CALL section_vals_val_get(xc_section, "XC_FUNCTIONAL%_SECTION_PARAMETERS_", i_val=xc_shortcut)
+      pure_hf = do_hf .AND. ABS(hf_fraction - 1.0_dp) < 1.0E-12_dp .AND. xc_shortcut == xc_none
+
       periodicity = COUNT(cell%perd /= 0)
       periodic = periodicity > 0
       pseudo_tol = 1.0E-8_dp
@@ -175,8 +196,14 @@ CONTAINS
       DO iatom = 1, natoms
          coord(:, iatom) = particle_set(iatom)%r(1:3)
          CALL get_atomic_kind(particle_set(iatom)%atomic_kind, kind_number=ikind)
-         CALL get_qs_kind(kind_set(ikind), zatom=zatom, zeff=zeff, &
+         CALL get_qs_kind(kind_set(ikind), zatom=zatom, zeff=zeff, ghost=ghost_kind, &
                           gth_potential=gth_potential, sgp_potential=sgp_potential)
+         IF (ghost_kind) THEN
+            ! CASINO convention for floating Gaussians: a "ghost nucleus" with charge zero
+            atomic_number(iatom) = 0
+            valence_charge(iatom) = 0.0_dp
+            CYCLE
+         END IF
          IF (ABS(zeff) < pseudo_tol) zeff = REAL(zatom, KIND=dp)
          atomic_number(iatom) = zatom
          IF (ASSOCIATED(gth_potential) .OR. ASSOCIATED(sgp_potential)) THEN
@@ -241,6 +268,10 @@ CONTAINS
                IF (l > max_casino_l) THEN
                   CPABORT("CASINO writer currently supports harmonic Gaussian shells up to g.")
                END IF
+               ! CASINO's periodic Gaussian evaluator handles s, sp, p, d and f shells only
+               IF (periodic .AND. l > 3) THEN
+                  CPABORT("CASINO cannot evaluate g shells in periodic Gaussian calculations.")
+               END IF
                shell_ang_mom(ishell) = l
                shell_type(ishell) = casino_shell_type(l)
                prim_per_shell(ishell) = npgf(iset)
@@ -273,7 +304,7 @@ CONTAINS
          CALL get_kpoint_info(casino_kpoints, kp_env=kp_env, kp_range=kp_range, nkp=nkp)
          CALL get_kpoint_env(kp_env(1)%kpoint_env, mos=mos_kp)
          DO ispin = 1, nspins
-            CALL get_mo_set(mos_kp(1, ispin), nmo=nmo)
+            CALL get_mo_set(mos_kp(ispin), nmo=nmo)
             IF (nmo < ao_num) THEN
                CPABORT("CASINO gwfn.data requires a complete MO set. Increase ADDED_MOS.")
             END IF
@@ -287,6 +318,8 @@ CONTAINS
          IF (.NOT. use_real_wfn) THEN
             CALL cp_fm_create(fm_mo_coeff_im, fm_struct)
             CALL cp_fm_set_all(fm_mo_coeff_im, 0.0_dp)
+            CALL cp_fm_create(kp_coeff_re, mos_kp(1)%cmo_coeff%matrix_struct)
+            CALL cp_fm_create(kp_coeff_im, mos_kp(1)%cmo_coeff%matrix_struct)
          END IF
          CALL cp_fm_struct_release(fm_struct)
 
@@ -297,18 +330,24 @@ CONTAINS
                IF (ikp >= kp_range(1) .AND. ikp <= kp_range(2)) THEN
                   ikp_loc = ikp - kp_range(1) + 1
                   CALL get_kpoint_env(kp_env(ikp_loc)%kpoint_env, mos=mos_kp)
-                  IF (mos_kp(1, ispin)%use_mo_coeff_b) THEN
-                     CALL copy_dbcsr_to_fm(mos_kp(1, ispin)%mo_coeff_b, mos_kp(1, ispin)%mo_coeff)
-                  END IF
-                  CALL cp_fm_to_fm_submat_general(mos_kp(1, ispin)%mo_coeff, fm_mo_coeff, &
-                                                  nsgf, nmo, 1, 1, 1, col_offset + 1, blacs_env)
-                  mo_energy(1:ao_num, ikp + (ispin - 1)*nkp_mo) = &
-                     mos_kp(1, ispin)%eigenvalues(1:ao_num)
-                  IF (.NOT. use_real_wfn) THEN
-                     IF (mos_kp(2, ispin)%use_mo_coeff_b) THEN
-                        CALL copy_dbcsr_to_fm(mos_kp(2, ispin)%mo_coeff_b, mos_kp(2, ispin)%mo_coeff)
+                  IF (use_real_wfn) THEN
+                     IF (mos_kp(ispin)%use_mo_coeff_b) THEN
+                        CALL copy_dbcsr_to_fm(mos_kp(ispin)%mo_coeff_b, mos_kp(ispin)%mo_coeff)
                      END IF
-                     CALL cp_fm_to_fm_submat_general(mos_kp(2, ispin)%mo_coeff, fm_mo_coeff_im, &
+                  ELSE
+                     CALL cp_cfm_to_fm(mos_kp(ispin)%cmo_coeff, kp_coeff_re, kp_coeff_im)
+                  END IF
+                  IF (use_real_wfn) THEN
+                     CALL cp_fm_to_fm_submat_general(mos_kp(ispin)%mo_coeff, fm_mo_coeff, &
+                                                     nsgf, nmo, 1, 1, 1, col_offset + 1, blacs_env)
+                  ELSE
+                     CALL cp_fm_to_fm_submat_general(kp_coeff_re, fm_mo_coeff, &
+                                                     nsgf, nmo, 1, 1, 1, col_offset + 1, blacs_env)
+                  END IF
+                  mo_energy(1:ao_num, ikp + (ispin - 1)*nkp_mo) = &
+                     mos_kp(ispin)%eigenvalues(1:ao_num)
+                  IF (.NOT. use_real_wfn) THEN
+                     CALL cp_fm_to_fm_submat_general(kp_coeff_im, fm_mo_coeff_im, &
                                                      nsgf, nmo, 1, 1, 1, col_offset + 1, blacs_env)
                   END IF
                ELSE
@@ -338,8 +377,14 @@ CONTAINS
       IF (do_kpoints .AND. .NOT. use_real_wfn) THEN
          ALLOCATE (agauge(3*natoms))
          DO iatom = 1, natoms
-            scoord(:) = MATMUL(cell%h_inv, particle_set(iatom)%r(1:3))
-            agauge(3*(iatom - 1) + 1:3*iatom) = -NINT(scoord(:))
+            CALL real_to_scaled(scoord, particle_set(iatom)%r(1:3), cell)
+            IF (kpoints%symmetry) THEN
+               r_pbc = pbc_stable(particle_set(iatom)%r(1:3), cell)
+            ELSE
+               r_pbc = pbc(particle_set(iatom)%r(1:3), cell)
+            END IF
+            CALL real_to_scaled(scoord_pbc, r_pbc, cell)
+            agauge(3*(iatom - 1) + 1:3*iatom) = NINT(scoord_pbc - scoord)
          END DO
       END IF
 
@@ -359,7 +404,7 @@ CONTAINS
          WRITE (output_unit, "((T2,A,A))") 'CASINO| Writing gwfn.data file ', TRIM(filename)
          CALL open_file(file_name=filename, file_status="REPLACE", file_action="WRITE", &
                         file_form="FORMATTED", unit_number=iw)
-         CALL write_casino_header(iw, periodicity, nspins, e_nn, nel_tot, natoms, coord, &
+         CALL write_casino_header(iw, pure_hf, periodicity, nspins, e_nn, nel_tot, natoms, coord, &
                                   atomic_number, valence_charge, cell, periodic, nkp_out, nreal_k, &
                                   kvec, shell_num, ao_num, prim_num, shell_ang_mom, shell_type, &
                                   prim_per_shell, first_shell, exponents, coefficients, shell_position)
@@ -434,7 +479,11 @@ CONTAINS
       DEALLOCATE (mos_sgf, mos_sgf_im)
       IF (do_kpoints) THEN
          CALL cp_fm_release(fm_mo_coeff)
-         IF (.NOT. use_real_wfn) CALL cp_fm_release(fm_mo_coeff_im)
+         IF (.NOT. use_real_wfn) THEN
+            CALL cp_fm_release(fm_mo_coeff_im)
+            CALL cp_fm_release(kp_coeff_re)
+            CALL cp_fm_release(kp_coeff_im)
+         END IF
       END IF
       IF (casino_kpoints_created) CALL kpoint_release(casino_kpoints)
       IF (ALLOCATED(agauge)) DEALLOCATE (agauge)
@@ -979,6 +1028,7 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Write all non-orbital CASINO gwfn.data sections.
 !> \param iw ...
+!> \param pure_hf reference is Hartree-Fock (no XC functional, HF fraction 1)
 !> \param periodicity ...
 !> \param nspins ...
 !> \param e_nn ...
@@ -1003,11 +1053,13 @@ CONTAINS
 !> \param coefficients ...
 !> \param shell_position ...
 ! **************************************************************************************************
-   SUBROUTINE write_casino_header(iw, periodicity, nspins, e_nn, nel_tot, natoms, coord, &
+   SUBROUTINE write_casino_header(iw, pure_hf, periodicity, nspins, e_nn, nel_tot, natoms, coord, &
                                   atomic_number, valence_charge, cell, periodic, nkp, nreal_k, kvec, &
                                   shell_num, ao_num, prim_num, shell_ang_mom, shell_type, prim_per_shell, &
                                   first_shell, exponents, coefficients, shell_position)
-      INTEGER, INTENT(IN)                                :: iw, periodicity, nspins
+      INTEGER, INTENT(IN)                                :: iw
+      LOGICAL, INTENT(IN)                                :: pure_hf
+      INTEGER, INTENT(IN)                                :: periodicity, nspins
       REAL(KIND=dp), INTENT(IN)                          :: e_nn
       INTEGER, INTENT(IN)                                :: nel_tot, natoms
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: coord
@@ -1034,9 +1086,9 @@ CONTAINS
       WRITE (iw, '(A)') "Generated by:"
       WRITE (iw, '(1X,A)') TRIM(cp2k_version)
       WRITE (iw, '(A)') "Method:"
-      WRITE (iw, '(A)') " DFT"
+      WRITE (iw, '(A)') MERGE(" HF ", " DFT", pure_hf)
       WRITE (iw, '(A)') "DFT functional:"
-      WRITE (iw, '(A)') " CP2K"
+      WRITE (iw, '(A)') MERGE(" none", " CP2K", pure_hf)
       WRITE (iw, '(A)') "Periodicity:"
       WRITE (iw, '(1X,I0)') periodicity
       WRITE (iw, '(A)') "Spin unrestricted:"
@@ -1498,7 +1550,7 @@ CONTAINS
       END IF
 
       cutoff_arg = SQRT(-LOG(1.0E-12_dp))
-      alpha = SQRT(pi)*(REAL(natoms, KIND=dp)/volume)**(1.0_dp/3.0_dp)
+      alpha = rootpi*(REAL(natoms, KIND=dp)/volume)**(1.0_dp/3.0_dp)
       alpha2 = alpha*alpha
       real_cut = cutoff_arg/alpha
       g_cut = 2.0_dp*alpha*cutoff_arg
@@ -1548,7 +1600,7 @@ CONTAINS
       END DO
       recip_energy = 2.0_dp*pi*recip_energy/volume
 
-      self_energy = -alpha*SUM(charge*charge)/SQRT(pi)
+      self_energy = -alpha*SUM(charge*charge)/rootpi
       neut_energy = -pi*SUM(charge)**2/(2.0_dp*alpha2*volume)
       e_nn = real_energy + recip_energy + self_energy + neut_energy
    END SUBROUTINE periodic_nuclear_repulsion_energy

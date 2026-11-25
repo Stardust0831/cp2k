@@ -66,7 +66,7 @@ MODULE qs_linres_current_utils
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
-   USE kinds,                           ONLY: default_path_length,&
+   USE kinds,                           ONLY: default_string_length,&
                                               dp
    USE memory_utilities,                ONLY: reallocate
    USE message_passing,                 ONLY: mp_para_env_type
@@ -132,12 +132,12 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'current_response'
 
-      CHARACTER(LEN=default_path_length)                 :: my_pos
+      CHARACTER(LEN=default_string_length)               :: my_pos
       INTEGER :: first_center, handle, i, icenter, idir, ii, iii, ispin, ist_true, istate, j, &
          jcenter, jstate, max_nbr_center, max_states, nao, natom, nbr_center(2), ncubes, nmo, &
          nspins, nstates(2), output_unit
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: first_sgf, last_sgf
-      INTEGER, DIMENSION(:), POINTER                     :: list_cubes, row_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: list_cubes, row_blk_sizes
       INTEGER, DIMENSION(:, :, :), POINTER               :: statetrueindex
       LOGICAL                                            :: append_cube, should_stop
       REAL(dp)                                           :: dk(3), dkl(3), dl(3)
@@ -259,7 +259,6 @@ CONTAINS
             CALL dbcsr_set(op_p_ao(idir)%matrix, 0.0_dp)
          END DO
          !
-         !CALL p_xyz_ao(op_p_ao,qs_env,minimum_image=.FALSE.)
          CALL build_lin_mom_matrix(qs_env, op_p_ao)
          !
       END IF
@@ -794,8 +793,9 @@ CONTAINS
       current_env%do_selected_states = n_rep > 0
       !
       ! for the moment selected states doesnt work with the preconditioner FULL_ALL
-      IF (linres_control%preconditioner_type == ot_precond_full_all .AND. current_env%do_selected_states) &
+      IF (linres_control%preconditioner_type == ot_precond_full_all .AND. current_env%do_selected_states) THEN
          CPABORT("Selected states doesnt work with the preconditioner FULL_ALL")
+      END IF
       !
       !
       NULLIFY (current_env%selected_states_on_atom_list)
@@ -1160,7 +1160,7 @@ CONTAINS
             REPEAT(' ', 20 - LEN_TRIM(current_env%orb_center_name))//TRIM(current_env%orb_center_name)
          IF (current_env%orb_center == current_orb_center_common) THEN
             WRITE (output_unit, "(T2,A,T50,3F10.6)") "CURRENT| Common center", common_center(1:3)
-         ELSEIF (current_env%orb_center == current_orb_center_box) THEN
+         ELSE IF (current_env%orb_center == current_orb_center_box) THEN
             WRITE (output_unit, "(T2,A,T60,3I5)") "CURRENT| Nbr boxes in each direction", nbox(1:3)
          END IF
          !

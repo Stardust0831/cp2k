@@ -22,7 +22,7 @@ fi
 # Load Spack or Toolchain environment.
 if [[ "${PROFILE}" =~ ^spack ]]; then
   eval "$(spack env activate myenv --sh)"
-elif [[ "${PROFILE}" =~ ^toolchain ]]; then
+elif [[ "${PROFILE}" =~ ^(toolchain|ubuntu|minimal) ]]; then
   # shellcheck disable=SC1091
   source /opt/cp2k-toolchain/install/setup
 fi
@@ -46,7 +46,7 @@ export OMPI_MCA_pml=ob1
 
 # Use keepalive mode for GPU tests.
 if [[ "${PROFILE}" == *cuda* ]] || [[ "${PROFILE}" == *hip* ]]; then
-  TESTOPTS="--keepalive ${TESTOPTS}"
+  TESTOPTS="--keepalive --timeout=400 --ompthreads=1 ${TESTOPTS}"
 fi
 
 # Flag slow tests in debug runs.

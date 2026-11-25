@@ -11,7 +11,7 @@
 #include "../../mpiwrap/cp_mpi.h"
 #include "../../offload/offload_runtime.h"
 
-#include <assert.h>
+#include "../../base/cp_assert.h"
 #include <omp.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -28,6 +28,8 @@
 
 typedef struct {
   grid_sphere_cache sphere_cache;
+  void *scratch; // thread local scratch, grown on demand
+  size_t scratch_size;
   long counters[GRID_NBACKENDS * GRID_NKERNELS * GRID_MAX_LP];
 } grid_library_globals;
 
@@ -39,11 +41,6 @@ static grid_library_config config = {
 
 #if !defined(_OPENMP)
 #error "OpenMP is required. Please add -fopenmp to your C compiler flags."
-#endif
-
-#if defined(NDEBUG)
-#error                                                                         \
-    "Please do not build CP2K with NDEBUG. There is no performance advantage and asserts will save your neck."
 #endif
 
 /*******************************************************************************
@@ -67,7 +64,7 @@ void grid_library_init(void) {
 
   max_threads = omp_get_max_threads();
   per_thread_globals = malloc(max_threads * sizeof(grid_library_globals *));
-  assert(per_thread_globals != NULL);
+  cp_assert(per_thread_globals != NULL);
 
 // Using parallel regions to ensure memory is allocated near a thread's core.
 #pragma omp parallel default(none) shared(per_thread_globals)                  \
@@ -75,7 +72,7 @@ void grid_library_init(void) {
   {
     const int ithread = omp_get_thread_num();
     per_thread_globals[ithread] = malloc(sizeof(grid_library_globals));
-    assert(per_thread_globals[ithread] != NULL);
+    cp_assert(per_thread_globals[ithread] != NULL);
     memset(per_thread_globals[ithread], 0, sizeof(grid_library_globals));
   }
 
@@ -94,6 +91,7 @@ void grid_library_finalize(void) {
 
   for (int i = 0; i < max_threads; i++) {
     grid_sphere_cache_free(&per_thread_globals[i]->sphere_cache);
+    free(per_thread_globals[i]->scratch);
     free(per_thread_globals[i]);
   }
   free(per_thread_globals);
@@ -107,8 +105,25 @@ void grid_library_finalize(void) {
  ******************************************************************************/
 grid_sphere_cache *grid_library_get_sphere_cache(void) {
   const int ithread = omp_get_thread_num();
-  assert(ithread < max_threads);
+  cp_assert(ithread < max_threads);
   return &per_thread_globals[ithread]->sphere_cache;
+}
+
+/*******************************************************************************
+ * \brief Returns a pointer to a thread local scratch buffer with at least the
+ *        given size. The buffer grows on demand and is reused across calls.
+ ******************************************************************************/
+void *grid_library_get_scratch(const size_t bytes) {
+  const int ithread = omp_get_thread_num();
+  cp_assert(ithread < max_threads);
+  grid_library_globals *globals = per_thread_globals[ithread];
+  if (globals->scratch_size < bytes) {
+    free(globals->scratch);
+    globals->scratch = malloc(bytes);
+    cp_assert(globals->scratch != NULL);
+    globals->scratch_size = bytes;
+  }
+  return globals->scratch;
 }
 
 /*******************************************************************************
@@ -135,14 +150,14 @@ grid_library_config grid_library_get_config(void) { return config; }
 void grid_library_counter_add(const int lp, const enum grid_backend backend,
                               const enum grid_library_kernel kernel,
                               const int increment) {
-  assert(lp >= 0);
-  assert(kernel < GRID_NKERNELS);
+  cp_assert(lp >= 0);
+  cp_assert(kernel < GRID_NKERNELS);
   const int back = backend - GRID_BACKEND_REF;
-  assert(back < GRID_NBACKENDS);
+  cp_assert(back < GRID_NBACKENDS);
   const int idx = back * GRID_NKERNELS * GRID_MAX_LP + kernel * GRID_MAX_LP +
                   imin(lp, GRID_MAX_LP - 1);
   const int ithread = omp_get_thread_num();
-  assert(ithread < max_threads);
+  cp_assert(ithread < max_threads);
   per_thread_globals[ithread]->counters[idx] += increment;
 }
 

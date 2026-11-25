@@ -40,6 +40,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
 #include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -61,7 +62,10 @@
  * \param port    The port number for the socket to be created. Low numbers are
  *                often reserved for important channels, so use of numbers of 4
  *                or more digits is recommended.
- * \param host    The name of the host server.
+ * \param host    The name of the host server (inet socket), or the full path
+ *                of the UNIX socket file (unix socket). The caller is
+ *                responsible for building this path, e.g. by prepending a
+ *                prefix such as "/tmp/ipi_".
  * \note  Fortran passes an extra argument for the string length, but this is
  *        ignored here for C compatibility.
  ******************************************************************************/
@@ -105,8 +109,11 @@ void open_connect_socket(int *psockfd, int *inet, int *port, char *host) {
     // fills up details of the socket address
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sun_family = AF_UNIX;
-    strcpy(serv_addr.sun_path, "/tmp/qiskit_");
-    strcpy(serv_addr.sun_path + 12, host);
+    if (strlen(host) >= sizeof(serv_addr.sun_path)) {
+      fprintf(stderr, "UNIX socket path is too long\n");
+      exit(EXIT_FAILURE);
+    }
+    strcpy(serv_addr.sun_path, host);
 
     // creates the socket
     sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -174,6 +181,10 @@ void open_bind_socket(int *psockfd, int *inet, int *port, char *host) {
     // fills up details of the socket address
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sun_family = AF_UNIX;
+    if (strlen(host) >= sizeof(serv_addr.sun_path)) {
+      fprintf(stderr, "UNIX socket path is too long\n");
+      exit(EXIT_FAILURE);
+    }
     strcpy(serv_addr.sun_path, host);
 
     // creates the socket
@@ -199,14 +210,20 @@ void open_bind_socket(int *psockfd, int *inet, int *port, char *host) {
  * \param plen    The length of the data in bytes.
  ******************************************************************************/
 void writebuffer(int *psockfd, char *data, int *plen) {
-  int n;
-  int sockfd = *psockfd;
-  int len = *plen;
-
-  n = write(sockfd, data, len);
-  if (n < 0) {
-    perror("Error writing to socket: server has quit or connection broke");
-    exit(-1);
+  if (*plen < 0) {
+    fprintf(stderr, "Invalid socket write length\n");
+    exit(EXIT_FAILURE);
+  }
+  size_t done = 0, len = (size_t)*plen;
+  while (done < len) {
+    ssize_t n = write(*psockfd, data + done, len - done);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0) {
+      perror("Error writing to socket: server has quit or connection broke");
+      exit(EXIT_FAILURE);
+    }
+    done += (size_t)n;
   }
 }
 
@@ -217,20 +234,24 @@ void writebuffer(int *psockfd, char *data, int *plen) {
  * \param plen    The length of the data in bytes.
  ******************************************************************************/
 void readbuffer(int *psockfd, char *data, int *plen) {
-  int n, nr;
-  int sockfd = *psockfd;
-  int len = *plen;
-
-  n = nr = read(sockfd, data, len);
-
-  while (nr > 0 && n < len) {
-    nr = read(sockfd, &data[n], len - n);
-    n += nr;
+  if (*plen < 0) {
+    fprintf(stderr, "Invalid socket read length\n");
+    exit(EXIT_FAILURE);
   }
-
-  if (n == 0) {
-    perror("Error reading from socket: server has quit or connection broke");
-    exit(-1);
+  size_t done = 0, len = (size_t)*plen;
+  while (done < len) {
+    ssize_t n = read(*psockfd, data + done, len - done);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0) {
+      if (n == 0)
+        fprintf(stderr, "Unexpected EOF reading from socket (%zu/%zu bytes)\n",
+                done, len);
+      else
+        perror("Error reading from socket");
+      exit(EXIT_FAILURE);
+    }
+    done += (size_t)n;
   }
 }
 

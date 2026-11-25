@@ -24,6 +24,7 @@ MODULE mp2
                                               Stein2022,&
                                               Stein2024,&
                                               cite_reference
+   USE bse_main,                        ONLY: bse_fulldiag_memory_check_from_mos
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_copy,&
@@ -57,14 +58,9 @@ MODULE mp2
         alloc_containers, dealloc_containers, hfx_basis_info_type, hfx_basis_type, &
         hfx_container_type, hfx_create_basis_types, hfx_init_container, hfx_release_basis_types, &
         hfx_type
-   USE input_constants,                 ONLY: cholesky_inverse,&
-                                              cholesky_off,&
-                                              do_eri_gpw,&
-                                              do_eri_mme,&
-                                              rpa_exchange_axk,&
-                                              rpa_exchange_none,&
-                                              rpa_exchange_sosex,&
-                                              sigma_none
+   USE input_constants,                 ONLY: &
+        bse_fulldiag, cholesky_inverse, cholesky_off, do_eri_gpw, do_eri_mme, ri_rs_rpa_method, &
+        rpa_exchange_axk, rpa_exchange_none, rpa_exchange_sosex, sigma_none
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type
@@ -101,6 +97,7 @@ MODULE mp2
                                               eigensolver_symm
    USE qs_scf_types,                    ONLY: qs_scf_env_type
    USE rpa_gw_sigma_x,                  ONLY: compute_vec_Sigma_x_minus_vxc_gw
+   USE rpa_ri_rs,                       ONLY: run_ri_rs_rpa
    USE scf_control_types,               ONLY: scf_control_type
    USE virial_types,                    ONLY: virial_type
 
@@ -136,7 +133,7 @@ CONTAINS
       INTEGER(KIND=int_8)                                :: mem
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: kind_of, nelec
       LOGICAL :: calc_ex, do_admm, do_admm_rpa_exx, do_dynamic_load_balancing, do_exx, do_gw, &
-         do_im_time, do_kpoints_cubic_RPA, free_hfx_buffer, reuse_hfx, update_xc_energy
+         do_im_time, do_kpoints, free_hfx_buffer, reuse_hfx, update_xc_energy
       REAL(KIND=dp) :: E_admm_from_GW(2), E_ex_from_GW, Emp2, Emp2_AA, Emp2_AA_Cou, Emp2_AA_ex, &
          Emp2_AB, Emp2_AB_Cou, Emp2_AB_ex, Emp2_BB, Emp2_BB_Cou, Emp2_BB_ex, Emp2_Cou, Emp2_ex, &
          Emp2_S, Emp2_T, maxocc, mem_real, t1, t2, t3
@@ -188,10 +185,11 @@ CONTAINS
 
       CALL cite_reference(DelBen2012)
 
-      do_kpoints_cubic_RPA = qs_env%mp2_env%ri_rpa_im_time%do_im_time_kpoints
+      do_kpoints = qs_env%mp2_env%ri_rpa_im_time%do_im_time_kpoints .OR. &
+                   qs_env%mp2_env%method == ri_rs_rpa_method
 
-      ! for cubic RPA and GW, we have kpoints and therefore, we get other matrices later
-      IF (do_kpoints_cubic_RPA) THEN
+      ! for cubic RPA and GW and for RI-RS RPA, we have kpoints and therefore, we get other matrices later
+      IF (do_kpoints) THEN
 
          CALL get_qs_env(qs_env, &
                          input=input, &
@@ -280,7 +278,7 @@ CONTAINS
          END IF
       END IF
 
-      IF (.NOT. do_kpoints_cubic_RPA) THEN
+      IF (.NOT. do_kpoints) THEN
          IF (virial%pv_availability .AND. (.NOT. virial%pv_numer) .AND. mp2_env%eri_method == do_eri_mme) THEN
             CPABORT("analytical stress not implemented with ERI_METHOD = MME")
          END IF
@@ -553,7 +551,7 @@ CONTAINS
          IF (mp2_env%ri_rpa%reuse_hfx) free_hfx_buffer = .FALSE.
       END IF
 
-      IF (.NOT. do_kpoints_cubic_RPA) THEN
+      IF (.NOT. do_kpoints) THEN
       IF (virial%pv_numer) THEN
          ! in the case of numerical stress we don't have to free the HFX integrals
          free_hfx_buffer = .FALSE.
@@ -564,6 +562,10 @@ CONTAINS
       ! calculate the matrix sigma_x - vxc for G0W0
       t3 = 0
       IF (mp2_env%ri_rpa%do_ri_g0w0) THEN
+         ! the full diagonalization's footprint is known here, before any GW work
+         IF (mp2_env%bse%do_bse .AND. mp2_env%bse%bse_diag_method == bse_fulldiag) THEN
+            CALL bse_fulldiag_memory_check_from_mos(mp2_env%bse, mos_mp2, para_env, unit_nr)
+         END IF
          CALL compute_vec_Sigma_x_minus_vxc_gw(qs_env, mp2_env, mos_mp2, E_ex_from_GW, E_admm_from_GW, t3, unit_nr)
       END IF
 
@@ -745,13 +747,17 @@ CONTAINS
          CALL mp2_gpw_main(qs_env, mp2_env, Emp2, Emp2_Cou, Emp2_EX, Emp2_S, Emp2_T, &
                            mos_mp2, para_env, unit_nr, calc_forces, calc_ex, do_ri_sos_laplace_mp2=.TRUE.)
 
+      CASE (ri_rs_rpa_method)
+         ! RPA correlation energy and exact exchange with RI-RS and k-point sampling
+         CALL run_ri_rs_rpa(qs_env, Emp2)
+
       CASE DEFAULT
          CPABORT("Unknown MP2 method")
       END SELECT
 
       t2 = m_walltime()
       IF (unit_nr > 0) WRITE (unit_nr, *)
-      IF (mp2_env%method /= ri_rpa_method_gpw) THEN
+      IF (mp2_env%method /= ri_rpa_method_gpw .AND. mp2_env%method /= ri_rs_rpa_method) THEN
          IF (unit_nr > 0) WRITE (unit_nr, '(T3,A,T56,F25.6)') 'Total MP2 Time=', t2 - t1
          IF (mp2_env%method == ri_mp2_laplace) THEN
             Emp2_S = Emp2
@@ -947,9 +953,8 @@ CONTAINS
 
       matrix_ks(1:nspins) => matrix_ks_transl(1:nspins, 1)
       matrix_s(1:1) => matrix_s_kp(1:1, 1)
-      mos(1:nspins) => kpoints%kp_env(1)%kpoint_env%mos(1:nspins, 1)
+      mos(1:nspins) => kpoints%kp_env(1)%kpoint_env%mos(1:nspins)
 
    END SUBROUTINE get_gamma
 
 END MODULE mp2
-

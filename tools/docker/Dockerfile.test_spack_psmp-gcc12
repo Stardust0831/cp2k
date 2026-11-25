@@ -3,13 +3,16 @@
 # Usage: ./spack_cache_start.sh; podman build --shm-size=1g -t spack_psmp-gcc12 -f ./Dockerfile.test_spack_psmp-gcc12 ../../
 #
 
-ARG BASE_IMAGE="ubuntu:24.04"
+ARG BASE_IMAGE="docker.io/ubuntu:24.04"
 
 ###### Stage 1: Build CP2K dependencies ######
 
 FROM "${BASE_IMAGE}" AS build_deps
 
-RUN apt-get update -qq && apt-get install -qq --no-install-recommends \
+ARG APT_GET="apt-get -o APT::Sandbox::User=root -qq"
+
+RUN ${APT_GET} update && \
+    ${APT_GET} install --no-install-recommends \
     bzip2 \
     ca-certificates \
     cmake \
@@ -37,36 +40,50 @@ RUN apt-get update -qq && apt-get install -qq --no-install-recommends \
     zstd \
     && rm -rf /var/lib/apt/lists/*
 
-ARG IMAGE_TAG
-ENV IMAGE_TAG=${IMAGE_TAG:-spack_psmp-gcc12}
+ARG IMAGE_TAG="spack_psmp-gcc12"
+ENV IMAGE_TAG="${IMAGE_TAG}"
 
-ARG SPACK_CACHE
-ENV SPACK_CACHE="${SPACK_CACHE:-s3://spack-cache --s3-endpoint-url=http://host.containers.internal:9000}"
+# Set number CPU cores if requested
+ARG NUM_PROCS=""
+ENV NUM_PROCS="${NUM_PROCS}"
+
+# Set number of packages built by spack in parallel
+ARG NUM_PACKAGES="2"
+ENV NUM_PACKAGES="${NUM_PACKAGES}"
+
+ARG SPACK_CACHE="s3://spack-cache --s3-endpoint-url=http://host.containers.internal:9000"
+ENV SPACK_CACHE="${SPACK_CACHE}"
 
 # Build CP2K dependencies
 WORKDIR /opt/cp2k
 COPY ./tools/spack ./tools/spack
 COPY ./tools/docker ./tools/docker
 COPY ./make_cp2k.sh .
-RUN ./make_cp2k.sh -bd_only -cv psmp -gpu none -gv 12 -mpi mpich -ue 
+COPY ./tools/make_cp2k ./tools/make_cp2k
+RUN ./make_cp2k.sh -bd_only -cv psmp -gpu none -gv 12 -j${NUM_PROCS} -mpi mpich -np ${NUM_PACKAGES} -ue 
 
 ###### Stage 2: Build CP2K ######
 
 FROM build_deps AS build_cp2k
 
-COPY ./src ./src
-COPY ./data ./data
-COPY ./tools/build_utils ./tools/build_utils
+COPY ./CMakeLists.txt ./CMakePresets.json ./
 COPY ./cmake ./cmake
-COPY ./CMakeLists.txt .
+COPY ./data ./data
+COPY ./src ./src
+COPY ./tests ./tests
+COPY ./tools/build_utils ./tools/build_utils
+COPY ./tools/conventions ./tools/conventions
 
-RUN ./make_cp2k.sh -cv psmp -gv 12 -gpu none -mpi mpich 
+RUN ./make_cp2k.sh -cv psmp -gv 12 -gpu none -j${NUM_PROCS} -mpi mpich 
 
 ###### Stage 3: Install CP2K ######
 
 FROM "${BASE_IMAGE}" AS install_cp2k
 
-RUN apt-get update -qq && apt-get install -qq --no-install-recommends \
+ARG APT_GET="apt-get -o APT::Sandbox::User=root -qq"
+
+RUN ${APT_GET} update && \
+    ${APT_GET} install --no-install-recommends \
     g++ g++-12 gcc gcc-12 gfortran gfortran-12 \
     python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -80,7 +97,7 @@ COPY --from=build_cp2k /opt/cp2k/spack/spack/opt/spack ./spack/spack/opt/spack
 COPY --from=build_cp2k /opt/cp2k/install ./install
 
 # Install CP2K regression tests
-COPY ./tests ./tests
+COPY --from=build_cp2k /opt/cp2k/tests ./tests
 COPY --from=build_cp2k /opt/cp2k/src/grid/sample_tasks ./src/grid/sample_tasks
 
 # Install CP2K/Quickstep CI benchmarks
@@ -91,7 +108,8 @@ COPY --from=build_cp2k /etc/ld.so.conf.d/cp2k.conf /etc/ld.so.conf.d/cp2k.conf
 RUN ldconfig
 
 # Run CP2K regression test
-RUN /opt/cp2k/install/bin/launch /opt/cp2k/install/bin/run_tests --keepalive || echo "ERROR: Tests failed"
+RUN /opt/cp2k/install/bin/launch /opt/cp2k/install/bin/run_tests --keepalive 2>&1 | tee report.log; \
+    grep -q '^Status:' report.log || printf "\nSummary: Regression test run failed\nStatus: FAILED\n" | tee -a report.log
 
 # Create entrypoint and finalise container build
 WORKDIR /mnt

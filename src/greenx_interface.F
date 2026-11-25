@@ -13,7 +13,8 @@
 MODULE greenx_interface
    USE kinds, ONLY: dp
    USE cp_log_handling, ONLY: cp_logger_type, &
-                              cp_get_default_logger
+                              cp_get_default_logger, &
+                              cp_logger_get_default_io_unit
    USE cp_output_handling, ONLY: cp_print_key_unit_nr, &
                                  cp_print_key_finished_output, &
                                  cp_print_key_generate_filename, &
@@ -38,9 +39,100 @@ MODULE greenx_interface
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'greenx_interface'
 
-   PUBLIC :: greenx_refine_pade, greenx_output_polarizability, greenx_refine_ft, greenx_get_minimax_grid
+   PUBLIC :: greenx_get_minimax_grid, greenx_refine_pade, greenx_output_polarizability, greenx_refine_ft
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Get a minimax grid with complete transform matrices from GreenX when it is available.
+!> \param unit_nr Output unit for diagnostics.
+!> \param num_integ_points Number of minimax points.
+!> \param emin Lower energy bound.
+!> \param emax Upper energy bound.
+!> \param regularization_minimax Regularization of the minimax fit.
+!> \param imaginary_time Imaginary-time grid points.
+!> \param time_weights_at_zero_frequency Imaginary-time weights.
+!> \param frequency Frequency grid points.
+!> \param frequency_weights Frequency weights.
+!> \param cosine_time_to_frequency Cosine time-to-frequency matrix, including cosine factors.
+!> \param cosine_frequency_to_time Cosine frequency-to-time matrix, including cosine factors.
+!> \param sine_time_to_frequency Sine time-to-frequency matrix, including sine factors.
+!> \param ierr Zero if GreenX supplied a grid, nonzero otherwise.
+! **************************************************************************************************
+   SUBROUTINE greenx_get_minimax_grid(unit_nr, num_integ_points, emin, emax, regularization_minimax, &
+                                      imaginary_time, time_weights_at_zero_frequency, frequency, &
+                                      frequency_weights, cosine_time_to_frequency, &
+                                      cosine_frequency_to_time, sine_time_to_frequency, ierr)
+
+      INTEGER, INTENT(IN)                                :: unit_nr, num_integ_points
+      REAL(KIND=dp), INTENT(IN)                           :: emin, emax, regularization_minimax
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), INTENT(OUT) :: imaginary_time, &
+                                                               time_weights_at_zero_frequency, &
+                                                               frequency, frequency_weights
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), INTENT(OUT) :: cosine_time_to_frequency, &
+                                                                  cosine_frequency_to_time, &
+                                                                  sine_time_to_frequency
+      INTEGER, INTENT(OUT)                                :: ierr
+
+#if defined (__GREENX)
+      INTEGER                                            :: gi
+      REAL(KIND=dp)                                      :: cosft_duality_error_greenx, &
+                                                            max_errors_greenx(3)
+
+      CALL gx_minimax_grid(num_integ_points, emin, emax, imaginary_time, &
+                           time_weights_at_zero_frequency, frequency, frequency_weights, &
+                           cosine_time_to_frequency, cosine_frequency_to_time, &
+                           sine_time_to_frequency, max_errors_greenx, cosft_duality_error_greenx, ierr, &
+                           bare_cos_sin_weights=.FALSE., regularization=regularization_minimax)
+      IF (ierr == 0) THEN
+         ! Factor 4 is hard-coded in the RPA weights in the internal CP2K minimax routines
+         frequency_weights(:) = frequency_weights(:)*4.0_dp
+         IF (unit_nr > 0) THEN
+            WRITE (UNIT=unit_nr, FMT="(T3,A,T75,i6)") &
+               "GREENX MINIMAX_INFO| Number of integration points:", num_integ_points
+            WRITE (UNIT=unit_nr, FMT="(T3,A,T61,3F20.7)") &
+               "GREENX MINIMAX_INFO| Gap (Emin):", emin
+            WRITE (UNIT=unit_nr, FMT="(T3,A,T61,3F20.7)") &
+               "GREENX MINIMAX_INFO| Maximum eigenvalue difference (Emax):", emax
+            WRITE (UNIT=unit_nr, FMT="(T3,A,T61,3F20.4)") &
+               "GREENX MINIMAX_INFO| Energy range (Emax/Emin):", emax/emin
+            WRITE (UNIT=unit_nr, FMT="(T3,A,T54,A,T72,A)") &
+               "GREENX MINIMAX_INFO| Frequency grid (scaled):", "Weights", "Abscissas"
+            DO gi = 1, num_integ_points
+               WRITE (UNIT=unit_nr, FMT="(T41,F20.10,F20.10)") frequency_weights(gi), frequency(gi)
+            END DO
+            WRITE (UNIT=unit_nr, FMT="(T3,A,T54,A,T72,A)") &
+               "GREENX MINIMAX_INFO| Time grid (scaled):", "Weights", "Abscissas"
+            DO gi = 1, num_integ_points
+               WRITE (UNIT=unit_nr, FMT="(T41,F20.10,F20.10)") &
+                  time_weights_at_zero_frequency(gi), imaginary_time(gi)
+            END DO
+            CALL m_flush(unit_nr)
+         END IF
+      ELSE
+         IF (unit_nr > 0) THEN
+            WRITE (UNIT=unit_nr, FMT="(T3,A,T75)") &
+               "GREENX MINIMAX_INFO| Grid not available, use internal CP2K grids"
+            CALL m_flush(unit_nr)
+         END IF
+      END IF
+#else
+      ierr = 1
+      MARK_USED(unit_nr)
+      MARK_USED(num_integ_points)
+      MARK_USED(emin)
+      MARK_USED(emax)
+      MARK_USED(regularization_minimax)
+      MARK_USED(imaginary_time)
+      MARK_USED(time_weights_at_zero_frequency)
+      MARK_USED(frequency)
+      MARK_USED(frequency_weights)
+      MARK_USED(cosine_time_to_frequency)
+      MARK_USED(cosine_frequency_to_time)
+      MARK_USED(sine_time_to_frequency)
+#endif
+
+   END SUBROUTINE greenx_get_minimax_grid
 
 ! **************************************************************************************************
 !> \brief Refines Pade approximants using GreenX, skips this step if GreenX is not available
@@ -209,14 +301,21 @@ CONTAINS
                                                             y_eval
       INTEGER, OPTIONAL                                  :: n_pade_opt
 #if defined (__GREENX)
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'greenx_refine_ft'
+
       INTEGER                                            :: fit_start, &
                                                             fit_end, &
                                                             max_fit, &
                                                             n_fit, &
                                                             n_pade, &
                                                             n_eval, &
-                                                            i
+                                                            i, &
+                                                            handle, &
+                                                            unit_nr
+      TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(params)                                       :: pade_params
+
+      CALL timeset(routineN, handle)
 
       ! Get the sizes from arrays
       max_fit = SIZE(x_fit)
@@ -241,10 +340,30 @@ CONTAINS
       n_pade = n_fit/2
       IF (PRESENT(n_pade_opt)) n_pade = n_pade_opt
 
+      ! Too few FT points (e.g. very short propagation with &FT on) leave n_pade < 1;
+      ! the Thiele recurrence would then divide by zero. Skip, returning zeros.
+      IF (n_pade < 1) THEN
+         CPWARN("FT deck too short for Padé; raise STEPS or disable &FT.")
+         y_eval(1:n_eval) = CMPLX(0.0, 0.0, kind=dp)
+         CALL timestop(handle)
+         RETURN
+      END IF
+
       ! Warn about a large number of Padé parameters
       IF (n_pade > 1000) THEN
          CPWARN("More then 1000 Padé parameters requested - may reduce with FIT_E_MIN/FIT_E_MAX.")
       END IF
+
+      ! The Padé order is derived from the FT bins inside [FIT_E_MIN, FIT_E_MAX]; report it so a
+      ! spectrum's fit is reconstructable from the log. Distinct from the GW AC Padé (nparam_pade).
+      logger => cp_get_default_logger()
+      unit_nr = cp_logger_get_default_io_unit(logger)
+      IF (unit_nr > 0) THEN
+         WRITE (UNIT=unit_nr, FMT="(T3,A,T45,I6,I8,2F11.4)") &
+            "GREENX FT_PADE| n_pade, n_fit, window [eV]", n_pade, n_fit, &
+            REAL(x_fit(fit_start), kind=dp)*evolt, REAL(x_fit(fit_end), kind=dp)*evolt
+      END IF
+
       ! TODO : Symmetry mode settable?
       ! Here, we assume that ft corresponds to transform of real trace
       pade_params = create_thiele_pade(n_pade, x_fit(fit_start:fit_end), y_fit(fit_start:fit_end), &
@@ -254,6 +373,7 @@ CONTAINS
       y_eval(1:n_eval) = evaluate_thiele_pade_at(pade_params, x_eval)
 
       CALL free_params(pade_params)
+      CALL timestop(handle)
 #else
       ! Mark used
       MARK_USED(fit_e_min)
@@ -266,118 +386,5 @@ CONTAINS
       CPABORT("Calls to GreenX require CP2K to be compiled with support for GreenX.")
 #endif
    END SUBROUTINE greenx_refine_ft
-
-! **************************************************************************************************
-!> \brief ...
-!> \param unit_nr ...
-!> \param num_integ_points ...
-!> \param emin ...
-!> \param emax ...
-!> \param tau_tj ...
-!> \param tau_wj ...
-!> \param regularization_minimax ...
-!> \param tj ...
-!> \param wj ...
-!> \param weights_cos_tf_t_to_w ...
-!> \param weights_cos_tf_w_to_t ...
-!> \param weights_sin_tf_t_to_w ...
-!> \param ierr ...
-! **************************************************************************************************
-   SUBROUTINE greenx_get_minimax_grid(unit_nr, num_integ_points, emin, emax, &
-                                      tau_tj, tau_wj, regularization_minimax, &
-                                      tj, wj, weights_cos_tf_t_to_w, &
-                                      weights_cos_tf_w_to_t, weights_sin_tf_t_to_w, ierr)
-
-      INTEGER, INTENT(IN)                                :: unit_nr, num_integ_points
-      REAL(KIND=dp), INTENT(IN)                          :: emin, emax
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), &
-         INTENT(OUT)                                     :: tau_tj, tau_wj
-      REAL(KIND=dp), INTENT(IN)                 :: regularization_minimax
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), &
-         INTENT(INOUT)                                   :: tj, wj
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
-         INTENT(OUT)                                     :: weights_cos_tf_t_to_w, &
-                                                            weights_cos_tf_w_to_t, &
-                                                            weights_sin_tf_t_to_w
-      INTEGER, INTENT(OUT) :: ierr
-#if defined (__GREENX)
-      INTEGER :: gi
-      REAL(KIND=dp)                                      :: cosft_duality_error_greenx, &
-                                                            max_errors_greenx(3)
-
-      CALL gx_minimax_grid(num_integ_points, Emin, Emax, tau_tj, tau_wj, tj, wj, &
-                           weights_cos_tf_t_to_w, weights_cos_tf_w_to_t, weights_sin_tf_t_to_w, &
-                           max_errors_greenx, cosft_duality_error_greenx, ierr, &
-                           bare_cos_sin_weights=.TRUE., &
-                           regularization=regularization_minimax)
-      ! Factor 4 is hard-coded in the RPA weights in the internal CP2K minimax routines
-      wj(:) = wj(:)*4.0_dp
-      IF (ierr == 0) THEN
-         IF (unit_nr > 0) THEN
-            WRITE (UNIT=unit_nr, FMT="(T3,A,T75,i6)") &
-               "GREENX MINIMAX_INFO| Number of integration points:", num_integ_points
-            WRITE (UNIT=unit_nr, FMT="(T3,A,T61,3F20.7)") &
-               "GREENX MINIMAX_INFO| Gap (Emin):", Emin
-            WRITE (UNIT=unit_nr, FMT="(T3,A,T61,3F20.7)") &
-               "GREENX MINIMAX_INFO| Maximum eigenvalue difference (Emax):", Emax
-            WRITE (UNIT=unit_nr, FMT="(T3,A,T61,3F20.4)") &
-               "GREENX MINIMAX_INFO| Energy range (Emax/Emin):", Emax/Emin
-            WRITE (UNIT=unit_nr, FMT="(T3,A,T54,A,T72,A)") &
-               "GREENX MINIMAX_INFO| Frequency grid (scaled):", "Weights", "Abscissas"
-            DO gi = 1, num_integ_points
-               WRITE (UNIT=unit_nr, FMT="(T41,F20.10,F20.10)") wj(gi), tj(gi)
-            END DO
-            WRITE (UNIT=unit_nr, FMT="(T3,A,T54,A,T72,A)") &
-               "GREENX MINIMAX_INFO| Time grid (scaled):", "Weights", "Abscissas"
-            DO gi = 1, num_integ_points
-               WRITE (UNIT=unit_nr, FMT="(T41,F20.10,F20.10)") tau_wj(gi), tau_tj(gi)
-            END DO
-            CALL m_flush(unit_nr)
-         END IF
-      ELSE
-         IF (unit_nr > 0) THEN
-            WRITE (UNIT=unit_nr, FMT="(T3,A,T75)") &
-               "GREENX MINIMAX_INFO| Grid not available, use internal CP2K grids"
-            CALL m_flush(unit_nr)
-         END IF
-         IF (ALLOCATED(tau_tj)) THEN
-            DEALLOCATE (tau_tj)
-         END IF
-         IF (ALLOCATED(tau_wj)) THEN
-            DEALLOCATE (tau_wj)
-         END IF
-         IF (ALLOCATED(tj)) THEN
-            DEALLOCATE (tj)
-         END IF
-         IF (ALLOCATED(wj)) THEN
-            DEALLOCATE (wj)
-         END IF
-         IF (ALLOCATED(weights_cos_tf_t_to_w)) THEN
-            DEALLOCATE (weights_cos_tf_t_to_w)
-         END IF
-         IF (ALLOCATED(weights_cos_tf_w_to_t)) THEN
-            DEALLOCATE (weights_cos_tf_w_to_t)
-         END IF
-         IF (ALLOCATED(weights_sin_tf_t_to_w)) THEN
-            DEALLOCATE (weights_sin_tf_t_to_w)
-         END IF
-      END IF
-#else
-      ierr = 1
-      MARK_USED(unit_nr)
-      MARK_USED(num_integ_points)
-      MARK_USED(emin)
-      MARK_USED(emax)
-      MARK_USED(tau_tj)
-      MARK_USED(tau_wj)
-      MARK_USED(regularization_minimax)
-      MARK_USED(tj)
-      MARK_USED(wj)
-      MARK_USED(weights_cos_tf_t_to_w)
-      MARK_USED(weights_cos_tf_w_to_t)
-      MARK_USED(weights_sin_tf_t_to_w)
-#endif
-
-   END SUBROUTINE greenx_get_minimax_grid
 
 END MODULE greenx_interface

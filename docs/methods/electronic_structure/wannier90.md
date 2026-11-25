@@ -5,9 +5,9 @@ CP2K can generate the input and matrix files required by [Wannier90](https://wan
 the k-point mesh, eigenvalues, and overlap matrices from a periodic Quickstep calculation; the
 subsequent construction and use of Wannier functions are performed by Wannier90.
 
-Wannier90 requires a complete, uniformly weighted k-point mesh with its nearest-neighbour
-connectivity. A high-symmetry band path is not a suitable input mesh. See [](../dft/k-points) for
-k-point sampling and convergence.
+Wannier-function construction requires a complete, uniformly weighted k-point mesh with its
+nearest-neighbour connectivity. A high-symmetry band path is not a suitable input mesh. See
+[](../dft/k-points) for k-point sampling and convergence.
 
 ## Basic workflow
 
@@ -46,18 +46,105 @@ additional bands for the export, and
 from it. Choose the exported band window and the subsequent Wannier90 settings for the particular
 material and target property.
 
+`EXCLUDE_BANDS` refers to the original, one-based MO indices, including the additional bands. CP2K
+removes these states consistently from the eigenvalues, overlap matrices, and AO projections before
+passing data to Wannier90. The retained bands are renumbered from one in ascending original order.
+Repeated indices are ignored, and out-of-range indices are rejected. A companion
+`SEED_NAME_band_indices.dat` file lists the exported band index and its original MO index. The
+generated files are already filtered: do not add the same exclusion list to the `.win` file. The
+export rejects an exclusion that cuts a degenerate band group inside the outer energy window
+(adjacent eigenvalues within `1.e-8` hartree), since selecting individual states there would depend
+on the arbitrary MO gauge. Retain or remove the entire group instead.
+
+## Initial projections
+
+[INITIAL_PROJECTIONS](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.WANNIER90.INITIAL_PROJECTIONS) makes physical
+trial orbitals available to external Wannier90 without linking a Wannier90 library.
+
+```text
+&WANNIER90 ON
+  KPOINTS_SOURCE SCF
+  WANNIER_FUNCTIONS 4
+  INITIAL_PROJECTIONS AO_HYBRID
+  USE_BLOCH_PHASES T
+&END WANNIER90
+```
+
+`AO_SCDM` forms the complex metric projections `C(k)^H S(k)` onto the AO basis and selects one fixed
+trial set across the full mesh using pivoted QR. This is AO-based and SCDM-inspired, not real-space
+density-matrix sampling. Rank checks at every k-point trigger alternative QR anchors and column
+exchanges when needed. An unresolved rank defect stops the export rather than silently changing the
+band space. Numerically tied columns are selected in their original candidate order.
+
+`AO_HYBRID` first forms tetrahedral s/p trials from every on-atom radial s-shell and p-shell pair.
+Other AOs, including d and higher angular momenta, remain available. Both choices support
+rectangular projection matrices and use the same Bloch gauge as the exported overlaps. They are
+alternative initial orbitals, not a guarantee of the global spread minimum. Compare converged
+Wannier90 spreads and centres when the initial gauge affects a degenerate band space.
+
+The default `NONE` preserves the historical export without an `.amn` file. With
+`USE_BLOCH_PHASES T`, it instead writes identity projections for a complete band space. Explicit
+`IDENTITY` also requires equal band and Wannier counts and retains the arbitrary MO gauge. Use AO
+trials to supply gauge-covariant projections for disentanglement. CP2K does not minimize spreads or
+automatically select a winner between independently localized projection families.
+
+### Spin-polarized calculations
+
+[SPIN_CHANNEL](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.WANNIER90.SPIN_CHANNEL) selects `BOTH` (the
+default), `ALPHA`, or `BETA`. For two-spin calculations, CP2K writes independent files with the seed
+suffixes `_up` and `_down`. Each channel uses its own eigenvalues, MO coefficients and projections.
+The exporter does not concatenate the two spin channels into a single `.eig` or `.mmn` file. With
+one spin channel, the original seed name is unchanged, and selecting `BETA` is an input error. The
+previous numeric settings `1` and `2` remain aliases for `ALPHA` and `BETA`.
+
+Specify `WANNIER_FUNCTIONS` once to use the same count in both channels, or twice to select the
+alpha and beta counts in that order. The order is independent of `SPIN_CHANNEL`, so the following
+exports only the beta channel with three Wannier functions:
+
+```text
+&WANNIER90 ON
+  SEED_NAME magnetic_crystal
+  KPOINTS_SOURCE SCF
+  SPIN_CHANNEL BETA
+  WANNIER_FUNCTIONS 5
+  WANNIER_FUNCTIONS 3
+  INITIAL_PROJECTIONS AO_SCDM
+&END WANNIER90
+```
+
+Band exclusions and energy windows apply to every selected spin channel and must be valid for each
+independently. This is collinear spin support, not spinor or spin-orbit-coupled Wannierization.
+
+### Disentanglement
+
+When there are more exported bands than `WANNIER_FUNCTIONS`, external Wannier90 performs
+disentanglement before localization. Set `ADDED_MOS` to export sufficient bands. The optional
+`DIS_WIN_MIN`, `DIS_WIN_MAX`, `DIS_FROZ_MIN` and `DIS_FROZ_MAX` keywords are written to `.win` and
+restrict AO trial selection consistently. Energies are in eV unless an explicit CP2K unit is
+supplied and refer to the exported eigenvalues without a Fermi-energy shift. Every outer window must
+contain at least the target number of states. Frozen states must lie inside it and cannot exceed
+that count. If they fill the entire target space, only frozen states enter the projection selection.
+All band-space overlaps and eigenvalues are still exported.
+
+Set localization and disentanglement convergence options in `.win` after CP2K finishes, then run
+`wannier90.x SEED_NAME`. Wannier90 can write its Hamiltonian, rotation matrices, checkpoints and
+postprocessing results through its ordinary standalone options. None of these operations requires a
+Wannier90 library linked into CP2K. The standalone workflow has been tested with Wannier90 4.0.3.
+
 ## Generated files
 
-With `SEED_NAME silicon`, CP2K writes the following Wannier90 files:
+In the ordinary file-export mode, `SEED_NAME silicon` produces the following Wannier90 files:
 
 - `silicon.win`: a starting Wannier90 input file containing the cell, atomic positions, exported
   band count, and k-point mesh;
 - `silicon.mmn`: overlap matrices between neighbouring k-points;
-- `silicon.eig`: eigenvalues for the exported bands; and
-- `silicon.amn`: an identity projection matrix, only when `USE_BLOCH_PHASES T` is used.
+- `silicon.eig`: eigenvalues for the exported bands;
+- `silicon.amn`: selected AO, hybrid or identity projections when requested; and
+- `silicon_band_indices.dat`: the mapping from exported bands to original MO indices, including the
+  identity mapping when no bands are excluded.
 
-CP2K regenerates these files when the calculation is run. Preserve a separate copy of a completed
-Wannier90 input file, or add project-specific settings after the CP2K export has finished.
+CP2K regenerates the enabled files when the calculation is run. Preserve a separate copy of a
+completed Wannier90 input file, or add project-specific settings after the CP2K export has finished.
 
 ## Selecting the k-point source
 
@@ -95,9 +182,10 @@ irreducible subset.
 
 ### Use a separate Monkhorst--Pack mesh
 
-`KPOINTS_SOURCE MP_GRID` is the historical default. It builds a full Monkhorst--Pack mesh from
+`KPOINTS_SOURCE MP_GRID` is the historical default. It builds a full Gamma-centred uniform mesh from
 [MP_GRID](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.WANNIER90.MP_GRID), independently of the SCF k-point
-setup:
+setup. For a like-for-like comparison with `KPOINTS_SOURCE SCF`, use the same dimensions and
+`GAMMA_CENTERED T` in `&DFT%KPOINTS`:
 
 ```text
 &PRINT
@@ -112,6 +200,162 @@ setup:
 This path performs the necessary full-mesh diagonalizations for the Wannier90 files. It can be used
 when the SCF calculation is Gamma-only or when the export mesh intentionally differs from the SCF
 mesh, but using a separately chosen mesh requires its own convergence assessment.
+
+### Explicit overlap loops and external topology analysis
+
+`KPOINTS_SOURCE NNKP` reads arbitrary fractional k-points and directed connections from `NNKP_FILE`.
+The Wannier90-format file must contain `real_lattice`, `recip_lattice`, `kpoints` and `nnkpts`
+blocks. The reciprocal-vector shift in each connection specifies the periodic closure; it must not
+be discarded when a loop crosses a Brillouin-zone boundary.
+
+```text
+&WANNIER90
+  KPOINTS_SOURCE NNKP
+  NNKP_FILE loop.nnkp
+  SEED_NAME loop
+  WILSON_LOOP T
+&END WANNIER90
+```
+
+CP2K keeps the converged SCF potential fixed while diagonalizing the requested post-SCF k-points.
+The SCF mesh is independent of these overlap loops and must be converged separately. The exported
+`.mmn` matrices contain the Gaussian-basis metric and periodic phase/image information:
+
+`M(k,b) = C(k)^dagger O(k,b) C(k+b)`.
+
+Plain Euclidean overlaps of AO coefficient vectors are not suitable. Directed cross-k overlaps use
+ordered, nonsymmetric AO pair matrices. `SPIN_CHANNEL ALPHA` or `BETA` selects a single collinear
+channel; `BOTH` processes the channels separately with `_up` and `_down` seed suffixes. UKS channels
+are never concatenated in one `.mmn` file. In SOC mode, `EXCLUDE_BANDS` selects spinor bands
+instead, and the SCF must be restricted. Duplicate `EXCLUDE_BANDS` indices are rejected for explicit
+loops.
+
+The NNKP/MMN file interface can be used by an external
+[Z2Pack overlap-system adapter](https://z2pack.greschd.ch/en/latest/reference/other_systems.html).
+Such an adapter supplies each requested closed loop in an NNKP file, runs CP2K with an unchanged SCF
+setup, and returns the corresponding ordered MMN matrices to Z2Pack. The Python adapter is
+maintained separately from CP2K; neither the native calculation nor CP2K's tests require Z2Pack. No
+Wannier90 library or Wannier fit is needed for explicit overlap loops.
+
+### Native Wilson loops and Z2 analysis
+
+`WILSON_LOOP T` calculates Wilson eigenphases from the SVD-unitarized links. With
+`KPOINTS_SOURCE WILSON`, CP2K generates a surface internally and doubles its longitudinal and
+transverse resolution until the convergence checks pass or `WILSON_MAX_REFINEMENT` is reached.
+`Z2 T` additionally calculates largest-gap crossing parity on a time-reversal half-plane.
+
+The following illustrates an eight-electron SOC system with five scalar bands (ten spinors), of
+which eight are retained. Adjust the band count and exclusions for the actual system:
+
+```text
+&WANNIER90
+  KPOINTS_SOURCE WILSON
+  SOC T
+  Z2 T
+  TIME_REVERSAL T
+  EXCLUDE_BANDS 9 10
+  WILSON_ORIGIN 0 0 0
+  WILSON_DIRECTION 1 0 0
+  WILSON_TRANSVERSE 0 0.5 0
+  WILSON_MESH 4 3
+  WILSON_MAX_REFINEMENT 2
+&END WANNIER90
+```
+
+SOC uses restricted SCF followed by second-variational pseudopotential SOC, not self-consistent
+noncollinear DFT. SOC-capable pseudopotentials are required. Converge the scalar unoccupied space
+(`SCF/ADDED_MOS` and `WANNIER90/ADDED_MOS`), basis, cutoffs and SCF mesh independently.
+
+`TIME_REVERSAL T` is a user assertion about the Hamiltonian, not an automatic symmetry proof. Native
+Z2 requires an even, lowest-energy occupied spinor subspace with one state per electron and an
+excluded conduction band. The supported native Z2 surfaces use two distinct reciprocal coordinate
+axes, with winding one along the loop and one half transversely. A single plane provides one 2D
+invariant, not all four strong/weak 3D indices. Arbitrary loops remain available for Wilson phases
+and external analysis.
+
+Checks cover singular links, sampled band gaps, boundary Kramers pairs, WCC changes under joint
+refinement, adjacent-line movement and gap separation, and parity stability. A coarse mesh can still
+miss a gap closing or rapid evolution between samples. Repeat with finer starting meshes and tighter
+tolerances. Gapless graphene does not have a well-defined insulating Z2 invariant without specifying
+and resolving a gap-opening Hamiltonian.
+
+The `.wilson` file contains the loop index, minimum link singular value, and sorted hybrid Wannier
+centres (WCC) in `[0,1)`. Printed Berry phases are in radians. Refinements overwrite the seed output
+with the final mesh; the log retains diagnostics from all levels.
+
+The regular CP2K test runner includes `topology_wilson_unittest` (known trivial/nontrivial BHZ
+models, Chern models, gauge/reversal invariance and failure checks) and the four short helium/neon
+inputs in `tests/QS/regtest-topology`. These are mathematical and smoke tests, not
+material-convergence benchmarks. Larger DFT/SOC, adaptive-surface and MPI-scaling validations are
+separate manual work.
+
+### Native first Chern number and spectral gaps
+
+`CHERN T` evaluates the determinant Wilson-phase winding on a full closed surface. For example:
+
+```text
+&WANNIER90
+  KPOINTS_SOURCE WILSON
+  CHERN T
+  WILSON_DIRECTION 1 0 0
+  WILSON_TRANSVERSE 0 1 0
+  WILSON_MESH 16 17
+  WILSON_MAX_REFINEMENT 3
+  REQUIRE_GLOBAL_GAP T
+&END WANNIER90
+```
+
+Set `EXCLUDE_BANDS` for the intended isolated subspace, with at least one computed band above it
+when testing a gap. `CHERN` requires integer transverse winding, not a Z2 half-surface, and cannot
+be combined with `Z2 T`. Scalar, single-collinear-channel and second-variational SOC states are
+supported without imposing time reversal. The sign follows Z2Pack's increasing-transverse-coordinate
+Wilson winding. No magnetic field, SOC term or other change to the Hamiltonian is implied.
+
+Checks require endpoint WCC closure, resolved determinant-phase steps, stable integer winding, and
+WCC convergence under joint refinement. The native unit test includes known C1=0,+1,-1 two-band
+models, orientation reversal, direct-sum additivity and rejection of invalid surfaces. A helium
+regression exercises `CHERN`, gap checking and state export through the regular CP2K test runner.
+
+For a selected lowest-band prefix, output distinguishes the minimum sampled direct separation from
+the sampled indirect gap `min(E[N+1]) - max(E[N])`. An isolated band bundle can have positive direct
+separation but a negative indirect gap. Optional `REQUIRE_GLOBAL_GAP T` rejects a missing common
+spectral interval above the prefix; it requires Wilson analysis and an excluded band above the
+selected states. No point-dependent Fermi shifts are applied. Finite sampling cannot rule out a
+missed bulk gap closing. Across separately self-consistent geometries, a common energy reference
+must be justified before interpreting an indirect gap.
+
+### Gaussian state snapshots for phason analysis
+
+The native [`topology_phasons` postprocessor](phason-topology.md) evaluates physical cross-geometry
+links, mixed-parameter C1 and four-parameter C2 from these snapshots, without Z2Pack or Python.
+External consumers may use the same file interface.
+
+For explicit `NNKP` or `WILSON` points, `STATE_EXPORT T` writes `SEED_NAME.topology`. The versioned
+text output can be large and is disabled by default. It provides physical AO states and basis
+metadata for cross-geometry analysis, not a Wannier fit. The export itself does not evaluate an
+invariant; the native postprocessor or an external consumer performs that analysis. Existing `.mmn`
+files describe cross-k links at a fixed geometry only.
+
+Version 1 uses atomic units and contains, in order:
+
+1. The header `CP2K_TOPOLOGY_STATE 1` and dimensions: atom count, AO count, selected state count,
+   k-point count, spinor component count, total computed band count and collinear channel.
+1. One-based selected band indices, the three direct lattice vectors, and three periodicity flags.
+1. For each atom: index, kind index, number of Gaussian sets, AO count and canonical periodic
+   centre. Each set stores its first atom-local AO index, spherical AO count, primitive count,
+   Cartesian count, minimum angular momentum and screening radius. Each primitive stores its
+   exponent and radius, followed by Cartesian powers and full spherical contraction coefficients.
+1. For each point: index, fractional reciprocal coordinates, all computed eigenvalues, and selected
+   complex AO coefficients in column-major order. Each complex value is a real/imaginary pair. SOC
+   spinor components are stacked by AO; a scalar export contains only its selected channel.
+
+The required moving-basis link is `C_a^dagger O_ab C_b`, with the cross-geometry Gaussian operator,
+not a Euclidean coefficient overlap or an independently orthogonalized basis identification. A
+physical phason family needs consistent cell, orbital/atom count, selected rank, spin convention and
+self-consistent branch, together with explicit endpoint geometry and subspace sewing. Dropping and
+adding atoms in a finite patch is not a fixed-rank cycle. External software must check metric
+normalization, sampled isolation and link singular values, then demonstrate mesh convergence. The
+snapshot format alone does not establish a topological invariant for a material.
 
 ## Reusing SCF orbitals
 
@@ -141,18 +385,28 @@ well-defined exported subspace.
 full-mesh reference and compares it with the reconstructed orbitals. It is expensive and intended
 for development and diagnostic use, not routine production calculations.
 
+The atom/AO transformation uses the same lattice-periodic Bloch gauge as the SCF matrices. Atom cell
+shifts contribute phases; folding a k-point by a reciprocal lattice vector does not add an extra
+atom-position phase to the SCF coefficients. This is distinct from the optional export gauge
+described below.
+
+A finite integration grid can weakly break crystal symmetry even when the AO overlap metric is
+preserved. The reference validation can then reject the reconstructed eigenvalues and select
+full-mesh diagonalization. Converge both `CUTOFF` and `REL_CUTOFF` as well as the SCF threshold when
+testing quantitative reconstruction; SCF convergence alone does not remove grid errors.
+
 ## Bloch phases and projections
 
 [USE_BLOCH_PHASES](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.WANNIER90.USE_BLOCH_PHASES) applies the CP2K
-Bloch-phase gauge and writes an identity `.amn` projection file. It is valid only when
-`WANNIER_FUNCTIONS` equals the number of exported bands. Disentanglement calculations, or any case
-with fewer Wannier functions than exported bands, still require explicit Wannier90 projections.
+Bloch-phase gauge to reused SCF coefficients. Projections and overlaps use the same gauge. AO and
+hybrid trials permit rectangular projection matrices. The equal-count restriction applies only to
+identity projections, including the historical `NONE` setting with Bloch phases enabled.
 
 ## Limitations
 
 The CP2K Wannier90 interface is experimental. In particular:
 
-- use a complete k-point mesh rather than a band path;
+- for Wannier-function construction, use a complete k-point mesh rather than a band path;
 - verify the convergence of the SCF and export meshes for the target quantity;
 - inspect CP2K output when exporting from a symmetry-reduced SCF mesh, since CP2K may reconstruct
   the missing orbitals or fall back to full-mesh diagonalization; and

@@ -52,10 +52,11 @@ MODULE qs_active_space_methods
       silent_print_level
    USE cp_realspace_grid_cube, ONLY: cp_pw_to_cube
    USE cp_dbcsr_api, ONLY: &
-      dbcsr_copy, dbcsr_csr_create, dbcsr_csr_type, dbcsr_p_type, dbcsr_type, dbcsr_release, &
+      dbcsr_copy, dbcsr_p_type, dbcsr_type, dbcsr_release, &
       dbcsr_type_no_symmetry, dbcsr_create, dbcsr_set, dbcsr_multiply, dbcsr_iterator_next_block, &
       dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_blocks_left, &
       dbcsr_iterator_type, dbcsr_type_symmetric, dbcsr_get_occupation, dbcsr_get_info
+   USE cp_dbcsr_csr, ONLY: dbcsr_csr_create, dbcsr_csr_type
    USE erf_complex, ONLY: erfz_fast
    USE group_dist_types, ONLY: get_group_dist, release_group_dist, group_dist_d1_type
    USE input_constants, ONLY: &
@@ -63,7 +64,8 @@ MODULE qs_active_space_methods
       eri_operator_erf, eri_operator_erfc, eri_operator_gaussian, eri_operator_yukawa, &
       eri_operator_trunc, eri_operator_lr_trunc, &
       fci_solver, manual_selection, mao_projection, no_solver, qiskit_solver, wannier_projection, &
-      eri_poisson_analytic, eri_poisson_periodic, eri_poisson_mt, high_spin_roks
+      eri_poisson_analytic, eri_poisson_periodic, eri_poisson_mt, high_spin_roks, &
+      ot_precond_full_single_inverse, ot_precond_solver_default
    USE kpoint_types, ONLY: get_kpoint_info, kpoint_type
    USE input_section_types, ONLY: section_vals_get, section_vals_get_subs_vals, &
                                   section_vals_set_subs_vals, section_vals_type, &
@@ -79,6 +81,7 @@ MODULE qs_active_space_methods
    USE mathlib, ONLY: diamat_all
    USE mathconstants, ONLY: fourpi, twopi, pi, rootpi
    USE memory_utilities, ONLY: reallocate
+   USE molden_utils, ONLY: write_mos_molden
    USE message_passing, ONLY: mp_comm_type, &
                               mp_para_env_type, &
                               mp_para_env_release
@@ -89,7 +92,10 @@ MODULE qs_active_space_methods
    USE particle_types, ONLY: particle_type
    USE periodic_table, ONLY: ptable
    USE physcon, ONLY: angstrom, bohr
-   USE preconditioner_types, ONLY: preconditioner_type
+   USE preconditioner, ONLY: make_preconditioner
+   USE preconditioner_types, ONLY: destroy_preconditioner, &
+                                   init_preconditioner, &
+                                   preconditioner_type
    USE pw_env_methods, ONLY: pw_env_create, &
                              pw_env_rebuild
    USE pw_env_types, ONLY: pw_env_get, &
@@ -129,6 +135,7 @@ MODULE qs_active_space_methods
                                      initialize_active_space_mixing, &
                                      update_active_density
    USE qs_active_space_utils, ONLY: eri_to_array, &
+                                    find_degenerate_splits, &
                                     subspace_matrix_to_array
    USE qs_collocate_density, ONLY: calculate_wavefunction
    USE qs_density_matrices, ONLY: calculate_density_matrix
@@ -143,8 +150,11 @@ MODULE qs_active_space_methods
    USE qs_ks_types, ONLY: qs_ks_did_change, &
                           qs_ks_env_type, set_ks_env
    USE qs_mo_io, ONLY: write_mo_set_to_output_unit
-   USE qs_mo_methods, ONLY: calculate_subspace_eigenvalues
+   USE qs_mo_methods, ONLY: calculate_orbital_fock_elements, &
+                            calculate_subspace_eigenvalues, &
+                            make_mo_set_canonical
    USE qs_mo_types, ONLY: allocate_mo_set, &
+                          deallocate_mo_set, &
                           get_mo_set, &
                           init_mo_set, &
                           mo_set_type
@@ -182,6 +192,8 @@ MODULE qs_active_space_methods
 
    TYPE, EXTENDS(eri_type_eri_element_func) :: eri_fcidump_print
       INTEGER :: unit_nr = -1, bra_start = -1, ket_start = -1
+      INTEGER :: nalpha = 0, nbeta = 0
+      REAL(KIND=dp) :: determinant_energy = 0.0_dp
    CONTAINS
       PROCEDURE :: func => eri_fcidump_print_func
    END TYPE eri_fcidump_print
@@ -232,7 +244,7 @@ CONTAINS
                                                             explicit, stop_after_print, store_wfn, &
                                                             use_real_wfn
       REAL(KIND=dp) :: eri_eps_filter, eri_eps_grid, eri_eps_int, eri_gpw_cutoff, eri_op_omega, &
-         eri_rcut, eri_rel_cutoff, fel, focc, maxocc, nze_percentage
+         eri_rcut, eri_rel_cutoff, fel, focc, max_offdiag, maxocc, nze_percentage
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: eigenvalues
       REAL(KIND=dp), DIMENSION(:), POINTER               :: evals_virtual
       TYPE(active_space_type), POINTER                   :: active_space_env
@@ -240,7 +252,7 @@ CONTAINS
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_blacs_env_type), POINTER                   :: context
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct_tmp
-      TYPE(cp_fm_type)                                   :: fm_dummy, mo_virtual
+      TYPE(cp_fm_type)                                   :: mo_virtual
       TYPE(cp_fm_type), POINTER                          :: fm_target_active, fm_target_inactive, &
                                                             fmat, mo_coeff, mo_ref, mo_target
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -288,19 +300,23 @@ CONTAINS
       NULLIFY (kpoints)
       CALL get_qs_env(qs_env, do_kpoints=do_kpoints, dft_control=dft_control, kpoints=kpoints)
       IF (do_kpoints) THEN
-         IF (.NOT. ASSOCIATED(kpoints)) &
+         IF (.NOT. ASSOCIATED(kpoints)) THEN
             CALL cp_abort(__LOCATION__, "Missing Gamma-point environment for active space module")
+         END IF
          CALL get_kpoint_info(kpoints, kp_scheme=kp_scheme, nkp=nkp, use_real_wfn=use_real_wfn)
          IF (TRIM(kp_scheme) /= "GAMMA" .OR. nkp /= 1 .OR. .NOT. use_real_wfn) THEN
             CALL cp_abort(__LOCATION__, &
                           "Only Gamma-point DFT%KPOINTS are supported in the active space module")
          END IF
-         IF (.NOT. ASSOCIATED(kpoints%kp_env)) &
+         IF (.NOT. ASSOCIATED(kpoints%kp_env)) THEN
             CALL cp_abort(__LOCATION__, "Missing Gamma-point environment for active space module")
-         IF (.NOT. ASSOCIATED(kpoints%kp_env(1)%kpoint_env)) &
+         END IF
+         IF (.NOT. ASSOCIATED(kpoints%kp_env(1)%kpoint_env)) THEN
             CALL cp_abort(__LOCATION__, "Missing Gamma-point environment for active space module")
-         IF (.NOT. ASSOCIATED(kpoints%kp_env(1)%kpoint_env%mos)) &
+         END IF
+         IF (.NOT. ASSOCIATED(kpoints%kp_env(1)%kpoint_env%mos)) THEN
             CALL cp_abort(__LOCATION__, "Missing Gamma-point MOs for active space module")
+         END IF
       END IF
 
       ! adiabatic rescaling?
@@ -341,6 +357,11 @@ CONTAINS
       active_space_env%energy_active = 0.0_dp
 
       ! input options
+
+      CALL section_vals_val_get(as_input, "EPS_FCI", r_val=active_space_env%eps_fci)
+      IF (.NOT. (active_space_env%eps_fci > 0.0_dp)) THEN
+         CPABORT("ACTIVE_SPACE%EPS_FCI must be positive.")
+      END IF
 
       ! figure out what needs to be printed/stored
       IF (BTEST(cp_print_key_should_output(logger%iter_info, as_input, "FCIDUMP"), cp_p_file)) THEN
@@ -449,7 +470,7 @@ CONTAINS
          CPABORT("Unknown orbital selection method")
       CASE (casci_canonical)
          IF (do_kpoints) THEN
-            mos => kpoints%kp_env(1)%kpoint_env%mos(1, :)
+            mos => kpoints%kp_env(1)%kpoint_env%mos(:)
          ELSE
             CALL get_qs_env(qs_env, mos=mos)
          END IF
@@ -532,6 +553,9 @@ CONTAINS
                WRITE (iw, '(/,T3,A)') "Calculating virtual MOs..."
             END IF
             DO ispin = 1, nspins
+               ! the selection needs canonical SCF orbitals (e.g. not after OT)
+               CALL ensure_canonical_orbitals(qs_env, mos(ispin), ks_matrix(ispin)%matrix, ispin, &
+                                              .FALSE., do_kpoints, iw)
                ! nmo_available is the number of MOs available from the SCF calculation:
                ! this is at least the number of occupied orbitals in the SCF, plus
                ! any number of added MOs (virtuals) requested in the SCF section
@@ -553,24 +577,26 @@ CONTAINS
                CALL cp_fm_struct_release(fm_struct_tmp)
                CALL cp_fm_init_random(mo_virtual, nmo_virtual)
 
-               NULLIFY (local_preconditioner)
-
                ! compute missing virtual MOs
+               CALL virtual_orbital_preconditioner(local_preconditioner, mos(ispin), ks_matrix(ispin)%matrix, &
+                                                   s_matrix(1)%matrix, nmo_virtual, para_env, context)
                CALL ot_eigensolver(matrix_h=ks_matrix(ispin)%matrix, matrix_s=s_matrix(1)%matrix, &
                                    matrix_c_fm=mo_virtual, matrix_orthogonal_space_fm=mo_ref, &
                                    eps_gradient=scf_control%eps_lumos, &
                                    preconditioner=local_preconditioner, &
                                    iter_max=scf_control%max_iter_lumos, &
                                    size_ortho_space=nmo_available)
+               IF (ASSOCIATED(local_preconditioner)) THEN
+                  CALL destroy_preconditioner(local_preconditioner)
+                  DEALLOCATE (local_preconditioner)
+               END IF
 
                ! get the eigenvalues
                CALL calculate_subspace_eigenvalues(mo_virtual, ks_matrix(ispin)%matrix, evals_virtual)
 
-               ! we need to send the copy of MOs to preserve the sign
-               CALL cp_fm_create(fm_dummy, mo_ref%matrix_struct)
-               CALL cp_fm_to_fm(mo_ref, fm_dummy)
-               CALL calculate_subspace_eigenvalues(fm_dummy, ks_matrix(ispin)%matrix, &
-                                                   evals_arg=eigenvalues(:, ispin), do_rotation=.TRUE.)
+               ! orbital energies <i|F|i> of the SCF orbitals, which are used unchanged
+               CALL calculate_orbital_fock_elements(mo_ref, ks_matrix(ispin)%matrix, &
+                                                    eigenvalues(:, ispin), max_offdiag)
 
                ! copy inactive orbitals
                mo_set => active_space_env%mos_inactive(ispin)
@@ -580,9 +606,9 @@ CONTAINS
                   CALL cp_fm_to_fm(mo_ref, mo_target, 1, m, m)
                   mo_set%eigenvalues(m) = eigenvalues(m, ispin)
                   IF (nspins > 1) THEN
-                     mo_set%occupation_numbers(m) = 1.0
+                     mo_set%occupation_numbers(m) = 1.0_dp
                   ELSE
-                     mo_set%occupation_numbers(m) = 2.0
+                     mo_set%occupation_numbers(m) = 2.0_dp
                   END IF
                END DO
 
@@ -606,7 +632,7 @@ CONTAINS
                   IF (m > nmo_available) THEN
                      CALL cp_fm_to_fm(mo_virtual, mo_target, 1, m - nmo_available, m)
                      eigenvalues(m, ispin) = evals_virtual(m - nmo_available)
-                     mo_set%occupation_numbers(m) = 0.0
+                     mo_set%occupation_numbers(m) = 0.0_dp
                   ELSE
                      CALL cp_fm_to_fm(mo_ref, mo_target, 1, m, m)
                      mo_set%occupation_numbers(m) = mos(ispin)%occupation_numbers(m)
@@ -615,7 +641,6 @@ CONTAINS
                END DO
                ! Release
                DEALLOCATE (evals_virtual)
-               CALL cp_fm_release(fm_dummy)
                CALL cp_fm_release(mo_virtual)
             END DO
 
@@ -679,7 +704,7 @@ CONTAINS
             END DO
 
             IF (do_kpoints) THEN
-               mos => kpoints%kp_env(1)%kpoint_env%mos(1, :)
+               mos => kpoints%kp_env(1)%kpoint_env%mos(:)
             ELSE
                CALL get_qs_env(qs_env, mos=mos)
             END IF
@@ -731,6 +756,9 @@ CONTAINS
                WRITE (iw, '(/,T3,A)') "Calculating virtual MOs..."
             END IF
             DO ispin = 1, nspins
+               ! the orbital indices refer to canonical SCF orbitals (e.g. not after OT)
+               CALL ensure_canonical_orbitals(qs_env, mos(ispin), ks_matrix(ispin)%matrix, ispin, &
+                                              .TRUE., do_kpoints, iw)
                CALL get_mo_set(mos(ispin), mo_coeff=mo_ref, nmo=nmo_available)
                nmo_virtual = max_orb_ind - nmo_available
                nmo_virtual = MAX(nmo_virtual, 0)
@@ -747,24 +775,25 @@ CONTAINS
                CALL cp_fm_struct_release(fm_struct_tmp)
                CALL cp_fm_init_random(mo_virtual, nmo_virtual)
 
-               NULLIFY (local_preconditioner)
-
+               CALL virtual_orbital_preconditioner(local_preconditioner, mos(ispin), ks_matrix(ispin)%matrix, &
+                                                   s_matrix(1)%matrix, nmo_virtual, para_env, context)
                CALL ot_eigensolver(matrix_h=ks_matrix(ispin)%matrix, matrix_s=s_matrix(1)%matrix, &
                                    matrix_c_fm=mo_virtual, matrix_orthogonal_space_fm=mo_ref, &
                                    eps_gradient=scf_control%eps_lumos, &
                                    preconditioner=local_preconditioner, &
                                    iter_max=scf_control%max_iter_lumos, &
                                    size_ortho_space=nmo_available)
+               IF (ASSOCIATED(local_preconditioner)) THEN
+                  CALL destroy_preconditioner(local_preconditioner)
+                  DEALLOCATE (local_preconditioner)
+               END IF
 
                CALL calculate_subspace_eigenvalues(mo_virtual, ks_matrix(ispin)%matrix, &
                                                    evals_virtual)
 
-               ! We need to send the copy of MOs to preserve the sign
-               CALL cp_fm_create(fm_dummy, mo_ref%matrix_struct)
-               CALL cp_fm_to_fm(mo_ref, fm_dummy)
-
-               CALL calculate_subspace_eigenvalues(fm_dummy, ks_matrix(ispin)%matrix, &
-                                                   evals_arg=eigenvalues(:, ispin), do_rotation=.TRUE.)
+               ! orbital energies <i|F|i> of the SCF orbitals, which are used unchanged
+               CALL calculate_orbital_fock_elements(mo_ref, ks_matrix(ispin)%matrix, &
+                                                    eigenvalues(:, ispin), max_offdiag)
 
                mo_set_active => active_space_env%mos_active(ispin)
                CALL get_mo_set(mo_set_active, mo_coeff=fm_target_active)
@@ -779,15 +808,15 @@ CONTAINS
                      IF (i > nmo_available) THEN
                         CALL cp_fm_to_fm(mo_virtual, fm_target_active, 1, i - nmo_available, i)
                         eigenvalues(i, ispin) = evals_virtual(i - nmo_available)
-                        mo_set_active%occupation_numbers(i) = 0.0
+                        mo_set_active%occupation_numbers(i) = 0.0_dp
                      ELSE
-                        CALL cp_fm_to_fm(fm_dummy, fm_target_active, 1, i, i)
+                        CALL cp_fm_to_fm(mo_ref, fm_target_active, 1, i, i)
                         mo_set_active%occupation_numbers(i) = mos(ispin)%occupation_numbers(i)
                      END IF
                      mo_set_active%eigenvalues(i) = eigenvalues(i, ispin)
                      ! if it was not an active orbital, check whether it is an inactive orbital
-                  ELSEIF (nmo_inactive_remaining > 0) THEN
-                     CALL cp_fm_to_fm(fm_dummy, fm_target_inactive, 1, i, i)
+                  ELSE IF (nmo_inactive_remaining > 0) THEN
+                     CALL cp_fm_to_fm(mo_ref, fm_target_inactive, 1, i, i)
                      ! store on the fly the mapping of inactive orbitals
                      active_space_env%inactive_orbitals(nmo_inactive - nmo_inactive_remaining + 1, ispin) = i
                      mo_set_inactive%eigenvalues(i) = eigenvalues(i, ispin)
@@ -805,7 +834,6 @@ CONTAINS
 
                ! Release
                DEALLOCATE (evals_virtual)
-               CALL cp_fm_release(fm_dummy)
                CALL cp_fm_release(mo_virtual)
             END DO
 
@@ -819,7 +847,7 @@ CONTAINS
                      DO j = 0, jm
                         IF (ANY(active_space_env%active_orbitals(:, ispin) == i + j)) THEN
                            WRITE (iw, '(T3,F12.6,A5)', advance="no") eigenvalues(i + j, ispin), " [A]"
-                        ELSEIF (ANY(active_space_env%inactive_orbitals(:, ispin) == i + j)) THEN
+                        ELSE IF (ANY(active_space_env%inactive_orbitals(:, ispin) == i + j)) THEN
                            WRITE (iw, '(T3,F12.6,A5)', advance="no") eigenvalues(i + j, ispin), " [I]"
                         ELSE
                            WRITE (iw, '(T3,F12.6,A5)', advance="no") eigenvalues(i + j, ispin), " [V]"
@@ -850,6 +878,9 @@ CONTAINS
          CPABORT("not yet available")
          !
       END SELECT
+
+      ! Warn if the active space splits a set of degenerate orbitals
+      CALL check_active_space_degeneracy(active_space_env, mos)
 
       ! Print orbitals on Cube files
       print_orb => section_vals_get_subs_vals(as_input, "PRINT_ORBITAL_CUBES")
@@ -996,7 +1027,7 @@ CONTAINS
          IF (i == 1) THEN
             n1 = nmo
             n2 = nmo
-         ELSEIF (i == 2) THEN
+         ELSE IF (i == 2) THEN
             n1 = nmo
             n2 = nmo
          ELSE
@@ -1172,12 +1203,22 @@ CONTAINS
       END SELECT
 
       ! Output a FCIDUMP file if requested
-      IF (active_space_env%fcidump) CALL fcidump(active_space_env, as_input, dft_control%roks)
+      IF (active_space_env%fcidump) THEN
+         CALL fcidump(active_space_env, as_input, dft_control%roks, &
+                      dft_control%roks .AND. mselect == casci_canonical .AND. as_solver == no_solver)
+      END IF
+
+      ! Output the inactive and active orbitals in FCIDUMP order as a Molden file if requested
+      IF (BTEST(cp_print_key_should_output(logger%iter_info, as_input, "MOLDEN"), cp_p_file)) THEN
+         CALL write_active_space_molden(qs_env, active_space_env, as_input)
+      END IF
 
       ! Output a QCSchema file if requested
       IF (active_space_env%qcschema) THEN
          CALL qcschema_env_create(qcschema_env, qs_env)
-         CALL qcschema_to_hdf5(qcschema_env, active_space_env%qcschema_filename)
+         IF (para_env%is_source()) THEN
+            CALL qcschema_to_hdf5(qcschema_env, active_space_env%qcschema_filename)
+         END IF
          CALL qcschema_env_release(qcschema_env)
       END IF
 
@@ -1191,6 +1232,220 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE active_space_main
+
+! **************************************************************************************************
+!> \brief Makes sure that the SCF orbitals used for the orbital selection are canonical. Orbitals
+!>        of a diagonalization SCF are left unchanged; non-canonical orbitals (OT) are rotated in
+!>        place once, separately within the occupied and the virtual orbitals (determinant
+!>        unchanged), together with the DBCSR copy and the OT orbital derivatives, so that later
+!>        users of the SCF orbitals see the same orbitals. The orbitals are left untouched for
+!>        k-points and ROKS (diagonalization only) and for orbitals localized on the fly in OT
+!>        (ON_THE_FLY_LOC), where MANUAL indices refer to the localized orbitals.
+!> \param qs_env the QS environment
+!> \param mo_set the SCF orbitals of one spin
+!> \param ks_matrix Kohn-Sham or Fock matrix of that spin
+!> \param ispin spin index
+!> \param manual MANUAL orbital selection (else CANONICAL)
+!> \param do_kpoints k-point calculation
+!> \param iw output unit (> 0 on the I/O node)
+! **************************************************************************************************
+   SUBROUTINE ensure_canonical_orbitals(qs_env, mo_set, ks_matrix, ispin, manual, do_kpoints, iw)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(mo_set_type), INTENT(INOUT)                   :: mo_set
+      TYPE(dbcsr_type), POINTER                          :: ks_matrix
+      INTEGER, INTENT(IN)                                :: ispin
+      LOGICAL, INTENT(IN)                                :: manual, do_kpoints
+      INTEGER, INTENT(IN)                                :: iw
+
+      LOGICAL                                            :: on_the_fly_loc, rotated
+      REAL(KIND=dp)                                      :: eps_canonical, max_offdiag
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: energies
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mo_derivs
+      TYPE(dbcsr_type), POINTER                          :: mo_deriv
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(scf_control_type), POINTER                    :: scf_control
+      TYPE(section_vals_type), POINTER                   :: input
+
+      ! k-point SCF and ROKS use diagonalization; ROKS orbitals are canonical with respect to the
+      ! ROKS Fock matrix and not to the spin Fock matrices, so the test below does not apply
+      IF (do_kpoints) RETURN
+      NULLIFY (dft_control, input, mo_derivs, mo_deriv, scf_control)
+      CALL get_qs_env(qs_env, dft_control=dft_control, scf_control=scf_control, input=input, &
+                      mo_derivs=mo_derivs)
+      IF (dft_control%roks) RETURN
+
+      ! a converged diagonalization SCF leaves off-diagonal elements of the order of EPS_SCF
+      eps_canonical = MAX(1.0E-4_dp, 100.0_dp*scf_control%eps_scf)
+      IF (mo_set%use_mo_coeff_b) CALL copy_dbcsr_to_fm(mo_set%mo_coeff_b, mo_set%mo_coeff)
+      ALLOCATE (energies(mo_set%nmo))
+      CALL calculate_orbital_fock_elements(mo_set%mo_coeff, ks_matrix, energies, max_offdiag)
+      DEALLOCATE (energies)
+      IF (max_offdiag <= eps_canonical) THEN
+         IF (iw > 0) WRITE (iw, '(/,T3,A,I0,A,ES9.2,A)') "SCF orbitals of spin ", ispin, &
+            " are canonical (max |<i|F|j>| = ", max_offdiag, ")"
+         RETURN
+      END IF
+
+      on_the_fly_loc = .FALSE.
+      IF (scf_control%use_ot) CALL section_vals_val_get(input, "DFT%SCF%OT%ON_THE_FLY_LOC", l_val=on_the_fly_loc)
+      IF (on_the_fly_loc) THEN
+         IF (.NOT. manual) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "ORBITAL_SELECTION CANONICAL needs canonical orbitals, but the "// &
+                          "SCF orbitals are localized (ON_THE_FLY_LOC). Use ORBITAL_SELECTION MANUAL "// &
+                          "to select localized orbitals, or switch off ON_THE_FLY_LOC.")
+         END IF
+         IF (iw > 0) WRITE (iw, '(/,T3,A,I0,A)') "SCF orbitals of spin ", ispin, &
+            " are localized (ON_THE_FLY_LOC): ACTIVE_ORBITAL_INDICES refer to the localized orbitals"
+         RETURN
+      END IF
+
+      IF (ASSOCIATED(mo_derivs)) THEN
+         IF (SIZE(mo_derivs) >= ispin) mo_deriv => mo_derivs(ispin)%matrix
+      END IF
+      CALL make_mo_set_canonical(mo_set, ks_matrix, eps_canonical, rotated, max_offdiag, mo_deriv)
+      IF (iw > 0) THEN
+         WRITE (iw, '(/,T3,A,I0,A,ES9.2,A)') "SCF orbitals of spin ", ispin, &
+            " are not canonical (max |<i|F|j>| = ", max_offdiag, ")"
+         WRITE (iw, '(T3,A)') "Rotated into canonical orbitals, separately for occupied and virtual orbitals"
+      END IF
+
+   END SUBROUTINE ensure_canonical_orbitals
+
+! **************************************************************************************************
+!> \brief Preconditioner (FULL_SINGLE_INVERSE) for the OT eigensolver that computes the virtual
+!>        orbitals not available from the SCF; without it the eigensolver hardly converges.
+!> \param preconditioner the preconditioner, not associated if no virtual orbitals are needed
+!> \param mo_set the SCF orbitals of one spin
+!> \param ks_matrix Kohn-Sham or Fock matrix of that spin
+!> \param s_matrix overlap matrix
+!> \param nmo_virtual number of virtual orbitals to compute
+!> \param para_env ...
+!> \param blacs_env ...
+! **************************************************************************************************
+   SUBROUTINE virtual_orbital_preconditioner(preconditioner, mo_set, ks_matrix, s_matrix, nmo_virtual, &
+                                             para_env, blacs_env)
+      TYPE(preconditioner_type), POINTER                 :: preconditioner
+      TYPE(mo_set_type), INTENT(IN)                      :: mo_set
+      TYPE(dbcsr_type), POINTER                          :: ks_matrix, s_matrix
+      INTEGER, INTENT(IN)                                :: nmo_virtual
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+
+      NULLIFY (preconditioner)
+      IF (nmo_virtual <= 0) RETURN
+      ALLOCATE (preconditioner)
+      CALL init_preconditioner(preconditioner, para_env=para_env, blacs_env=blacs_env)
+      CALL make_preconditioner(preconditioner, precon_type=ot_precond_full_single_inverse, &
+                               solver_type=ot_precond_solver_default, matrix_h=ks_matrix, &
+                               matrix_s=s_matrix, convert_precond_to_dbcsr=.TRUE., &
+                               mo_set=mo_set, energy_gap=0.2_dp)
+
+   END SUBROUTINE virtual_orbital_preconditioner
+
+! **************************************************************************************************
+!> \brief Warns if active and non-active orbitals are degenerate, i.e. if the active space
+!>        splits a set of degenerate orbitals. The orbitals of such a set are only defined up
+!>        to rotations within the set, so the active space is not uniquely defined.
+!> \param active_space_env the active space environment
+!> \param mos the SCF orbitals with their eigenvalues
+! **************************************************************************************************
+   SUBROUTINE check_active_space_degeneracy(active_space_env, mos)
+      TYPE(active_space_type), POINTER                   :: active_space_env
+      TYPE(mo_set_type), DIMENSION(:), INTENT(IN)        :: mos
+
+      REAL(KIND=dp), PARAMETER                           :: eps_degenerate = 1.0E-5_dp
+
+      CHARACTER(LEN=200)                                 :: message
+      INTEGER                                            :: first_active, first_other, ispin, mspin, &
+                                                            nmo, npairs
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues
+
+      DO ispin = 1, SIZE(active_space_env%active_orbitals, 2)
+         mspin = MIN(ispin, SIZE(mos))
+         CALL get_mo_set(mos(mspin), nmo=nmo, eigenvalues=eigenvalues)
+         ! no orbital energies available
+         IF (.NOT. ASSOCIATED(eigenvalues)) CYCLE
+         IF (ALL(ABS(eigenvalues(1:nmo)) < EPSILON(1.0_dp))) CYCLE
+         CALL find_degenerate_splits(eigenvalues(1:nmo), active_space_env%active_orbitals(:, ispin), &
+                                     eps_degenerate, npairs, first_active, first_other)
+         IF (npairs > 0) THEN
+            WRITE (message, '(A,I0,A,I0,A,I0,A,I0,A)') &
+               "The active space splits a set of degenerate orbitals: active orbital ", first_active, &
+               " and inactive/virtual orbital ", first_other, " (spin ", ispin, ", ", npairs, &
+               " degenerate pairs in total)."
+            CPWARN(TRIM(message))
+         END IF
+      END DO
+
+   END SUBROUTINE check_active_space_degeneracy
+
+! **************************************************************************************************
+!> \brief Writes the orbitals of the active space Hamiltonian to a Molden file: the inactive
+!>        orbitals first, then the active orbitals in the order of the active orbital list,
+!>        i.e. the orbital order of the FCIDUMP file.
+!> \param qs_env the QS environment
+!> \param active_space_env the active space environment
+!> \param as_input the ACTIVE_SPACE input section
+! **************************************************************************************************
+   SUBROUTINE write_active_space_molden(qs_env, active_space_env, as_input)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(active_space_type), POINTER                   :: active_space_env
+      TYPE(section_vals_type), POINTER                   :: as_input
+
+      INTEGER                                            :: i, iorb, ispin, m, nao, nmo_active, &
+                                                            nmo_inactive, nmo_out, nspins
+      REAL(KIND=dp)                                      :: maxocc
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
+      TYPE(cp_fm_type), POINTER                          :: mo_coeff_active, mo_coeff_inactive
+      TYPE(mo_set_type), ALLOCATABLE, DIMENSION(:)       :: mos_out
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      TYPE(section_vals_type), POINTER                   :: molden_section
+
+      NULLIFY (cell, fm_struct, mo_coeff_active, mo_coeff_inactive, particle_set, qs_kind_set)
+      CALL get_qs_env(qs_env, cell=cell, particle_set=particle_set, qs_kind_set=qs_kind_set)
+      molden_section => section_vals_get_subs_vals(as_input, "MOLDEN")
+
+      nspins = SIZE(active_space_env%mos_active)
+      nmo_active = SIZE(active_space_env%active_orbitals, 1)
+      nmo_inactive = SIZE(active_space_env%inactive_orbitals, 1)
+      nmo_out = nmo_inactive + nmo_active
+      ALLOCATE (mos_out(nspins))
+      DO ispin = 1, nspins
+         CALL get_mo_set(active_space_env%mos_active(ispin), nao=nao, maxocc=maxocc, &
+                         mo_coeff=mo_coeff_active)
+         CALL get_mo_set(active_space_env%mos_inactive(ispin), mo_coeff=mo_coeff_inactive)
+         CALL allocate_mo_set(mos_out(ispin), nao, nmo_out, 0, 0.0_dp, maxocc, 0.0_dp)
+         CALL cp_fm_struct_create(fm_struct, nrow_global=nao, ncol_global=nmo_out, &
+                                  template_fmstruct=mo_coeff_active%matrix_struct)
+         CALL init_mo_set(mos_out(ispin), fm_struct=fm_struct, name="active space orbitals")
+         CALL cp_fm_struct_release(fm_struct)
+         ! the MO sets of the active space store each orbital in the column of its MO index
+         DO i = 1, nmo_inactive
+            m = active_space_env%inactive_orbitals(i, ispin)
+            CALL cp_fm_to_fm(mo_coeff_inactive, mos_out(ispin)%mo_coeff, 1, m, i)
+            mos_out(ispin)%eigenvalues(i) = active_space_env%mos_inactive(ispin)%eigenvalues(m)
+            mos_out(ispin)%occupation_numbers(i) = active_space_env%mos_inactive(ispin)%occupation_numbers(m)
+         END DO
+         DO i = 1, nmo_active
+            m = active_space_env%active_orbitals(i, ispin)
+            iorb = nmo_inactive + i
+            CALL cp_fm_to_fm(mo_coeff_active, mos_out(ispin)%mo_coeff, 1, m, iorb)
+            mos_out(ispin)%eigenvalues(iorb) = active_space_env%mos_active(ispin)%eigenvalues(m)
+            mos_out(ispin)%occupation_numbers(iorb) = active_space_env%mos_active(ispin)%occupation_numbers(m)
+         END DO
+      END DO
+
+      CALL write_mos_molden(mos_out, qs_kind_set, particle_set, molden_section, cell=cell)
+
+      DO ispin = 1, nspins
+         CALL deallocate_mo_set(mos_out(ispin))
+      END DO
+      DEALLOCATE (mos_out)
+
+   END SUBROUTINE write_active_space_molden
 
 ! **************************************************************************************************
 !> \brief computes the alpha-beta overlap within the active subspace
@@ -1451,8 +1706,9 @@ CONTAINS
       ! Check the input group
       CALL get_qs_env(qs_env, para_env=para_env, blacs_env=blacs_env)
       IF (eri_env%eri_gpw%group_size < 1) eri_env%eri_gpw%group_size = para_env%num_pe
-      IF (MOD(para_env%num_pe, eri_env%eri_gpw%group_size) /= 0) &
+      IF (MOD(para_env%num_pe, eri_env%eri_gpw%group_size) /= 0) THEN
          CPABORT("Group size must be a divisor of the total number of processes!")
+      END IF
       ! Create a new para_env or reuse the old one
       IF (eri_env%eri_gpw%group_size == para_env%num_pe) THEN
          eri_env%para_env_sub => para_env
@@ -1774,7 +2030,7 @@ CONTAINS
                      !
                      DEALLOCATE (eri, eri_index)
                   END DO
-               ELSEIF (eri_env%method == eri_method_full_gpw) THEN
+               ELSE IF (eri_env%method == eri_method_full_gpw) THEN
                   DO isp2 = isp1, nspins
                      CALL get_mo_set(mo_set=mos(isp2), nmo=nmo2)
                      nx = (nmo2*(nmo2 + 1))/2
@@ -2193,7 +2449,7 @@ CONTAINS
       CALL section_vals_val_get(input, "STRIDE", i_vals=istride)
       IF (SIZE(istride) == 1) THEN
          str(1:3) = istride(1)
-      ELSEIF (SIZE(istride) == 3) THEN
+      ELSE IF (SIZE(istride) == 3) THEN
          str(1:3) = istride(1:3)
       ELSE
          CPABORT("STRIDE arguments inconsistent")
@@ -2288,23 +2544,31 @@ CONTAINS
 !> \param active_space_env ...
 !> \param as_input ...
 !> \param restricted ...
+!> \param check_reference compare the canonical ROKS determinant with the reference energy
 !> \par History
 !>      04.2016 created [JGH]
 ! **************************************************************************************************
-   SUBROUTINE fcidump(active_space_env, as_input, restricted)
+   SUBROUTINE fcidump(active_space_env, as_input, restricted, check_reference)
 
       TYPE(active_space_type), POINTER                   :: active_space_env
       TYPE(section_vals_type), POINTER                   :: as_input
-      LOGICAL, INTENT(IN)                                :: restricted
+      LOGICAL, INTENT(IN)                                :: restricted, check_reference
+
+      CHARACTER(LEN=*), PARAMETER :: roks_warning = &
+         "ROKS FCIDUMP spin blocks differ. Check the cell size and the consistency of "// &
+         "the SCF exchange and active-space ERI operators."
+      REAL(KIND=dp), PARAMETER                           :: roks_fock_tol = 1.0E-6_dp
 
       INTEGER                                            :: i, i1, i2, i3, i4, isym, iw, m1, m2, &
                                                             ms2, nmo, norb, nspins
-      REAL(KIND=dp)                                      :: checksum, esub
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: fmat
+      REAL(KIND=dp)                                      :: checksum, esub, spin_difference
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: fmat, fock_diff, pmat
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(eri_fcidump_checksum)                         :: eri_checksum
+      TYPE(eri_fcidump_print)                            :: writer
 
       checksum = 0.0_dp
+      spin_difference = 0.0_dp
 
       logger => cp_get_default_logger()
       iw = cp_print_key_unit_nr(logger, as_input, "FCIDUMP", &
@@ -2328,8 +2592,13 @@ CONTAINS
             END IF
             !
             ! Print integrals: ERI
+            writer = eri_fcidump_print(iw, 1, 1)
+            IF (check_reference) THEN
+               writer%nalpha = (nelec + ms2)/2
+               writer%nbeta = (nelec - ms2)/2
+            END IF
             CALL active_space_env%eri%eri_foreach(1, active_space_env%active_orbitals, &
-                                                  eri_fcidump_print(iw, 1, 1), 1, 1)
+                                                  writer, 1, 1)
             CALL eri_checksum%set(1, 1)
             CALL active_space_env%eri%eri_foreach(1, active_space_env%active_orbitals, eri_checksum, 1, 1)
 
@@ -2338,10 +2607,28 @@ CONTAINS
             nmo = active_space_env%eri%norb
             ALLOCATE (fmat(nmo, nmo))
             CALL replicate_and_symmetrize_matrix(nmo, active_space_env%fock_sub(1), fmat)
+            esub = active_space_env%energy_inactive
+            IF (restricted) THEN
+               ALLOCATE (fock_diff(nmo, nmo), pmat(nmo, nmo))
+               CALL replicate_and_symmetrize_matrix(nmo, active_space_env%fock_sub(2), fock_diff)
+               fock_diff(:, :) = fmat - fock_diff
+               ASSOCIATE (active => active_space_env%active_orbitals(:, 1))
+                  spin_difference = MAXVAL(ABS(fock_diff(active, active)))
+               END ASSOCIATE
+               ! Use one spin-independent operator and preserve the energy at the embedding density.
+               fmat(:, :) = fmat - 0.5_dp*fock_diff
+               CALL replicate_and_symmetrize_matrix(nmo, active_space_env%p_active(1), pmat)
+               esub = esub + 0.5_dp*SUM(fock_diff*pmat)
+               CALL replicate_and_symmetrize_matrix(nmo, active_space_env%p_active(2), pmat)
+               esub = esub - 0.5_dp*SUM(fock_diff*pmat)
+               DEALLOCATE (fock_diff, pmat)
+            END IF
             IF (iw > 0) THEN
                i3 = 0; i4 = 0
                DO m1 = 1, SIZE(active_space_env%active_orbitals, 1)
                   i1 = active_space_env%active_orbitals(m1, 1)
+                  IF (m1 <= writer%nalpha) writer%determinant_energy = writer%determinant_energy + fmat(i1, i1)
+                  IF (m1 <= writer%nbeta) writer%determinant_energy = writer%determinant_energy + fmat(i1, i1)
                   DO m2 = m1, SIZE(active_space_env%active_orbitals, 1)
                      i2 = active_space_env%active_orbitals(m2, 1)
                      checksum = checksum + ABS(fmat(i1, i2))
@@ -2351,7 +2638,6 @@ CONTAINS
             END IF
             DEALLOCATE (fmat)
             ! Print energy
-            esub = active_space_env%energy_inactive
             i1 = 0; i2 = 0; i3 = 0; i4 = 0
             checksum = checksum + ABS(esub)
             IF (iw > 0) WRITE (iw, "(ES23.16,4I4)") esub, i1, i2, i3, i4
@@ -2431,6 +2717,17 @@ CONTAINS
       !>>
       iw = cp_logger_get_default_io_unit(logger)
       IF (iw > 0) WRITE (iw, '(T4,A,T66,F12.8)') "FCIDUMP| Checksum:", eri_checksum%checksum + checksum
+      IF (restricted) THEN
+         IF (check_reference .AND. writer%unit_nr > 0 .AND. iw > 0) THEN
+            WRITE (iw, '(T4,A,1X,ES23.16)') "FCIDUMP| Reference determinant energy offset [hartree]:", &
+               writer%determinant_energy + esub - active_space_env%energy_ref
+         END IF
+         IF (iw > 0) WRITE (iw, '(T4,A,1X,ES12.5)') &
+            "FCIDUMP| Max. ROKS spin-block difference [hartree]:", spin_difference
+         IF (spin_difference > roks_fock_tol) THEN
+            CPWARN(roks_warning)
+         END IF
+      END IF
       !<<
 
    END SUBROUTINE fcidump
@@ -2551,17 +2848,21 @@ CONTAINS
             ! In the restricted case, we use the same ERIs for each spin channel
             eri_aa => active_space_env%eri%eri(1)%csr_mat
             CALL build_subspace_spin_fock_matrix(active_space_env%active_orbitals, eri_aa, eri_aa, p_a_mat, p_b_mat, ks_a_ref, &
-                                                 tr_mixed_eri=.FALSE., comm_exchange=active_space_env%eri%comm_exchange)
+                                                 tr_mixed_eri=.FALSE., comm_exchange=active_space_env%eri%comm_exchange, &
+                                                 restricted=restricted)
             CALL build_subspace_spin_fock_matrix(active_space_env%active_orbitals, eri_aa, eri_aa, p_b_mat, p_a_mat, ks_b_ref, &
-                                                 tr_mixed_eri=.TRUE., comm_exchange=active_space_env%eri%comm_exchange)
+                                                 tr_mixed_eri=.TRUE., comm_exchange=active_space_env%eri%comm_exchange, &
+                                                 restricted=restricted)
          ELSE
             eri_aa => active_space_env%eri%eri(1)%csr_mat
             eri_ab => active_space_env%eri%eri(2)%csr_mat
             eri_bb => active_space_env%eri%eri(3)%csr_mat
             CALL build_subspace_spin_fock_matrix(active_space_env%active_orbitals, eri_aa, eri_ab, p_a_mat, p_b_mat, ks_a_ref, &
-                                                 tr_mixed_eri=.FALSE., comm_exchange=active_space_env%eri%comm_exchange)
+                                                 tr_mixed_eri=.FALSE., comm_exchange=active_space_env%eri%comm_exchange, &
+                                                 restricted=restricted)
             CALL build_subspace_spin_fock_matrix(active_space_env%active_orbitals, eri_bb, eri_ab, p_b_mat, p_a_mat, ks_b_ref, &
-                                                 tr_mixed_eri=.TRUE., comm_exchange=active_space_env%eri%comm_exchange)
+                                                 tr_mixed_eri=.TRUE., comm_exchange=active_space_env%eri%comm_exchange, &
+                                                 restricted=restricted)
          END IF
          !
          ! calculate energy
@@ -2665,6 +2966,19 @@ CONTAINS
                   IF (i1 /= i2 .AND. i3 /= i4) THEN
                      ks_ref(i2, i4) = ks_ref(i2, i4) + erint*p_mat(i1, i3)
                   END IF
+                  ! The stored integral represents both orders of unequal orbital pairs.
+                  IF (i12 /= i34) THEN
+                     ks_ref(i3, i1) = ks_ref(i3, i1) + erint*p_mat(i4, i2)
+                     IF (i1 /= i2) THEN
+                        ks_ref(i3, i2) = ks_ref(i3, i2) + erint*p_mat(i4, i1)
+                     END IF
+                     IF (i3 /= i4) THEN
+                        ks_ref(i4, i1) = ks_ref(i4, i1) + erint*p_mat(i3, i2)
+                     END IF
+                     IF (i1 /= i2 .AND. i3 /= i4) THEN
+                        ks_ref(i4, i2) = ks_ref(i4, i2) + erint*p_mat(i3, i1)
+                     END IF
+                  END IF
                END DO
             END IF
          END DO
@@ -2693,22 +3007,24 @@ CONTAINS
 !> \param ks_a_ref fockian matrix for up-spin
 !> \param tr_mixed_eri boolean to indicate Coulomb interaction alignment
 !> \param comm_exchange ...
+!> \param restricted use the common, eightfold-symmetric ERIs for both spin densities
 ! **************************************************************************************************
    SUBROUTINE build_subspace_spin_fock_matrix(active_orbitals, eri_aa, eri_ab, p_a_mat, p_b_mat, ks_a_ref, tr_mixed_eri, &
-                                              comm_exchange)
+                                              comm_exchange, restricted)
       INTEGER, DIMENSION(:, :), INTENT(IN)               :: active_orbitals
       TYPE(dbcsr_csr_type), INTENT(IN)                   :: eri_aa, eri_ab
       REAL(dp), DIMENSION(:, :), INTENT(IN)              :: p_a_mat, p_b_mat
       REAL(dp), DIMENSION(:, :), INTENT(INOUT)           :: ks_a_ref
       LOGICAL, INTENT(IN)                                :: tr_mixed_eri
       TYPE(mp_comm_type), INTENT(IN)                     :: comm_exchange
+      LOGICAL, INTENT(IN)                                :: restricted
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_subspace_spin_fock_matrix'
 
       INTEGER                                            :: handle, i1, i12, i12l, i2, i3, i34, &
                                                             i34l, i4, irptr, m1, m2, nindex, &
                                                             nmo_total, norb, spin1, spin2
-      REAL(dp)                                           :: erint
+      REAL(dp)                                           :: erint, p12, p34
       TYPE(mp_comm_type)                                 :: mp_group
 
       CALL timeset(routineN, handle)
@@ -2736,11 +3052,19 @@ CONTAINS
                   CALL csr_idx_from_combined(i34, nmo_total, i3, i4)
                   erint = eri_aa%nzval_local%r_dp(irptr + i34l)
                   ! Coulomb
+                  p12 = p_a_mat(i1, i2)
+                  p34 = p_a_mat(i3, i4)
+                  IF (restricted) THEN
+                     p12 = p12 + p_b_mat(i1, i2)
+                     p34 = p34 + p_b_mat(i3, i4)
+                  END IF
+                  IF (i1 /= i2) p12 = 2.0_dp*p12
+                  IF (i3 /= i4) p34 = 2.0_dp*p34
                   !F_ij += (ij|kl)*d_kl
-                  ks_a_ref(i1, i2) = ks_a_ref(i1, i2) + erint*p_a_mat(i3, i4)
+                  ks_a_ref(i1, i2) = ks_a_ref(i1, i2) + erint*p34
                   IF (i12 /= i34) THEN
                      !F_kl += (ij|kl)*d_ij
-                     ks_a_ref(i3, i4) = ks_a_ref(i3, i4) + erint*p_a_mat(i1, i2)
+                     ks_a_ref(i3, i4) = ks_a_ref(i3, i4) + erint*p12
                   END IF
                   ! Exchange
                   erint = -1.0_dp*erint
@@ -2758,36 +3082,53 @@ CONTAINS
                      !F_jl -= (ij|kl)*d_ik
                      ks_a_ref(i2, i4) = ks_a_ref(i2, i4) + erint*p_a_mat(i1, i3)
                   END IF
+                  IF (i12 /= i34) THEN
+                     ks_a_ref(i3, i1) = ks_a_ref(i3, i1) + erint*p_a_mat(i4, i2)
+                     IF (i1 /= i2) THEN
+                        ks_a_ref(i3, i2) = ks_a_ref(i3, i2) + erint*p_a_mat(i4, i1)
+                     END IF
+                     IF (i3 /= i4) THEN
+                        ks_a_ref(i4, i1) = ks_a_ref(i4, i1) + erint*p_a_mat(i3, i2)
+                     END IF
+                     IF (i1 /= i2 .AND. i3 /= i4) THEN
+                        ks_a_ref(i4, i2) = ks_a_ref(i4, i2) + erint*p_a_mat(i3, i1)
+                     END IF
+                  END IF
                END DO
             END IF
          END DO
       END DO
       !
 
-      DO m1 = 1, norb
-         i1 = active_orbitals(m1, 1)
-         DO m2 = m1, norb
-            i2 = active_orbitals(m2, 1)
-            i12 = csr_idx_to_combined(i1, i2, nmo_total)
-            IF (MOD(i12 - 1, comm_exchange%num_pe) == comm_exchange%mepos) THEN
-               i12l = (i12 - 1)/comm_exchange%num_pe + 1
-               irptr = eri_ab%rowptr_local(i12l) - 1
-               DO i34l = 1, eri_ab%nzerow_local(i12l)
-                  i34 = eri_ab%colind_local(irptr + i34l)
-                  CALL csr_idx_from_combined(i34, nmo_total, i3, i4)
-                  erint = eri_ab%nzval_local%r_dp(irptr + i34l)
-                  ! Coulomb
-                  IF (tr_mixed_eri) THEN
-                     !F_kl += (kl beta|ij alpha )*d_alpha_ij
-                     ks_a_ref(i3, i4) = ks_a_ref(i3, i4) + erint*p_b_mat(i1, i2)
-                  ELSE
-                     !F_ij += (ij alpha|kl beta )*d_beta_kl
-                     ks_a_ref(i1, i2) = ks_a_ref(i1, i2) + erint*p_b_mat(i3, i4)
-                  END IF
-               END DO
-            END IF
+      ! Shared-orbital Coulomb contributions from both spins were included above.
+      IF (.NOT. restricted) THEN
+         DO m1 = 1, norb
+            i1 = active_orbitals(m1, 1)
+            DO m2 = m1, norb
+               i2 = active_orbitals(m2, 1)
+               i12 = csr_idx_to_combined(i1, i2, nmo_total)
+               IF (MOD(i12 - 1, comm_exchange%num_pe) == comm_exchange%mepos) THEN
+                  i12l = (i12 - 1)/comm_exchange%num_pe + 1
+                  irptr = eri_ab%rowptr_local(i12l) - 1
+                  DO i34l = 1, eri_ab%nzerow_local(i12l)
+                     i34 = eri_ab%colind_local(irptr + i34l)
+                     CALL csr_idx_from_combined(i34, nmo_total, i3, i4)
+                     erint = eri_ab%nzval_local%r_dp(irptr + i34l)
+                     ! Coulomb
+                     IF (tr_mixed_eri) THEN
+                        !F_kl += (kl beta|ij alpha )*d_alpha_ij
+                        ks_a_ref(i3, i4) = ks_a_ref(i3, i4) + erint*p_b_mat(i1, i2)
+                        IF (i1 /= i2) ks_a_ref(i3, i4) = ks_a_ref(i3, i4) + erint*p_b_mat(i1, i2)
+                     ELSE
+                        !F_ij += (ij alpha|kl beta )*d_beta_kl
+                        ks_a_ref(i1, i2) = ks_a_ref(i1, i2) + erint*p_b_mat(i3, i4)
+                        IF (i3 /= i4) ks_a_ref(i1, i2) = ks_a_ref(i1, i2) + erint*p_b_mat(i3, i4)
+                     END IF
+                  END DO
+               END IF
+            END DO
          END DO
-      END DO
+      END IF
       !
       DO m1 = 1, norb
          i1 = active_orbitals(m1, spin1)
@@ -2932,6 +3273,19 @@ CONTAINS
       IF (this%unit_nr > 0) THEN
          WRITE (this%unit_nr, "(ES23.16,4I4)") val, i + this%bra_start - 1, j + this%bra_start - 1, &
               &                                     k + this%ket_start - 1, l + this%ket_start - 1
+         ! Each spatial integral is emitted once per permutation class.
+         IF (MAX(i, j, k, l) <= this%nalpha) THEN
+            IF (i == j .AND. k == l) THEN
+               IF (i == k) THEN
+                  IF (i <= this%nbeta) this%determinant_energy = this%determinant_energy + val
+               ELSE
+                  this%determinant_energy = this%determinant_energy + &
+                                            MERGE(2, 1, i <= this%nbeta)*MERGE(2, 1, k <= this%nbeta)*val
+               END IF
+            ELSE IF (i == k .AND. j == l) THEN
+               this%determinant_energy = this%determinant_energy - MERGE(2, 1, MAX(i, j) <= this%nbeta)*val
+            END IF
+         END IF
       END IF
 
       cont = .TRUE.
@@ -3065,7 +3419,7 @@ CONTAINS
       CALL section_vals_val_get(as_input, "MAX_ITER", i_val=max_iter)
       IF (max_iter < 0) CPABORT("Specify a non-negative number of max iterations.")
       CALL section_vals_val_get(as_input, "EPS_ITER", r_val=eps_iter)
-      IF (eps_iter < 0.0) CPABORT("Specify a non-negative convergence threshold.")
+      IF (eps_iter < 0.0_dp) CPABORT("Specify a non-negative convergence threshold.")
 
       CALL get_qs_env(qs_env, rho=rho, energy=energy, ks_env=ks_env)
       CALL qs_rho_get(rho, rho_ao=rho_ao)
@@ -3136,7 +3490,7 @@ CONTAINS
             END IF
             converged = .TRUE.
             EXIT
-         ELSEIF (ABS(delta_E) <= eps_iter) THEN
+         ELSE IF (ABS(delta_E) <= eps_iter) THEN
             IF (iw > 0) THEN
                WRITE (UNIT=iw, FMT="(/,T3,A,I5,A)") &
                   "*** rs-DFT embedding run converged in ", iter, " iteration(s) ***"
@@ -3225,7 +3579,7 @@ CONTAINS
       CALL section_vals_val_get(as_input, "MAX_ITER", i_val=max_iter)
       IF (max_iter < 0) CPABORT("Specify a non-negative number of max iterations.")
       CALL section_vals_val_get(as_input, "EPS_ITER", r_val=eps_iter)
-      IF (eps_iter < 0.0) CPABORT("Specify a non-negative convergence threshold.")
+      IF (eps_iter < 0.0_dp) CPABORT("Specify a non-negative convergence threshold.")
 
       ! create the socket and wait for the client to connect
       CALL initialize_socket(socket_fd, client_fd, as_input, ionode)
@@ -3250,7 +3604,7 @@ CONTAINS
          WRITE (UNIT=iw, FMT="(/,T3,A,T11,A,T21,A,T34,A,T55,A,T75,A,/,T3,A)") &
             "Iter", "Update", "Time", "Corr. energy", "Total energy", "Change", REPEAT("-", 78)
       END IF
-      ! CALL cp_add_iter_level(logger%iter_info, "QS_SCF")
+      ! TODO: consider using an iteration level
 
       iter = 0
       converged = .FALSE.
@@ -3318,7 +3672,7 @@ CONTAINS
             converged = .TRUE.
             EXIT
             ! check for convergence
-         ELSEIF (ABS(delta_E) <= eps_iter) THEN
+         ELSE IF (ABS(delta_E) <= eps_iter) THEN
             IF (iw > 0) THEN
                WRITE (UNIT=iw, FMT="(/,T3,A,I5,A)") &
                   "*** rs-DFT embedding run converged in ", iter, " iteration(s) ***"

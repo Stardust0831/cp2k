@@ -30,12 +30,22 @@ MODULE transport
    USE bibliography,                    ONLY: Bruck2014,&
                                               cite_reference
    USE cp_control_types,                ONLY: dft_control_type
-   USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_convert_csr_to_dbcsr, dbcsr_convert_dbcsr_to_csr, dbcsr_copy, dbcsr_create, &
-        dbcsr_csr_create, dbcsr_csr_create_from_dbcsr, dbcsr_csr_dbcsr_blkrow_dist, &
-        dbcsr_csr_print_sparsity, dbcsr_csr_type, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
-        dbcsr_has_symmetry, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
+   USE cp_dbcsr_api,                    ONLY: dbcsr_copy,&
+                                              dbcsr_create,&
+                                              dbcsr_deallocate_matrix,&
+                                              dbcsr_desymmetrize,&
+                                              dbcsr_has_symmetry,&
+                                              dbcsr_set,&
+                                              dbcsr_type,&
+                                              dbcsr_type_no_symmetry
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_to_csr_screening
+   USE cp_dbcsr_csr,                    ONLY: dbcsr_convert_csr_to_dbcsr,&
+                                              dbcsr_convert_dbcsr_to_csr,&
+                                              dbcsr_csr_create,&
+                                              dbcsr_csr_create_from_dbcsr,&
+                                              dbcsr_csr_dbcsr_blkrow_dist,&
+                                              dbcsr_csr_print_sparsity,&
+                                              dbcsr_csr_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_unit_nr,&
                                               cp_logger_type
@@ -381,10 +391,11 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       CALL C_F_PROCPOINTER(transport_env%ext_c_method_ptr, c_method)
-      IF (.NOT. C_ASSOCIATED(transport_env%ext_c_method_ptr)) &
+      IF (.NOT. C_ASSOCIATED(transport_env%ext_c_method_ptr)) THEN
          CALL cp_abort(__LOCATION__, &
                        "MISSING C/C++ ROUTINE: The TRANSPORT section is meant to be used together with an external "// &
                        "program, e.g. the quantum transport code OMEN, that provides CP2K with a density matrix.")
+      END IF
 
       transport_env%params%n_occ = nelectron_spin
       transport_env%params%n_atoms = natoms

@@ -8,6 +8,7 @@
 ! **************************************************************************************************
 !> \brief  Methods dealing with Neural Network potentials
 !> \author Christoph Schran (christoph.schran@rub.de)
+!> \author Dhruv Sharma (ds2173@cam.ac.uk)
 !> \date   2020-10-10
 ! **************************************************************************************************
 MODULE nnp_environment
@@ -33,11 +34,17 @@ MODULE nnp_environment
    USE distribution_1d_types,           ONLY: distribution_1d_release,&
                                               distribution_1d_type
    USE distribution_methods,            ONLY: distribute_molecules_1d
+   USE input_constants,                 ONLY: nnp_gpu_prec_double,&
+                                              nnp_gpu_prec_mixed,&
+                                              nnp_use_gpu_auto,&
+                                              nnp_use_gpu_off,&
+                                              nnp_use_gpu_on
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
    USE kinds,                           ONLY: default_path_length,&
+                                              default_string_length,&
                                               dp
    USE message_passing,                 ONLY: mp_para_env_type
    USE molecule_kind_types,             ONLY: molecule_kind_type,&
@@ -51,6 +58,11 @@ MODULE nnp_environment
         nnp_actfnct_cos, nnp_actfnct_exp, nnp_actfnct_gaus, nnp_actfnct_invsig, nnp_actfnct_lin, &
         nnp_actfnct_quad, nnp_actfnct_sig, nnp_actfnct_softplus, nnp_actfnct_tanh, nnp_env_set, &
         nnp_type
+   USE nnp_gpu,                         ONLY: nnp_gpu_available,&
+                                              nnp_gpu_init_device,&
+                                              nnp_gpu_model_capacity_ok,&
+                                              nnp_gpu_upload_descriptor_statics,&
+                                              nnp_gpu_upload_network
    USE nnp_model,                       ONLY: nnp_write_arc
    USE particle_methods,                ONLY: write_fist_particle_coordinates,&
                                               write_particle_distances,&
@@ -63,7 +75,7 @@ MODULE nnp_environment
 
    PRIVATE
 
-   LOGICAL, PARAMETER, PRIVATE :: debug_this_module = .TRUE.
+   LOGICAL, PARAMETER, PRIVATE :: debug_this_module = .FALSE.
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'nnp_environment'
 
    PUBLIC :: nnp_init
@@ -223,28 +235,32 @@ CONTAINS
 !> \brief Initialize the Neural Network Potential
 !> \param nnp_env ...
 !> \param printtag ...
+!> \param gpu_capable .FALSE. for callers whose force evaluation has no device
+!>                    path, such as the path-integral helium-solute coupling.
+!>                    The GPU keywords are then not consulted at all and the
+!>                    environment stays on the CPU, so it can neither claim the
+!>                    per-process device nor make a &FORCE_EVAL NNP lose it.
+!>                    Defaults to .TRUE.
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_init_model(nnp_env, printtag)
+   SUBROUTINE nnp_init_model(nnp_env, printtag, gpu_capable)
       TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp_env
       CHARACTER(LEN=*), INTENT(IN)                       :: printtag
+      LOGICAL, INTENT(IN), OPTIONAL                      :: gpu_capable
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_init_model'
-      INTEGER, PARAMETER                                 :: def_str_len = 256, &
-                                                            default_path_length = 256
+      INTEGER, PARAMETER                                 :: def_str_len = 256
 
       CHARACTER(len=1), ALLOCATABLE, DIMENSION(:)        :: cactfnct
       CHARACTER(len=2)                                   :: ele
       CHARACTER(len=def_str_len)                         :: dummy, line
-      CHARACTER(len=default_path_length)                 :: base_name, file_name
-      INTEGER                                            :: handle, i, i_com, io, iweight, j, k, l, &
-                                                            n_weight, nele, nuc_ele, symfnct_type, &
-                                                            unit_nr
-      LOGICAL                                            :: at_end, atom_e_found, explicit, first, &
-                                                            found
+      CHARACTER(len=default_path_length)                 :: file_name
+      INTEGER                                            :: handle, i, io, j, k, nele, nuc_ele, &
+                                                            symfnct_type, unit_nr
+      LOGICAL                                            :: atom_e_found, explicit, first, found, &
+                                                            my_gpu_capable
       REAL(KIND=dp)                                      :: energy
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: weights
       REAL(KIND=dp), DIMENSION(7)                        :: test_array
       REAL(KIND=dp), DIMENSION(:), POINTER               :: work
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -257,8 +273,8 @@ CONTAINS
 
       logger => cp_get_default_logger()
 
-      IF (logger%para_env%is_source()) THEN
-         unit_nr = cp_logger_get_default_unit_nr(logger)
+      unit_nr = cp_logger_get_default_unit_nr(logger)
+      IF (unit_nr > 0) THEN
          WRITE (unit_nr, *) ""
          WRITE (unit_nr, *) TRIM(printtag)//"| Neural Network Potential Force Environment"
       END IF
@@ -272,6 +288,15 @@ CONTAINS
       ALLOCATE (nnp_env%committee_stress(3, 3, nnp_env%n_committee))
 
       CALL section_vals_val_get(nnp_env%nnp_input, "NNP_INPUT_FILE_NAME", c_val=file_name)
+      CALL section_vals_val_get(nnp_env%nnp_input, "RAD_SPLINE_N", i_val=nnp_env%rad_spline_n)
+      IF (nnp_env%rad_spline_n < 2) THEN
+         CPABORT("NNP| RAD_SPLINE_N must be >= 2.")
+      END IF
+      CALL section_vals_val_get(nnp_env%nnp_input, "VERLET_SKIN", r_val=nnp_env%verlet_skin)
+
+      my_gpu_capable = .TRUE.
+      IF (PRESENT(gpu_capable)) my_gpu_capable = gpu_capable
+
       CALL parser_create(parser, file_name, para_env=logger%para_env)
 
       ! read number of elements and cut_type and check for scale and center
@@ -284,8 +309,7 @@ CONTAINS
       nnp_env%normnodes = .FALSE.
       nnp_env%n_hlayer = 0
 
-      IF (logger%para_env%is_source()) THEN
-         unit_nr = cp_logger_get_default_unit_nr(logger)
+      IF (unit_nr > 0) THEN
          WRITE (unit_nr, *) TRIM(printtag)//"| Reading NNP input from file: ", TRIM(file_name)
       END IF
 
@@ -306,10 +330,12 @@ CONTAINS
                                 search_from_begin_of_file=.TRUE.)
       nnp_env%scale_acsf = found
 
-      ! Test if there are two keywords of this:
+      ! parser_search_string matches substrings, so a search for
+      ! "scale_symmetry_functions" also fires on "..._sigma". Re-search from the
+      ! current parser position to confirm the bare keyword appears on its own line.
       CALL parser_search_string(parser, "scale_symmetry_functions", .TRUE., found)
       IF (found .AND. nnp_env%scale_sigma_acsf) THEN
-         CPWARN('Two scaling keywords in the input, we will ignore sigma scaling in this case')
+         CPWARN("Ignoring sigma ACSF scaling; both keywords were set.")
          nnp_env%scale_sigma_acsf = .FALSE.
       ELSE IF (.NOT. found .AND. nnp_env%scale_sigma_acsf) THEN
          nnp_env%scale_acsf = .FALSE.
@@ -634,7 +660,7 @@ CONTAINS
 
       ! read scaling information from file
       IF (nnp_env%scale_acsf .OR. nnp_env%center_acsf .OR. nnp_env%scale_sigma_acsf) THEN
-         IF (logger%para_env%is_source()) THEN
+         IF (unit_nr > 0) THEN
             WRITE (unit_nr, *) TRIM(printtag)//"| Reading scaling information from file: ", TRIM(file_name)
          END IF
          CALL section_vals_val_get(nnp_env%nnp_input, "SCALE_FILE_NAME", &
@@ -689,11 +715,59 @@ CONTAINS
             END DO
          END DO
          CALL parser_release(parser)
+
+         ! Reject degenerate scaling.data at load time. The (loc_max - loc_min)
+         ! and sigma denominators are used unguarded inside nnp_scale_acsf;
+         ! a zero range or zero sigma there produces silent NaN forces.
+         IF (nnp_env%scale_acsf) THEN
+            DO i = 1, nnp_env%n_ele
+               DO j = 1, nnp_env%n_rad(i)
+                  IF (nnp_env%rad(i)%loc_max(j) <= nnp_env%rad(i)%loc_min(j)) THEN
+                     WRITE (line, '(A,I0,A,I0,A,2(1X,ES13.6))') &
+                        "scaling.data: radial sf range non-positive for element ", i, &
+                        " sf ", j, " (loc_min, loc_max) =", &
+                        nnp_env%rad(i)%loc_min(j), nnp_env%rad(i)%loc_max(j)
+                     CPABORT(TRIM(line))
+                  END IF
+               END DO
+               DO j = 1, nnp_env%n_ang(i)
+                  IF (nnp_env%ang(i)%loc_max(j) <= nnp_env%ang(i)%loc_min(j)) THEN
+                     WRITE (line, '(A,I0,A,I0,A,2(1X,ES13.6))') &
+                        "scaling.data: angular sf range non-positive for element ", i, &
+                        " sf ", j, " (loc_min, loc_max) =", &
+                        nnp_env%ang(i)%loc_min(j), nnp_env%ang(i)%loc_max(j)
+                     CPABORT(TRIM(line))
+                  END IF
+               END DO
+            END DO
+         END IF
+         IF (nnp_env%scale_sigma_acsf) THEN
+            DO i = 1, nnp_env%n_ele
+               DO j = 1, nnp_env%n_rad(i)
+                  IF (nnp_env%rad(i)%sigma(j) <= 0.0_dp) THEN
+                     WRITE (line, '(A,I0,A,I0,A,1X,ES13.6)') &
+                        "scaling.data: radial sf sigma non-positive for element ", i, &
+                        " sf ", j, " sigma =", nnp_env%rad(i)%sigma(j)
+                     CPABORT(TRIM(line))
+                  END IF
+               END DO
+               DO j = 1, nnp_env%n_ang(i)
+                  IF (nnp_env%ang(i)%sigma(j) <= 0.0_dp) THEN
+                     WRITE (line, '(A,I0,A,I0,A,1X,ES13.6)') &
+                        "scaling.data: angular sf sigma non-positive for element ", i, &
+                        " sf ", j, " sigma =", nnp_env%ang(i)%sigma(j)
+                     CPABORT(TRIM(line))
+                  END IF
+               END DO
+            END DO
+         END IF
       END IF
 
       CALL nnp_init_acsf_groups(nnp_env)
 
-      ! read weights from file
+      ! Allocate per-layer weight tables, then load each committee member
+      ! from disk. Allocation lives at the call site because n_committee /
+      ! n_layer / n_nodes are owned here; the loader only fills them.
       DO i = 1, nnp_env%n_ele
          DO j = 2, nnp_env%n_layer
             ALLOCATE (nnp_env%arc(i)%layer(j)%weights(nnp_env%arc(i)%n_nodes(j - 1), &
@@ -701,14 +775,238 @@ CONTAINS
             ALLOCATE (nnp_env%arc(i)%layer(j)%bweights(nnp_env%arc(i)%n_nodes(j), nnp_env%n_committee))
          END DO
       END DO
+      CALL nnp_read_committee_weights(nnp_env, model_section, printtag)
+
+      ! Resolve USE_GPU only now that the model definition is fully read: the
+      ! resolution sizes the model against the compiled-in device-table
+      ! capacities, which needs the group tables populated above.
+      IF (my_gpu_capable) THEN
+         CALL nnp_resolve_gpu(nnp_env, printtag, unit_nr, logger)
+      ELSE
+         ! This caller has no device force path, and its section carries no GPU
+         ! keywords to read.
+         nnp_env%use_gpu = nnp_use_gpu_off
+         nnp_env%gpu_precision = nnp_gpu_prec_double
+      END IF
+
+      ! Upload the model-static descriptor tables (per-element scaling
+      ! parameters and per-(group, element) symmetry-function maps) to the
+      ! device once the model definition is fully read; the per-step descriptor
+      ! kernels read them from device memory.
+      IF (nnp_env%use_gpu == nnp_use_gpu_on) THEN
+         CALL nnp_gpu_upload_descriptor_statics(nnp_env)
+         CALL nnp_gpu_upload_network(nnp_env)
+      END IF
+
+      nnp_env%expol = 0
+
+      ! Bias the standard deviation of committee disagreement
+      NULLIFY (bias_section)
+      explicit = .FALSE.
+      !HELIUM NNP does not currently define a bias term
+      bias_section => section_vals_get_subs_vals(nnp_env%nnp_input, "BIAS", can_return_null=.TRUE.)
+      IF (ASSOCIATED(bias_section)) CALL section_vals_get(bias_section, explicit=explicit)
+      nnp_env%bias = .FALSE.
+      IF (explicit) THEN
+         IF (nnp_env%n_committee > 1) THEN
+            IF (unit_nr > 0) THEN
+               WRITE (unit_nr, *) "NNP| Biasing of committee disagreement enabled"
+            END IF
+            nnp_env%bias = .TRUE.
+            ALLOCATE (nnp_env%bias_forces(3, nnp_env%num_atoms))
+            ALLOCATE (nnp_env%bias_e_avrg(nnp_env%n_committee))
+            CALL section_vals_val_get(bias_section, "SIGMA_0", r_val=nnp_env%bias_sigma0)
+            CALL section_vals_val_get(bias_section, "K_B", r_val=nnp_env%bias_kb)
+            nnp_env%bias_e_avrg(:) = 0.0_dp
+            CALL section_vals_val_get(bias_section, "ALIGN_NNP_ENERGIES", explicit=explicit)
+            nnp_env%bias_align = explicit
+            IF (explicit) THEN
+               NULLIFY (work)
+               CALL section_vals_val_get(bias_section, "ALIGN_NNP_ENERGIES", r_vals=work)
+               IF (SIZE(work) /= nnp_env%n_committee) THEN
+                  CPABORT("ALIGN_NNP_ENERGIES size mismatch wrt committee size.")
+               END IF
+               nnp_env%bias_e_avrg(:) = work
+               IF (unit_nr > 0) THEN
+                  WRITE (unit_nr, *) TRIM(printtag)//"| Biasing is aligned by shifting the energy prediction of the C-NNP members"
+               END IF
+            END IF
+         ELSE
+            CPWARN("NNP committee size is 1, BIAS section is ignored.")
+         END IF
+      END IF
+
+      IF (unit_nr > 0) THEN
+         WRITE (unit_nr, *) TRIM(printtag)//"| NNP force environment initialized"
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE nnp_init_model
+
+! **************************************************************************************************
+!> \brief Resolve &NNP / USE_GPU and GPU_PRECISION once, before any force code
+!>        runs, and claim the device when the GPU path is selected.
+!>
+!> AUTO probes for an offload device and otherwise falls back to the CPU path;
+!> builds without NNP GPU support always report no device. The resolved value is
+!> either nnp_use_gpu_on or nnp_use_gpu_off, so the force evaluation never has
+!> to interpret AUTO.
+!>
+!> \param nnp_env  NNP environment; use_gpu and gpu_precision are set here.
+!> \param printtag Log-line prefix.
+!> \param unit_nr  Output unit, or a non-positive value when there is none.
+!> \param logger   Default logger, for its parallel environment.
+!> \author Dhruv Sharma (ds2173@cam.ac.uk)
+! **************************************************************************************************
+   SUBROUTINE nnp_resolve_gpu(nnp_env, printtag, unit_nr, logger)
+      TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp_env
+      CHARACTER(LEN=*), INTENT(IN)                       :: printtag
+      INTEGER, INTENT(IN)                                :: unit_nr
+      TYPE(cp_logger_type), POINTER                      :: logger
+
+      INTEGER, PARAMETER :: gpu_auto_min_atoms_per_rank = 1000
+
+      CHARACTER(LEN=2*default_string_length)             :: cap_reason
+      INTEGER                                            :: n_gpu_ranks, use_gpu_input
+      LOGICAL                                            :: gpu_accepted, gpu_everywhere
+
+      CALL section_vals_val_get(nnp_env%nnp_input, "USE_GPU", i_val=use_gpu_input)
+      CALL section_vals_val_get(nnp_env%nnp_input, "VALIDATE", l_val=nnp_env%validate_gpu)
+
+      ! The outcome has to be the same on every rank. A rank-dependent answer
+      ! would either hang (some ranks abort below while the rest go on into the
+      ! collectives) or run a silent mix of CPU and GPU arithmetic, so count the
+      ! ranks that see a device and decide from the total.
+      n_gpu_ranks = MERGE(1, 0, nnp_gpu_available())
+      CALL logger%para_env%sum(n_gpu_ranks)
+      gpu_everywhere = (n_gpu_ranks == logger%para_env%num_pe)
+
+      SELECT CASE (use_gpu_input)
+      CASE (nnp_use_gpu_off)
+         nnp_env%use_gpu = nnp_use_gpu_off
+      CASE (nnp_use_gpu_on)
+         IF (n_gpu_ranks == 0) THEN
+            CALL cp_abort(__LOCATION__, TRIM(printtag)// &
+                          "| USE_GPU ON requested, but this build has no NNP GPU "// &
+                          "support or no device is available on this node.")
+         ELSE IF (.NOT. gpu_everywhere) THEN
+            CALL cp_abort(__LOCATION__, TRIM(printtag)// &
+                          "| USE_GPU ON requested, but only some of the MPI ranks see "// &
+                          "a device. Give every rank one, or set USE_GPU OFF.")
+         END IF
+         nnp_env%use_gpu = nnp_use_gpu_on
+      CASE (nnp_use_gpu_auto)
+         ! Below roughly gpu_auto_min_atoms_per_rank rank-local atoms the kernel
+         ! launch and transfer overhead outweighs the device throughput, so AUTO
+         ! keeps such systems on the CPU path rather than making an existing
+         ! input slower, and its trajectory irreproducible, the moment it is run
+         ! on an accelerated build. USE_GPU ON overrides the threshold, and so
+         ! does VALIDATE: a validation run exists to exercise the GPU path, so
+         ! it engages the device whenever the build and the machine support it,
+         ! regardless of the system size.
+         IF (gpu_everywhere .AND. &
+             (nnp_env%validate_gpu .OR. &
+              nnp_env%num_atoms >= gpu_auto_min_atoms_per_rank*logger%para_env%num_pe)) THEN
+            nnp_env%use_gpu = nnp_use_gpu_on
+         ELSE
+            nnp_env%use_gpu = nnp_use_gpu_off
+         END IF
+      CASE DEFAULT
+         CPABORT("Unknown USE_GPU value.")
+      END SELECT
+
+      CALL section_vals_val_get(nnp_env%nnp_input, "GPU_PRECISION", &
+                                i_val=nnp_env%gpu_precision)
+
+      ! A model larger than the compiled-in device-table capacities cannot take
+      ! the GPU path. Sized here, before the device is claimed and before the
+      ! banner prints, so an oversized model falls back cleanly under AUTO and
+      ! aborts with the limit named under ON.
+      IF (nnp_env%use_gpu == nnp_use_gpu_on) THEN
+         IF (.NOT. nnp_gpu_model_capacity_ok(nnp_env, cap_reason)) THEN
+            nnp_env%use_gpu = nnp_use_gpu_off
+            IF (use_gpu_input == nnp_use_gpu_on) THEN
+               CALL cp_abort(__LOCATION__, TRIM(printtag)// &
+                             "| USE_GPU ON requested, but "//TRIM(cap_reason)// &
+                             ". Set USE_GPU OFF, or raise the limit in "// &
+                             "src/nnp/gpu/nnp_gpu_state.h and rebuild.")
+            END IF
+            IF (unit_nr > 0) THEN
+               WRITE (unit_nr, *) TRIM(printtag)//"| GPU offload: declined, "// &
+                  TRIM(cap_reason)//"; using the CPU path"
+            END IF
+         END IF
+      END IF
+
+      IF (nnp_env%use_gpu /= nnp_use_gpu_on) RETURN
+
+      ! Claim the device and push the precision selector; any failure aborts
+      ! here rather than mid-MD. The claim is declined
+      ! when another NNP environment in this process already holds the device,
+      ! which is a hard error only if the user asked for the GPU explicitly.
+      CALL nnp_gpu_init_device(nnp_env%gpu_precision, gpu_accepted)
+      IF (.NOT. gpu_accepted) THEN
+         nnp_env%use_gpu = nnp_use_gpu_off
+         IF (use_gpu_input == nnp_use_gpu_on) THEN
+            CALL cp_abort(__LOCATION__, TRIM(printtag)// &
+                          "| USE_GPU ON requested, but another NNP environment in this "// &
+                          "process already uses the GPU, and only one may. Set USE_GPU "// &
+                          "OFF on this section.")
+         END IF
+         IF (unit_nr > 0) THEN
+            WRITE (unit_nr, *) TRIM(printtag)//"| GPU offload: declined, another NNP "// &
+               "environment holds the device; using the CPU path"
+         END IF
+      ELSE IF (unit_nr > 0) THEN
+         IF (nnp_env%gpu_precision == nnp_gpu_prec_mixed) THEN
+            WRITE (unit_nr, *) TRIM(printtag)//"| GPU offload: enabled (MIXED precision)"
+         ELSE
+            WRITE (unit_nr, *) TRIM(printtag)//"| GPU offload: enabled (DOUBLE precision)"
+         END IF
+         IF (nnp_env%validate_gpu) THEN
+            WRITE (unit_nr, *) TRIM(printtag)//"| GPU validation: CPU reference runs in shadow mode"
+         END IF
+      END IF
+
+   END SUBROUTINE nnp_resolve_gpu
+
+! **************************************************************************************************
+!> \brief Read committee weights from disk into pre-allocated arc layer tables.
+!>
+!> One file per (committee member, element), named <base>.<nuc>.data. The file
+!> is a flat list of doubles; the order on disk is layer-major over (i->j weights
+!> then biases) so a single counter walks every value into its slot.
+!>
+!> \param nnp_env       NNP environment with arc()%layer()%weights/bweights already allocated.
+!> \param model_section &MODEL section block; supplies the per-member WEIGHTS base path.
+!> \param printtag      Log-line prefix.
+! **************************************************************************************************
+   SUBROUTINE nnp_read_committee_weights(nnp_env, model_section, printtag)
+      TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp_env
+      TYPE(section_vals_type), POINTER                   :: model_section
+      CHARACTER(LEN=*), INTENT(IN)                       :: printtag
+
+      CHARACTER(len=default_path_length)                 :: base_name, file_name
+      INTEGER                                            :: i, i_com, iweight, j, k, l, n_weight, &
+                                                            unit_nr
+      LOGICAL                                            :: at_end
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: weights
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(cp_parser_type)                               :: parser
+
+      NULLIFY (logger)
+      logger => cp_get_default_logger()
+      unit_nr = cp_logger_get_default_unit_nr(logger)
+
       DO i_com = 1, nnp_env%n_committee
          CALL section_vals_val_get(model_section, "WEIGHTS", c_val=base_name, i_rep_section=i_com)
-         IF (logger%para_env%is_source()) THEN
+         IF (unit_nr > 0) THEN
             WRITE (unit_nr, *) TRIM(printtag)//"| Initializing weights for model: ", i_com
          END IF
          DO i = 1, nnp_env%n_ele
             WRITE (file_name, '(A,I0.3,A)') TRIM(base_name)//".", nnp_env%nuc_ele(i), ".data"
-            IF (logger%para_env%is_source()) THEN
+            IF (unit_nr > 0) THEN
                WRITE (unit_nr, *) TRIM(printtag)//"| Reading weights from file: ", TRIM(file_name)
             END IF
             CALL parser_create(parser, file_name, para_env=logger%para_env)
@@ -748,51 +1046,6 @@ CONTAINS
          END DO
       END DO
 
-      !Initialize extrapolation counter
-      nnp_env%expol = 0
-
-      ! Bias the standard deviation of committee disagreement
-      NULLIFY (bias_section)
-      explicit = .FALSE.
-      !HELIUM NNP does atm not allow for bias (not even defined)
-      bias_section => section_vals_get_subs_vals(nnp_env%nnp_input, "BIAS", can_return_null=.TRUE.)
-      IF (ASSOCIATED(bias_section)) CALL section_vals_get(bias_section, explicit=explicit)
-      nnp_env%bias = .FALSE.
-      IF (explicit) THEN
-         IF (nnp_env%n_committee > 1) THEN
-            IF (logger%para_env%is_source()) THEN
-               WRITE (unit_nr, *) "NNP| Biasing of committee disagreement enabled"
-            END IF
-            nnp_env%bias = .TRUE.
-            ALLOCATE (nnp_env%bias_forces(3, nnp_env%num_atoms))
-            ALLOCATE (nnp_env%bias_e_avrg(nnp_env%n_committee))
-            CALL section_vals_val_get(bias_section, "SIGMA_0", r_val=nnp_env%bias_sigma0)
-            CALL section_vals_val_get(bias_section, "K_B", r_val=nnp_env%bias_kb)
-            nnp_env%bias_e_avrg(:) = 0.0_dp
-            CALL section_vals_val_get(bias_section, "ALIGN_NNP_ENERGIES", explicit=explicit)
-            nnp_env%bias_align = explicit
-            IF (explicit) THEN
-               NULLIFY (work)
-               CALL section_vals_val_get(bias_section, "ALIGN_NNP_ENERGIES", r_vals=work)
-               IF (SIZE(work) /= nnp_env%n_committee) THEN
-                  CPABORT("ALIGN_NNP_ENERGIES size mismatch wrt committee size.")
-               END IF
-               nnp_env%bias_e_avrg(:) = work
-               IF (logger%para_env%is_source()) THEN
-                  WRITE (unit_nr, *) TRIM(printtag)//"| Biasing is aligned by shifting the energy prediction of the C-NNP members"
-               END IF
-            END IF
-         ELSE
-            CPWARN("NNP committee size is 1, BIAS section is ignored.")
-         END IF
-      END IF
-
-      IF (logger%para_env%is_source()) THEN
-         WRITE (unit_nr, *) TRIM(printtag)//"| NNP force environment initialized"
-      END IF
-
-      CALL timestop(handle)
-
-   END SUBROUTINE nnp_init_model
+   END SUBROUTINE nnp_read_committee_weights
 
 END MODULE nnp_environment

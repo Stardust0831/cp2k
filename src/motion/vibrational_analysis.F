@@ -19,6 +19,7 @@
 ! **************************************************************************************************
 MODULE vibrational_analysis
    USE atomic_kind_types,               ONLY: get_atomic_kind
+   USE cell_types,                      ONLY: cell_type
    USE cp_blacs_env,                    ONLY: cp_blacs_env_create,&
                                               cp_blacs_env_release,&
                                               cp_blacs_env_type
@@ -65,6 +66,10 @@ MODULE vibrational_analysis
    USE molecule_kind_types,             ONLY: fixd_constraint_type,&
                                               get_molecule_kind,&
                                               molecule_kind_type
+   USE molsym,                          ONLY: get_symmetry_number,&
+                                              molecular_symmetry,&
+                                              molsym_type,&
+                                              release_molsym
    USE motion_utils,                    ONLY: rot_ana,&
                                               thrs_motion
    USE particle_list_types,             ONLY: particle_list_type
@@ -114,7 +119,7 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: Clist, Mlist
       LOGICAL :: calc_intens, calc_thchdata, do_mode_tracking, intens_ir, intens_raman, &
          keep_rotations, row_force, something_frozen
-      REAL(KIND=dp)                                      :: a1, a2, a3, conver, dummy, dx, &
+      REAL(KIND=dp)                                      :: a1, a2, a3, conver, dummy, dx, eps_sym, &
                                                             inertia(3), minimum_energy, norm, &
                                                             tc_press, tc_temp, tmp
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: H_eigval1, H_eigval2, HeigvalDfull, &
@@ -128,6 +133,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: D, Dfull, dip_deriv, RotTrM
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: polar_deriv, tmp_dip
       REAL(KIND=dp), DIMENSION(:, :, :, :), POINTER      :: tmp_polar
+      TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(cp_subsys_type), POINTER                      :: subsys
       TYPE(f_env_type), POINTER                          :: f_env
@@ -138,7 +144,7 @@ CONTAINS
                                                             vib_section
 
       CALL timeset(routineN, handle)
-      NULLIFY (D, RotTrM, logger, subsys, f_env, particles, rep_env, intensities_d, intensities_p, &
+      NULLIFY (D, RotTrM, cell, logger, subsys, f_env, particles, rep_env, intensities_d, intensities_p, &
                vib_section, print_section, depol_p, depol_u)
       logger => cp_get_default_logger()
       vib_section => section_vals_get_subs_vals(input, "VIBRATIONAL_ANALYSIS")
@@ -168,6 +174,7 @@ CONTAINS
       CALL section_vals_val_get(vib_section, "THERMOCHEMISTRY", l_val=calc_thchdata)
       CALL section_vals_val_get(vib_section, "TC_TEMPERATURE", r_val=tc_temp)
       CALL section_vals_val_get(vib_section, "TC_PRESSURE", r_val=tc_press)
+      CALL section_vals_val_get(vib_section, "EPS_SYMMETRY", r_val=eps_sym)
 
       tc_temp = tc_temp*kelvin
       tc_press = tc_press*pascal
@@ -190,11 +197,12 @@ CONTAINS
       IF (ASSOCIATED(rep_env)) THEN
          CALL f_env_add_defaults(f_env_id=rep_env%f_env_id, f_env=f_env)
          CALL force_env_get(f_env%force_env, subsys=subsys)
+         CALL cp_subsys_get(subsys, cell=cell)
          particles => subsys%particles%els
          ! Decide which kind of Vibrational Analysis to perform
          IF (do_mode_tracking) THEN
             CALL ms_vb_anal(input, rep_env, para_env, globenv, particles, &
-                            nrep, calc_intens, dx, output_unit, logger)
+                            nrep, calc_intens, dx, output_unit, logger, cell)
             CALL f_env_rm_defaults(f_env, ierr)
          ELSE
             CALL get_moving_atoms(force_env=f_env%force_env, Ilist=Mlist)
@@ -653,7 +661,7 @@ CONTAINS
                      DO j = 1, nvib
                         D_deriv(:) = D_deriv(:) + dip_deriv(:, j)*Hint2(j, i)
                      END DO
-                     intensities_d(i) = SQRT(DOT_PRODUCT(D_deriv, D_deriv))
+                     intensities_d(i) = NORM2(D_deriv)
                      P_deriv = 0._dp
                      DO j = 1, nvib
                         ! P_deriv has units bohr^2/sqrt(a.u.)
@@ -709,10 +717,11 @@ CONTAINS
                   CALL vib_out(iw, nvib, D, konst, rmass, H_eigval2, particles, Mlist, din, pin, depp, depu)
                END IF
                IF (.NOT. something_frozen .AND. calc_thchdata) THEN
-                  CALL get_thch_values(H_eigval2, iw, mass, nvib, inertia, 1, minimum_energy, tc_temp, tc_press)
+                  CALL get_thch_values(H_eigval2, iw, mass, nvib, inertia, 1, minimum_energy, tc_temp, tc_press, &
+                                       get_particles_sym_num(particles, eps_sym))
                END IF
                CALL write_vibrations_molden(input, particles, H_eigval2, D, intensities_d, calc_intens, &
-                                            dump_only_positive=.FALSE., logger=logger, list=Mlist)
+                                            dump_only_positive=.FALSE., logger=logger, list=Mlist, cell=cell)
             ELSE
                IF (output_unit > 0) THEN
                   WRITE (output_unit, '(T2,"VIB| No further vibrational info. Detected a single atom")')
@@ -970,7 +979,7 @@ CONTAINS
             work(:) = work - norm*D(:, i)
          END DO
          ! Check norm of the new generated vector
-         norm = SQRT(DOT_PRODUCT(work, work))
+         norm = NORM2(work)
          IF (norm >= 10E4_dp*thrs_motion) THEN
             ! Accept new vector
             ifound = ifound + 1
@@ -1000,10 +1009,11 @@ CONTAINS
 !> \param totene ...
 !> \param temp ...
 !> \param pressure ...
+!> \param sym_num ...
 !> \author MI 10:2015
 ! **************************************************************************************************
 
-   SUBROUTINE get_thch_values(freqs, iw, mass, nvib, inertia, spin, totene, temp, pressure)
+   SUBROUTINE get_thch_values(freqs, iw, mass, nvib, inertia, spin, totene, temp, pressure, sym_num)
 
       REAL(KIND=dp), DIMENSION(:)                        :: freqs
       INTEGER, INTENT(IN)                                :: iw
@@ -1012,8 +1022,9 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: inertia(3)
       INTEGER, INTENT(IN)                                :: spin
       REAL(KIND=dp), INTENT(IN)                          :: totene, temp, pressure
+      INTEGER, INTENT(IN)                                :: sym_num
 
-      INTEGER                                            :: i, natoms, sym_num
+      INTEGER                                            :: i, natoms
       REAL(KIND=dp) :: el_entropy, entropy, exp_min_one, fact, fact2, freq_arg, freq_arg2, &
          freqsum, Gibbs, heat_capacity, inertia_kg(3), mass_tot, one_min_exp, partition_function, &
          rot_cv, rot_energy, rot_entropy, rot_part_func, rotvibtra, tran_cv, tran_energy, &
@@ -1041,11 +1052,10 @@ CONTAINS
       inertia_kg = inertia*e_mass*(a_bohr**2)
 
 !   ROTATIONAL: Partition function and Entropy
-      sym_num = 1
       fact = temp*2.0_dp*boltzmann/(h_bar*h_bar)
       IF (inertia_kg(1)*inertia_kg(2)*inertia_kg(3) > 1.0_dp) THEN
          rot_part_func = fact*fact*fact*inertia_kg(1)*inertia_kg(2)*inertia_kg(3)*pi
-         rot_part_func = SQRT(rot_part_func)
+         rot_part_func = SQRT(rot_part_func)/REAL(sym_num, KIND=dp)
          rot_entropy = n_avogadro*boltzmann*(LOG(rot_part_func) + 1.5_dp)
          rot_energy = 1.5_dp*n_avogadro*boltzmann*temp
          rot_cv = 1.5_dp*n_avogadro*boltzmann
@@ -1058,6 +1068,7 @@ CONTAINS
          ELSE
             rot_part_func = fact*inertia_kg(3)
          END IF
+         rot_part_func = rot_part_func/REAL(sym_num, KIND=dp)
          rot_entropy = n_avogadro*boltzmann*(LOG(rot_part_func) + 1.0_dp)
          rot_energy = n_avogadro*boltzmann*temp
          rot_cv = n_avogadro*boltzmann
@@ -1140,6 +1151,40 @@ CONTAINS
       END IF
 
    END SUBROUTINE get_thch_values
+
+! **************************************************************************************************
+!> \brief Rotational symmetry number of the molecule from its point group.
+!> \param particles ...
+!> \param eps_sym accuracy for the detection of the symmetry
+!> \return ...
+! **************************************************************************************************
+   FUNCTION get_particles_sym_num(particles, eps_sym) RESULT(sym_num)
+      TYPE(particle_type), DIMENSION(:), INTENT(IN)      :: particles
+      REAL(KIND=dp), INTENT(IN)                          :: eps_sym
+      INTEGER                                            :: sym_num
+
+      INTEGER                                            :: i, natom
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atype
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: weight
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: coord
+      TYPE(molsym_type), POINTER                         :: mol_sym
+
+      NULLIFY (mol_sym)
+      natom = SIZE(particles)
+      ALLOCATE (coord(3, natom), atype(natom), weight(natom))
+      DO i = 1, natom
+         CALL get_atomic_kind(atomic_kind=particles(i)%atomic_kind, kind_number=atype(i), mass=weight(i))
+         coord(1:3, i) = particles(i)%r(1:3)
+      END DO
+      weight(:) = weight(:)/massunit
+
+      CALL molecular_symmetry(mol_sym, eps_sym, coord, atype, weight)
+      sym_num = get_symmetry_number(mol_sym)
+      CALL release_molsym(mol_sym)
+
+      DEALLOCATE (coord, atype, weight)
+
+   END FUNCTION get_particles_sym_num
 
 ! **************************************************************************************************
 !> \brief write out the non-orthogalized, i.e. without rotation and translational symmetry removed,

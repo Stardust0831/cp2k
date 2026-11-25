@@ -18,13 +18,11 @@
 !> \author Teodoro Laino 10.2006
 ! **************************************************************************************************
 MODULE neb_utils
-   USE bibliography,                    ONLY: E2002,&
-                                              Elber1987,&
-                                              Jonsson1998,&
-                                              Jonsson2000_1,&
-                                              Jonsson2000_2,&
-                                              Wales2004,&
-                                              cite_reference
+   USE bibliography,                    ONLY: &
+        E2002, Elber1987, Jonsson1998, Jonsson2000_1, Jonsson2000_2, Schmerwitz2024, &
+        Smidstrup2014, Wales2004, cite_reference
+   USE cell_methods,                    ONLY: init_cell
+   USE cell_types,                      ONLY: cell_type
    USE colvar_utils,                    ONLY: eval_colvar,&
                                               get_clv_force,&
                                               set_colvars_target
@@ -37,6 +35,9 @@ MODULE neb_utils
    USE cp_parser_types,                 ONLY: cp_parser_type,&
                                               parser_create,&
                                               parser_release
+   USE cp_subsys_types,                 ONLY: cp_subsys_get,&
+                                              cp_subsys_set,&
+                                              cp_subsys_type
    USE f77_interface,                   ONLY: f_env_add_defaults,&
                                               f_env_rm_defaults,&
                                               f_env_type,&
@@ -52,6 +53,8 @@ MODULE neb_utils
         band_diis_opt, do_b_neb, do_band_cartesian, do_ci_neb, do_d_neb, do_eb, do_it_neb, do_sm, &
         pot_neb_fe, pot_neb_full, pot_neb_me
    USE input_cp2k_check,                ONLY: remove_restart_info
+   USE input_cp2k_neb,                  ONLY: neb_li_bisect,&
+                                              neb_s_idpp
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
@@ -59,8 +62,10 @@ MODULE neb_utils
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
+   USE mathlib,                         ONLY: det_3x3
    USE md_run,                          ONLY: qs_mol_dyn
    USE message_passing,                 ONLY: mp_para_env_type
+   USE neb_idpp,                        ONLY: neb_initialize_idpp
    USE neb_io,                          ONLY: dump_replica_coordinates,&
                                               handle_band_file_names
    USE neb_md_utils,                    ONLY: neb_initialize_velocity
@@ -72,6 +77,11 @@ MODULE neb_utils
    USE replica_types,                   ONLY: rep_env_sync,&
                                               replica_env_type
    USE rmsd,                            ONLY: rmsd3
+   USE solid_state_coordinates,         ONLY: solid_state_force,&
+                                              solid_state_frame,&
+                                              solid_state_pack,&
+                                              solid_state_unpack
+   USE virial_types,                    ONLY: virial_type
 #include "../base/base_uses.f90"
 
    IMPLICIT NONE
@@ -118,8 +128,7 @@ CONTAINS
          CALL rmsd3(particle_set, coords%xyz(:, i), coords%xyz(:, i0), &
                     iw, rotate=my_rotate)
       END IF
-      distance = SQRT(DOT_PRODUCT(coords%wrk(:, i) - coords%wrk(:, i0), &
-                                  coords%wrk(:, i) - coords%wrk(:, i0)))
+      distance = NORM2(coords%wrk(:, i) - coords%wrk(:, i0))
 
    END SUBROUTINE neb_replica_distance
 
@@ -148,15 +157,17 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'build_replica_coords'
 
       CHARACTER(LEN=default_path_length)                 :: filename
-      INTEGER :: handle, i_rep, iatom, ic, input_nr_replica, is, ivar, j, jtarg, k, n_rep, natom, &
-         neb_nr_replica, nr_replica_to_interpolate, nval, nvar, shell_index
+      INTEGER :: handle, i_rep, iatom, ic, input_nr_replica, interp_method, is, ivar, j, jtarg, k, &
+         n_rep, natom, neb_nr_replica, nr_replica_to_interpolate, nval, nvar, shell_index
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: rep_map
-      LOGICAL                                            :: check, explicit, skip_vel_section
+      LOGICAL                                            :: align_interpolated, check, explicit, &
+                                                            idpp, sequential, skip_vel_section
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: distance
       REAL(KIND=dp), DIMENSION(3)                        :: r
       REAL(KIND=dp), DIMENSION(:), POINTER               :: initial_colvars, rptr
-      TYPE(section_vals_type), POINTER                   :: coord_section, replica_section, &
-                                                            vel_section
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(section_vals_type), POINTER                   :: constraint_section, coord_section, &
+                                                            replica_section, vel_section
 
       CALL timeset(routineN, handle)
       CPASSERT(ASSOCIATED(coords))
@@ -164,8 +175,31 @@ CONTAINS
       neb_nr_replica = neb_env%number_of_replica
       replica_section => section_vals_get_subs_vals(neb_section, "REPLICA")
       CALL section_vals_get(replica_section, n_repetition=input_nr_replica)
+      IF (neb_env%solid_state .AND. input_nr_replica < 2) THEN
+         CPABORT("SOLID_STATE requires two endpoint replicas.")
+      END IF
       ! Calculation is aborted if input replicas are more then the requested ones for the BAND..
       CPASSERT(input_nr_replica <= neb_nr_replica)
+      CALL section_vals_val_get(neb_section, "INTERPOLATION_METHOD", i_val=interp_method)
+      IF (neb_env%solid_state .AND. interp_method /= neb_li_bisect) THEN
+         CPABORT("BAND IDPP is not supported with SOLID_STATE.")
+      END IF
+      idpp = interp_method /= neb_li_bisect .AND. input_nr_replica < neb_nr_replica
+      sequential = idpp .AND. interp_method == neb_s_idpp
+      align_interpolated = neb_env%align_frames .AND. .NOT. sequential
+      IF (idpp) THEN
+         CPASSERT(input_nr_replica >= 2)
+         IF (neb_env%use_colvar .OR. ANY(particle_set%shell_index /= 0)) THEN
+            CPABORT("BAND IDPP requires Cartesian images without shells.")
+         END IF
+         constraint_section => section_vals_get_subs_vals(neb_env%root_section, "MOTION%CONSTRAINT")
+         CALL section_vals_get(constraint_section, explicit=explicit)
+         IF (explicit) CPABORT("BAND IDPP does not currently support MOTION%CONSTRAINT.")
+         CALL force_env_get(neb_env%force_env, cell=cell)
+         IF (ANY(cell%perd /= 0) .AND. .NOT. cell%orthorhombic) THEN
+            CPABORT("BAND IDPP requires an orthorhombic periodic cell.")
+         END IF
+      END IF
       ! Read in replicas coordinates
       skip_vel_section = (input_nr_replica /= neb_nr_replica)
       IF ((iw > 0) .AND. skip_vel_section) THEN
@@ -224,11 +258,12 @@ CONTAINS
                DO iatom = 1, natom
                   ! Atom coordinates
                   CALL parser_get_next_line(parser, 1, at_end=my_end)
-                  IF (my_end) &
+                  IF (my_end) THEN
                      CALL cp_abort(__LOCATION__, &
                                    "Number of lines in XYZ format not equal to the number of atoms."// &
                                    " Error in XYZ format for REPLICA coordinates. Very probably the"// &
                                    " line with title is missing or is empty. Please check the XYZ file and rerun your job!")
+                  END IF
                   READ (parser%input_line, *) dummy_char, r(1:3)
                   ic = 3*(iatom - 1)
                   coords%xyz(ic + 1:ic + 3, i_rep) = r(1:3)*bohr
@@ -241,6 +276,18 @@ CONTAINS
                END DO
                CALL parser_release(parser)
             END BLOCK
+         END IF
+         IF (neb_env%solid_state) THEN
+            CALL section_vals_val_get(replica_section, "CELL_MATRIX", i_rep_section=i_rep, n_rep_val=nval)
+            IF (nval /= 1) THEN
+               CPABORT("Each SOLID_STATE replica needs a CELL_MATRIX.")
+            END IF
+            CALL section_vals_val_get(replica_section, "CELL_MATRIX", i_rep_section=i_rep, r_vals=rptr)
+            coords%cells(:, :, i_rep) = RESHAPE(rptr, [3, 3])
+            IF (i_rep == 1) CALL solid_state_frame(neb_env%solid_frame, coords%cells(:, :, i_rep), &
+                                                   SIZE(particle_set), neb_env%cell_weight)
+            CALL solid_state_pack(neb_env%solid_frame, coords%cells(:, :, i_rep), coords%xyz(:, i_rep), &
+                                  coords%wrk(:, i_rep))
          END IF
          ! Collective Variables
          IF (neb_env%use_colvar) THEN
@@ -262,7 +309,9 @@ CONTAINS
          ! Dump cartesian and colvar info..
          CALL dump_replica_coordinates(particle_set, coords, i_rep, i_rep, iw, neb_env%use_colvar)
          ! Setup Velocities
-         IF (skip_vel_section) THEN
+         IF (neb_env%solid_state) THEN
+            vels%xyz(:, i_rep) = 0.0_dp
+         ELSE IF (skip_vel_section) THEN
             CALL neb_initialize_velocity(vels%wrk, neb_section, particle_set, &
                                          i_rep, iw, globenv, neb_env)
          ELSE
@@ -308,22 +357,33 @@ CONTAINS
          END DO
       END IF
       IF (input_nr_replica < neb_nr_replica) THEN
+         ! S-IDPP uses the bisection only to allocate the missing images among
+         ! anchors. Align the anchors before constructing any provisional images.
+         IF (sequential .AND. neb_env%align_frames) THEN
+            DO j = 1, input_nr_replica - 1
+               CALL neb_replica_distance(particle_set, coords, j, j + 1, distance(j), iw, rotate=.TRUE.)
+            END DO
+         END IF
          ! Interpolate missing replicas
          nr_replica_to_interpolate = neb_nr_replica - input_nr_replica
          k = 0
          distance = 0.0_dp
          IF (iw > 0) THEN
-            WRITE (iw, '(T2,A,I0,A)') 'NEB| Interpolating ', nr_replica_to_interpolate, ' missing replica '// &
-               'by stepwise bisection of distance.'
+            IF (sequential) THEN
+               WRITE (iw, '(T2,A,I0,A)') 'NEB| Allocating ', nr_replica_to_interpolate, ' missing replicas for S-IDPP.'
+            ELSE
+               WRITE (iw, '(T2,A,I0,A)') 'NEB| Interpolating ', nr_replica_to_interpolate, ' missing replica '// &
+                  'by stepwise bisection of distance.'
+            END IF
          END IF
          DO WHILE (nr_replica_to_interpolate > 0)
             ! Compute distances between known images to find the interval
             ! where to add a new image
             DO j = 1, input_nr_replica - 1
                CALL neb_replica_distance(particle_set, coords, j, j + 1, distance(j), iw, &
-                                         rotate=neb_env%align_frames)
+                                         rotate=align_interpolated)
             END DO
-            jtarg = MAXLOC(distance(1:input_nr_replica), 1)
+            jtarg = MAXLOC(distance(1:input_nr_replica - 1), 1)
             IF (iw > 0) THEN
                WRITE (iw, '(/,T2,3(A,I0),A)') 'NEB| Interpolating Nr. ', &
                   nr_replica_to_interpolate, ' missing Replica; next between Replica Nr. ', &
@@ -334,23 +394,30 @@ CONTAINS
             k = k + 1
             rep_map(jtarg + 2:input_nr_replica) = rep_map(jtarg + 1:input_nr_replica - 1)
             IF (jtarg + 1 <= neb_nr_replica .AND. jtarg + 1 >= 1) rep_map(jtarg + 1) = -k
-            ! Interpolation is a simple bisection in XYZ
+            ! Insert a Cartesian midpoint. S-IDPP uses this provisional image only
+            ! to distribute missing replicas before growing the band from its anchors.
             coords%xyz(:, jtarg + 2:input_nr_replica) = coords%xyz(:, jtarg + 1:input_nr_replica - 1)
             coords%xyz(:, jtarg + 1) = (coords%xyz(:, jtarg) + coords%xyz(:, jtarg + 2))/2.0_dp
+            IF (neb_env%solid_state) THEN
+               coords%wrk(:, jtarg + 2:input_nr_replica) = coords%wrk(:, jtarg + 1:input_nr_replica - 1)
+               coords%wrk(:, jtarg + 1) = 0.5_dp*(coords%wrk(:, jtarg) + coords%wrk(:, jtarg + 2))
+               CALL solid_state_unpack(neb_env%solid_frame, coords%wrk(:, jtarg + 1), &
+                                       coords%cells(:, :, jtarg + 1), coords%xyz(:, jtarg + 1))
+            END IF
             IF (neb_env%use_colvar) THEN
-               ! Interpolation is a simple bisection also in internal coordinates
-               ! in this case the XYZ coordinates need only as a starting point for computing
-               ! the potential energy function. The reference are the internal coordinates
-               ! interpolated here after..
+               ! In a collective-variable band the internal midpoint is the target;
+               ! the Cartesian midpoint is only the starting geometry.
                coords%int(:, jtarg + 2:input_nr_replica) = coords%int(:, jtarg + 1:input_nr_replica - 1)
                coords%int(:, jtarg + 1) = (coords%int(:, jtarg) + coords%int(:, jtarg + 2))/2.0_dp
             END IF
             vels%wrk(:, jtarg + 2:input_nr_replica) = vels%wrk(:, jtarg + 1:input_nr_replica - 1)
             vels%wrk(:, jtarg + 1) = 0.0_dp
-            CALL dump_replica_coordinates(particle_set, coords, jtarg + 1, &
-                                          input_nr_replica, iw, neb_env%use_colvar)
-            CALL neb_initialize_velocity(vels%wrk, neb_section, particle_set, &
-                                         jtarg + 1, iw, globenv, neb_env)
+            IF (.NOT. sequential) THEN
+               CALL dump_replica_coordinates(particle_set, coords, jtarg + 1, &
+                                             input_nr_replica, iw, neb_env%use_colvar)
+            END IF
+            IF (.NOT. neb_env%solid_state) CALL neb_initialize_velocity(vels%wrk, neb_section, particle_set, &
+                                                                        jtarg + 1, iw, globenv, neb_env)
             IF (iw > 0) THEN
                WRITE (iw, '(T2,A)') 'NEB| Mapping between input and requested replica so far'
                DO j = 1, neb_nr_replica, 8
@@ -367,10 +434,24 @@ CONTAINS
       ! Rotate the frames in order to minimize the RMSD
       DO j = 1, input_nr_replica - 1
          CALL neb_replica_distance(particle_set, coords, j, j + 1, distance(j), iw, &
-                                   rotate=neb_env%align_frames)
+                                   rotate=align_interpolated)
       END DO
+      IF (idpp) THEN
+         CALL cite_reference(Smidstrup2014)
+         IF (sequential) CALL cite_reference(Schmerwitz2024)
+         CALL neb_initialize_idpp(coords%xyz, rep_map > 0, cell, iw, sequential)
+         IF (sequential .AND. iw > 0) THEN
+            WRITE (iw, '(T2,A)') "NEB| Initial band after S-IDPP"
+            DO j = 1, input_nr_replica
+               CALL dump_replica_coordinates(particle_set, coords, j, j, iw, neb_env%use_colvar)
+            END DO
+         END IF
+         DO j = 1, input_nr_replica - 1
+            CALL neb_replica_distance(particle_set, coords, j, j + 1, distance(j), iw, rotate=.FALSE.)
+         END DO
+      END IF
       ! If there are still large distances, hint that more replica may be requested
-      IF (MAXVAL(distance)/MINVAL(distance) > 1.5_dp) THEN
+      IF (MAXVAL(distance) > 1.5_dp*MINVAL(distance)) THEN
          IF (iw > 0) THEN
             WRITE (iw, '(/,T2,A)') 'NEB| After interpolating replica, the maximum distance between adjacent replica'
             WRITE (iw, '(T2,A)') 'NEB| is still larger than 1.5 times the minimum distance. In order to make the'
@@ -410,10 +491,15 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'neb_calc_energy_forces'
       CHARACTER(LEN=1), DIMENSION(3), PARAMETER          :: lab = ["X", "Y", "Z"]
 
-      INTEGER                                            :: handle, i, irep, j, n_int, n_rep, &
-                                                            n_rep_neb, nsize_wrk
+      INTEGER                                            :: handle, i, ihist, ilocal, irep, j, &
+                                                            n_int, n_rep, n_rep_neb, nsize_wrk
+      LOGICAL                                            :: has_local_img
+      REAL(KIND=dp), ALLOCATABLE                         :: cell_data(:, :)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: tangent, tmp_a, tmp_b
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: cvalues, Mmatrix, Mmatrix_tmp
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(cp_subsys_type), POINTER                      :: subsys
+      TYPE(virial_type), POINTER                         :: virial
 
       CALL timeset(routineN, handle)
       n_int = neb_env%nsize_int
@@ -424,25 +510,46 @@ CONTAINS
       ALLOCATE (cvalues(n_int, n_rep))
       ALLOCATE (Mmatrix_tmp(n_int*n_int, n_rep))
       ALLOCATE (Mmatrix(n_int*n_int, n_rep_neb))
+      IF (neb_env%solid_state) THEN
+         ALLOCATE (cell_data(10, n_rep))
+         CALL force_env_get(neb_env%force_env, cell=cell, subsys=subsys)
+         CALL cp_subsys_get(subsys, virial=virial)
+         DO i = 1, n_rep_neb
+            CALL solid_state_unpack(neb_env%solid_frame, coords%wrk(:, i), coords%cells(:, :, i), coords%xyz(:, i))
+         END DO
+      END IF
       IF (output_unit > 0) WRITE (output_unit, '(/,T2,A)') "NEB| Computing Energies and Forces"
       DO irep = 1, n_rep_neb, n_rep
          DO j = 0, n_rep - 1
             IF (irep + j <= n_rep_neb) THEN
-               ! If the number of replica in replica_env and the number of replica
-               ! used in the NEB does not match, the other replica in replica_env
-               ! just compute energies and forces keeping the fixed coordinates and
-               ! forces
                rep_env%r(:, j + 1) = coords%xyz(:, irep + j)
             END IF
          END DO
          ! Fix file name for BAND replicas.. Each BAND replica has its own file
          ! independently from the number of replicas in replica_env..
-         CALL handle_band_file_names(rep_env, irep, n_rep_neb, neb_env%istep)
+         ihist = (irep - 1)/n_rep + 1
+         ilocal = rep_env%local_rep_indices(1)
+         has_local_img = (irep + ilocal - 1 <= n_rep_neb)
+         IF (has_local_img) THEN
+            CALL handle_band_file_names(rep_env, irep, n_rep_neb, neb_env%istep)
+         END IF
          ! Let's select the potential we want to use for the band calculation
          SELECT CASE (neb_env%pot_type)
          CASE (pot_neb_full)
             ! Full potential Energy
-            CALL rep_env_calc_e_f(rep_env, calc_f=.TRUE.)
+            IF (neb_env%solid_state .AND. has_local_img) THEN
+               CALL init_cell(cell, hmat=coords%cells(:, :, irep + ilocal - 1))
+               CALL cp_subsys_set(subsys, cell=cell)
+            END IF
+            CALL rep_env_calc_e_f(rep_env, calc_f=.TRUE., wf_hist_slot=ihist, do_calc=has_local_img)
+            IF (neb_env%solid_state) THEN
+               cell_data(:, :) = 0.0_dp
+               IF (has_local_img) THEN
+                  cell_data(1:9, ilocal) = RESHAPE(virial%pv_virial, [9])
+                  cell_data(10, ilocal) = neb_env%external_pressure*cell%deth
+               END IF
+               CALL rep_env_sync(rep_env, cell_data)
+            END IF
          CASE (pot_neb_fe)
             ! Free Energy Case
             CALL perform_replica_md(rep_env, coords, irep, n_rep_neb, cvalues, Mmatrix_tmp)
@@ -454,8 +561,16 @@ CONTAINS
          DO j = 0, n_rep - 1
             IF (irep + j <= n_rep_neb) THEN
                ! Copy back Forces and Energies
-               forces%wrk(:, irep + j) = rep_env%f(1:nsize_wrk, j + 1)
                energies(irep + j) = rep_env%f(rep_env%ndim + 1, j + 1)
+               IF (neb_env%solid_state) THEN
+                  forces%xyz(:, irep + j) = rep_env%f(1:rep_env%ndim, j + 1)
+                  CALL solid_state_force(neb_env%solid_frame, coords%wrk(:, irep + j), forces%xyz(:, irep + j), &
+                                         RESHAPE(cell_data(1:9, j + 1), [3, 3]), cell_data(10, j + 1), &
+                                         forces%wrk(:, irep + j))
+                  energies(irep + j) = energies(irep + j) + cell_data(10, j + 1)
+               ELSE
+                  forces%wrk(:, irep + j) = rep_env%f(1:nsize_wrk, j + 1)
+               END IF
                SELECT CASE (neb_env%pot_type)
                CASE (pot_neb_full)
                   ! Dump Info
@@ -464,6 +579,13 @@ CONTAINS
                         "NEB| REPLICA Nr.", irep + j, "- Energy and Forces"
                      WRITE (output_unit, '(T2,A,T43,A,T57,F24.12)') &
                         "NEB|", "Total energy:", rep_env%f(rep_env%ndim + 1, j + 1)
+                     IF (neb_env%solid_state) THEN
+                        WRITE (output_unit, '(T2,A,T43,A,T57,F24.12)') "NEB|", "Enthalpy:", energies(irep + j)
+                        WRITE (output_unit, '(T2,A,1X,I0,1X,F24.12)') "SS-NEB| Volume [bohr^3]", irep + j, &
+                           det_3x3(coords%cells(:, :, irep + j))
+                        WRITE (output_unit, '(T2,A,1X,I0,6(1X,ES18.10))') "SS-NEB| Cell force", irep + j, &
+                           forces%wrk(rep_env%ndim + 1:, irep + j)
+                     END IF
                      WRITE (output_unit, '(T2,"NEB|",T10,"ATOM",T33,3(9X,A,7X))') lab(1), lab(2), lab(3)
                      DO i = 1, SIZE(particle_set)
                         WRITE (output_unit, '(T2,"NEB|",T12,A,T30,3(2X,F15.9))') &
@@ -737,7 +859,11 @@ CONTAINS
          ! String method..
          tangent(:) = 0.0_dp
       END SELECT
-      distance0 = SQRT(DOT_PRODUCT(tangent(:), tangent(:)))
+      distance0 = NORM2(tangent(:))
+      IF (neb_env%solid_state .AND. distance0 == 0.0_dp) THEN
+         tangent(:) = coords%wrk(:, i + 1) - coords%wrk(:, i - 1)
+         distance0 = NORM2(tangent(:))
+      END IF
       IF (distance0 /= 0.0_dp) tangent(:) = tangent(:)/distance0
    END SUBROUTINE get_tangent
 
@@ -849,7 +975,7 @@ CONTAINS
          ALLOCATE (dtmp1(nsize_wrk))
          dtmp1(:) = forces%wrk(:, i) - dot_product_band(neb_env, forces%wrk(:, i), tangent, Mmatrix)*tangent
          forces%wrk(:, i) = dtmp1
-         tmp = SQRT(DOT_PRODUCT(dtmp1, dtmp1))
+         tmp = NORM2(dtmp1)
          dtmp1(:) = dtmp1(:)/tmp
          ! Project out only the spring component interfering with the
          ! orthogonal gradient of the band

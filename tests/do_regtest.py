@@ -5,9 +5,11 @@
 from asyncio import Semaphore, Task
 from asyncio.subprocess import DEVNULL, PIPE, STDOUT, Process
 from datetime import datetime
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, TextIO, Tuple, Union
 from statistics import mean, stdev
+import atexit
 import argparse
 import asyncio
 import math
@@ -16,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from matchers import run_matcher
 
@@ -62,27 +65,36 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Runs CP2K regression test suite.")
     parser.add_argument("--mpiranks", type=int, default=2)
     parser.add_argument("--ompthreads", type=int)
-    parser.add_argument("--maxtasks", type=int, default=os.cpu_count())
+    parser.add_argument("--maxtasks", type=int, default=cpu_count())
     parser.add_argument("--num_gpus", type=int, default=0)
-    parser.add_argument("--timeout", type=int, default=400)
+    parser.add_argument("--timeout", type=int, default=150)
     parser.add_argument("--maxerrors", type=int, default=50)
     help = "Template for launching MPI jobs, {N} is replaced by number of processors."
     parser.add_argument("--mpiexec", default="mpiexec -n {N} --bind-to none", help=help)
-    help = "Runs only the first test of each directory."
-    parser.add_argument("--smoketest", dest="smoketest", action="store_true", help=help)
+    parser.add_argument("--workbasedir", type=Path, default=Path.cwd() / "regtesting")
+    parser.add_argument("--cp2kdatadir", type=Path)
+
     help = "Runs tests under Valgrind memcheck. Best used together with --keepalive."
     parser.add_argument("--valgrind", action="store_true", help=help)
     help = "Use a persistent cp2k-shell process to reduce startup time."
     parser.add_argument("--keepalive", dest="keepalive", action="store_true", help=help)
-    help = "Flag slow tests in the final summary and status report."
+    help = "Flag slow tests and directories in the final summary and status report."
     parser.add_argument("--flagslow", dest="flagslow", action="store_true", help=help)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--restrictdir", action="append")
-    parser.add_argument("--skipdir", action="append")
-    parser.add_argument("--workbasedir", type=Path, default=Path.cwd() / "regtesting")
-    parser.add_argument("--cp2kdatadir", type=Path)
-    parser.add_argument("--skip_unittests", action="store_true")
-    parser.add_argument("--skip_regtests", action="store_true")
+
+    help = "Runs only the first test of each directory."
+    parser.add_argument("--smoketest", dest="smoketest", action="store_true", help=help)
+    help = "Run only directories that match a glob pattern. Can be used multiple times."
+    parser.add_argument("--restrictdir", action="append", help=help)
+    help = "Skip directories that match a glob pattern. Can be used multiple times."
+    parser.add_argument("--skipdir", action="append", help=help)
+    help = "Run only directories listed in given file, i.e overwrite TEST_DIRS."
+    parser.add_argument("--testdirs", type=Path, help=help)
+    help = "Skip all unit tests."
+    parser.add_argument("--skip_unittests", action="store_true", help=help)
+    help = "Skip all regtests."
+    parser.add_argument("--skip_regtests", action="store_true", help=help)
+
     parser.add_argument("binary_dir", type=Path)
     parser.add_argument("version")
     cfg = Config(parser.parse_args())
@@ -130,31 +142,36 @@ async def main() -> None:
     batches: List[Batch] = []
 
     # Read UNIT_TESTS.
-    unit_tests_fn = cfg.cp2k_root / "tests" / "UNIT_TESTS"
-    for line in unit_tests_fn.read_text(encoding="utf8").split("\n"):
-        line = line.split("#", 1)[0].strip()
-        if line:
-            batch = Batch(f"UNIT/{line}", cfg)
-            batch.workdir.mkdir(parents=True)
-            batch.unittests.append(Unittest(line.split()[0], batch.workdir))
-            batches.append(batch)
+    if not cfg.skip_unittests:
+        unit_tests_fn = cfg.cp2k_root / "tests" / "UNIT_TESTS"
+        for line in unit_tests_fn.read_text(encoding="utf8").split("\n"):
+            line = line.split("#", 1)[0].strip()
+            if line:
+                batch = Batch(f"UNIT/{line}", cfg)
+                batch.workdir.mkdir(parents=True)
+                batch.unittests.append(Unittest(line.split()[0], batch.workdir))
+                batches.append(batch)
 
     # Read TEST_DIRS.
-    test_dirs_fn = cfg.cp2k_root / "tests" / "TEST_DIRS"
-    for line in test_dirs_fn.read_text(encoding="utf8").split("\n"):
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        batch = Batch(line, cfg)
+    if not cfg.skip_regtests:
+        for line in cfg.test_dirs.read_text(encoding="utf8").split("\n"):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            batch = Batch(line, cfg)
 
-        # Read TEST_FILES.toml
-        test_files_fn = Path(batch.src_dir / "TEST_FILES.toml")
-        test_files_content = test_files_fn.read_text(encoding="utf8")
-        for inp_fn, matcher_specs in tomllib.loads(test_files_content).items():
-            batch.regtests.append(Regtest(inp_fn, matcher_specs, batch.workdir))
-            if cfg.smoketest:
-                break  # run only one test per directory
-        batches.append(batch)
+            # Read TEST_FILES.toml
+            try:
+                test_files_fn = Path(batch.src_dir / "TEST_FILES.toml")
+                test_files = tomllib.loads(test_files_fn.read_text(encoding="utf8"))
+            except Exception as e:
+                print(f"Error: Could not parse {test_files_fn}\n{e}")
+                sys.exit(1)
+            for inp_fn, matcher_specs in test_files.items():
+                batch.regtests.append(Regtest(inp_fn, matcher_specs, batch.workdir))
+                if cfg.smoketest:
+                    break  # run only one test per directory
+            batches.append(batch)
 
     # Check for nested test dirs.
     for batch_a in batches:
@@ -169,9 +186,9 @@ async def main() -> None:
     for batch in batches:
         if not batch.requirements_satisfied(flags, cfg.mpiranks):
             print(f"Skipping {batch.name} because its requirements are not satisfied.")
-        elif not any(re.fullmatch(p, batch.name) for p in cfg.restrictdirs):
+        elif not any(fnmatchcase(batch.name, p) for p in cfg.restrictdirs):
             num_restrictdirs += 1
-        elif any(re.fullmatch(p, batch.name) for p in cfg.skipdirs):
+        elif any(fnmatchcase(batch.name, p) for p in cfg.skipdirs):
             num_skipdirs += 1
         else:
             # Need to keep a reference of the task to protect it from garbage collection.
@@ -190,10 +207,13 @@ async def main() -> None:
 
     # Wait for tasks to finish and print their results.
     all_results: List[TestResult] = []
+    dir_durations: Dict[str, float] = {}
     with open(cfg.error_summary, "wt", encoding="utf8", errors="replace") as err_fh:
         for num_done, task in enumerate(asyncio.as_completed(tasks)):
             batch_result = await task
             all_results += batch_result.results
+            if batch_result.batch.regtests:
+                dir_durations[batch_result.batch.name] = batch_result.duration
             print(f">>> {batch_result.batch.workdir}")
             print("\n".join(str(r) for r in batch_result.results))
             print(f"<<< {batch_result.batch.workdir} ({num_done + 1}", end="")
@@ -209,7 +229,7 @@ async def main() -> None:
     print("\n".join(r.error for r in all_results if r.error))
 
     print("\n------------------------------- Timings --------------------------------")
-    timings = sorted(r.duration for r in all_results)
+    timings = sorted(r.duration for r in all_results if r.duration)
     print('Plot: name="timings", title="Timing Distribution", ylabel="time [s]"')
     for p in (100, 99, 98, 95, 90, 80):
         y = percentile(timings, p / 100.0)
@@ -219,7 +239,9 @@ async def main() -> None:
     if cfg.flag_slow:
         print("\n" + "-" * 15 + "--------------- Slow Tests ---------------" + "-" * 15)
         threshold = 2 * percentile(timings, 0.95)
-        outliers = [r for r in all_results if r.duration > 0.95 * threshold]
+        outliers = [
+            r for r in all_results if r.duration and r.duration > 0.95 * threshold
+        ]
         maybe_slow = [r for r in outliers if r.fullname not in cfg.slow_suppressions]
         num_suppressed = len(outliers) - len(maybe_slow)
         rerun_tasks: List[Task[BatchResult]] = []
@@ -228,13 +250,27 @@ async def main() -> None:
             rerun_tasks.append(asyncio.get_event_loop().create_task(run_batch(b, cfg)))
         rerun_times: Dict[str, float] = {}
         for t in await asyncio.gather(*rerun_tasks):
-            rerun_times.update({r.fullname: r.duration for r in t.results})
-        stats = {r.fullname: [r.duration, rerun_times[r.fullname]] for r in maybe_slow}
+            rerun_times.update(
+                {r.fullname: r.duration for r in t.results if r.duration}
+            )
+        stats = {
+            r.fullname: [r.duration, rerun_times[r.fullname]]
+            for r in maybe_slow
+            if r.duration
+        }
         slow_tests = {k: v for k, v in stats.items() if mean(v) - stdev(v) > threshold}
         print(f"Duration threshold (2x 95th %ile): {threshold:.2f} sec")
         print(f"Found {len(slow_tests)} slow tests ({num_suppressed} suppressed):")
         for k, v in slow_tests.items():
             print(f"    {k :<80s} ( {mean(v):6.2f} ±{stdev(v):4.2f} sec)")
+
+        print("\n" + "-" * 15 + "---------- Slow Test Directories ---------" + "-" * 15)
+        dir_threshold = 2 * percentile(sorted(dir_durations.values()), 0.95)
+        slow_dirs = {k: v for k, v in dir_durations.items() if v > dir_threshold}
+        print(f"Duration threshold (2x 95th %ile): {dir_threshold:.2f} sec")
+        print(f"Found {len(slow_dirs)} slow test directories:")
+        for name, duration in sorted(slow_dirs.items()):
+            print(f"    {name :<80s} ( {duration:.2f} sec)")
 
     print("\n------------------------------- Summary --------------------------------")
     total_duration = time.perf_counter() - start_time
@@ -244,7 +280,8 @@ async def main() -> None:
     num_wrong = sum(r.status == "WRONG RESULT" for r in all_results)
     num_na = sum(r.status == "N/A" for r in all_results)
     num_ok = sum(r.status == "OK" for r in all_results)
-    status_ok = (num_ok == num_tests) and (not cfg.flag_slow or not slow_tests)
+    slowness_detected = cfg.flag_slow and (slow_tests or slow_dirs)
+    status_ok = (num_ok == num_tests) and not slowness_detected
     print(f"Number of FAILED  tests {num_failed}")
     print(f"Number of WRONG   tests {num_wrong}")
     print(f"Number of CORRECT tests {num_ok}")
@@ -253,7 +290,9 @@ async def main() -> None:
     summary += f"; wrong: {num_wrong}" if num_wrong > 0 else ""
     summary += f"; failed: {num_failed}" if num_failed > 0 else ""
     summary += f"; n/a: {num_na}" if num_na > 0 else ""
-    summary += f"; slow: {len(slow_tests)}" if cfg.flag_slow and slow_tests else ""
+    if cfg.flag_slow:
+        summary += f"; slow: {len(slow_tests)}" if slow_tests else ""
+        summary += f"; slow dirs: {len(slow_dirs)}" if slow_dirs else ""
     summary += f"; {total_duration/60.0:.0f}min"
     print(summary)
     print("Status: " + ("OK" if status_ok else "FAILED") + "\n")
@@ -263,8 +302,8 @@ async def main() -> None:
 
 
 # ======================================================================================
-def _is_intel_mpi(mpiexec_cmd: str = "mpiexec") -> bool:
-    """Check if the given mpiexec command belongs to Intel MPI."""
+def _mpi_version(mpiexec_cmd: str = "mpiexec") -> str:
+    """Return the version information reported by the MPI launcher."""
     try:
         result = subprocess.run(
             [mpiexec_cmd, "--version"],
@@ -272,9 +311,9 @@ def _is_intel_mpi(mpiexec_cmd: str = "mpiexec") -> bool:
             text=True,
             timeout=10,
         )
-        return "Intel" in result.stdout or "Intel" in result.stderr
+        return result.stdout + result.stderr
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return False
+        return ""
 
 
 # ======================================================================================
@@ -291,7 +330,9 @@ class Config:
         self.mpiexec = args.mpiexec
         if "{N}" not in self.mpiexec:  # backwards compatibility
             self.mpiexec = f"{self.mpiexec} ".replace(" ", " -n {N} ", 1).strip()
-        self.intel_mpi = _is_intel_mpi(self.mpiexec.split()[0])
+        mpi_version = _mpi_version(self.mpiexec.split()[0])
+        self.intel_mpi = "Intel" in mpi_version
+        self.openmpi = "Open MPI" in mpi_version
         if self.intel_mpi and "--bind-to" in self.mpiexec:
             self.mpiexec = self.mpiexec.replace(" --bind-to none", "")
         self.smoketest = args.smoketest
@@ -302,10 +343,11 @@ class Config:
         self.version = args.version
         self.debug = args.debug
         self.max_errors = args.maxerrors
-        self.restrictdirs = args.restrictdir if args.restrictdir else [".*"]
-        self.skipdirs = args.skipdir if args.skipdir else []
+        self.restrictdirs = [d.rstrip("/") for d in args.restrictdir or ["*"]]
+        self.skipdirs = [d.rstrip("/") for d in args.skipdir or []]
         self.skip_unittests = args.skip_unittests
         self.skip_regtests = args.skip_regtests
+        self.test_dirs = args.testdirs or self.cp2k_root / "tests" / "TEST_DIRS"
         datestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.work_base_dir = args.workbasedir.resolve() / f"TEST-{datestamp}"
         self.error_summary = self.work_base_dir / "error_summary"
@@ -320,10 +362,6 @@ class Config:
         huge_supps_fn = self.cp2k_root / "tests" / "HUGE_TESTS_SUPPRESSIONS"
         self.huge_suppressions = huge_supps_fn.read_text(encoding="utf8").split("\n")
 
-        def run_with_capture_stdout(cmd: str) -> bytes:
-            # capture_output argument not available before Python 3.7
-            return subprocess.run(cmd, shell=True, stdout=PIPE, stderr=DEVNULL).stdout
-
         # Detect number of GPU devices, if not specified by the user
         if args.num_gpus > 0:
             self.num_gpus = args.num_gpus
@@ -334,6 +372,29 @@ class Config:
             amd_gpus = int(run_with_capture_stdout(amd_cmd))
             self.num_gpus = nv_gpus + amd_gpus
         self.next_gpu = 0  # Used to assign devices round robin to processes.
+        self.openmpi_shm_root: Optional[Path] = None
+        self.next_mpi_launch = 0
+
+    def isolate_openmpi_shm(self, env: Dict[str, str]) -> None:
+        """Give each OpenMPI launch a private shared-memory backing directory."""
+        key = "OMPI_MCA_btl_sm_backing_directory"
+        shm_parent = Path("/dev/shm")
+        if not self.openmpi or key in env or not shm_parent.is_dir():
+            return
+        if self.openmpi_shm_root is None:
+            try:
+                root = tempfile.mkdtemp(prefix="cp2k-regtest-", dir=shm_parent)
+            except OSError:
+                return
+            self.openmpi_shm_root = Path(root)
+            atexit.register(shutil.rmtree, root, ignore_errors=True)
+        launch_dir = self.openmpi_shm_root / str(self.next_mpi_launch)
+        self.next_mpi_launch += 1
+        try:
+            launch_dir.mkdir()
+        except OSError:
+            return
+        env[key] = str(launch_dir)
 
     def launch_exe(
         self, exe_stem: str, *args: str, cwd: Optional[Path] = None
@@ -362,6 +423,7 @@ class Config:
         if self.valgrind:
             cmd = ["valgrind", "--error-exitcode=42", "--exit-on-first-error=yes"] + cmd
         if self.use_mpi:
+            self.isolate_openmpi_shm(env)
             cmd = self.mpiexec.format(N=self.mpiranks).split() + cmd
         if self.debug:
             print(f"Creating subprocess: {cmd} {args}")
@@ -424,7 +486,7 @@ class TestResult:
         batch: Batch,
         test: Union[Regtest, Unittest],
         spec: Optional[Dict[str, Any]],
-        duration: float,
+        duration: Optional[float],
         status: TestStatus,
         error: Optional[str] = None,
         value: Optional[float] = None,
@@ -443,7 +505,8 @@ class TestResult:
         if self.spec and len(self.test.matcher_specs) > 1:
             display_name += f":{self.spec.get('matcher', '???')}"
         value = f"{self.value:.10g}" if self.value else "-"
-        return f"    {display_name :<80s} {value :>17} {self.status :>12s} ( {self.duration:6.2f} sec)"
+        timing = f" ( {self.duration:6.2f} sec)" if self.duration else ""
+        return f"    {display_name :<80s} {value :>17} {self.status :>12s}{timing}"
 
 
 # ======================================================================================
@@ -451,7 +514,7 @@ class BatchResult:
     def __init__(self, batch: Batch, results: List[TestResult]):
         self.batch = batch
         self.results = results
-        self.duration = sum(float(r.duration) for r in results)
+        self.duration = sum(r.duration for r in results if r.duration)
 
 
 # ======================================================================================
@@ -461,12 +524,20 @@ class Cp2kShell:
         self.workdir = workdir
         self._child: Optional[Process] = None
 
-    async def stop(self) -> None:
+    async def stop(self, force: bool = False) -> None:
         assert self._child
-        try:
-            self._child.terminate()  # Give mpiexec a chance to shutdown
-        except ProcessLookupError:
-            pass
+        if self._child.returncode is None:
+            if force:
+                try:
+                    self._child.terminate()
+                except ProcessLookupError:
+                    pass
+            else:
+                # Let CP2K finalize MPI and release launcher resources.
+                try:
+                    await self.sendline("EXIT")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
         await self._child.communicate()  # Read output to prevent a zombie process.
         self._child = None
 
@@ -538,11 +609,7 @@ async def wait_for_child_process(
 # ======================================================================================
 async def run_batch(batch: Batch, cfg: Config) -> BatchResult:
     async with cfg.workers:
-        results = []
-        if not cfg.skip_unittests:
-            results += await run_unittests(batch, cfg)
-        if not cfg.skip_regtests:
-            results += await run_regtests(batch, cfg)
+        results = (await run_unittests(batch, cfg)) + (await run_regtests(batch, cfg))
         return BatchResult(batch, results)
 
 
@@ -598,7 +665,7 @@ async def run_regtests_keepalive(batch: Batch, cfg: Config) -> List[TestResult]:
                 returncode = -9
 
         if returncode != 0:
-            await shell.stop()
+            await shell.stop(force=timed_out)
             await shell.start()
         duration = time.perf_counter() - start_time
         output_size = dirsize(batch.workdir) - start_dirsize
@@ -667,9 +734,10 @@ def eval_regtest(
     if not test.matcher_specs:
         return [TestResult(batch, test, None, duration, "OK")]
 
-    # run the matchers
+    # Only the first matcher carries the duration of the single test execution.
     results = []
-    for spec in test.matcher_specs:
+    for i, spec in enumerate(test.matcher_specs):
+        matcher_duration = duration if i == 0 else None
         spec = dict(spec)  # shallow copy so we can pop without mutating the original
         alt_file = spec.pop("file", None)
         if alt_file:
@@ -677,7 +745,7 @@ def eval_regtest(
             if not alt_path.exists():
                 err = f"{error}Spec: {spec}\nExpected output file not found: {alt_path}"
                 results += [
-                    TestResult(batch, test, spec, duration, "WRONG RESULT", err)
+                    TestResult(batch, test, spec, matcher_duration, "WRONG RESULT", err)
                 ]
                 continue
             match_output = alt_path.read_bytes().decode("utf8", errors="replace")
@@ -686,7 +754,9 @@ def eval_regtest(
         m = run_matcher(match_output, **spec)
         if m.error:
             m.error = f"{error}Spec: {spec}\n{m.error}"
-        results += [TestResult(batch, test, spec, duration, m.status, m.error, m.value)]
+        results += [
+            TestResult(batch, test, spec, matcher_duration, m.status, m.error, m.value)
+        ]
 
     return results
 
@@ -706,6 +776,18 @@ def percentile(values: List[float], percent: float) -> float:
 # ======================================================================================
 def is_relative_to(p: Path, u: Path) -> bool:  # not in pathlib before Python 3.9
     return u == p or u in p.parents
+
+
+# ======================================================================================
+def run_with_capture_stdout(cmd: str) -> bytes:
+    # capture_output argument not available before Python 3.7
+    return subprocess.run(cmd, shell=True, stdout=PIPE, stderr=DEVNULL).stdout
+
+
+# ======================================================================================
+def cpu_count() -> int:
+    # os.cpu_count() ignores $PYTHON_CPU_COUNT before Python 3.13
+    return int(os.getenv("PYTHON_CPU_COUNT") or str(os.cpu_count()))
 
 
 # ======================================================================================

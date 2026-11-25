@@ -101,7 +101,7 @@ CONTAINS
             ! Although the Helium MC is not really an md it is most of the times
             ! embedded in the pint code so the same step counter applies.
             IF (k == 1) THEN
-               CALL cp_add_iter_level(helium_env(k)%helium%logger%iter_info, "PINT")
+               CALL cp_add_iter_level(helium_env(k)%helium%logger, "PINT")
                CALL cp_iterate(helium_env(k)%helium%logger%iter_info, &
                                iter_nr=helium_env(k)%helium%first_step)
             END IF
@@ -156,7 +156,7 @@ CONTAINS
 
       ! remove iteration level
       IF (ASSOCIATED(helium_env)) THEN
-         CALL cp_rm_iter_level(helium_env(1)%helium%logger%iter_info, "PINT")
+         CALL cp_rm_iter_level(helium_env(1)%helium%logger, "PINT")
       END IF
 
       RETURN
@@ -661,7 +661,7 @@ CONTAINS
                      IF (x >= 0.01_dp) EXIT
                   END DO
                   z = -LOG(0.01_dp)
-                  y = LOG(x)/z + 1.0_dp;
+                  y = LOG(x)/z + 1.0_dp
                   cyclen = INT(helium%maxcycle*y) + 1
                   IF (cyclen /= helium%m_value) EXIT
                END DO

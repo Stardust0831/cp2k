@@ -36,8 +36,6 @@ MODULE xc_perdew86
    PRIVATE
 
 ! *** Global parameters ***
-
-   REAL(KIND=dp), PARAMETER :: pi = 3.14159265358979323846264338_dp
    REAL(KIND=dp), PARAMETER :: f13 = 1.0_dp/3.0_dp, &
                                f23 = 2.0_dp*f13, &
                                f43 = 4.0_dp*f13, &
@@ -125,7 +123,7 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'p86_lda_eval'
 
-      INTEGER                                            :: handle, m, npoints
+      INTEGER                                            :: handle, npoints
       INTEGER, DIMENSION(2, 3)                           :: bo
       REAL(KIND=dp)                                      :: drho_cutoff, rho_cutoff
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: rs
@@ -147,19 +145,16 @@ CONTAINS
                           drho_cutoff=drho_cutoff)
       npoints = (bo(2, 1) - bo(1, 1) + 1)*(bo(2, 2) - bo(1, 2) + 1)*(bo(2, 3) - bo(1, 3) + 1)
       CALL p86_init(rho_cutoff)
-      m = ABS(order)
 
       ALLOCATE (rs(npoints))
 
       CALL calc_rs_pw(rho, rs, npoints)
-      IF (order >= 0) THEN
-         deriv => xc_dset_get_derivative(deriv_set, [INTEGER::], &
-                                         allocate_deriv=.TRUE.)
-         CALL xc_derivative_get(deriv, deriv_data=e_0)
+      deriv => xc_dset_get_derivative(deriv_set, [INTEGER::], &
+                                      allocate_deriv=.TRUE.)
+      CALL xc_derivative_get(deriv, deriv_data=e_0)
 
-         CALL p86_u_0(rho, rs, grho, e_0, npoints)
-      END IF
-      IF (order >= 1 .OR. order == -1) THEN
+      CALL p86_u_0(rho, rs, grho, e_0, npoints)
+      IF (order >= 1) THEN
          deriv => xc_dset_get_derivative(deriv_set, [deriv_rho], &
                                          allocate_deriv=.TRUE.)
          CALL xc_derivative_get(deriv, deriv_data=e_rho)
@@ -170,7 +165,7 @@ CONTAINS
          CALL p86_u_1(rho, grho, rs, e_rho, &
                       e_ndrho, npoints)
       END IF
-      IF (order >= 2 .OR. order == -2) THEN
+      IF (order >= 2) THEN
          deriv => xc_dset_get_derivative(deriv_set, [deriv_rho, deriv_rho], &
                                          allocate_deriv=.TRUE.)
          CALL xc_derivative_get(deriv, deriv_data=e_rho_rho)
@@ -184,7 +179,7 @@ CONTAINS
          CALL p86_u_2(rho, grho, rs, e_rho_rho, &
                       e_rho_ndrho, e_ndrho_ndrho, npoints)
       END IF
-      IF (order >= 3 .OR. order == -3) THEN
+      IF (order >= 3) THEN
          deriv => xc_dset_get_derivative(deriv_set, [deriv_rho, deriv_rho, deriv_rho], &
                                          allocate_deriv=.TRUE.)
          CALL xc_derivative_get(deriv, deriv_data=e_rho_rho_rho)
@@ -202,7 +197,7 @@ CONTAINS
                       e_rho_rho_ndrho, e_rho_ndrho_ndrho, e_ndrho_ndrho_ndrho, &
                       npoints)
       END IF
-      IF (order > 3 .OR. order < -3) THEN
+      IF (order > 3) THEN
          CPABORT("derivatives bigger than 3 not implemented")
       END IF
       DEALLOCATE (rs)
@@ -345,7 +340,7 @@ CONTAINS
             e_rho_rho(ip) = e_rho_rho(ip) + x*or*ep*g*g* &
                             (-f43*or*dcr + d2cr - dcr*dphir + &
                              f43*or*cr*dphir - dcr*dphir - cr*d2phir + cr*dphir*dphir + &
-                             f43*or*(7.*f13*or*cr - dcr + cr*dphir))
+                             f43*or*(7._dp*f13*or*cr - dcr + cr*dphir))
             e_rho_ndrho(ip) = e_rho_ndrho(ip) + x*or*ep*g* &
                               (-2*f43*cr*or + 2*dcr - 2*cr*dphir + f43*or*g*cr*dphig - &
                                g*dcr*dphig + g*cr*dphir*dphig - g*cr*dphigr)
@@ -397,8 +392,8 @@ CONTAINS
             d2p = 2.0_dp*b
             q = 1.0_dp + c*r + d*r*r + 1.e4_dp*b*r*r*r
             dq = c + 2.0_dp*d*r + 3.e4_dp*b*r*r
-            d2q = 2.0_dp*d + 6.e4*b*r
-            d3q = 6.e4*b
+            d2q = 2.0_dp*d + 6.e4_dp*b*r
+            d3q = 6.e4_dp*b
             pq = p/q
             dpq = (dpv*q - p*dq)/(q*q)
             d2pq = (d2p*q*q - 2*dpv*dq*q + 2*p*dq*dq - p*d2q*q)/(q*q*q)
@@ -411,8 +406,8 @@ CONTAINS
                    dpq*(-f13*f43*f13*7*r*or*or*or)
             oz = SQRT(x)*or/cr
             dz = dcr/cr + f76*or
-            d2z = d2cr/cr + 2*f76*dcr/cr*or + f76/6.*or*or
-            d3z = d3cr/cr + 3*f76*d2cr/cr*or + 3*f76/6.*dcr/cr*or*or - 5*f76/36.*or*or*or
+            d2z = d2cr/cr + 2*f76*dcr/cr*or + f76/6._dp*or*or
+            d3z = d3cr/cr + 3*f76*d2cr/cr*or + 3*f76/6._dp*dcr/cr*or*or - 5*f76/36._dp*or*or*or
             dphig = fpe*pci*oz
             phi = dphig*g
             dphir = -phi*dz
@@ -423,20 +418,20 @@ CONTAINS
                       dphig*((d2cr*cr - dcr*dcr)/(cr*cr) - f76*or*or)
             ep = EXP(-phi)
             e_rho_rho_rho(ip) = e_rho_rho_rho(ip) &
-                                + g*g*x*or*ep*(-280./27.*or*or*or*cr + 3*28./9.*or*or*dcr + &
-                                               3*28./9.*or*or*cr*(-dphir) - 4*or*d2cr - 8*or*dcr*(-dphir) - &
+                                + g*g*x*or*ep*(-280._dp/27._dp*or*or*or*cr + 3*28._dp/9._dp*or*or*dcr + &
+                                               3*28._dp/9._dp*or*or*cr*(-dphir) - 4*or*d2cr - 8*or*dcr*(-dphir) - &
                                                4*or*cr*(-d2phir + dphir*dphir) + d3cr + 3*d2cr*(-dphir) + &
                                                3*dcr*(-d2phir + dphir*dphir) + cr*(-d3phir + 3*dphir*d2phir - &
                                                                                    dphir**3))
             e_rho_rho_ndrho(ip) = e_rho_rho_ndrho(ip) &
-                                  + 2.*x*or*ep*g*(-f43*or*dcr + d2cr - dcr*dphir + &
-                                                  f43*or*cr*dphir - dcr*dphir - cr*d2phir + cr*dphir*dphir + &
-                                                  f43*or*(7.*f13*or*cr - dcr + cr*dphir)) - &
+                                  + 2._dp*x*or*ep*g*(-f43*or*dcr + d2cr - dcr*dphir + &
+                                                     f43*or*cr*dphir - dcr*dphir - cr*d2phir + cr*dphir*dphir + &
+                                                     f43*or*(7._dp*f13*or*cr - dcr + cr*dphir)) - &
                                   dphig*x*or*ep*g*g*(-f43*or*dcr + d2cr - dcr*dphir + &
                                                      f43*or*cr*dphir - dcr*dphir - cr*d2phir + cr*dphir*dphir + &
-                                                     f43*or*(7.*f13*or*cr - dcr + cr*dphir)) + &
+                                                     f43*or*(7._dp*f13*or*cr - dcr + cr*dphir)) + &
                                   x*or*ep*g*g*(-dcr*dphigr + f43*or*cr*dphigr - dcr*dphigr - cr*d2phirg + &
-                                               2.*cr*dphigr*dphir + f43*or*cr*dphigr)
+                                               2._dp*cr*dphigr*dphir + f43*or*cr*dphigr)
             e_rho_ndrho_ndrho(ip) = e_rho_ndrho_ndrho(ip) &
                                     + x*or*ep*(-2*f43*cr*or + 2*dcr - 2*cr*dphir + f43*or*g*cr*dphig - &
                                                g*dcr*dphig + g*cr*dphir*dphig - g*cr*dphigr) + &

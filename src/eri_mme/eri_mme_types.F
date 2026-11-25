@@ -127,8 +127,9 @@ CONTAINS
       CHARACTER(len=2)                                   :: string
 
       WRITE (string, '(I2)') n_minimax_max
-      IF (n_minimax > n_minimax_max) &
+      IF (n_minimax > n_minimax_max) THEN
          CPABORT("The maximum allowed number of minimax points N_MINIMAX is "//TRIM(string))
+      END IF
 
       param%n_minimax = n_minimax
       param%n_grids = 1
@@ -263,6 +264,8 @@ CONTAINS
       INTEGER, INTENT(IN), OPTIONAL                      :: potential
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: pot_par
 
+      REAL(KIND=dp), PARAMETER                           :: zet_d = 1.0E-12_dp
+
       REAL(KIND=dp)                                      :: cutoff_max, cutoff_min, cutoff_rel
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: minimax_aw
 
@@ -287,7 +290,7 @@ CONTAINS
 
       DEALLOCATE (minimax_aw)
 
-      CPASSERT(param%zet_max + 1.0E-12 > param%zet_min)
+      CPASSERT(param%zet_max + zet_d > param%zet_min)
       CPASSERT(param%n_grids >= 1)
 
       cutoff_max = param%cutoff
@@ -327,6 +330,8 @@ CONTAINS
       INTEGER, INTENT(IN), OPTIONAL                      :: potential
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: pot_par
 
+      REAL(KIND=dp), PARAMETER                           :: err_mm_d = 1.0E-12_dp
+
       INTEGER                                            :: i_grid, n_mm
       REAL(KIND=dp)                                      :: cutoff, cutoff_delta, err_mm, err_mm_prev
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: minimax_aw, minimax_aw_prev
@@ -338,7 +343,7 @@ CONTAINS
       ! for first grid (for max. cutoff) always use default n_minimax
       CALL get_minimax_coeff_v_gspace(n_minimax, cutoff, G_min, minimax_aw, err_minimax=err_mm, &
                                       potential=potential, pot_par=pot_par)
-      CPASSERT(err_mm < 1.1_dp*target_error + 1.0E-12)
+      CPASSERT(err_mm < 1.1_dp*target_error + err_mm_d)
       CALL create_minimax_grid(minimax_grids(n_grids), cutoff, n_minimax, minimax_aw, err_mm)
       DEALLOCATE (minimax_aw)
 

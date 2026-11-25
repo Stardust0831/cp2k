@@ -40,6 +40,7 @@ cd build || return 1
 #
 if [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "pdbg" ]]; then
   cmake \
+    --preset "native-gnu-x86_64" \
     -GNinja \
     -DCMAKE_BUILD_TYPE="Debug" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
@@ -53,6 +54,7 @@ if [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "pdbg" ]]; then
 
 elif [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "sdbg" ]]; then
   cmake \
+    --preset "native-gnu-x86_64" \
     -GNinja \
     -DCMAKE_BUILD_TYPE="Debug" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
@@ -65,6 +67,7 @@ elif [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "sdbg" ]]; then
 
 elif [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
+    --preset "native-gnu-x86_64" \
     -GNinja \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
@@ -77,6 +80,7 @@ elif [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "psmp" ]]; then
 
 elif [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "ssmp" ]]; then
   cmake \
+    --preset "native-gnu-x86_64" \
     -GNinja \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
@@ -86,8 +90,48 @@ elif [[ "${PROFILE}" == "toolchain" ]] && [[ "${VERSION}" == "ssmp" ]]; then
     .. |& tee ./cmake.log
   CMAKE_EXIT_CODE=$?
 
+elif [[ "${PROFILE}" == "toolchain_mkl" ]] && [[ "${VERSION}" == "psmp" ]]; then
+  cmake \
+    --preset "native-gnu-x86_64" \
+    -GNinja \
+    -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+    -DCP2K_BLAS_VENDOR=MKL \
+    -DCP2K_USE_EVERYTHING=ON \
+    -DCP2K_USE_MPI=ON \
+    -DCP2K_USE_LIBTORCH=OFF \
+    -DCP2K_USE_OPENPMD=OFF \
+    -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
+    -DCP2K_USE_MIMIC=OFF \
+    -DCP2K_USE_PEXSI=OFF \
+    -DCP2K_USE_DLAF=OFF \
+    -Werror=dev \
+    .. |& tee ./cmake.log
+  CMAKE_EXIT_CODE=$?
+
+elif [[ "${PROFILE}" == "toolchain_mkl" ]] && [[ "${VERSION}" == "ssmp" ]]; then
+  cmake \
+    --preset "native-gnu-x86_64" \
+    -GNinja \
+    -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+    -DCP2K_BLAS_VENDOR=MKL \
+    -DCP2K_USE_EVERYTHING=ON \
+    -DCP2K_USE_MPI=OFF \
+    -DCP2K_USE_LIBTORCH=OFF \
+    -DCP2K_USE_DEEPMD=OFF \
+    -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
+    -DCP2K_USE_MIMIC=OFF \
+    -DCP2K_USE_PEXSI=OFF \
+    -DCP2K_USE_DLAF=OFF \
+    -Werror=dev \
+    .. |& tee ./cmake.log
+  CMAKE_EXIT_CODE=$?
+
 elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
+    --preset "native-intel" \
     -GNinja \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
@@ -95,6 +139,7 @@ elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "psmp" ]]; th
     -DCP2K_USE_OPENPMD=OFF \
     -DCP2K_USE_DEEPMD=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_MIMIC=OFF \
     -DCP2K_USE_PEXSI=OFF \
     -DCP2K_USE_DLAF=OFF \
@@ -104,6 +149,7 @@ elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "psmp" ]]; th
 
 elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "ssmp" ]]; then
   cmake \
+    --preset "native-intel" \
     -GNinja \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
@@ -111,6 +157,7 @@ elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "ssmp" ]]; th
     -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_DEEPMD=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_MIMIC=OFF \
     -DCP2K_USE_PEXSI=OFF \
     -DCP2K_USE_DLAF=OFF \
@@ -120,6 +167,7 @@ elif [[ "${PROFILE}" == "toolchain_intel" ]] && [[ "${VERSION}" == "ssmp" ]]; th
 
 elif [[ "${PROFILE}" == "toolchain_arm64" ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
+    --preset "native-gnu-arm64" \
     -GNinja \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
@@ -129,6 +177,7 @@ elif [[ "${PROFILE}" == "toolchain_arm64" ]] && [[ "${VERSION}" == "psmp" ]]; th
     -DCP2K_USE_DEEPMD=OFF \
     -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
     -Werror=dev \
     .. |& tee ./cmake.log
@@ -137,6 +186,7 @@ elif [[ "${PROFILE}" == "toolchain_arm64" ]] && [[ "${VERSION}" == "psmp" ]]; th
 elif [[ "${PROFILE}" == "toolchain_cuda_"* ]] && [[ "${VERSION}" == "psmp" ]]; then
   # TODO: CP2K_USE_SPLA_GEMM_OFFLOADING should get enabled automatically.
   cmake \
+    --preset "native-gnu-x86_64" \
     -GNinja \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DSPLA_ROOT="${SPLA_ROOT}-cuda" \
@@ -152,19 +202,21 @@ elif [[ "${PROFILE}" == "toolchain_cuda_"* ]] && [[ "${VERSION}" == "psmp" ]]; t
     -DCP2K_USE_LIBSMEAGOL=OFF \
     -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_GREENX=OFF \
-    -DCP2K_USE_SPGLIB=OFF \
     -DCP2K_USE_VORI=OFF \
     -DCP2K_USE_TREXIO=OFF \
     -DCP2K_USE_MIMIC=OFF \
     -DCP2K_USE_LIBFCI=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
+    -DCP2K_USE_SIRIUS=OFF \
     -Werror=dev \
     .. |& tee ./cmake.log
   CMAKE_EXIT_CODE=$?
 
 elif [[ "${PROFILE}" == "toolchain_hip_"* ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
+    --preset "native-gnu-x86_64" \
     -GNinja \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_WITH_GPU="${PROFILE:14}" \
@@ -176,25 +228,24 @@ elif [[ "${PROFILE}" == "toolchain_hip_"* ]] && [[ "${VERSION}" == "psmp" ]]; th
   CMAKE_EXIT_CODE=$?
 
 elif [[ "${PROFILE}" == "toolchain_generic" ]] && [[ "${VERSION}" == "psmp" ]]; then
+  # No --preset to keep this build generic.
   cmake \
     -GNinja \
-    -DCMAKE_BUILD_TYPE="Generic" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
     -DCP2K_USE_DLAF=OFF \
     -DCP2K_USE_PEXSI=OFF \
-    -DCP2K_USE_DEEPMD=OFF \
-    -DCP2K_USE_LIBTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -Werror=dev \
     .. |& tee ./cmake.log
   CMAKE_EXIT_CODE=$?
 
 elif [[ "${PROFILE}" == "toolchain_conventions" ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
+    --preset "conventions" \
     -GNinja \
-    -DCMAKE_BUILD_TYPE="Conventions" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCMAKE_Fortran_COMPILER_LAUNCHER="redirect_gfortran_output.py" \
     -DCP2K_USE_EVERYTHING=ON \
@@ -207,8 +258,8 @@ elif [[ "${PROFILE}" == "toolchain_conventions" ]] && [[ "${VERSION}" == "psmp" 
 
 elif [[ "${PROFILE}" == "toolchain_coverage" ]] && [[ "${VERSION}" == "psmp" ]]; then
   cmake \
+    --preset "coverage" \
     -GNinja \
-    -DCMAKE_BUILD_TYPE="Coverage" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
     -DCP2K_USE_DLAF=OFF \
@@ -222,8 +273,8 @@ elif [[ "${PROFILE}" == "toolchain_asan" ]] && [[ "${VERSION}" == "psmp" ]]; the
   # TODO Re-enable GREENX. It currently leads to a heap-buffer-overflow
   # in `greenx_refine_pade()` at greenx_interface.F:80.
   cmake \
+    --preset "asan" \
     -GNinja \
-    -DCMAKE_BUILD_TYPE="ASAN" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DCP2K_USE_EVERYTHING=ON \
     -DCP2K_USE_DLAF=OFF \
@@ -235,10 +286,11 @@ elif [[ "${PROFILE}" == "toolchain_asan" ]] && [[ "${VERSION}" == "psmp" ]]; the
   CMAKE_EXIT_CODE=$?
 
 elif [[ "${PROFILE}" == "ubuntu" ]] && [[ "${VERSION}" == "ssmp" ]]; then
-  # TODO Enable libxsmm and libspglib once we dropped GCC 8.
-  # TODO fix spglib https://github.com/cp2k/cp2k/issues/3414
-  # NOTE: libxc 5.2.3 is provided, CP2K requires libxc 7
+  # NOTE:
+  #  1. libxc 5.2.3 is provided, CP2K requires libxc 7
+  #  2. Spglib does not provide SpglibConfig.cmake
   cmake \
+    --preset "native-gnu-x86_64" \
     -GNinja \
     -DCMAKE_BUILD_TYPE="RelWithDebInfo" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
@@ -257,6 +309,7 @@ elif [[ "${PROFILE}" == "ubuntu" ]] && [[ "${VERSION}" == "ssmp" ]]; then
     -DCP2K_USE_TREXIO=OFF \
     -DCP2K_USE_LIBFCI=OFF \
     -DCP2K_USE_GAUXC=OFF \
+    -DCP2K_USE_SKALA_FTORCH=OFF \
     -DCP2K_USE_OPENPMD=OFF \
     -Werror=dev \
     .. |& tee ./cmake.log
@@ -264,6 +317,7 @@ elif [[ "${PROFILE}" == "ubuntu" ]] && [[ "${VERSION}" == "ssmp" ]]; then
 
 elif [[ "${PROFILE}" == "minimal" ]] && [[ "${VERSION}" == "sdbg" ]]; then
   cmake \
+    --preset "native-gnu-x86_64" \
     -GNinja \
     -DCMAKE_BUILD_TYPE="Debug" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \

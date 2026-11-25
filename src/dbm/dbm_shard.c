@@ -8,7 +8,7 @@
 #include "../offload/offload_mempool.h"
 #include "dbm_hyperparams.h"
 
-#include <assert.h>
+#include "../base/cp_assert.h"
 #include <omp.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -32,13 +32,12 @@ static int next_power2(const int start) {
  * \author Ole Schuett
  ******************************************************************************/
 static int next_prime(const int start) {
-  int candidate = start, divisor = 0;
-  while (divisor < candidate) {
-    for (divisor = 2; divisor < candidate; divisor++) {
-      if (candidate % divisor == 0) {
-        candidate++;
-        break;
-      }
+  int candidate = start;
+  // Divisors up to the square root suffice (division avoids an overflow).
+  for (int divisor = 2; divisor <= candidate / divisor; divisor++) {
+    if (candidate % divisor == 0) { // try the next candidate
+      ++candidate;
+      divisor = 1;
     }
   }
   return candidate;
@@ -54,7 +53,7 @@ static void hashtable_init(dbm_shard_t *shard) {
       next_power2(DBM_HASHTABLE_FACTOR * shard->nblocks_allocated);
   shard->hashtable_prime = next_prime(shard->hashtable_size);
   shard->hashtable = calloc(shard->hashtable_size, sizeof(int));
-  assert(shard->hashtable != NULL);
+  cp_assert(shard->hashtable != NULL);
 }
 
 /*******************************************************************************
@@ -78,20 +77,20 @@ void dbm_shard_init(dbm_shard_t *shard) {
  * \author Ole Schuett
  ******************************************************************************/
 void dbm_shard_copy(dbm_shard_t *shard_a, const dbm_shard_t *shard_b) {
-  assert(shard_a != NULL && shard_b != NULL);
+  cp_assert(shard_a != NULL && shard_b != NULL);
 
   if (shard_a->nblocks_allocated < shard_b->nblocks) {
     free(shard_a->blocks);
     shard_a->blocks = malloc(shard_b->nblocks * sizeof(dbm_block_t));
     shard_a->nblocks_allocated = shard_b->nblocks;
-    assert(shard_a->blocks != NULL);
+    cp_assert(shard_a->blocks != NULL);
   }
   shard_a->nblocks = shard_b->nblocks;
 
   if (shard_a->hashtable_size < shard_b->hashtable_size) {
     free(shard_a->hashtable);
     shard_a->hashtable = malloc(shard_b->hashtable_size * sizeof(int));
-    assert(shard_a->hashtable != NULL);
+    cp_assert(shard_a->hashtable != NULL);
   }
   shard_a->hashtable_size = shard_b->hashtable_size;
   shard_a->hashtable_prime = shard_b->hashtable_prime;
@@ -101,22 +100,23 @@ void dbm_shard_copy(dbm_shard_t *shard_a, const dbm_shard_t *shard_b) {
     shard_a->data =
         offload_mempool_host_malloc(shard_b->data_size * sizeof(double));
     shard_a->data_allocated = shard_b->data_size;
-    assert(shard_a->data != NULL);
+    cp_assert(shard_a->data != NULL);
   }
   shard_a->data_size = shard_b->data_size;
+  shard_a->data_promised = shard_b->data_size;
 
   if (shard_b->nblocks != 0) {
-    assert(shard_a->blocks != NULL && shard_b->blocks != NULL);
+    cp_assert(shard_a->blocks != NULL && shard_b->blocks != NULL);
     memcpy(shard_a->blocks, shard_b->blocks,
            shard_b->nblocks * sizeof(dbm_block_t));
   }
   if (shard_b->hashtable_size != 0) {
-    assert(shard_a->hashtable != NULL && shard_b->hashtable != NULL);
+    cp_assert(shard_a->hashtable != NULL && shard_b->hashtable != NULL);
     memcpy(shard_a->hashtable, shard_b->hashtable,
            shard_b->hashtable_size * sizeof(int));
   }
   if (shard_b->data_size != 0) {
-    assert(shard_a->data != NULL && shard_b->data != NULL);
+    cp_assert(shard_a->data != NULL && shard_b->data != NULL);
     memcpy(shard_a->data, shard_b->data, shard_b->data_size * sizeof(double));
   }
 }
@@ -133,45 +133,24 @@ void dbm_shard_release(dbm_shard_t *shard) {
 }
 
 /*******************************************************************************
- * \brief Private hash function based on Cantor pairing function.
- *        https://en.wikipedia.org/wiki/Pairing_function#Cantor_pairing_function
- *        Szudzik's elegant pairing proved to be too asymmetric wrt. row / col.
- *        Using unsigned int to return a positive number even after overflow.
- * \author Ole Schuett
- ******************************************************************************/
-static inline unsigned int hash(const unsigned int row,
-                                const unsigned int col) {
-  return (row + col) * (row + col + 1) / 2 + row; // Division by 2 is cheap.
-}
-
-/*******************************************************************************
- * \brief Internal routine for masking a slot in the hash-table.
- * \author Hans Pabst
- ******************************************************************************/
-static inline int hashtable_mask(const dbm_shard_t *shard) {
-  return shard->hashtable_size - 1;
-}
-
-/*******************************************************************************
  * \brief Private routine for inserting a block into a shard's hashtable.
  * \author Ole Schuett
  ******************************************************************************/
 static void hashtable_insert(dbm_shard_t *shard, const int block_idx) {
-  assert(0 <= block_idx && block_idx < shard->nblocks);
+  cp_assert(0 <= block_idx && block_idx < shard->nblocks);
   const dbm_block_t *blk = &shard->blocks[block_idx];
-  const unsigned int h = hash(blk->row, blk->col);
   // Bounded probe: at most hashtable_size steps (load factor < 1 guarantees
   // termination). Avoids unbounded scans when the slot variable wrapped around
   // via the mask but the inner iteration continued past the table end.
-  int slot = (shard->hashtable_prime * h) & hashtable_mask(shard);
+  int slot = dbm_shard_slot(shard, blk->row, blk->col);
   for (int i = 0; i < shard->hashtable_size; ++i) { // linear probing
     if (shard->hashtable[slot] == 0) {              // 0 means empty
       shard->hashtable[slot] = block_idx + 1;       // 1-based
       return;
     }
-    slot = (slot + 1) & hashtable_mask(shard);
+    slot = dbm_shard_nextslot(shard, slot);
   }
-  assert(false);
+  cp_assert(false);
 }
 
 /*******************************************************************************
@@ -182,20 +161,45 @@ dbm_block_t *dbm_shard_lookup(const dbm_shard_t *shard, const int row,
                               const int col) {
   // Bounded probe count prevents scanning the entire table on a miss when
   // clusters exist (previous code could re-enter via slot wrap and re-scan).
-  int slot = (shard->hashtable_prime * hash(row, col)) & hashtable_mask(shard);
+  int slot = dbm_shard_slot(shard, row, col);
   for (int i = 0; i < shard->hashtable_size; ++i) { // linear probing
     const int block_idx = shard->hashtable[slot];
     if (block_idx == 0) { // 1-based, 0 means empty
       return NULL;        // block not found
     }
-    assert(0 < block_idx && block_idx <= shard->nblocks);
+    cp_assert(0 < block_idx && block_idx <= shard->nblocks);
     dbm_block_t *blk = &shard->blocks[block_idx - 1];
     if (blk->row == row && blk->col == col) {
       return blk;
     }
-    slot = (slot + 1) & hashtable_mask(shard);
+    slot = dbm_shard_nextslot(shard, slot);
   }
   return NULL;
+}
+
+/*******************************************************************************
+ * \brief Internal routine for growing the block metadata of a shard such that
+ *        it holds nblocks blocks in total without growing again.
+ * \author Ole Schuett and Hans Pabst
+ ******************************************************************************/
+void dbm_shard_reserve(dbm_shard_t *shard, const int nblocks) {
+  // Grow blocks array if necessary.
+  if (shard->nblocks_allocated < nblocks) {
+    shard->nblocks_allocated = DBM_ALLOCATION_FACTOR * nblocks;
+    cp_assert(nblocks <= shard->nblocks_allocated);
+    shard->blocks =
+        realloc(shard->blocks, shard->nblocks_allocated * sizeof(dbm_block_t));
+    cp_assert(shard->blocks != NULL);
+  }
+
+  // A copied hash table can hold fewer blocks than the block array.
+  if (shard->hashtable_size < DBM_HASHTABLE_FACTOR * nblocks) {
+    free(shard->hashtable);
+    hashtable_init(shard);
+    for (int i = 0; i < shard->nblocks; i++) {
+      hashtable_insert(shard, i);
+    }
+  }
 }
 
 /*******************************************************************************
@@ -204,21 +208,7 @@ dbm_block_t *dbm_shard_lookup(const dbm_shard_t *shard, const int row,
  ******************************************************************************/
 dbm_block_t *dbm_shard_promise_new_block(dbm_shard_t *shard, const int row,
                                          const int col, const int block_size) {
-  // Grow blocks array if necessary.
-  if (shard->nblocks_allocated < shard->nblocks + 1) {
-    shard->nblocks_allocated = DBM_ALLOCATION_FACTOR * (shard->nblocks + 1);
-    assert((shard->nblocks + 1) <= shard->nblocks_allocated);
-    shard->blocks =
-        realloc(shard->blocks, shard->nblocks_allocated * sizeof(dbm_block_t));
-    assert(shard->blocks != NULL);
-
-    // rebuild hashtable
-    free(shard->hashtable);
-    hashtable_init(shard);
-    for (int i = 0; i < shard->nblocks; i++) {
-      hashtable_insert(shard, i);
-    }
-  }
+  dbm_shard_reserve(shard, shard->nblocks + 1);
 
   const int new_block_idx = shard->nblocks;
   shard->nblocks++;
@@ -241,10 +231,10 @@ void dbm_shard_allocate_promised_blocks(dbm_shard_t *shard) {
   if (shard->data_allocated < shard->data_promised) {
     const double *data = shard->data;
     shard->data_allocated = DBM_ALLOCATION_FACTOR * shard->data_promised;
-    assert(shard->data_promised <= shard->data_allocated);
+    cp_assert(shard->data_promised <= shard->data_allocated);
     shard->data =
         offload_mempool_host_malloc(shard->data_allocated * sizeof(double));
-    assert(shard->data != NULL);
+    cp_assert(shard->data != NULL);
     if (data != NULL) {
       memcpy(shard->data, data, shard->data_size * sizeof(double));
       offload_mempool_host_free(data);

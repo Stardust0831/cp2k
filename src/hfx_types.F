@@ -44,6 +44,14 @@ MODULE hfx_types
         dbt_create, dbt_default_distvec, dbt_destroy, dbt_distribution_destroy, &
         dbt_distribution_new, dbt_distribution_type, dbt_mp_dims_create, dbt_pgrid_create, &
         dbt_pgrid_destroy, dbt_pgrid_type, dbt_type
+   USE four_center_integral_interface,  ONLY: four_center_integral_cleanup,&
+                                              four_center_integral_context_type,&
+                                              four_center_integral_init
+   USE four_center_integral_preparation,ONLY: prepare_eri4_contraction
+   USE four_center_integral_types,      ONLY: eri4_contraction_type,&
+                                              hfx_cell_type => eri4_cell_type,&
+                                              hfx_pgf_list => eri4_pgf_pair_type,&
+                                              hfx_screen_coeff_type => eri4_screen_coeff_type
    USE hfx_helpers,                     ONLY: count_cells_perd,&
                                               next_image_cell_perd
    USE input_constants,                 ONLY: &
@@ -56,24 +64,18 @@ MODULE hfx_types
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
+   USE integral_library_types,          ONLY: compare_potential_types,&
+                                              coulomb_operator_type,&
+                                              hfx_potential_type => coulomb_operator_type
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp,&
                                               int_8
-   USE libint_2c_3c,                    ONLY: compare_potential_types,&
-                                              libint_potential_type
-   USE libint_wrapper,                  ONLY: &
-        cp_libint_cleanup_eri, cp_libint_cleanup_eri1, cp_libint_init_eri, cp_libint_init_eri1, &
-        cp_libint_set_contrdepth, cp_libint_static_cleanup, cp_libint_static_init, cp_libint_t, &
-        prim_data_f_size
    USE machine,                         ONLY: m_chdir,&
                                               m_getcwd
    USE mathlib,                         ONLY: erfc_cutoff
    USE message_passing,                 ONLY: mp_cart_type,&
                                               mp_para_env_type
-   USE orbital_pointers,                ONLY: nco,&
-                                              ncoset,&
-                                              nso
    USE particle_methods,                ONLY: get_particle_set
    USE particle_types,                  ONLY: particle_type
    USE physcon,                         ONLY: a_bohr
@@ -86,7 +88,6 @@ MODULE hfx_types
         distribution_3d_create, distribution_3d_destroy, distribution_3d_type, pgf_block_sizes, &
         split_block_sizes
    USE string_utilities,                ONLY: compress
-   USE t_c_g0,                          ONLY: free_C0
 
 !$ USE OMP_LIB, ONLY: omp_get_max_threads, omp_get_thread_num, omp_get_num_threads
 
@@ -100,14 +101,14 @@ MODULE hfx_types
              hfx_cell_type, hfx_distribution, &
              hfx_potential_type, hfx_screening_type, &
              hfx_memory_type, hfx_load_balance_type, hfx_general_type, &
-             hfx_container_type, hfx_cache_type, &
+             hfx_container_type, hfx_cache_type, hfx_real_cache_type, &
              hfx_basis_type, parse_memory_section, &
              hfx_init_container, &
              hfx_basis_info_type, hfx_screen_coeff_type, &
              hfx_reset_memory_usage_counter, pair_list_type, pair_list_element_type, &
              pair_set_list_type, hfx_p_kind, hfx_2D_map, hfx_pgf_list, &
-             hfx_pgf_product_list, hfx_block_range_type, &
-             alloc_containers, dealloc_containers, hfx_task_list_type, init_t_c_g0_lmax, &
+             hfx_block_range_type, &
+             alloc_containers, dealloc_containers, hfx_task_list_type, &
              hfx_create_neighbor_cells, hfx_create_basis_types, hfx_release_basis_types, &
              hfx_ri_type, hfx_compression_type, block_ind_type, hfx_ri_init, hfx_ri_release, &
              compare_hfx_sections
@@ -133,20 +134,7 @@ MODULE hfx_types
                                                              2.1261_dp, &
                                                              2.2165_dp]
 
-   INTEGER, SAVE                                         :: init_t_c_g0_lmax = -1
-
 !***
-
-! **************************************************************************************************
-   TYPE hfx_potential_type
-      INTEGER                                  :: potential_type = do_potential_coulomb !! 1/r/ erfc(wr)/r ...
-      REAL(dp)                                 :: omega = 0.0_dp !! w
-      REAL(dp)                                 :: scale_coulomb = 0.0_dp !! scaling factor for mixed potential
-      REAL(dp)                                 :: scale_longrange = 0.0_dp !! scaling factor for mixed potential
-      REAL(dp)                                 :: scale_gaussian = 0.0_dp!! scaling factor for mixed potential
-      REAL(dp)                                 :: cutoff_radius = 0.0_dp!! cutoff radius if cutoff potential in use
-      CHARACTER(default_path_length)           :: filename = ""
-   END TYPE hfx_potential_type
 
 ! **************************************************************************************************
    TYPE hfx_screening_type
@@ -205,12 +193,6 @@ MODULE hfx_types
    END TYPE hfx_general_type
 
 ! **************************************************************************************************
-   TYPE hfx_cell_type
-      REAL(dp)                                 :: cell(3) = 0.0_dp
-      REAL(dp)                                 :: cell_r(3) = 0.0_dp
-   END TYPE hfx_cell_type
-
-! **************************************************************************************************
    TYPE hfx_distribution
       INTEGER(int_8)                           :: istart = 0_int_8
       INTEGER(int_8)                           :: number_of_atom_quartets = 0_int_8
@@ -248,6 +230,12 @@ MODULE hfx_types
    END TYPE hfx_cache_type
 
 ! **************************************************************************************************
+   TYPE hfx_real_cache_type
+      REAL(dp), DIMENSION(CACHE_SIZE)          :: DATA = 0.0_dp
+      INTEGER                                  :: element_counter = 0
+   END TYPE hfx_real_cache_type
+
+! **************************************************************************************************
    TYPE hfx_container_node
       TYPE(hfx_container_node), POINTER        :: next => NULL(), prev => NULL()
       INTEGER(int_8), DIMENSION(CACHE_SIZE)    :: DATA = 0_int_8
@@ -277,8 +265,7 @@ MODULE hfx_types
       INTEGER, DIMENSION(:, :), POINTER         :: nl => NULL()
       INTEGER, DIMENSION(:, :), POINTER         :: nsgfl => NULL()
       INTEGER, DIMENSION(:), POINTER           :: nshell => NULL()
-      REAL(dp), DIMENSION(:, :, :, :), POINTER &
-         :: sphi_ext => NULL()
+      TYPE(eri4_contraction_type), ALLOCATABLE       :: contraction(:, :)
       REAL(dp), DIMENSION(:, :, :), POINTER   :: gcc => NULL()
       REAL(dp), DIMENSION(:), POINTER          :: set_radius => NULL()
       REAL(dp), DIMENSION(:, :), POINTER        :: pgf_radius => NULL()
@@ -293,11 +280,6 @@ MODULE hfx_types
    END TYPE hfx_basis_info_type
 
 ! **************************************************************************************************
-   TYPE hfx_screen_coeff_type
-      REAL(dp)                                 :: x(2) = 0.0_dp
-   END TYPE hfx_screen_coeff_type
-
-! **************************************************************************************************
    TYPE hfx_p_kind
       REAL(dp), DIMENSION(:, :, :, :), POINTER    :: p_kind => NULL()
    END TYPE hfx_p_kind
@@ -307,38 +289,6 @@ MODULE hfx_types
       INTEGER, DIMENSION(:), POINTER           :: iatom_list => NULL()
       INTEGER, DIMENSION(:), POINTER           :: jatom_list => NULL()
    END TYPE hfx_2D_map
-
-! **************************************************************************************************
-   TYPE hfx_pgf_image
-      REAL(dp)                                 :: ra(3) = 0.0_dp, rb(3) = 0.0_dp
-      REAL(dp)                                 :: rab2 = 0.0_dp
-      REAL(dp)                                 :: S1234 = 0.0_dp
-      REAL(dp)                                 :: P(3) = 0.0_dp
-      REAL(dp)                                 :: R = 0.0_dp
-      REAL(dp)                                 :: pgf_max = 0.0_dp
-      REAL(dp), DIMENSION(3)                   :: bcell = 0.0_dp
-   END TYPE hfx_pgf_image
-
-! **************************************************************************************************
-   TYPE hfx_pgf_list
-      TYPE(hfx_pgf_image), DIMENSION(:), POINTER &
-         :: image_list => NULL()
-      INTEGER                                  :: nimages = 0
-      REAL(dp)                                 :: zetapzetb = 0.0_dp
-      REAL(dp)                                 :: ZetaInv = 0.0_dp
-      REAL(dp)                                 :: zeta = 0.0_dp, zetb = 0.0_dp
-      INTEGER                                  :: ipgf = 0, jpgf = 0
-   END TYPE hfx_pgf_list
-
-! **************************************************************************************************
-   TYPE hfx_pgf_product_list
-      REAL(dp)                                 :: ra(3) = 0.0_dp, rb(3) = 0.0_dp, rc(3) = 0.0_dp, rd(3) = 0.0_dp
-      REAL(dp)                                 :: ZetapEtaInv = 0.0_dp
-      REAL(dp)                                 :: Rho = 0.0_dp, RhoInv = 0.0_dp
-      REAL(dp)                                 :: P(3) = 0.0_dp, Q(3) = 0.0_dp, W(3) = 0.0_dp
-      REAL(dp)                                 :: AB(3) = 0.0_dp, CD(3) = 0.0_dp
-      REAL(dp)                                 :: Fm(prim_data_f_size) = 0.0_dp
-   END TYPE hfx_pgf_product_list
 
 ! **************************************************************************************************
    TYPE hfx_block_range_type
@@ -383,10 +333,11 @@ MODULE hfx_types
                  ncell_RI = 0, nimg = 0, kp_stack_size = 0, nimg_nze = 0, kp_ngroups = 1
       LOGICAL :: check_2c_inv = .FALSE., calc_condnum = .FALSE.
 
-      TYPE(libint_potential_type) :: ri_metric = libint_potential_type()
+      TYPE(coulomb_operator_type) :: ri_metric = coulomb_operator_type()
 
       ! input parameters from hfx
-      TYPE(libint_potential_type) :: hfx_pot = libint_potential_type() ! interaction potential
+      TYPE(coulomb_operator_type) :: hfx_pot = coulomb_operator_type() ! interaction potential
+      LOGICAL :: explicit_hfx_cutoff = .FALSE.
       REAL(KIND=dp) :: eps_schwarz = 0.0_dp ! integral screening threshold
       REAL(KIND=dp) :: eps_schwarz_forces = 0.0_dp ! integral derivatives screening threshold
 
@@ -414,7 +365,15 @@ MODULE hfx_types
       ! KP distribution of iatom (of i,j atom pairs) to subgroups
       TYPE(cp_1d_logical_p_type), DIMENSION(:), ALLOCATABLE :: iatom_to_subgroup
 
-      ! KP 3c tensors replicated on the subgroups
+      ! Potential-weighted fitted pair densities G_j(P^x; nu^0, lambda^l).
+      ! Values are independent of the SCF density and retained on each subgroup.
+      ! RI rows are shifted only when forming a KS batch.
+      TYPE(dbt_type), DIMENSION(:), ALLOCATABLE :: kp_t_3c_G_sub
+      INTEGER, ALLOCATABLE :: kp_G_to_RI(:, :), kp_RI_atom(:)
+      LOGICAL, ALLOCATABLE :: kp_RI_neighbors(:, :)
+      INTEGER :: kp_G_ngroups = 0
+
+      ! Unweighted fitted pairs on the subgroups, allocated only for forces.
       TYPE(dbt_type), DIMENSION(:), ALLOCATABLE :: kp_t_3c_int
 
       ! Note: changed static DIMENSION(1,1) of dbt_type to allocatables as workaround for gfortran 8.3.0,
@@ -498,7 +457,7 @@ MODULE hfx_types
 !> \param b_first_load_balance_x flag to indicate if it is enough just to update
 !>        the distribution of the integrals
 !> \param full_ks_x full ks matrices
-!> \param lib libint type for eris
+!> \param eri4_context per-thread four-center integral context
 !> \param basis_info contains information for basis sets
 !> \param screen_funct_coeffs_pgf pgf based near field screening coefficients
 !> \param pair_dist_radii_pgf pgf based radii coefficients of pair distributions
@@ -537,7 +496,7 @@ MODULE hfx_types
                                                   b_first_load_balance_forces = .FALSE.
       REAL(dp), DIMENSION(:, :), POINTER        :: full_ks_alpha => NULL()
       REAL(dp), DIMENSION(:, :), POINTER        :: full_ks_beta => NULL()
-      TYPE(cp_libint_t)                        :: lib
+      TYPE(four_center_integral_context_type) :: eri4_context
       TYPE(hfx_basis_info_type)                :: basis_info = hfx_basis_info_type()
       TYPE(hfx_screen_coeff_type), &
          DIMENSION(:, :, :, :, :, :), POINTER     :: screen_funct_coeffs_pgf => NULL(), &
@@ -559,7 +518,6 @@ MODULE hfx_types
       TYPE(hfx_task_list_type), DIMENSION(:), &
          POINTER        :: task_list => NULL()
       REAL(dp), DIMENSION(:, :), POINTER        :: pmax_atom => NULL(), pmax_atom_forces => NULL()
-      TYPE(cp_libint_t)                         :: lib_deriv
       REAL(dp), DIMENSION(:, :), POINTER        :: pmax_block => NULL()
       LOGICAL, DIMENSION(:, :), POINTER         :: atomic_pair_list => NULL()
       LOGICAL, DIMENSION(:, :), POINTER         :: atomic_pair_list_forces => NULL()
@@ -778,8 +736,9 @@ CONTAINS
             actual_x_data%load_balance_parameter%do_randomize = logic_val
 
             actual_x_data%load_balance_parameter%rtp_redistribute = .FALSE.
-            IF (ASSOCIATED(dft_control%rtp_control)) &
+            IF (ASSOCIATED(dft_control%rtp_control)) THEN
                actual_x_data%load_balance_parameter%rtp_redistribute = dft_control%rtp_control%hfx_redistribute
+            END IF
 
             CALL section_vals_val_get(hf_sub_section, "BLOCK_SIZE", i_val=int_val)
             ! negative values ask for a computed default
@@ -972,12 +931,7 @@ CONTAINS
                DEALLOCATE (kind_of, atom2kind)
             END IF
 
-            ! ** Initialize libint type
-            CALL cp_libint_static_init()
-            CALL cp_libint_init_eri(actual_x_data%lib, actual_x_data%basis_info%max_am)
-            CALL cp_libint_init_eri1(actual_x_data%lib_deriv, actual_x_data%basis_info%max_am)
-            CALL cp_libint_set_contrdepth(actual_x_data%lib, 1)
-            CALL cp_libint_set_contrdepth(actual_x_data%lib_deriv, 1)
+            CALL four_center_integral_init(actual_x_data%eri4_context, actual_x_data%basis_info%max_am)
 
             CALL alloc_containers(actual_x_data%store_ints, 1)
             CALL alloc_containers(actual_x_data%store_forces, 1)
@@ -1044,11 +998,13 @@ CONTAINS
                ! Sanity checks
                IF (actual_x_data%use_ace) THEN
                   ! ACE requires HFX to be meaningful
-                  IF (actual_x_data%general_parameter%fraction <= 0.0_dp) &
+                  IF (actual_x_data%general_parameter%fraction <= 0.0_dp) THEN
                      CPABORT("ACE requires FRACTION > 0.")
+                  END IF
                   ! If frequency is 1, it is full HFX
-                  IF (actual_x_data%ace_rebuild_freq < 1) &
+                  IF (actual_x_data%ace_rebuild_freq < 1) THEN
                      CPABORT("ACE: REBUILD_FREQUENCY must be >= 1")
+                  END IF
                END IF
             END IF
          END DO
@@ -1105,13 +1061,7 @@ CONTAINS
 
       NULLIFY (hf_sub_section)
 
-      ASSOCIATE (hfx_pot => ri_data%hfx_pot)
-         hfx_pot%potential_type = x_data%potential_parameter%potential_type
-         hfx_pot%omega = x_data%potential_parameter%omega
-         hfx_pot%cutoff_radius = x_data%potential_parameter%cutoff_radius
-         hfx_pot%scale_coulomb = x_data%potential_parameter%scale_coulomb
-         hfx_pot%scale_longrange = x_data%potential_parameter%scale_longrange
-      END ASSOCIATE
+      ri_data%hfx_pot = x_data%potential_parameter
       ri_data%ri_section => ri_section
       ri_data%hfx_section => hfx_section
       ri_data%eps_schwarz = x_data%screening_parameter%eps_schwarz
@@ -1125,6 +1075,7 @@ CONTAINS
                                      extension=".scfLog")
 
       hf_sub_section => section_vals_get_subs_vals(hfx_section, "INTERACTION_POTENTIAL", i_rep_section=irep)
+      CALL section_vals_val_get(hf_sub_section, "CUTOFF_RADIUS", explicit=ri_data%explicit_hfx_cutoff)
       CALL section_vals_val_get(hf_sub_section, "T_C_G_DATA", c_val=char_val)
       CALL compress(char_val, .TRUE.)
 
@@ -1179,7 +1130,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_ri_init_read_input'
 
       INTEGER                                            :: handle
-      LOGICAL                                            :: explicit
+      LOGICAL                                            :: explicit, explicit_ri_cutoff
       REAL(dp)                                           :: eps_storage_scaling
 
       CALL timeset(routineN, handle)
@@ -1201,9 +1152,13 @@ CONTAINS
             ri_metric%omega = hfx_pot%omega
          END IF
 
-         CALL section_vals_val_get(ri_section, "CUTOFF_RADIUS", r_val=ri_metric%cutoff_radius, explicit=explicit)
-         IF (.NOT. explicit) THEN
-            ri_metric%cutoff_radius = hfx_pot%cutoff_radius
+         CALL section_vals_val_get(ri_section, "CUTOFF_RADIUS", r_val=ri_metric%cutoff_radius, explicit=explicit_ri_cutoff)
+         IF (.NOT. explicit_ri_cutoff) THEN
+            IF (ri_metric%potential_type == do_potential_short) THEN
+               CALL erfc_cutoff(ri_data%eps_schwarz, ri_metric%omega, ri_metric%cutoff_radius)
+            ELSE
+               ri_metric%cutoff_radius = hfx_pot%cutoff_radius
+            END IF
          END IF
 
          CALL section_vals_val_get(ri_section, "SCALE_COULOMB", r_val=ri_metric%scale_coulomb, explicit=explicit)
@@ -1216,9 +1171,18 @@ CONTAINS
             ri_metric%scale_longrange = hfx_pot%scale_longrange
          END IF
 
-         IF (ri_metric%potential_type == do_potential_short) &
-            CALL erfc_cutoff(ri_data%eps_schwarz, ri_metric%omega, ri_metric%cutoff_radius)
          IF (ri_metric%potential_type == do_potential_id) ri_metric%cutoff_radius = 0.0_dp
+         IF (hfx_pot%potential_type == do_potential_short .AND. .NOT. ri_data%explicit_hfx_cutoff) THEN
+            ! Use the tighter 2c screening threshold for the exchange metric.
+            CALL erfc_cutoff(ri_data%filter_eps_2c, hfx_pot%omega, hfx_pot%cutoff_radius)
+         END IF
+
+         ri_data%same_op = compare_potential_types(ri_metric, hfx_pot)
+         IF (ri_metric%potential_type == do_potential_short .AND. &
+             (explicit_ri_cutoff .OR. ri_data%explicit_hfx_cutoff)) THEN
+            ! Distinct user-selected screening ranges require separate 2c matrices.
+            ri_data%same_op = ri_data%same_op .AND. ri_metric%cutoff_radius == hfx_pot%cutoff_radius
+         END IF
       END ASSOCIATE
 
       CALL section_vals_val_get(ri_section, "2C_MATRIX_FUNCTIONS", i_val=ri_data%t2c_method)
@@ -1280,7 +1244,6 @@ CONTAINS
                                                             dist_RI
       INTEGER, DIMENSION(2)                              :: pdims_2d
       INTEGER, DIMENSION(3)                              :: pdims
-      LOGICAL                                            :: same_op
       TYPE(distribution_3d_type)                         :: dist_3d
       TYPE(gto_basis_set_p_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: basis_set_AO, basis_set_RI
@@ -1290,28 +1253,9 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      ! initialize libint
-      CALL cp_libint_static_init()
-
       natom = SIZE(particle_set)
       nkind = SIZE(qs_kind_set, 1)
       nproc = para_env%num_pe
-
-      ASSOCIATE (ri_metric => ri_data%ri_metric, hfx_pot => ri_data%hfx_pot)
-         IF (ri_metric%potential_type == do_potential_short) THEN
-            CALL erfc_cutoff(ri_data%eps_schwarz, ri_metric%omega, ri_metric%cutoff_radius)
-         END IF
-
-         IF (hfx_pot%potential_type == do_potential_short) THEN
-            ! need a more accurate threshold for determining 2-center integral operator range
-            ! because stability of matrix inversion/sqrt is sensitive to this
-            CALL erfc_cutoff(ri_data%filter_eps_2c, hfx_pot%omega, hfx_pot%cutoff_radius)
-         END IF
-         ! determine whether RI metric is same operator as used in HFX
-         same_op = compare_potential_types(ri_metric, hfx_pot)
-      END ASSOCIATE
-
-      ri_data%same_op = same_op
 
       pdims = 0
       CALL mp_comm_3d%create(para_env, 3, pdims)
@@ -1432,7 +1376,7 @@ CONTAINS
          DEALLOCATE (dist1, dist2)
          CALL dbt_create(ri_data%ks_t(1, 1), ri_data%ks_t(2, 1))
 
-      ELSEIF (ri_data%flavor == ri_mo) THEN
+      ELSE IF (ri_data%flavor == ri_mo) THEN
          ALLOCATE (ri_data%t_2c_int(2, 1))
 
          CALL create_2c_tensor(ri_data%t_2c_int(1, 1), dist1, dist2, ri_data%pgrid_2d, &
@@ -1532,9 +1476,6 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      ! cleanup libint
-      CALL cp_libint_static_cleanup()
-
       my_write_stats = .TRUE.
       IF (PRESENT(write_stats)) my_write_stats = write_stats
       IF (my_write_stats) CALL hfx_ri_write_stats(ri_data)
@@ -1622,7 +1563,7 @@ CONTAINS
 
          DEALLOCATE (ri_data%blk_indices)
          DEALLOCATE (ri_data%store_3c)
-      ELSEIF (ri_data%flavor == ri_mo) THEN
+      ELSE IF (ri_data%flavor == ri_mo) THEN
          CALL dbt_destroy(ri_data%t_3c_int_ctr_1(1, 1))
          CALL dbt_destroy(ri_data%t_3c_int_ctr_2(1, 1))
          DEALLOCATE (ri_data%t_3c_int_ctr_1)
@@ -1666,6 +1607,17 @@ CONTAINS
          END DO
          DEALLOCATE (ri_data%kp_mat_2c_pot)
       END IF
+
+      IF (ALLOCATED(ri_data%kp_t_3c_G_sub)) THEN
+         DO i = 1, SIZE(ri_data%kp_t_3c_G_sub)
+            CALL dbt_destroy(ri_data%kp_t_3c_G_sub(i))
+         END DO
+         DEALLOCATE (ri_data%kp_t_3c_G_sub)
+      END IF
+      IF (ALLOCATED(ri_data%kp_G_to_RI)) DEALLOCATE (ri_data%kp_G_to_RI)
+      IF (ALLOCATED(ri_data%kp_RI_atom)) DEALLOCATE (ri_data%kp_RI_atom)
+      IF (ALLOCATED(ri_data%kp_RI_neighbors)) DEALLOCATE (ri_data%kp_RI_neighbors)
+      ri_data%kp_G_ngroups = 0
 
       IF (ALLOCATED(ri_data%kp_t_3c_int)) THEN
          DO i = 1, SIZE(ri_data%kp_t_3c_int)
@@ -1720,12 +1672,9 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_create_basis_types'
 
-      INTEGER :: co_counter, handle, i, ikind, ipgf, iset, j, k, la, max_am_kind, max_coeff, &
-         max_nsgfl, max_pgf, max_pgf_kind, max_set, nkind, nl_count, nset, nseta, offset_a, &
-         offset_a1, s_offset_nl_a, sgfa, so_counter
-      INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, npgfa, nshell
-      INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa, nl_a
-      REAL(dp), DIMENSION(:, :), POINTER                 :: sphi_a
+      INTEGER                                            :: handle, i, ikind, iset, j, max_set, &
+                                                            nkind, nl_count, nset
+      INTEGER, DIMENSION(:), POINTER                     :: nshell
       TYPE(gto_basis_set_type), POINTER                  :: orb_basis_a
 
       CALL timeset(routineN, handle)
@@ -1760,6 +1709,7 @@ CONTAINS
                                 set_radius=basis_parameter(ikind)%set_radius, &
                                 pgf_radius=basis_parameter(ikind)%pgf_radius, &
                                 kind_radius=basis_parameter(ikind)%kind_radius)
+         CALL prepare_eri4_contraction(orb_basis_a, basis_parameter(ikind)%contraction)
       END DO
       DO ikind = 1, nkind
          ALLOCATE (basis_parameter(ikind)%nsgfl(0:basis_info%max_am, max_set))
@@ -1773,60 +1723,6 @@ CONTAINS
                   IF (basis_parameter(ikind)%nl(j, iset) == i) nl_count = nl_count + 1
                END DO
                basis_parameter(ikind)%nsgfl(i, iset) = nl_count
-            END DO
-         END DO
-      END DO
-
-      max_nsgfl = 0
-      max_pgf = 0
-      DO ikind = 1, nkind
-         max_coeff = 0
-         max_am_kind = 0
-         max_pgf_kind = 0
-         npgfa => basis_parameter(ikind)%npgf
-         nseta = basis_parameter(ikind)%nset
-         nl_a => basis_parameter(ikind)%nsgfl
-         la_max => basis_parameter(ikind)%lmax
-         la_min => basis_parameter(ikind)%lmin
-         DO iset = 1, nseta
-            max_pgf_kind = MAX(max_pgf_kind, npgfa(iset))
-            max_pgf = MAX(max_pgf, npgfa(iset))
-            DO la = la_min(iset), la_max(iset)
-               max_nsgfl = MAX(max_nsgfl, nl_a(la, iset))
-               max_coeff = MAX(max_coeff, nso(la)*nl_a(la, iset)*nco(la))
-               max_am_kind = MAX(max_am_kind, la)
-            END DO
-         END DO
-         ALLOCATE (basis_parameter(ikind)%sphi_ext(max_coeff, 0:max_am_kind, max_pgf_kind, nseta))
-         basis_parameter(ikind)%sphi_ext = 0.0_dp
-      END DO
-
-      DO ikind = 1, nkind
-         sphi_a => basis_parameter(ikind)%sphi
-         nseta = basis_parameter(ikind)%nset
-         la_max => basis_parameter(ikind)%lmax
-         la_min => basis_parameter(ikind)%lmin
-         npgfa => basis_parameter(ikind)%npgf
-         first_sgfa => basis_parameter(ikind)%first_sgf
-         nl_a => basis_parameter(ikind)%nsgfl
-         DO iset = 1, nseta
-            sgfa = first_sgfa(1, iset)
-            DO ipgf = 1, npgfa(iset)
-               offset_a1 = (ipgf - 1)*ncoset(la_max(iset))
-               s_offset_nl_a = 0
-               DO la = la_min(iset), la_max(iset)
-                  offset_a = offset_a1 + ncoset(la - 1)
-                  co_counter = 0
-                  co_counter = co_counter + 1
-                  so_counter = 0
-                  DO k = sgfa + s_offset_nl_a, sgfa + s_offset_nl_a + nso(la)*nl_a(la, iset) - 1
-                     DO i = offset_a + 1, offset_a + nco(la)
-                        so_counter = so_counter + 1
-                        basis_parameter(ikind)%sphi_ext(so_counter, la, ipgf, iset) = sphi_a(i, k)
-                     END DO
-                  END DO
-                  s_offset_nl_a = s_offset_nl_a + nso(la)*(nl_a(la, iset))
-               END DO
             END DO
          END DO
       END DO
@@ -1848,10 +1744,10 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      !! BASIS parameter
       DO i = 1, SIZE(basis_parameter)
-         DEALLOCATE (basis_parameter(i)%nsgfl)
-         DEALLOCATE (basis_parameter(i)%sphi_ext)
+         IF (ASSOCIATED(basis_parameter(i)%nsgfl)) DEALLOCATE (basis_parameter(i)%nsgfl)
+         ! gfortran may skip allocatable components when deallocating the pointer array.
+         IF (ALLOCATED(basis_parameter(i)%contraction)) DEALLOCATE (basis_parameter(i)%contraction)
       END DO
       DEALLOCATE (basis_parameter)
       CALL timestop(handle)
@@ -1975,11 +1871,6 @@ CONTAINS
       n_rep_hf = x_data(1, 1)%n_rep_hf
       n_threads = SIZE(x_data, 2)
 
-      IF (x_data(1, 1)%potential_parameter%potential_type == do_potential_truncated .OR. &
-          x_data(1, 1)%potential_parameter%potential_type == do_potential_mix_cl_trunc) THEN
-         init_t_c_g0_lmax = -1
-         CALL free_C0()
-      END IF
       DO i_thread = 1, n_threads
          DO irep = 1, n_rep_hf
             actual_x_data => x_data(irep, i_thread)
@@ -2026,10 +1917,7 @@ CONTAINS
             !! BASIS parameter
             CALL hfx_release_basis_types(actual_x_data%basis_parameter)
 
-            !MK Release libint and libderiv data structure
-            CALL cp_libint_cleanup_eri(actual_x_data%lib)
-            CALL cp_libint_cleanup_eri1(actual_x_data%lib_deriv)
-            CALL cp_libint_static_cleanup()
+            CALL four_center_integral_cleanup(actual_x_data%eri4_context)
 
             !! Deallocate containers
             CALL dealloc_containers(actual_x_data%store_ints, actual_x_data%memory_parameter%actual_memory_usage)
@@ -2961,7 +2849,8 @@ CONTAINS
          DEALLOCATE (data%maxval_container(bin)%first)
       END DO
       DEALLOCATE (data%maxval_container)
-      DEALLOCATE (data%maxval_cache)
+      ! compress_tensor (qs_tensors) keeps no caches, a (de)compression holds them while it runs
+      IF (ASSOCIATED(data%maxval_cache)) DEALLOCATE (data%maxval_cache)
 
       DO bin = 1, SIZE(data%integral_containers, 2)
          DO i = 1, 64
@@ -2972,7 +2861,7 @@ CONTAINS
       END DO
       DEALLOCATE (data%integral_containers)
 
-      DEALLOCATE (data%integral_caches)
+      IF (ASSOCIATED(data%integral_caches)) DEALLOCATE (data%integral_caches)
 
    END SUBROUTINE dealloc_containers
 
@@ -3036,7 +2925,7 @@ CONTAINS
 
       CHARACTER(LEN=default_path_length)                 :: cval1, cval2
       INTEGER                                            :: irep, ival1, ival2, n_rep_hf1, n_rep_hf2
-      LOGICAL                                            :: lval1, lval2
+      LOGICAL                                            :: explicit1, explicit2, lval1, lval2
       REAL(dp)                                           :: rval1, rval2
       TYPE(section_vals_type), POINTER                   :: hfx_sub_section1, hfx_sub_section2
 
@@ -3072,6 +2961,17 @@ CONTAINS
          CALL section_vals_val_get(hfx_sub_section2, "POTENTIAL_TYPE", i_val=ival2, i_rep_section=irep)
          IF (ival1 /= ival2) is_identical = .FALSE.
          IF (.NOT. is_identical) RETURN
+
+         IF (ival1 == do_potential_short) THEN
+            CALL section_vals_val_get(hfx_sub_section1, "CUTOFF_RADIUS", explicit=explicit1)
+            CALL section_vals_val_get(hfx_sub_section2, "CUTOFF_RADIUS", explicit=explicit2)
+            IF (explicit1 .NEQV. explicit2) is_identical = .FALSE.
+            IF (explicit1 .AND. explicit2) THEN
+               CALL section_vals_val_get(hfx_sub_section1, "CUTOFF_RADIUS", r_val=rval1)
+               CALL section_vals_val_get(hfx_sub_section2, "CUTOFF_RADIUS", r_val=rval2)
+               IF (ABS(rval1 - rval2) > EPSILON(1.0_dp)) is_identical = .FALSE.
+            END IF
+         END IF
 
          IF (ival1 == do_potential_truncated .OR. ival1 == do_potential_mix_cl_trunc) THEN
             CALL section_vals_val_get(hfx_sub_section1, "CUTOFF_RADIUS", r_val=rval1, i_rep_section=irep)

@@ -124,8 +124,9 @@ CONTAINS
 !                    rng_seed=elem%rng_seed, rng_seed_last_acc=last_acc_elem%rng_seed)
          !-- atom translation
       CASE (mv_type_atom_trans)
-         IF (act_nr_elem_mv == 0) &
+         IF (act_nr_elem_mv == 0) THEN
             act_nr_elem_mv = SIZE(elem%pos)/tmc_params%dim_per_elem
+         END IF
          ALLOCATE (elem_center(tmc_params%dim_per_elem))
          i = 1
          move_elements_loop: DO
@@ -142,7 +143,7 @@ CONTAINS
                ! displace atom
                DO d = 0, tmc_params%dim_per_elem - 1
                   rnd = rng_stream%next()
-                  elem%pos(ind + d) = elem%pos(ind + d) + (rnd - 0.5)*2.0* &
+                  elem%pos(ind + d) = elem%pos(ind + d) + (rnd - 0.5_dp)*2.0_dp* &
                                       move_types%mv_size(mv_type_atom_trans, mv_conf)
                END DO
                ! check if new position is in subbox
@@ -167,8 +168,9 @@ CONTAINS
       CASE (mv_type_mol_trans)
          nr_molec = MAXVAL(elem%mol(:))
          ! if all particles should be displaced, set the amount of molecules
-         IF (act_nr_elem_mv == 0) &
+         IF (act_nr_elem_mv == 0) THEN
             act_nr_elem_mv = nr_molec
+         END IF
          ALLOCATE (mol_in_sb(nr_molec))
          ALLOCATE (elem_center(tmc_params%dim_per_elem))
          mol_in_sb(:) = status_frozen
@@ -181,8 +183,9 @@ CONTAINS
             IF (check_pos_in_subbox(pos=elem_center, &
                                     subbox_center=elem%subbox_center, &
                                     box_scale=elem%box_scale, tmc_params=tmc_params) &
-                ) &
+                ) THEN
                mol_in_sb(m) = status_ok
+            END IF
          END DO
          ! displace the selected amount of molecules
          IF (ANY(mol_in_sb(:) == status_ok)) THEN
@@ -207,7 +210,7 @@ CONTAINS
                   ! calculate displacement
                   DO d = 1, tmc_params%dim_per_elem
                      rnd = rng_stream%next()
-                     direction(d) = (rnd - 0.5)*2.0_dp*move_types%mv_size( &
+                     direction(d) = (rnd - 0.5_dp)*2.0_dp*move_types%mv_size( &
                                     mv_type_mol_trans, mv_conf)
                   END DO
                   ! check if displaced position is still in subbox
@@ -242,8 +245,9 @@ CONTAINS
          !-- molecule rotation
       CASE (mv_type_mol_rot)
          nr_molec = MAXVAL(elem%mol(:))
-         IF (act_nr_elem_mv == 0) &
+         IF (act_nr_elem_mv == 0) THEN
             act_nr_elem_mv = nr_molec
+         END IF
          ALLOCATE (mol_in_sb(nr_molec))
          ALLOCATE (elem_center(tmc_params%dim_per_elem))
          mol_in_sb(:) = status_frozen
@@ -256,8 +260,9 @@ CONTAINS
             IF (check_pos_in_subbox(pos=elem_center, &
                                     subbox_center=elem%subbox_center, &
                                     box_scale=elem%box_scale, tmc_params=tmc_params) &
-                ) &
+                ) THEN
                mol_in_sb(m) = status_ok
+            END IF
          END DO
          ! rotate the selected amount of molecules
          IF (ANY(mol_in_sb(:) == status_ok)) THEN
@@ -441,8 +446,8 @@ CONTAINS
          CALL get_scaled_cell(cell=tmc_params%cell, box_scale=box_scale, &
                               vec=pos_tmp)
          ! check
-         IF (ANY(pos_tmp(:) >= tmc_params%sub_box_size(:)/2.0) .OR. &
-             ANY(pos_tmp(:) <= -tmc_params%sub_box_size(:)/2.0)) THEN
+         IF (ANY(pos_tmp(:) >= tmc_params%sub_box_size(:)/2.0_dp) .OR. &
+             ANY(pos_tmp(:) <= -tmc_params%sub_box_size(:)/2.0_dp)) THEN
             inside = .FALSE.
          END IF
       END IF
@@ -560,11 +565,11 @@ CONTAINS
 
       ! calculate rotation matrix (using quanternions)
       rnd = rng_stream%next()
-      a1 = (rnd - 0.5)*2.0*max_angle !move_types%mv_size(mv_type_mol_rot,mv_conf)
+      a1 = (rnd - 0.5_dp)*2.0_dp*max_angle !move_types%mv_size(mv_type_mol_rot,mv_conf)
       rnd = rng_stream%next()
-      a2 = (rnd - 0.5)*2.0*max_angle !move_types%mv_size(mv_type_mol_rot,mv_conf)
+      a2 = (rnd - 0.5_dp)*2.0_dp*max_angle !move_types%mv_size(mv_type_mol_rot,mv_conf)
       rnd = rng_stream%next()
-      a3 = (rnd - 0.5)*2.0*max_angle !move_types%mv_size(mv_type_mol_rot,mv_conf)
+      a3 = (rnd - 0.5_dp)*2.0_dp*max_angle !move_types%mv_size(mv_type_mol_rot,mv_conf)
       q0 = COS(a2/2)*COS((a1 + a3)/2.0_dp)
       q1 = SIN(a2/2)*COS((a1 - a3)/2.0_dp)
       q2 = SIN(a2/2)*SIN((a1 - a3)/2.0_dp)
@@ -628,7 +633,7 @@ CONTAINS
       ! without still the balance condition should be fulfilled
 
       rnd3 = rng_stream%next()
-      IF (rnd3 >= 0.5 .AND. rnd_sign_change) THEN
+      IF (rnd3 >= 0.5_dp .AND. rnd_sign_change) THEN
          d = -1
       ELSE
          d = 1
@@ -703,16 +708,18 @@ CONTAINS
          CALL find_nearest_proton_acceptor_donator(elem=elem, mol=mol, &
                                                    donor_acceptor=donor_acceptor, tmc_params=tmc_params, &
                                                    rng_stream=rng_stream)
-         IF (ANY(mol_arr(:) == mol)) &
+         IF (ANY(mol_arr(:) == mol)) THEN
             EXIT chain_completition_loop
+         END IF
          mol_arr(counter) = mol
       END DO chain_completition_loop
       counter = counter - 1 ! last searched element is equal to one other in list
 
       ! just take the loop of molecules out of the chain
       DO k = 1, counter
-         IF (mol_arr(k) == mol) &
+         IF (mol_arr(k) == mol) THEN
             EXIT
+         END IF
       END DO
       mol_arr(1:counter - k + 1) = mol_arr(k:counter)
       counter = counter - k + 1

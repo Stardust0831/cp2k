@@ -87,8 +87,7 @@ MODULE qs_linres_op
                                               build_local_moment_matrix
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_operators_ao,                 ONLY: build_ang_mom_matrix,&
-                                              build_lin_mom_matrix,&
-                                              rRc_xyz_ao
+                                              build_lin_mom_matrix
    USE qs_spin_orbit,                   ONLY: build_pso_matrix
 #include "./base/base_uses.f90"
 
@@ -135,7 +134,7 @@ CONTAINS
                                                             nbr_center(2), nmo, nsgf, nspins, &
                                                             nstates(2), output_unit
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: first_sgf, last_sgf
-      INTEGER, DIMENSION(:), POINTER                     :: row_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: row_blk_sizes
       REAL(dp)                                           :: chk(3), ck(3), ckdk(3), dk(3)
       REAL(dp), DIMENSION(:, :), POINTER                 :: basisfun_center, vecbuf_c0
       TYPE(cell_type), POINTER                           :: cell
@@ -320,7 +319,6 @@ CONTAINS
       END DO
       !
       CALL build_lin_mom_matrix(qs_env, op_ao)
-      !CALL p_xyz_ao(op_ao,qs_env,minimum_image=.FALSE.)
       !
       ! print checksums
       chk(1) = dbcsr_checksum(op_ao(1)%matrix)
@@ -589,7 +587,8 @@ CONTAINS
          CALL dbcsr_set(matrix_dso(1)%matrix, 0.0_dp)
          CALL dbcsr_set(matrix_dso(2)%matrix, 0.0_dp)
          CALL dbcsr_set(matrix_dso(3)%matrix, 0.0_dp)
-         CALL rRc_xyz_ao(matrix_dso, qs_env, [0.0_dp, 0.0_dp, 0.0_dp], 1)
+         CALL build_local_moment_matrix(qs_env, matrix_dso, 1, &
+                                        ref_point=[0.0_dp, 0.0_dp, 0.0_dp], all_images=.TRUE.)
       END IF
       !
       ! multiply by the mos
@@ -774,8 +773,6 @@ CONTAINS
 
          DO i = 1, 3
             kvec(:) = twopi*cell%h_inv(i, :)
-            CALL dbcsr_set(cosmat, 0.0_dp)
-            CALL dbcsr_set(sinmat, 0.0_dp)
             CALL build_berry_moment_matrix(qs_env, cosmat, sinmat, kvec)
 
             DO ispin = 1, dft_control%nspins ! spin
@@ -1276,7 +1273,7 @@ CONTAINS
 
       IF ((b == a + 1 .OR. b == a - 2) .AND. (c == b + 1 .OR. c == b - 2)) THEN
          factor = 1.0_dp
-      ELSEIF ((b == a - 1 .OR. b == a + 2) .AND. (c == b - 1 .OR. c == b + 2)) THEN
+      ELSE IF ((b == a - 1 .OR. b == a + 2) .AND. (c == b - 1 .OR. c == b + 2)) THEN
          factor = -1.0_dp
       END IF
 
@@ -1298,9 +1295,9 @@ CONTAINS
       l(1:3) = 0
       IF (ii == 0) THEN
          l(iii) = 1
-      ELSEIF (iii == 0) THEN
+      ELSE IF (iii == 0) THEN
          l(ii) = 1
-      ELSEIF (ii == iii) THEN
+      ELSE IF (ii == iii) THEN
          l(ii) = 2
          i = coset(l(1), l(2), l(3)) - 1
       ELSE
@@ -1324,10 +1321,10 @@ CONTAINS
       IF (i1 == 1) THEN
          i2 = 2
          i3 = 3
-      ELSEIF (i1 == 2) THEN
+      ELSE IF (i1 == 2) THEN
          i2 = 3
          i3 = 1
-      ELSEIF (i1 == 3) THEN
+      ELSE IF (i1 == 3) THEN
          i2 = 1
          i3 = 2
       ELSE
@@ -1347,9 +1344,9 @@ CONTAINS
 
       IF ((i1 + i2) == 3) THEN
          i3 = 3
-      ELSEIF ((i1 + i2) == 4) THEN
+      ELSE IF ((i1 + i2) == 4) THEN
          i3 = 2
-      ELSEIF ((i1 + i2) == 5) THEN
+      ELSE IF ((i1 + i2) == 5) THEN
          i3 = 1
       ELSE
       END IF
@@ -1409,4 +1406,3 @@ CONTAINS
    END SUBROUTINE fm_scale_by_pbc_AC
 
 END MODULE qs_linres_op
-

@@ -19,15 +19,15 @@ MODULE pao_methods
                                               cite_reference
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_add, dbcsr_binary_read, dbcsr_complete_redistribute, dbcsr_copy, dbcsr_create, &
-        dbcsr_desymmetrize, dbcsr_distribution_get, dbcsr_distribution_new, &
-        dbcsr_distribution_type, dbcsr_filter, dbcsr_get_block_p, dbcsr_get_info, &
-        dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
-        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_p_type, dbcsr_release, dbcsr_scale, &
-        dbcsr_set, dbcsr_type
+        dbcsr_add, dbcsr_complete_redistribute, dbcsr_copy, dbcsr_create, dbcsr_desymmetrize, &
+        dbcsr_distribution_get, dbcsr_distribution_new, dbcsr_distribution_type, dbcsr_filter, &
+        dbcsr_get_block_p, dbcsr_get_info, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
+        dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_p_type, &
+        dbcsr_release, dbcsr_scale, dbcsr_set, dbcsr_type
    USE cp_dbcsr_contrib,                ONLY: dbcsr_checksum,&
                                               dbcsr_dot,&
                                               dbcsr_reserve_diag_blocks
+   USE cp_dbcsr_io,                     ONLY: dbcsr_binary_read
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_type,&
                                               cp_to_string
@@ -133,8 +133,9 @@ CONTAINS
 
          ! Load torch model.
          IF (LEN_TRIM(pao_model_file) > 0) THEN
-            IF (.NOT. ALLOCATED(pao%models)) &
+            IF (.NOT. ALLOCATED(pao%models)) THEN
                ALLOCATE (pao%models(SIZE(qs_kind_set)))
+            END IF
             CALL pao_model_load(pao, qs_env, ikind, pao_model_file, pao%models(ikind))
          END IF
 
@@ -268,7 +269,7 @@ CONTAINS
 
       INTEGER                                            :: acol, arow, handle, i, iatom, ikind, M, &
                                                             natoms
-      INTEGER, DIMENSION(:), POINTER                     :: blk_sizes_aux, blk_sizes_pri
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_sizes_aux, blk_sizes_pri
       REAL(dp), DIMENSION(:, :), POINTER                 :: block_Y
       TYPE(dbcsr_iterator_type)                          :: iter
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s
@@ -290,8 +291,9 @@ CONTAINS
          CALL get_atomic_kind(particle_set(iatom)%atomic_kind, kind_number=ikind)
          CALL get_qs_kind(qs_kind_set(ikind), pao_basis_size=M)
          CPASSERT(M > 0)
-         IF (blk_sizes_pri(iatom) < M) &
+         IF (blk_sizes_pri(iatom) < M) THEN
             CPABORT("PAO basis size exceeds primary basis size.")
+         END IF
          blk_sizes_aux(iatom) = M
       END DO
 
@@ -335,7 +337,7 @@ CONTAINS
 
       INTEGER                                            :: handle, iatom, natoms, pgrid_cols, &
                                                             pgrid_rows
-      INTEGER, DIMENSION(:), POINTER                     :: diag_col_dist, diag_row_dist
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: diag_col_dist, diag_row_dist
       TYPE(dbcsr_distribution_type)                      :: main_dist
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s
 
@@ -375,7 +377,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'pao_build_matrix_X'
 
       INTEGER                                            :: handle, iatom, ikind, natoms
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, row_blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_size, row_blk_size
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
 
       CALL timeset(routineN, handle)
@@ -554,8 +556,9 @@ CONTAINS
 
       CALL dbcsr_release(matrix_S_desym)
 
-      IF (ABS(ls_scf_env%nelectron_total - trace_PS) > 0.5) &
+      IF (ABS(ls_scf_env%nelectron_total - trace_PS) > 0.5_dp) THEN
          CPABORT("Number of electrons wrong. Trace(PS) ="//cp_to_string(trace_PS))
+      END IF
 
       CALL timestop(handle)
    END SUBROUTINE pao_check_trace_PS
@@ -983,12 +986,15 @@ CONTAINS
       IF (pao%iw > 0) WRITE (pao%iw, *) "PAO| Adding forces."
 
       IF (pao%max_pao /= 0) THEN
-         IF (pao%penalty_strength /= 0.0_dp) &
+         IF (pao%penalty_strength /= 0.0_dp) THEN
             CPABORT("PAO forces require PENALTY_STRENGTH or MAX_PAO set to zero")
-         IF (pao%linpot_regu_strength /= 0.0_dp) &
+         END IF
+         IF (pao%linpot_regu_strength /= 0.0_dp) THEN
             CPABORT("PAO forces require LINPOT_REGULARIZATION_STRENGTH or MAX_PAO set to zero")
-         IF (pao%regularization /= 0.0_dp) &
+         END IF
+         IF (pao%regularization /= 0.0_dp) THEN
             CPABORT("PAO forces require REGULARIZATION or MAX_PAO set to zero")
+         END IF
       END IF
 
       CALL get_qs_env(qs_env, &
@@ -999,11 +1005,13 @@ CONTAINS
       ALLOCATE (forces(natoms, 3))
       CALL pao_calc_AB(pao, qs_env, ls_scf_env, gradient=.TRUE., forces=forces) ! without penalty terms
 
-      IF (SIZE(pao%ml_training_set) > 0) &
+      IF (SIZE(pao%ml_training_set) > 0) THEN
          CALL pao_ml_forces(pao, qs_env, pao%matrix_G, forces)
+      END IF
 
-      IF (ALLOCATED(pao%models)) &
+      IF (ALLOCATED(pao%models)) THEN
          CALL pao_model_forces(pao, qs_env, pao%matrix_G, forces)
+      END IF
 
       CALL para_env%sum(forces)
       DO iatom = 1, natoms

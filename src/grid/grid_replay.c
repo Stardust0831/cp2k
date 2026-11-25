@@ -5,7 +5,7 @@
 /*  SPDX-License-Identifier: BSD-3-Clause                                     */
 /*----------------------------------------------------------------------------*/
 
-#include <assert.h>
+#include "../base/cp_assert.h"
 #include <fenv.h>
 #include <limits.h>
 #include <math.h>
@@ -46,7 +46,7 @@ static int parse_int(const char key[], FILE *fp) {
   read_next_line(line, sizeof(line), fp);
   snprintf(format, sizeof(format), "%s %%i", key);
   if (sscanf(line, format, &value) != 1) {
-    assert(!"parse_int failed");
+    cp_assert(!"parse_int failed");
   }
   return value;
 }
@@ -60,7 +60,7 @@ static void parse_int3(const char key[], FILE *fp, int vec[3]) {
   read_next_line(line, sizeof(line), fp);
   snprintf(format, sizeof(format), "%s %%i %%i %%i", key);
   if (sscanf(line, format, &vec[0], &vec[1], &vec[2]) != 3) {
-    assert(!"parse_int3 failed");
+    cp_assert(!"parse_int3 failed");
   }
 }
 
@@ -74,7 +74,7 @@ static double parse_double(const char key[], FILE *fp) {
   read_next_line(line, sizeof(line), fp);
   snprintf(format, sizeof(format), "%s %%lf", key);
   if (sscanf(line, format, &value) != 1) {
-    assert(!"parse_double failed");
+    cp_assert(!"parse_double failed");
   }
   return value;
 }
@@ -88,7 +88,7 @@ static void parse_double3(const char key[], FILE *fp, double vec[3]) {
   read_next_line(line, sizeof(line), fp);
   snprintf(format, sizeof(format), "%s %%lf %%lf %%lf", key);
   if (sscanf(line, format, &vec[0], &vec[1], &vec[2]) != 3) {
-    assert(!"parse_double3 failed");
+    cp_assert(!"parse_double3 failed");
   }
 }
 
@@ -102,7 +102,7 @@ static void parse_double3x3(const char key[], FILE *fp, double mat[3][3]) {
     read_next_line(line, sizeof(line), fp);
     snprintf(format, sizeof(format), "%s %i %%lf %%lf %%lf", key, i);
     if (sscanf(line, format, &mat[i][0], &mat[i][1], &mat[i][2]) != 3) {
-      assert(!"parse_double3x3 failed");
+      cp_assert(!"parse_double3x3 failed");
     }
   }
 }
@@ -121,10 +121,10 @@ static void create_dummy_basis_set(const int size, const int lmin,
       sphi_mutable[i][j] = (i == j) ? 1.0 : 0.0; // identity matrix
     }
   }
-  const double(*sphi)[size] = (const double(*)[size])sphi_mutable;
+  const double (*sphi)[size] = (const double (*)[size])sphi_mutable;
 
   const int npgf = size / ncoset(lmax);
-  assert(size == npgf * ncoset(lmax));
+  cp_assert(size == npgf * ncoset(lmax));
 
   const int first_sgf[1] = {1};
 
@@ -132,7 +132,7 @@ static void create_dummy_basis_set(const int size, const int lmin,
   for (int i = 0; i < npgf; i++) {
     zet_array_mutable[0][i] = zet;
   }
-  const double(*zet_array)[npgf] = (const double(*)[npgf])zet_array_mutable;
+  const double (*zet_array)[npgf] = (const double (*)[npgf])zet_array_mutable;
 
   grid_create_basis_set(/*nset=*/1,
                         /*nsgf=*/size,
@@ -180,8 +180,8 @@ static void create_dummy_task_list(
   const grid_basis_set *basis_sets[2] = {basis_set_a, basis_set_b};
   const int ipgf = o1 / ncoset(la_max) + 1;
   const int jpgf = o2 / ncoset(lb_max) + 1;
-  assert(o1 == (ipgf - 1) * ncoset(la_max));
-  assert(o2 == (jpgf - 1) * ncoset(lb_max));
+  cp_assert(o1 == (ipgf - 1) * ncoset(la_max));
+  cp_assert(o2 == (jpgf - 1) * ncoset(lb_max));
 
   int level_list[ntasks], iatom_list[ntasks], jatom_list[ntasks];
   int iset_list[ntasks], jset_list[ntasks], ipgf_list[ntasks],
@@ -203,7 +203,7 @@ static void create_dummy_task_list(
     rab_list_mutable[i][1] = rab[1];
     rab_list_mutable[i][2] = rab[2];
   }
-  const double(*rab_list)[3] = (const double(*)[3])rab_list_mutable;
+  const double (*rab_list)[3] = (const double (*)[3])rab_list_mutable;
 
   grid_create_task_list(
       orthorhombic, ntasks, nlevels, natoms, nkinds, nblocks, block_offsets,
@@ -263,8 +263,8 @@ bool grid_replay(const char *filename, const int cycles, const bool collocate,
   parse_double3x3("dh_inv", fp, dh_inv_mutable);
   parse_double3("ra", fp, ra);
   parse_double3("rab", fp, rab);
-  const double(*dh)[3] = (const double(*)[3])dh_mutable;
-  const double(*dh_inv)[3] = (const double(*)[3])dh_inv_mutable;
+  const double (*dh)[3] = (const double (*)[3])dh_mutable;
+  const double (*dh_inv)[3] = (const double (*)[3])dh_inv_mutable;
 
   int npts_global[3], npts_local[3], shift_local[3], border_width[3];
   parse_int3("npts_global", fp, npts_global);
@@ -284,14 +284,14 @@ bool grid_replay(const char *filename, const int cycles, const bool collocate,
     fprintf(stderr, "Error: Could not allocate pab buffer.\n");
     abort();
   }
-  double(*pab)[n1] = (double(*)[n1])pab_storage;
+  double (*pab)[n1] = (double (*)[n1])pab_storage;
   char line[100], format[100];
   for (int i = 0; i < n2; i++) {
     for (int j = 0; j < n1; j++) {
       read_next_line(line, sizeof(line), fp);
       snprintf(format, sizeof(format), "pab %i %i %%lf", i, j);
       if (sscanf(line, format, &pab[i][j]) != 1) {
-        assert(!"parse_pab failed");
+        cp_assert(!"parse_pab failed");
       }
     }
   }
@@ -307,7 +307,7 @@ bool grid_replay(const char *filename, const int cycles, const bool collocate,
     double value;
     read_next_line(line, sizeof(line), fp);
     if (sscanf(line, "grid %i %i %i %le", &i, &j, &k, &value) != 4) {
-      assert(!"parse_grid failed");
+      cp_assert(!"parse_grid failed");
     }
     grid_ref->host_buffer[k * npts_local[1] * npts_local[0] +
                           j * npts_local[0] + i] = value;
@@ -318,13 +318,13 @@ bool grid_replay(const char *filename, const int cycles, const bool collocate,
     fprintf(stderr, "Error: Could not allocate hab_ref buffer.\n");
     abort();
   }
-  double(*hab_ref)[n1] = (double(*)[n1])hab_ref_storage;
+  double (*hab_ref)[n1] = (double (*)[n1])hab_ref_storage;
   for (int i = o2; i < ncoset(lb_max) + o2; i++) {
     for (int j = o1; j < ncoset(la_max) + o1; j++) {
       read_next_line(line, sizeof(line), fp);
       snprintf(format, sizeof(format), "hab %i %i %%lf", i, j);
       if (sscanf(line, format, &hab_ref[i][j]) != 1) {
-        assert(!"parse_hab failed");
+        cp_assert(!"parse_hab failed");
       }
     }
   }
@@ -355,7 +355,7 @@ bool grid_replay(const char *filename, const int cycles, const bool collocate,
     fprintf(stderr, "Error: Could not allocate hab_test buffer.\n");
     abort();
   }
-  double(*hab_test)[n1] = (double(*)[n1])hab_test_storage;
+  double (*hab_test)[n1] = (double (*)[n1])hab_test_storage;
   double forces_test[2][3];
   double virial_test[3][3];
   double start_time, end_time;
@@ -367,10 +367,10 @@ bool grid_replay(const char *filename, const int cycles, const bool collocate,
     grid_task_list *task_list = NULL;
     create_dummy_task_list(
         orthorhombic, border_mask, ra, rab, radius, basisa, basisb, o1, o2,
-        la_max, lb_max, cycles, cycles_per_block, (const int(*)[3])npts_global,
-        (const int(*)[3])npts_local, (const int(*)[3])shift_local,
-        (const int(*)[3])border_width, (const double(*)[3][3])dh,
-        (const double(*)[3][3])dh_inv, &task_list);
+        la_max, lb_max, cycles, cycles_per_block, (const int (*)[3])npts_global,
+        (const int (*)[3])npts_local, (const int (*)[3])shift_local,
+        (const int (*)[3])border_width, (const double (*)[3][3])dh,
+        (const double (*)[3][3])dh_inv, &task_list);
     offload_buffer *pab_blocks = NULL, *hab_blocks = NULL;
     offload_create_buffer(n1 * n2, &pab_blocks);
     offload_create_buffer(n1 * n2, &hab_blocks);
@@ -387,12 +387,12 @@ bool grid_replay(const char *filename, const int cycles, const bool collocate,
       // collocate
       offload_buffer *grids[1] = {grid_test};
       grid_collocate_task_list(task_list, func, nlevels,
-                               (const int(*)[3])npts_local, pab_blocks, grids);
+                               (const int (*)[3])npts_local, pab_blocks, grids);
     } else {
       // integrate
       const offload_buffer *grids[1] = {grid_ref};
       grid_integrate_task_list(task_list, compute_tau, natoms, nlevels,
-                               (const int(*)[3])npts_local, pab_blocks, grids,
+                               (const int (*)[3])npts_local, pab_blocks, grids,
                                hab_blocks, forces_test, virial_test);
       for (int i = 0; i < n2; i++) {
         for (int j = 0; j < n1; j++) {

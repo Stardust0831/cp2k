@@ -48,8 +48,9 @@ CONTAINS
          CALL dbcsr_copy(pao%matrix_D_preconed, pao%matrix_D)
       END IF
 
-      IF (pao%optimizer == pao_opt_bfgs) &
+      IF (pao%optimizer == pao_opt_bfgs) THEN
          CALL pao_opt_init_bfgs(pao)
+      END IF
 
    END SUBROUTINE pao_opt_init
 
@@ -60,7 +61,7 @@ CONTAINS
    SUBROUTINE pao_opt_init_bfgs(pao)
       TYPE(pao_env_type), POINTER                        :: pao
 
-      INTEGER, DIMENSION(:), POINTER                     :: nparams
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: nparams
 
       CALL dbcsr_get_info(pao%matrix_X, row_blk_size=nparams)
 
@@ -85,11 +86,13 @@ CONTAINS
 
       CALL dbcsr_release(pao%matrix_D)
       CALL dbcsr_release(pao%matrix_G_prev)
-      IF (pao%precondition) &
+      IF (pao%precondition) THEN
          CALL dbcsr_release(pao%matrix_D_preconed)
+      END IF
 
-      IF (pao%optimizer == pao_opt_bfgs) &
+      IF (pao%optimizer == pao_opt_bfgs) THEN
          CALL dbcsr_release(pao%matrix_BFGS)
+      END IF
 
    END SUBROUTINE pao_opt_finalize
 
@@ -278,7 +281,7 @@ CONTAINS
             theta = 0.8_dp*trace_yHy/(trace_yHy - trace_sy)
             IF (pao%iw_opt > 0) WRITE (pao%iw_opt, *) "PAO|BFGS| Dampening theta:", theta
          ELSE
-            theta = 1.0
+            theta = 1.0_dp
          END IF
 
          ! r = theta*s + (1-theta)*Hy

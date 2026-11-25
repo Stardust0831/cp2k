@@ -14,6 +14,7 @@ MODULE swarm_message
    USE cp_parser_methods, ONLY: parser_get_next_line
    USE cp_parser_types, ONLY: cp_parser_type
    USE kinds, ONLY: default_string_length, &
+                    dp, &
                     int_4, &
                     int_8, &
                     real_4, &
@@ -361,6 +362,9 @@ CONTAINS
       TYPE(swarm_message_type), INTENT(IN)               :: msg1, msg2
       LOGICAL                                            :: res
 
+      REAL(KIND=dp), PARAMETER                           :: eps_r4 = 1.0E-05_dp, &
+                                                            eps_r8 = 1.0E-10_dp
+
       LOGICAL                                            :: found
       TYPE(message_entry_type), POINTER                  :: entry1, entry2
 
@@ -397,11 +401,11 @@ CONTAINS
 
          ELSE IF (ASSOCIATED(entry1%value_r4)) THEN
             IF (.NOT. ASSOCIATED(entry2%value_r4)) RETURN
-            IF (ABS(entry1%value_r4 - entry2%value_r4) > 1e-5) RETURN
+            IF (ABS(entry1%value_r4 - entry2%value_r4) > eps_r4) RETURN
 
          ELSE IF (ASSOCIATED(entry1%value_r8)) THEN
             IF (.NOT. ASSOCIATED(entry2%value_r8)) RETURN
-            IF (ABS(entry1%value_r8 - entry2%value_r8) > 1e-10) RETURN
+            IF (ABS(entry1%value_r8 - entry2%value_r8) > eps_r8) RETURN
 
          ELSE IF (ASSOCIATED(entry1%value_1d_i4)) THEN
             IF (.NOT. ASSOCIATED(entry2%value_1d_i4)) RETURN
@@ -413,11 +417,11 @@ CONTAINS
 
          ELSE IF (ASSOCIATED(entry1%value_1d_r4)) THEN
             IF (.NOT. ASSOCIATED(entry2%value_1d_r4)) RETURN
-            IF (ANY(ABS(entry1%value_1d_r4 - entry2%value_1d_r4) > 1e-5)) RETURN
+            IF (ANY(ABS(entry1%value_1d_r4 - entry2%value_1d_r4) > eps_r4)) RETURN
 
          ELSE IF (ASSOCIATED(entry1%value_1d_r8)) THEN
             IF (.NOT. ASSOCIATED(entry2%value_1d_r8)) RETURN
-            IF (ANY(ABS(entry1%value_1d_r8 - entry2%value_1d_r8) > 1e-10)) RETURN
+            IF (ANY(ABS(entry1%value_1d_r8 - entry2%value_1d_r8) > eps_r8)) RETURN
          ELSE
             CPABORT("no value ASSOCIATED")
          END IF
@@ -866,8 +870,9 @@ CONTAINS
 
          TYPE(message_entry_type), POINTER :: new_entry
 
-         IF (swarm_message_haskey(msg, key)) &
+         IF (swarm_message_haskey(msg, key)) THEN
             CPABORT("swarm_message_add_${label}$: key already exists: "//TRIM(key))
+         END IF
 
          ALLOCATE (new_entry)
          new_entry%key = key
@@ -920,8 +925,9 @@ CONTAINS
          curr_entry => msg%root
          DO WHILE (ASSOCIATED(curr_entry))
             IF (TRIM(curr_entry%key) == TRIM(key)) THEN
-               IF (.NOT. ASSOCIATED(curr_entry%value_${label}$)) &
+               IF (.NOT. ASSOCIATED(curr_entry%value_${label}$)) THEN
                   CPABORT("swarm_message_get_${label}$: value not associated key: "//TRIM(key))
+               END IF
                #:if label.startswith("1d_")
                   ALLOCATE (value(SIZE(curr_entry%value_${label}$)))
                #:endif

@@ -27,7 +27,7 @@ MODULE qmmm_util
                                               section_vals_val_get
    USE kinds,                           ONLY: dp
    USE mathconstants,                   ONLY: gaussi,&
-                                              pi
+                                              twopi
    USE particle_methods,                ONLY: write_fist_particle_coordinates,&
                                               write_qs_particle_coordinates
    USE particle_types,                  ONLY: particle_type
@@ -128,10 +128,11 @@ CONTAINS
       END IF
 
       IF (force_env%in_use == use_qmmmx) THEN
-         IF (iwall_type /= do_qmmm_wall_none) &
+         IF (iwall_type /= do_qmmm_wall_none) THEN
             CALL cp_warn(__LOCATION__, &
                          "Reflective walls for QM/MM are not implemented (or useful) when "// &
                          "force mixing is active.  Skipping!")
+         END IF
          RETURN
       END IF
 
@@ -433,7 +434,7 @@ CONTAINS
                                              particles_mm(qm_atom_index(min_ip))%r, i_dim, 0, lat_dv)
                   avoid(max_ip) = .TRUE.
                   ! switch min and max if necessary
-                  IF (lat_dv < 0.0) THEN
+                  IF (lat_dv < 0.0_dp) THEN
                      tmp_ip = min_ip
                      min_ip = max_ip
                      max_ip = tmp_ip
@@ -529,12 +530,12 @@ CONTAINS
 
       mean_z = 0.0_dp
       DO ip = 1, SIZE(qm_atom_index)
-         mean_z = mean_z + EXP(gaussi*2.0*pi* &
+         mean_z = mean_z + EXP(gaussi*twopi* &
                                MATMUL(mm_cell%h_inv, particles_mm(qm_atom_index(ip))%r))
       END DO
       mean_z = mean_z/ABS(mean_z)
       qmmm_pbc_aware_mean = MATMUL(mm_cell%hmat, &
-                                   REAL(LOG(mean_z)/(gaussi*2.0_dp*pi), dp))
+                                   REAL(LOG(mean_z)/(gaussi*twopi), dp))
    END FUNCTION qmmm_pbc_aware_mean
 
 ! **************************************************************************************************
@@ -584,13 +585,13 @@ CONTAINS
       REAL(dp)                                           :: lat_dv3(3), lat_dv_shifted, my_closest_dv
 
       closest_ip = -1
-      my_closest_dv = HUGE(0.0)
+      my_closest_dv = HUGE(0.0_dp)
       DO ip = 1, SIZE(qm_atom_index)
          IF (avoid(ip)) CYCLE
          lat_dv3 = qmmm_lat_dv(mm_cell, p, particles_mm(qm_atom_index(ip))%r)
          DO shift = -1, 1
             lat_dv_shifted = lat_dv3(i_dim) + shift*1.0_dp
-            IF (ABS(lat_dv_shifted) < ABS(my_closest_dv) .AND. (dir*lat_dv_shifted >= 0.0)) THEN
+            IF (ABS(lat_dv_shifted) < ABS(my_closest_dv) .AND. (dir*lat_dv_shifted >= 0.0_dp)) THEN
                my_closest_dv = lat_dv_shifted
                closest_ip = ip
             END IF
@@ -619,7 +620,7 @@ CONTAINS
 
       REAL(KIND=dp)                                      :: r, r0
 
-      r = SQRT(DOT_PRODUCT(rij, rij))
+      r = NORM2(rij)
       r0 = spherical_cutoff(1) - 20.0_dp*spherical_cutoff(2)
       factor = 0.5_dp*(1.0_dp - TANH((r - r0)/spherical_cutoff(2)))
 

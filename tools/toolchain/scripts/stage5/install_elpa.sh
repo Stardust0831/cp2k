@@ -53,9 +53,15 @@ case "${with_elpa}" in
       patch -l -p1 < "${SCRIPT_DIR}/stage5/elpa-${elpa_ver}-library-only.patch" \
         > elpa_library_only.patch.log 2>&1 || tail_excerpt elpa_library_only.patch.log
 
+      # Backport the width-1 tail block fixes from ELPA branch bugfix_elpa2_65_65_64.
+      patch -l -p1 < "${SCRIPT_DIR}/stage5/elpa-${elpa_ver}-nx1-tail-block.patch" \
+        > elpa_nx1_tail_block.patch.log 2>&1 ||
+        tail_excerpt elpa_nx1_tail_block.patch.log
+
       # Ensure a successful installation of nVidia version built with "-std=c++14" flag
-      sed -i 's/creal(/__real__(/g' src/GPU/CUDA/cudaFunctions_template.h
-      sed -i 's/cimag(/__imag__(/g' src/GPU/CUDA/cudaFunctions_template.h
+      # -i.bak: the in-place form BSD (macOS) and GNU sed both accept.
+      sed -i.bak -e 's/creal(/__real__(/g' -e 's/cimag(/__imag__(/g' src/GPU/CUDA/cudaFunctions_template.h
+      rm -f src/GPU/CUDA/cudaFunctions_template.h.bak
 
       # ELPA-2017xxxx enables AVX2 by default, switch off if machine doesn't support it.
       AVX_flag=""
@@ -64,7 +70,7 @@ case "${with_elpa}" in
       SSE4_flag=""
       config_flags="--disable-avx-kernels --disable-avx2-kernels --disable-avx512-kernels --disable-sse-kernels --disable-sse-assembly-kernels"
       if [ "${TARGET_CPU}" = "native" ]; then
-        if [ -f /proc/cpuinfo ] && [ "${OPENBLAS_ARCH}" = "x86_64" ]; then
+        if [ -f /proc/cpuinfo ] && [ "${SYSTEM_ARCH}" = "x86_64" ]; then
           has_AVX=$(grep '\bavx\b' /proc/cpuinfo 1> /dev/null && echo 'yes' || echo 'no')
           [ "${has_AVX}" = "yes" ] && AVX_flag="-mavx" || AVX_flag=""
           has_AVX2=$(grep '\bavx2\b' /proc/cpuinfo 1> /dev/null && echo 'yes' || echo 'no')
@@ -85,7 +91,7 @@ case "${with_elpa}" in
         echo "Installing from scratch into ${pkg_install_dir}/${TARGET}"
 
         gnu_ldflags="-Wl,--allow-multiple-definition -Wl,--enable-new-dtags"
-        if [[ "$(uname)" == "Darwin" ]]; then
+        if [ "$(uname)" = "Darwin" ]; then
           gnu_ldflags=""
           config_flags="${config_flags} --enable-affinity-checking=no"
         fi
@@ -123,7 +129,8 @@ case "${with_elpa}" in
       done
       cd ..
       write_checksums "${install_lock_file}" "${SCRIPT_DIR}/stage5/$(basename ${SCRIPT_NAME})" \
-        "${SCRIPT_DIR}/stage5/elpa-${elpa_ver}-library-only.patch"
+        "${SCRIPT_DIR}/stage5/elpa-${elpa_ver}-library-only.patch" \
+        "${SCRIPT_DIR}/stage5/elpa-${elpa_ver}-nx1-tail-block.patch"
     fi
     ;;
   __SYSTEM__)

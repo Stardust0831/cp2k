@@ -13,7 +13,7 @@
 ! **************************************************************************************************
 MODULE qs_active_space_utils
 
-   USE cp_dbcsr_api,                    ONLY: dbcsr_csr_type
+   USE cp_dbcsr_csr,                    ONLY: dbcsr_csr_type
    USE cp_fm_types,                     ONLY: cp_fm_get_element,&
                                               cp_fm_get_info,&
                                               cp_fm_type
@@ -30,7 +30,7 @@ MODULE qs_active_space_utils
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_active_space_utils'
 
-   PUBLIC :: subspace_matrix_to_array, eri_to_array
+   PUBLIC :: subspace_matrix_to_array, eri_to_array, find_degenerate_splits
 
 CONTAINS
 
@@ -121,15 +121,8 @@ CONTAINS
                DO i34l = 1, eri%nzerow_local(i12l)
                   i34 = eri%colind_local(irptr + i34l)
                   CALL csr_idx_from_combined(i34, nmo_max, i3, i4)
-! The FINDLOC intrinsic function of the Fortran 2008 standard is only available since GCC 9
-! That is why we use a custom-made implementation of this function for this compiler
-#if __GNUC__ < 9
-                  k = cp_findloc(active_orbitals(:, spin2), i3)
-                  l = cp_findloc(active_orbitals(:, spin2), i4)
-#else
                   k = FINDLOC(active_orbitals(:, spin2), i3, dim=1)
                   l = FINDLOC(active_orbitals(:, spin2), i4, dim=1)
-#endif
                   erival = eri%nzval_local%r_dp(irptr + i34l)
 
                   ! 8-fold permutational symmetry
@@ -159,30 +152,43 @@ CONTAINS
 
    END SUBROUTINE eri_to_array
 
-#if __GNUC__ < 9
 ! **************************************************************************************************
-!> \brief This function implements the FINDLOC function of the Fortran 2008 standard for the case needed above
-!>        To be removed as soon GCC 8 is dropped.
-!> \param array ...
-!> \param value ...
-!> \return ...
+!> \brief Finds pairs of degenerate orbitals of which one is active and the other is not, i.e.
+!>        sets of degenerate orbitals that are split by the active space.
+!> \param eigenvalues orbital energies of the available orbitals
+!> \param active indices of the active orbitals; indices outside the available orbitals are skipped
+!> \param eps_degenerate energy difference below which two orbitals count as degenerate
+!> \param npairs number of split pairs
+!> \param first_active active orbital of the first split pair (0 if there is none)
+!> \param first_other non-active orbital of the first split pair (0 if there is none)
 ! **************************************************************************************************
-   PURE INTEGER FUNCTION cp_findloc(array, value) RESULT(loc)
-      INTEGER, DIMENSION(:), INTENT(IN)                  :: array
-      INTEGER, INTENT(IN)                                :: value
+   PURE SUBROUTINE find_degenerate_splits(eigenvalues, active, eps_degenerate, npairs, &
+                                          first_active, first_other)
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: eigenvalues
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: active
+      REAL(KIND=dp), INTENT(IN)                          :: eps_degenerate
+      INTEGER, INTENT(OUT)                               :: npairs, first_active, first_other
 
-      INTEGER                                            :: idx
+      INTEGER                                            :: i, k, m
 
-      loc = 0
-
-      DO idx = 1, SIZE(array)
-      IF (array(idx) == value) THEN
-         loc = idx
-         RETURN
-      END IF
+      npairs = 0
+      first_active = 0
+      first_other = 0
+      DO i = 1, SIZE(active)
+         m = active(i)
+         IF (m < 1 .OR. m > SIZE(eigenvalues)) CYCLE
+         DO k = 1, SIZE(eigenvalues)
+            IF (ANY(active == k)) CYCLE
+            IF (ABS(eigenvalues(k) - eigenvalues(m)) < eps_degenerate) THEN
+               npairs = npairs + 1
+               IF (npairs == 1) THEN
+                  first_active = m
+                  first_other = k
+               END IF
+            END IF
+         END DO
       END DO
 
-   END FUNCTION cp_findloc
-#endif
+   END SUBROUTINE find_degenerate_splits
 
 END MODULE qs_active_space_utils

@@ -24,18 +24,20 @@ MODULE mp2_ri_2c
                                               cp_blacs_env_release,&
                                               cp_blacs_env_type
    USE cp_cfm_basic_linalg,             ONLY: cp_cfm_scale_and_add_fm
-   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
+   USE cp_cfm_diag,                     ONLY: cp_cfm_power
+   USE cp_cfm_types,                    ONLY: cp_cfm_copy_general,&
+                                              cp_cfm_create,&
                                               cp_cfm_release,&
+                                              cp_cfm_to_cfm,&
                                               cp_cfm_to_fm,&
-                                              cp_cfm_type
+                                              cp_cfm_type,&
+                                              cp_fm_to_cfm
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
         dbcsr_distribution_release, dbcsr_distribution_type, dbcsr_p_type, dbcsr_release, &
-        dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, &
-        dbcsr_type_symmetric
+        dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry, dbcsr_type_symmetric
    USE cp_dbcsr_contrib,                ONLY: dbcsr_reserve_all_blocks
-   USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               cp_dbcsr_dist2d_to_dist,&
                                               dbcsr_allocate_matrix_set,&
@@ -47,6 +49,7 @@ MODULE mp2_ri_2c
    USE cp_fm_diag,                      ONLY: choose_eigv_solver,&
                                               cp_fm_power,&
                                               cp_fm_syevx
+   USE cp_fm_redistribution,            ONLY: cp_array_columns_to_fm
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
@@ -69,25 +72,26 @@ MODULE mp2_ri_2c
                                               do_potential_id,&
                                               do_potential_long,&
                                               do_potential_truncated
+   USE integral_library_types,          ONLY: compare_potential_types,&
+                                              coulomb_operator_type
    USE kinds,                           ONLY: dp
    USE kpoint_coulomb_2c,               ONLY: build_2c_coulomb_matrix_kp
-   USE kpoint_methods,                  ONLY: kpoint_init_cell_index,&
-                                              rskp_transform
+   USE kpoint_methods,                  ONLY: kpoint_init_cell_index
+   USE kpoint_transform,                ONLY: rskp_prepared_transform_type,&
+                                              rskp_transform_evaluate,&
+                                              rskp_transform_prepare,&
+                                              rskp_transform_release
    USE kpoint_types,                    ONLY: get_kpoint_info,&
                                               kpoint_type
-   USE libint_2c_3c,                    ONLY: compare_potential_types,&
-                                              libint_potential_type
    USE machine,                         ONLY: m_flush
    USE mathconstants,                   ONLY: gaussi,&
                                               z_one,&
                                               z_zero
    USE message_passing,                 ONLY: mp_comm_type,&
                                               mp_para_env_release,&
-                                              mp_para_env_type,&
-                                              mp_request_type
+                                              mp_para_env_type
    USE mp2_eri,                         ONLY: mp2_eri_2c_integrate
    USE mp2_eri_gpw,                     ONLY: mp2_eri_2c_integrate_gpw
-   USE mp2_types,                       ONLY: integ_mat_buffer_type
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_methods,                ONLY: get_particle_set
    USE particle_types,                  ONLY: particle_type
@@ -103,8 +107,6 @@ MODULE mp2_ri_2c
                                               release_neighbor_list_sets
    USE qs_tensors,                      ONLY: build_2c_integrals,&
                                               build_2c_neighbor_lists
-   USE rpa_communication,               ONLY: communicate_buffer
-   USE rpa_gw_kpoints_util,             ONLY: cp_cfm_power
 
 !$ USE OMP_LIB, ONLY: omp_get_max_threads, omp_get_thread_num
 #include "./base/base_uses.f90"
@@ -115,7 +117,7 @@ MODULE mp2_ri_2c
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'mp2_ri_2c'
 
-   PUBLIC :: get_2c_integrals, trunc_coulomb_for_exchange, RI_2c_integral_mat, &
+   PUBLIC :: get_2c_integrals, trunc_coulomb_for_exchange, RI_2c_integral_mat, RI_2c_integral_mat_kp, &
              inversion_of_M_and_mult_with_chol_dec_of_V
 
 CONTAINS
@@ -145,8 +147,9 @@ CONTAINS
 !> \param eps_svd ...
 !> \param potential ...
 !> \param ri_metric ...
-!> \param fm_matrix_L_kpoints ...
-!> \param fm_matrix_Minv_L_kpoints ...
+!> \param cfm_matrix_L_kpoints ...
+!> \param cfm_matrix_Minv_L_kpoints ...
+!> \param fm_matrix_Minv_L_gamma ...
 !> \param fm_matrix_Minv ...
 !> \param fm_matrix_Minv_Vtrunc_Minv ...
 !> \param do_im_time ...
@@ -161,7 +164,7 @@ CONTAINS
                                my_Lrows, my_Vrows, fm_matrix_PQ, ngroup, color_sub, dimen_RI, dimen_RI_red, &
                                kpoints, my_group_L_size, my_group_L_start, my_group_L_end, &
                                gd_array, calc_PQ_cond_num, do_svd, eps_svd, potential, ri_metric, &
-                               fm_matrix_L_kpoints, fm_matrix_Minv_L_kpoints, &
+                               cfm_matrix_L_kpoints, cfm_matrix_Minv_L_kpoints, fm_matrix_Minv_L_gamma, &
                                fm_matrix_Minv, fm_matrix_Minv_Vtrunc_Minv, &
                                do_im_time, do_kpoints, mp2_eps_pgf_orb_S, qs_kind_set, sab_orb_sub, calc_forces, unit_nr)
 
@@ -181,10 +184,12 @@ CONTAINS
       TYPE(group_dist_d1_type), INTENT(OUT)              :: gd_array
       LOGICAL, INTENT(IN)                                :: calc_PQ_cond_num, do_svd
       REAL(KIND=dp), INTENT(IN)                          :: eps_svd
-      TYPE(libint_potential_type)                        :: potential, ri_metric
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_matrix_L_kpoints, &
-                                                            fm_matrix_Minv_L_kpoints, &
-                                                            fm_matrix_Minv, &
+      TYPE(coulomb_operator_type)                        :: potential, ri_metric
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_matrix_L_kpoints, &
+                                                            cfm_matrix_Minv_L_kpoints
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: fm_matrix_Minv_L_gamma
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_matrix_Minv, &
                                                             fm_matrix_Minv_Vtrunc_Minv
       LOGICAL, INTENT(IN)                                :: do_im_time, do_kpoints
       REAL(KIND=dp), INTENT(IN)                          :: mp2_eps_pgf_orb_S
@@ -196,12 +201,13 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'get_2c_integrals'
 
-      INTEGER                                            :: handle, num_small_eigen
+      INTEGER                                            :: handle, i_size, num_small_eigen
       REAL(KIND=dp)                                      :: cond_num, eps_pgf_orb_old
+      TYPE(coulomb_operator_type)                        :: trunc_coulomb
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_matrix_M_kpoints
       TYPE(cp_fm_type)                                   :: fm_matrix_L_work, fm_matrix_M_inv_work, &
                                                             fm_matrix_V
       TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(libint_potential_type)                        :: trunc_coulomb
       TYPE(mp_para_env_type), POINTER                    :: para_env_L
 
       CALL timeset(routineN, handle)
@@ -235,9 +241,15 @@ CONTAINS
             dft_control%qs_control%eps_pgf_orb = mp2_eps_pgf_orb_S
             CALL init_interaction_radii(dft_control%qs_control, qs_kind_set)
 
-            CALL RI_2c_integral_mat(qs_env, fm_matrix_Minv_L_kpoints, fm_matrix_L_work, dimen_RI, ri_metric, &
-                                    do_kpoints, kpoints, put_mat_KS_env=.TRUE., &
-                                    regularization_RI=qs_env%mp2_env%ri_rpa_im_time%regularization_RI)
+            IF (do_kpoints) THEN
+               CALL RI_2c_integral_mat_kp(qs_env, cfm_matrix_M_kpoints, fm_matrix_L_work%matrix_struct, dimen_RI, &
+                                          ri_metric, kpoints, put_mat_KS_env=.TRUE., &
+                                          regularization_RI=qs_env%mp2_env%ri_rpa_im_time%regularization_RI)
+            ELSE
+               CALL RI_2c_integral_mat(qs_env, fm_matrix_Minv_L_gamma, fm_matrix_L_work%matrix_struct, dimen_RI, &
+                                       ri_metric, put_mat_KS_env=.TRUE., &
+                                       regularization_RI=qs_env%mp2_env%ri_rpa_im_time%regularization_RI)
+            END IF
 
             ! re-init the radii to previous values
             dft_control%qs_control%eps_pgf_orb = eps_pgf_orb_old
@@ -249,35 +261,40 @@ CONTAINS
             CALL mp_para_env_release(para_env_L)
             CALL release_group_dist(gd_array)
 
-            ALLOCATE (fm_matrix_Minv_L_kpoints(1, 1))
+            ALLOCATE (fm_matrix_Minv_L_gamma(1, 1))
 
-            ! Calculate matrix of RI operator (for overlap metric: S), store it in fm_matrix_Minv_L_kpoints
+            ! Calculate matrix of RI operator (for overlap metric: S), store it in fm_matrix_Minv_L_gamma
             CALL compute_2c_integrals(qs_env, eri_method, eri_param, para_env, para_env_sub, para_env_L, mp2_memory, &
-                                      fm_matrix_Minv_L_kpoints(1, 1), ngroup, color_sub, dimen_RI, &
+                                      fm_matrix_Minv_L_gamma(1, 1), ngroup, color_sub, dimen_RI, &
                                       my_group_L_size, my_group_L_start, my_group_L_end, &
                                       gd_array, calc_PQ_cond_num, cond_num, &
                                       num_small_eigen, ri_metric, sab_orb_sub, &
-                                      fm_matrix_L_extern=fm_matrix_L_work)
+                                      fm_matrix_L_struct=fm_matrix_L_work%matrix_struct)
 
          END IF
 
          IF (do_kpoints) THEN
 
             ! k-dependent 1/r Coulomb matrix V_PQ(k)
-            CALL compute_V_by_lattice_sum(qs_env, fm_matrix_L_kpoints, fm_matrix_Minv_L_kpoints, kpoints)
+            CALL compute_V_by_lattice_sum(qs_env, cfm_matrix_L_kpoints, fm_matrix_L_work%matrix_struct, kpoints)
 
-            CALL inversion_of_M_and_mult_with_chol_dec_of_V(fm_matrix_Minv_L_kpoints, fm_matrix_L_kpoints, dimen_RI, &
-                                                            kpoints, qs_env%mp2_env%ri_rpa_im_time%eps_eigval_S)
+            CALL inversion_of_M_and_mult_with_chol_dec_of_V(cfm_matrix_M_kpoints, cfm_matrix_L_kpoints, &
+                                                            cfm_matrix_Minv_L_kpoints, dimen_RI, kpoints, &
+                                                            qs_env%mp2_env%ri_rpa_im_time%eps_eigval_S)
+            DO i_size = 1, SIZE(cfm_matrix_M_kpoints)
+               CALL cp_cfm_release(cfm_matrix_M_kpoints(i_size))
+            END DO
+            DEALLOCATE (cfm_matrix_M_kpoints)
 
             CALL trunc_coulomb_for_exchange(qs_env, trunc_coulomb)
 
             ! Gamma-only truncated Coulomb matrix V^tr with cutoff radius = half the unit cell size; for exchange self-energy
-            CALL RI_2c_integral_mat(qs_env, fm_matrix_Minv_Vtrunc_Minv, fm_matrix_L_work, dimen_RI, trunc_coulomb, &
-                                    do_kpoints=.FALSE., kpoints=kpoints, put_mat_KS_env=.FALSE., regularization_RI=0.0_dp)
+            CALL RI_2c_integral_mat(qs_env, fm_matrix_Minv_Vtrunc_Minv, fm_matrix_L_work%matrix_struct, dimen_RI, trunc_coulomb, &
+                                    put_mat_KS_env=.FALSE., regularization_RI=0.0_dp)
 
             ! Gamma-only RI-metric matrix; for computing Gamma-only/MIC self-energy
-            CALL RI_2c_integral_mat(qs_env, fm_matrix_Minv, fm_matrix_L_work, dimen_RI, ri_metric, &
-                                    do_kpoints=.FALSE., kpoints=kpoints, put_mat_KS_env=.FALSE., regularization_RI=0.0_dp)
+            CALL RI_2c_integral_mat(qs_env, fm_matrix_Minv, fm_matrix_L_work%matrix_struct, dimen_RI, ri_metric, &
+                                    put_mat_KS_env=.FALSE., regularization_RI=0.0_dp)
 
             CALL Gamma_only_inversion_of_M_and_mult_with_chol_dec_of_Vtrunc(fm_matrix_Minv_Vtrunc_Minv, &
                                                                             fm_matrix_Minv, qs_env)
@@ -294,36 +311,40 @@ CONTAINS
             CALL decomp_mat_L(fm_matrix_L_work, do_svd, eps_svd, num_small_eigen, cond_num, .FALSE., gd_array, ngroup, &
                               dimen_RI, dimen_RI_red, para_env)
 
-            CALL decomp_mat_L(fm_matrix_Minv_L_kpoints(1, 1), .FALSE., 0.0_dp, num_small_eigen, cond_num, .TRUE., &
+            CALL decomp_mat_L(fm_matrix_Minv_L_gamma(1, 1), .FALSE., 0.0_dp, num_small_eigen, cond_num, .TRUE., &
                               gd_array, ngroup, dimen_RI, dimen_RI_red, para_env)
 
-            CALL cp_fm_create(fm_matrix_M_inv_work, fm_matrix_Minv_L_kpoints(1, 1)%matrix_struct)
+            CALL cp_fm_create(fm_matrix_M_inv_work, fm_matrix_Minv_L_gamma(1, 1)%matrix_struct)
             CALL cp_fm_set_all(fm_matrix_M_inv_work, 0.0_dp)
 
-            CALL parallel_gemm('N', 'T', dimen_RI, dimen_RI, dimen_RI, 1.0_dp, fm_matrix_Minv_L_kpoints(1, 1), &
-                               fm_matrix_Minv_L_kpoints(1, 1), 0.0_dp, fm_matrix_M_inv_work)
+            CALL parallel_gemm('N', 'T', dimen_RI, dimen_RI, dimen_RI, 1.0_dp, fm_matrix_Minv_L_gamma(1, 1), &
+                               fm_matrix_Minv_L_gamma(1, 1), 0.0_dp, fm_matrix_M_inv_work)
 
             IF (do_svd) THEN
-               ! We have to reset the size of fm_matrix_Minv_L_kpoints
-               CALL reset_size_matrix(fm_matrix_Minv_L_kpoints(1, 1), dimen_RI_red, fm_matrix_L_work%matrix_struct)
+               ! We have to reset the size of fm_matrix_Minv_L_gamma
+               CALL reset_size_matrix(fm_matrix_Minv_L_gamma(1, 1), dimen_RI_red, fm_matrix_L_work%matrix_struct)
 
-               ! L (=fm_matrix_Minv_L_kpoints) = S^(-1)*chol_dec(V)
+               ! L (=fm_matrix_Minv_L_gamma) = S^(-1)*chol_dec(V)
                CALL parallel_gemm('T', 'N', dimen_RI, dimen_RI_red, dimen_RI, 1.0_dp, fm_matrix_M_inv_work, &
-                                  fm_matrix_L_work, 0.0_dp, fm_matrix_Minv_L_kpoints(1, 1))
+                                  fm_matrix_L_work, 0.0_dp, fm_matrix_Minv_L_gamma(1, 1))
             ELSE
-               ! L (=fm_matrix_Minv_L_kpoints) = S^(-1)*chol_dec(V)
+               ! L (=fm_matrix_Minv_L_gamma) = S^(-1)*chol_dec(V)
                CALL parallel_gemm('T', 'T', dimen_RI, dimen_RI, dimen_RI, 1.0_dp, fm_matrix_M_inv_work, &
-                                  fm_matrix_L_work, 0.0_dp, fm_matrix_Minv_L_kpoints(1, 1))
+                                  fm_matrix_L_work, 0.0_dp, fm_matrix_Minv_L_gamma(1, 1))
             END IF
 
             ! clean the S_inv matrix
             CALL cp_fm_release(fm_matrix_M_inv_work)
+
          END IF
 
          IF (.NOT. do_im_time) THEN
-
-            CALL cp_fm_to_fm(fm_matrix_Minv_L_kpoints(1, 1), fm_matrix_L_work)
-            CALL cp_fm_release(fm_matrix_Minv_L_kpoints)
+            IF (do_kpoints) THEN
+               CALL cp_cfm_to_fm(cfm_matrix_Minv_L_kpoints(1), mtargetr=fm_matrix_L_work)
+            ELSE
+               CALL cp_fm_to_fm(fm_matrix_Minv_L_gamma(1, 1), fm_matrix_L_work)
+               CALL cp_fm_release(fm_matrix_Minv_L_gamma)
+            END IF
 
          END IF
 
@@ -412,23 +433,24 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief ...
 !> \param qs_env ...
-!> \param fm_matrix_L_kpoints ...
-!> \param fm_matrix_Minv_L_kpoints ...
+!> \param cfm_matrix_L_kpoints ...
+!> \param fm_matrix_L_struct ...
 !> \param kpoints ...
 ! **************************************************************************************************
-   SUBROUTINE compute_V_by_lattice_sum(qs_env, fm_matrix_L_kpoints, fm_matrix_Minv_L_kpoints, kpoints)
+   SUBROUTINE compute_V_by_lattice_sum(qs_env, cfm_matrix_L_kpoints, fm_matrix_L_struct, kpoints)
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_matrix_L_kpoints, &
-                                                            fm_matrix_Minv_L_kpoints
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_matrix_L_kpoints
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_matrix_L_struct
       TYPE(kpoint_type), POINTER                         :: kpoints
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_V_by_lattice_sum'
 
-      INTEGER                                            :: handle, i_dim, i_real_imag, ikp, nkp, &
-                                                            nkp_extra, nkp_orig
+      INTEGER                                            :: handle, i_dim, ikp, nkp, nkp_extra, &
+                                                            nkp_orig
       INTEGER, DIMENSION(3)                              :: nkp_grid_orig, periodic
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
+      TYPE(cp_fm_type)                                   :: fm_matrix_L_work
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s_RI_aux_transl, matrix_v_RI_kp
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
@@ -454,14 +476,11 @@ CONTAINS
 
       nkp = kpoints%nkp
 
-      ALLOCATE (fm_matrix_L_kpoints(nkp, 2))
-      DO i_real_imag = 1, 2
-         DO ikp = 1, nkp
-            CALL cp_fm_create(fm_matrix_L_kpoints(ikp, i_real_imag), &
-                              fm_matrix_Minv_L_kpoints(1, i_real_imag)%matrix_struct)
-            CALL cp_fm_set_all(fm_matrix_L_kpoints(ikp, i_real_imag), 0.0_dp)
-         END DO
+      ALLOCATE (cfm_matrix_L_kpoints(nkp))
+      DO ikp = 1, nkp
+         CALL cp_cfm_create(cfm_matrix_L_kpoints(ikp), fm_matrix_L_struct)
       END DO
+      CALL cp_fm_create(fm_matrix_L_work, fm_matrix_L_struct)
 
       CALL allocate_matrix_v_RI_kp(matrix_v_RI_kp, matrix_s_RI_aux_transl, nkp)
 
@@ -498,11 +517,10 @@ CONTAINS
       END IF
 
       DO ikp = 1, nkp
-
-         CALL copy_dbcsr_to_fm(matrix_v_RI_kp(ikp, 1)%matrix, fm_matrix_L_kpoints(ikp, 1))
-         CALL copy_dbcsr_to_fm(matrix_v_RI_kp(ikp, 2)%matrix, fm_matrix_L_kpoints(ikp, 2))
-
+         CALL copy_dbcsr_pair_to_cfm(matrix_v_RI_kp(ikp, 1)%matrix, matrix_v_RI_kp(ikp, 2)%matrix, &
+                                     fm_matrix_L_work, cfm_matrix_L_kpoints(ikp))
       END DO
+      CALL cp_fm_release(fm_matrix_L_work)
 
       CALL dbcsr_deallocate_matrix_set(matrix_v_RI_kp)
 
@@ -547,8 +565,72 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief ...
 !> \param qs_env ...
-!> \param fm_matrix_Minv_L_kpoints ...
-!> \param fm_matrix_L ...
+!> \param fm_matrix_Minv_L_gamma real Gamma-point result ...
+!> \param fm_matrix_L_struct matrix distribution used for the result ...
+!> \param dimen_RI ...
+!> \param ri_metric ...
+!> \param put_mat_KS_env ...
+!> \param regularization_RI ...
+! **************************************************************************************************
+   SUBROUTINE RI_2c_integral_mat(qs_env, fm_matrix_Minv_L_gamma, fm_matrix_L_struct, dimen_RI, ri_metric, &
+                                 put_mat_KS_env, regularization_RI)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_matrix_Minv_L_gamma
+      TYPE(cp_fm_struct_type), INTENT(IN), POINTER       :: fm_matrix_L_struct
+      INTEGER, INTENT(IN)                                :: dimen_RI
+      TYPE(coulomb_operator_type)                        :: ri_metric
+      LOGICAL, OPTIONAL                                  :: put_mat_KS_env
+      REAL(KIND=dp), OPTIONAL                            :: regularization_RI
+
+      CALL RI_2c_integral_mat_core(qs_env, fm_matrix_Minv_L_gamma=fm_matrix_Minv_L_gamma, &
+                                   fm_matrix_L_struct=fm_matrix_L_struct, dimen_RI=dimen_RI, ri_metric=ri_metric, &
+                                   do_kpoints=.FALSE., put_mat_KS_env=put_mat_KS_env, &
+                                   regularization_RI=regularization_RI)
+
+   END SUBROUTINE RI_2c_integral_mat
+
+! **************************************************************************************************
+!> \brief Computes the complex k-point RI metric as native CFM matrices.
+!> \param qs_env ...
+!> \param cfm_matrix_M_kpoints ...
+!> \param fm_matrix_struct ...
+!> \param dimen_RI ...
+!> \param ri_metric ...
+!> \param kpoints ...
+!> \param put_mat_KS_env ...
+!> \param regularization_RI ...
+!> \param ikp_ext ...
+!> \param do_build_cell_index ...
+! **************************************************************************************************
+   SUBROUTINE RI_2c_integral_mat_kp(qs_env, cfm_matrix_M_kpoints, fm_matrix_struct, dimen_RI, ri_metric, &
+                                    kpoints, put_mat_KS_env, regularization_RI, ikp_ext, do_build_cell_index)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_matrix_M_kpoints
+      TYPE(cp_fm_struct_type), INTENT(IN), POINTER       :: fm_matrix_struct
+      INTEGER, INTENT(IN)                                :: dimen_RI
+      TYPE(coulomb_operator_type)                        :: ri_metric
+      TYPE(kpoint_type), POINTER                         :: kpoints
+      LOGICAL, OPTIONAL                                  :: put_mat_KS_env
+      REAL(KIND=dp), OPTIONAL                            :: regularization_RI
+      INTEGER, OPTIONAL                                  :: ikp_ext
+      LOGICAL, OPTIONAL                                  :: do_build_cell_index
+
+      CALL RI_2c_integral_mat_core(qs_env, cfm_matrix_M_kpoints=cfm_matrix_M_kpoints, &
+                                   fm_matrix_L_struct=fm_matrix_struct, dimen_RI=dimen_RI, ri_metric=ri_metric, &
+                                   do_kpoints=.TRUE., kpoints=kpoints, put_mat_KS_env=put_mat_KS_env, &
+                                   regularization_RI=regularization_RI, ikp_ext=ikp_ext, &
+                                   do_build_cell_index=do_build_cell_index)
+
+   END SUBROUTINE RI_2c_integral_mat_kp
+
+! **************************************************************************************************
+!> \brief Shared DBCSR evaluator with representation-specific matrix output adapters.
+!> \param qs_env ...
+!> \param fm_matrix_Minv_L_gamma ...
+!> \param cfm_matrix_M_kpoints ...
+!> \param fm_matrix_L_struct ...
 !> \param dimen_RI ...
 !> \param ri_metric ...
 !> \param do_kpoints ...
@@ -558,15 +640,18 @@ CONTAINS
 !> \param ikp_ext ...
 !> \param do_build_cell_index ...
 ! **************************************************************************************************
-   SUBROUTINE RI_2c_integral_mat(qs_env, fm_matrix_Minv_L_kpoints, fm_matrix_L, dimen_RI, ri_metric, &
-                                 do_kpoints, kpoints, put_mat_KS_env, regularization_RI, ikp_ext, &
-                                 do_build_cell_index)
+   SUBROUTINE RI_2c_integral_mat_core(qs_env, fm_matrix_Minv_L_gamma, cfm_matrix_M_kpoints, &
+                                      fm_matrix_L_struct, dimen_RI, ri_metric, do_kpoints, kpoints, &
+                                      put_mat_KS_env, regularization_RI, ikp_ext, do_build_cell_index)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_matrix_Minv_L_kpoints
-      TYPE(cp_fm_type), INTENT(IN)                       :: fm_matrix_L
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT), OPTIONAL                           :: fm_matrix_Minv_L_gamma
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:), &
+         INTENT(OUT), OPTIONAL                           :: cfm_matrix_M_kpoints
+      TYPE(cp_fm_struct_type), INTENT(IN), POINTER       :: fm_matrix_L_struct
       INTEGER, INTENT(IN)                                :: dimen_RI
-      TYPE(libint_potential_type)                        :: ri_metric
+      TYPE(coulomb_operator_type)                        :: ri_metric
       LOGICAL, INTENT(IN)                                :: do_kpoints
       TYPE(kpoint_type), OPTIONAL, POINTER               :: kpoints
       LOGICAL, OPTIONAL                                  :: put_mat_KS_env
@@ -574,25 +659,23 @@ CONTAINS
       INTEGER, OPTIONAL                                  :: ikp_ext
       LOGICAL, OPTIONAL                                  :: do_build_cell_index
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'RI_2c_integral_mat'
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'RI_2c_integral_mat_core'
 
-      INTEGER                                            :: handle, i_real_imag, i_size, ikp, &
-                                                            ikp_for_xkp, img, n_real_imag, natom, &
+      INTEGER                                            :: handle, ikp, ikp_for_xkp, img, natom, &
                                                             nimg, nkind, nkp
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: sizes_RI
-      INTEGER, DIMENSION(:), POINTER                     :: col_bsize, row_bsize
-      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_bsize, row_bsize
       LOGICAL                                            :: my_do_build_cell_index, my_put_mat_KS_env
       REAL(KIND=dp)                                      :: my_regularization_RI
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
+      TYPE(cp_cfm_type)                                  :: cfm_matrix_S_global
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
       TYPE(cp_fm_type)                                   :: fm_matrix_S_global
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_matrix_M_kpoints
       TYPE(dbcsr_distribution_type)                      :: dbcsr_dist
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_s_RI_aux_transl
       TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:)        :: mat_2c
-      TYPE(dbcsr_type), POINTER                          :: cmatrix, matrix_s_RI_aux_desymm, &
-                                                            rmatrix, tmpmat
+      TYPE(dbcsr_type), POINTER                          :: matrix_s_RI_aux_desymm
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(distribution_2d_type), POINTER                :: dist_2d
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_RI
@@ -601,8 +684,15 @@ CONTAINS
          POINTER                                         :: sab_RI
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      TYPE(rskp_prepared_transform_type)                 :: transform
 
       CALL timeset(routineN, handle)
+
+      IF (do_kpoints) THEN
+         CPASSERT(PRESENT(cfm_matrix_M_kpoints))
+      ELSE
+         CPASSERT(PRESENT(fm_matrix_Minv_L_gamma))
+      END IF
 
       NULLIFY (sab_RI, matrix_s_RI_aux_transl, dist_2d)
 
@@ -654,13 +744,10 @@ CONTAINS
          IF (my_do_build_cell_index) THEN
             CALL kpoint_init_cell_index(kpoints, sab_RI, para_env, dft_control%nimages)
          END IF
-         CALL get_kpoint_info(kpoints, nkp=nkp, xkp=xkp, &
-                              cell_to_index=cell_to_index)
-         n_real_imag = 2
+         CALL get_kpoint_info(kpoints, nkp=nkp)
          nimg = dft_control%nimages
       ELSE
          nkp = 1
-         n_real_imag = 1
          nimg = 1
       END IF
 
@@ -697,67 +784,44 @@ CONTAINS
 
       IF (PRESENT(ikp_ext)) nkp = 1
 
-      ALLOCATE (fm_matrix_Minv_L_kpoints(nkp, n_real_imag))
-      DO i_real_imag = 1, n_real_imag
-         DO i_size = 1, nkp
-            CALL cp_fm_create(fm_matrix_Minv_L_kpoints(i_size, i_real_imag), fm_matrix_L%matrix_struct)
-            CALL cp_fm_set_all(fm_matrix_Minv_L_kpoints(i_size, i_real_imag), 0.0_dp)
+      IF (do_kpoints) THEN
+         ALLOCATE (cfm_matrix_M_kpoints(nkp))
+         DO ikp = 1, nkp
+            CALL cp_cfm_create(cfm_matrix_M_kpoints(ikp), fm_matrix_L_struct)
          END DO
-      END DO
+      ELSE
+         ALLOCATE (fm_matrix_M_kpoints(1, 1))
+         CALL cp_fm_create(fm_matrix_M_kpoints(1, 1), fm_matrix_L_struct)
+         CALL cp_fm_set_all(fm_matrix_M_kpoints(1, 1), 0.0_dp)
+      END IF
 
       NULLIFY (fm_struct)
       CALL cp_fm_struct_create(fm_struct, context=blacs_env, nrow_global=dimen_RI, &
                                ncol_global=dimen_RI, para_env=para_env)
 
-      CALL cp_fm_create(fm_matrix_S_global, fm_struct)
-      CALL cp_fm_set_all(fm_matrix_S_global, 0.0_dp)
+      IF (do_kpoints) THEN
+         CALL cp_cfm_create(cfm_matrix_S_global, fm_struct, set_zero=.TRUE.)
+      ELSE
+         CALL cp_fm_create(fm_matrix_S_global, fm_struct)
+         CALL cp_fm_set_all(fm_matrix_S_global, 0.0_dp)
+      END IF
 
       IF (do_kpoints) THEN
-
-         ALLOCATE (rmatrix, cmatrix, tmpmat)
-         CALL dbcsr_create(rmatrix, template=matrix_s_RI_aux_transl(1, 1)%matrix, &
-                           matrix_type=dbcsr_type_symmetric)
-         CALL dbcsr_create(cmatrix, template=matrix_s_RI_aux_transl(1, 1)%matrix, &
-                           matrix_type=dbcsr_type_antisymmetric)
-         CALL dbcsr_create(tmpmat, template=matrix_s_RI_aux_transl(1, 1)%matrix, &
-                           matrix_type=dbcsr_type_no_symmetry)
-         CALL cp_dbcsr_alloc_block_from_nbl(rmatrix, sab_RI)
-         CALL cp_dbcsr_alloc_block_from_nbl(cmatrix, sab_RI)
+         CALL rskp_transform_prepare(transform, matrix_s_RI_aux_transl, [1], sab_RI, &
+                                     kpoints%cell_to_index, fm_struct, world=para_env, &
+                                     backend=kpoints%rskp_transform, xkp=kpoints%xkp, &
+                                     nkp_grid=kpoints%nkp_grid)
 
          DO ikp = 1, nkp
-
-            ! s matrix is not spin dependent, double the work
-            CALL dbcsr_set(rmatrix, 0.0_dp)
-            CALL dbcsr_set(cmatrix, 0.0_dp)
-
-            IF (PRESENT(ikp_ext)) THEN
-               ikp_for_xkp = ikp_ext
-            ELSE
-               ikp_for_xkp = ikp
-            END IF
-
-            CALL rskp_transform(rmatrix=rmatrix, cmatrix=cmatrix, rsmat=matrix_s_RI_aux_transl, ispin=1, &
-                                xkp=xkp(1:3, ikp_for_xkp), cell_to_index=cell_to_index, sab_nl=sab_RI)
-
-            CALL dbcsr_set(tmpmat, 0.0_dp)
-            CALL dbcsr_desymmetrize(rmatrix, tmpmat)
-
-            CALL cp_fm_set_all(fm_matrix_S_global, 0.0_dp)
-            CALL copy_dbcsr_to_fm(tmpmat, fm_matrix_S_global)
-            CALL cp_fm_copy_general(fm_matrix_S_global, fm_matrix_Minv_L_kpoints(ikp, 1), para_env)
-
-            CALL dbcsr_set(tmpmat, 0.0_dp)
-            CALL dbcsr_desymmetrize(cmatrix, tmpmat)
-
-            CALL cp_fm_set_all(fm_matrix_S_global, 0.0_dp)
-            CALL copy_dbcsr_to_fm(tmpmat, fm_matrix_S_global)
-            CALL cp_fm_copy_general(fm_matrix_S_global, fm_matrix_Minv_L_kpoints(ikp, 2), para_env)
+            ikp_for_xkp = ikp
+            IF (PRESENT(ikp_ext)) ikp_for_xkp = ikp_ext
+            CALL rskp_transform_evaluate(transform, 1, ikp_for_xkp, kpoints%xkp, &
+                                         cfm=cfm_matrix_S_global)
+            CALL cp_cfm_copy_general(cfm_matrix_S_global, cfm_matrix_M_kpoints(ikp), para_env)
 
          END DO
 
-         CALL dbcsr_deallocate_matrix(rmatrix)
-         CALL dbcsr_deallocate_matrix(cmatrix)
-         CALL dbcsr_deallocate_matrix(tmpmat)
+         CALL rskp_transform_release(transform)
 
       ELSE
 
@@ -770,7 +834,7 @@ CONTAINS
 
          CALL copy_dbcsr_to_fm(matrix_s_RI_aux_desymm, fm_matrix_S_global)
 
-         CALL cp_fm_copy_general(fm_matrix_S_global, fm_matrix_Minv_L_kpoints(1, 1), para_env)
+         CALL cp_fm_copy_general(fm_matrix_S_global, fm_matrix_M_kpoints(1, 1), para_env)
 
          CALL dbcsr_deallocate_matrix(matrix_s_RI_aux_desymm)
 
@@ -780,7 +844,14 @@ CONTAINS
 
       CALL cp_fm_struct_release(fm_struct)
 
-      CALL cp_fm_release(fm_matrix_S_global)
+      IF (.NOT. do_kpoints) CALL cp_fm_release(fm_matrix_S_global)
+
+      IF (do_kpoints) THEN
+         CALL cp_cfm_release(cfm_matrix_S_global)
+      ELSE
+         CPASSERT(PRESENT(fm_matrix_Minv_L_gamma))
+         CALL MOVE_ALLOC(fm_matrix_M_kpoints, fm_matrix_Minv_L_gamma)
+      END IF
 
       IF (.NOT. my_put_mat_KS_env) THEN
          CALL dbcsr_deallocate_matrix_set(matrix_s_RI_aux_transl)
@@ -788,7 +859,28 @@ CONTAINS
 
       CALL timestop(handle)
 
-   END SUBROUTINE RI_2c_integral_mat
+   END SUBROUTINE RI_2c_integral_mat_core
+
+! **************************************************************************************************
+!> \brief Copies a real/imaginary DBCSR pair into its native complex full-matrix representation.
+!> \param matrix_re ...
+!> \param matrix_im ...
+!> \param fm_work ...
+!> \param cfm_matrix ...
+! **************************************************************************************************
+   SUBROUTINE copy_dbcsr_pair_to_cfm(matrix_re, matrix_im, fm_work, cfm_matrix)
+      TYPE(dbcsr_type), POINTER                          :: matrix_re, matrix_im
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm_work
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_matrix
+
+      CALL cp_fm_set_all(fm_work, 0.0_dp)
+      CALL copy_dbcsr_to_fm(matrix_re, fm_work)
+      CALL cp_fm_to_cfm(msourcer=fm_work, mtarget=cfm_matrix)
+
+      CALL cp_fm_set_all(fm_work, 0.0_dp)
+      CALL copy_dbcsr_to_fm(matrix_im, fm_work)
+      CALL cp_cfm_scale_and_add_fm(z_one, cfm_matrix, gaussi, fm_work)
+   END SUBROUTINE copy_dbcsr_pair_to_cfm
 
 ! **************************************************************************************************
 !> \brief ...
@@ -813,13 +905,13 @@ CONTAINS
 !> \param potential ...
 !> \param sab_orb_sub ...
 !> \param do_im_time ...
-!> \param fm_matrix_L_extern ...
+!> \param fm_matrix_L_struct ...
 ! **************************************************************************************************
    SUBROUTINE compute_2c_integrals(qs_env, eri_method, eri_param, para_env, para_env_sub, para_env_L, mp2_memory, &
                                    fm_matrix_L, ngroup, color_sub, dimen_RI, &
                                    my_group_L_size, my_group_L_start, my_group_L_end, &
                                    gd_array, calc_PQ_cond_num, cond_num, num_small_eigen, potential, &
-                                   sab_orb_sub, do_im_time, fm_matrix_L_extern)
+                                   sab_orb_sub, do_im_time, fm_matrix_L_struct)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       INTEGER, INTENT(IN)                                :: eri_method
@@ -836,11 +928,11 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: calc_PQ_cond_num
       REAL(KIND=dp), INTENT(OUT)                         :: cond_num
       INTEGER, INTENT(OUT)                               :: num_small_eigen
-      TYPE(libint_potential_type), INTENT(IN)            :: potential
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_orb_sub
       LOGICAL, INTENT(IN), OPTIONAL                      :: do_im_time
-      TYPE(cp_fm_type), INTENT(IN), OPTIONAL             :: fm_matrix_L_extern
+      TYPE(cp_fm_struct_type), OPTIONAL, POINTER         :: fm_matrix_L_struct
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_2c_integrals'
 
@@ -916,9 +1008,9 @@ CONTAINS
                                    hab=L_local_col, first_b=my_group_L_start, last_b=my_group_L_end, &
                                    eri_method=eri_method)
 
-      ELSEIF (eri_method == do_eri_gpw .OR. &
-              (potential_type == do_potential_long .AND. qs_env%mp2_env%eri_method == do_eri_os) &
-              .OR. (potential_type == do_potential_id .AND. qs_env%mp2_env%eri_method == do_eri_mme)) THEN
+      ELSE IF (eri_method == do_eri_gpw .OR. &
+               (potential_type == do_potential_long .AND. qs_env%mp2_env%eri_method == do_eri_os) &
+               .OR. (potential_type == do_potential_id .AND. qs_env%mp2_env%eri_method == do_eri_mme)) THEN
 
          CALL mp2_eri_2c_integrate_gpw(qs_env, para_env_sub, my_group_L_start, my_group_L_end, &
                                        natom, potential, sab_orb_sub, L_local_col, kind_of)
@@ -966,13 +1058,13 @@ CONTAINS
       CALL cp_blacs_env_create(blacs_env=blacs_env_L, para_env=para_env_L)
 
       ! create the full matrix L defined in the L group
-      CALL create_matrix_L(fm_matrix_L, blacs_env_L, dimen_RI, para_env_L, "fm_matrix_L", fm_matrix_L_extern)
+      CALL create_matrix_L(fm_matrix_L, blacs_env_L, dimen_RI, para_env_L, "fm_matrix_L", fm_matrix_L_struct)
 
       IF (my_do_im_time .AND. para_env%num_pe > 1) THEN
 
-         CALL fill_fm_L_from_L_loc_non_blocking(fm_matrix_L, L_local_col, para_env, &
-                                                my_group_L_start, my_group_L_end, &
-                                                dimen_RI)
+         CALL cp_array_columns_to_fm(fm_matrix_L, L_local_col, para_env, &
+                                     my_group_L_start, my_group_L_end, &
+                                     dimen_RI)
 
       ELSE
          BLOCK
@@ -1046,7 +1138,7 @@ CONTAINS
          ! calculate the condition number of the (P|Q) matrix
          ! create a copy of the matrix
 
-         CALL create_matrix_L(fm_matrix_L_diag, blacs_env_L, dimen_RI, para_env_L, "fm_matrix_L_diag", fm_matrix_L_extern)
+         CALL create_matrix_L(fm_matrix_L_diag, blacs_env_L, dimen_RI, para_env_L, "fm_matrix_L_diag", fm_matrix_L_struct)
 
          CALL cp_fm_to_fm(source=fm_matrix_L, destination=fm_matrix_L_diag)
 
@@ -1210,210 +1302,6 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief ...
 !> \param fm_matrix_L ...
-!> \param L_local_col ...
-!> \param para_env ...
-!> \param my_group_L_start ...
-!> \param my_group_L_end ...
-!> \param dimen_RI ...
-! **************************************************************************************************
-   SUBROUTINE fill_fm_L_from_L_loc_non_blocking(fm_matrix_L, L_local_col, para_env, my_group_L_start, &
-                                                my_group_L_end, dimen_RI)
-      TYPE(cp_fm_type), INTENT(IN)                       :: fm_matrix_L
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
-         INTENT(IN)                                      :: L_local_col
-      TYPE(mp_para_env_type), INTENT(IN)                 :: para_env
-      INTEGER, INTENT(IN)                                :: my_group_L_start, my_group_L_end, &
-                                                            dimen_RI
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'fill_fm_L_from_L_loc_non_blocking'
-
-      INTEGER :: dummy_proc, handle, handle2, i_entry_rec, i_row, iproc, j_col, LLL, MMM, &
-         ncol_local, nrow_local, proc_send, send_pcol, send_prow
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: entry_counter, num_entries_rec, &
-                                                            num_entries_send
-      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
-      TYPE(integ_mat_buffer_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: buffer_rec, buffer_send
-      TYPE(mp_request_type), DIMENSION(:, :), POINTER    :: req_array
-
-      CALL timeset(routineN, handle)
-
-      CALL timeset(routineN//"_1", handle2)
-
-      ! get info for the dest
-      CALL cp_fm_get_info(matrix=fm_matrix_L, &
-                          nrow_local=nrow_local, &
-                          ncol_local=ncol_local, &
-                          row_indices=row_indices, &
-                          col_indices=col_indices)
-
-      ALLOCATE (num_entries_rec(0:para_env%num_pe - 1))
-      ALLOCATE (num_entries_send(0:para_env%num_pe - 1))
-
-      num_entries_rec(:) = 0
-      num_entries_send(:) = 0
-
-      dummy_proc = 0
-
-      ! get the process, where the elements from L_local_col have to be sent
-      DO LLL = 1, dimen_RI
-
-         send_prow = fm_matrix_L%matrix_struct%g2p_row(LLL)
-
-         DO MMM = my_group_L_start, my_group_L_end
-
-            send_pcol = fm_matrix_L%matrix_struct%g2p_col(MMM)
-
-            proc_send = fm_matrix_L%matrix_struct%context%blacs2mpi(send_prow, send_pcol)
-
-            num_entries_send(proc_send) = num_entries_send(proc_send) + 1
-
-         END DO
-
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_2", handle2)
-
-      CALL para_env%alltoall(num_entries_send, num_entries_rec, 1)
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_3", handle2)
-
-      ! allocate buffers to send the entries and the information of the entries
-      ALLOCATE (buffer_rec(0:para_env%num_pe - 1))
-      ALLOCATE (buffer_send(0:para_env%num_pe - 1))
-
-      ! allocate data message and corresponding indices
-      DO iproc = 0, para_env%num_pe - 1
-
-         ALLOCATE (buffer_rec(iproc)%msg(num_entries_rec(iproc)))
-         buffer_rec(iproc)%msg = 0.0_dp
-
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_4", handle2)
-
-      DO iproc = 0, para_env%num_pe - 1
-
-         ALLOCATE (buffer_send(iproc)%msg(num_entries_send(iproc)))
-         buffer_send(iproc)%msg = 0.0_dp
-
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_5", handle2)
-
-      DO iproc = 0, para_env%num_pe - 1
-
-         ALLOCATE (buffer_rec(iproc)%indx(num_entries_rec(iproc), 2))
-         buffer_rec(iproc)%indx = 0
-
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_6", handle2)
-
-      DO iproc = 0, para_env%num_pe - 1
-
-         ALLOCATE (buffer_send(iproc)%indx(num_entries_send(iproc), 2))
-         buffer_send(iproc)%indx = 0
-
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_7", handle2)
-
-      ALLOCATE (entry_counter(0:para_env%num_pe - 1))
-      entry_counter(:) = 0
-
-      ! get the process, where the elements from L_local_col have to be sent and
-      ! write the data and the info to buffer_send
-      DO MMM = my_group_L_start, my_group_L_end
-
-         send_pcol = fm_matrix_L%matrix_struct%g2p_col(MMM)
-
-         DO LLL = 1, dimen_RI
-
-            send_prow = fm_matrix_L%matrix_struct%g2p_row(LLL)
-
-            proc_send = fm_matrix_L%matrix_struct%context%blacs2mpi(send_prow, send_pcol)
-
-            entry_counter(proc_send) = entry_counter(proc_send) + 1
-
-            buffer_send(proc_send)%msg(entry_counter(proc_send)) = &
-               L_local_col(LLL, MMM - my_group_L_start + 1)
-
-            buffer_send(proc_send)%indx(entry_counter(proc_send), 1) = LLL
-            buffer_send(proc_send)%indx(entry_counter(proc_send), 2) = MMM
-
-         END DO
-
-      END DO
-
-      ALLOCATE (req_array(1:para_env%num_pe, 4))
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_8", handle2)
-
-      ! communicate the buffer
-      CALL communicate_buffer(para_env, num_entries_rec, num_entries_send, buffer_rec, &
-                              buffer_send, req_array)
-
-      fm_matrix_L%local_data = 0.0_dp
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_9", handle2)
-
-      ! fill fm_matrix_L with the entries from buffer_rec
-      DO iproc = 0, para_env%num_pe - 1
-         DO i_entry_rec = 1, num_entries_rec(iproc)
-            DO j_col = 1, ncol_local
-               IF (col_indices(j_col) == buffer_rec(iproc)%indx(i_entry_rec, 2)) THEN
-                  DO i_row = 1, nrow_local
-                     IF (row_indices(i_row) == buffer_rec(iproc)%indx(i_entry_rec, 1)) THEN
-                        fm_matrix_L%local_data(i_row, j_col) = buffer_rec(iproc)%msg(i_entry_rec)
-                     END IF
-                  END DO
-               END IF
-            END DO
-         END DO
-      END DO
-
-      CALL timestop(handle2)
-
-      CALL timeset(routineN//"_10", handle2)
-
-      DO iproc = 0, para_env%num_pe - 1
-         DEALLOCATE (buffer_rec(iproc)%msg)
-         DEALLOCATE (buffer_rec(iproc)%indx)
-         DEALLOCATE (buffer_send(iproc)%msg)
-         DEALLOCATE (buffer_send(iproc)%indx)
-      END DO
-
-      DEALLOCATE (buffer_rec, buffer_send)
-      DEALLOCATE (req_array)
-      DEALLOCATE (entry_counter)
-      DEALLOCATE (num_entries_rec, num_entries_send)
-
-      CALL timestop(handle2)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE fill_fm_L_from_L_loc_non_blocking
-
-! **************************************************************************************************
-!> \brief ...
-!> \param fm_matrix_L ...
 !> \param dimen_RI ...
 !> \param do_inversion ...
 ! **************************************************************************************************
@@ -1458,17 +1346,20 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief ...
-!> \param fm_matrix_Minv_L_kpoints ...
-!> \param fm_matrix_L_kpoints ...
+!> \param cfm_matrix_M_kpoints ...
+!> \param cfm_matrix_L_kpoints ...
+!> \param cfm_matrix_Minv_L_kpoints ...
 !> \param dimen_RI ...
 !> \param kpoints ...
 !> \param eps_eigval_S ...
 ! **************************************************************************************************
-   SUBROUTINE inversion_of_M_and_mult_with_chol_dec_of_V(fm_matrix_Minv_L_kpoints, fm_matrix_L_kpoints, &
-                                                         dimen_RI, kpoints, eps_eigval_S)
+   SUBROUTINE inversion_of_M_and_mult_with_chol_dec_of_V(cfm_matrix_M_kpoints, cfm_matrix_L_kpoints, &
+                                                         cfm_matrix_Minv_L_kpoints, dimen_RI, kpoints, eps_eigval_S)
 
-      TYPE(cp_fm_type), DIMENSION(:, :), INTENT(IN)      :: fm_matrix_Minv_L_kpoints, &
-                                                            fm_matrix_L_kpoints
+      TYPE(cp_cfm_type), DIMENSION(:), INTENT(IN)        :: cfm_matrix_M_kpoints
+      TYPE(cp_cfm_type), DIMENSION(:), INTENT(INOUT)     :: cfm_matrix_L_kpoints
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:), &
+         INTENT(INOUT)                                   :: cfm_matrix_Minv_L_kpoints
       INTEGER, INTENT(IN)                                :: dimen_RI
       TYPE(kpoint_type), POINTER                         :: kpoints
       REAL(KIND=dp), INTENT(IN)                          :: eps_eigval_S
@@ -1476,49 +1367,36 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'inversion_of_M_and_mult_with_chol_dec_of_V'
 
       INTEGER                                            :: handle, ikp, nkp
-      TYPE(cp_cfm_type)                                  :: cfm_matrix_K_tmp, cfm_matrix_M_tmp, &
-                                                            cfm_matrix_V_tmp, cfm_matrix_Vtrunc_tmp
+      TYPE(cp_cfm_type)                                  :: cfm_matrix_M_tmp
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
 
       CALL timeset(routineN, handle)
 
-      CALL cp_fm_get_info(fm_matrix_Minv_L_kpoints(1, 1), matrix_struct=matrix_struct)
+      matrix_struct => cfm_matrix_M_kpoints(1)%matrix_struct
 
       CALL cp_cfm_create(cfm_matrix_M_tmp, matrix_struct)
-      CALL cp_cfm_create(cfm_matrix_V_tmp, matrix_struct)
-      CALL cp_cfm_create(cfm_matrix_K_tmp, matrix_struct)
-      CALL cp_cfm_create(cfm_matrix_Vtrunc_tmp, matrix_struct)
 
       CALL get_kpoint_info(kpoints, nkp=nkp)
+      ALLOCATE (cfm_matrix_Minv_L_kpoints(nkp))
 
       DO ikp = 1, nkp
 
-         CALL cp_cfm_scale_and_add_fm(z_zero, cfm_matrix_M_tmp, z_one, fm_matrix_Minv_L_kpoints(ikp, 1))
-         CALL cp_cfm_scale_and_add_fm(z_one, cfm_matrix_M_tmp, gaussi, fm_matrix_Minv_L_kpoints(ikp, 2))
-
-         CALL cp_cfm_scale_and_add_fm(z_zero, cfm_matrix_V_tmp, z_one, fm_matrix_L_kpoints(ikp, 1))
-         CALL cp_cfm_scale_and_add_fm(z_one, cfm_matrix_V_tmp, gaussi, fm_matrix_L_kpoints(ikp, 2))
+         CALL cp_cfm_to_cfm(cfm_matrix_M_kpoints(ikp), cfm_matrix_M_tmp)
 
          CALL cp_cfm_power(cfm_matrix_M_tmp, threshold=eps_eigval_S, exponent=-1.0_dp)
 
-         CALL cp_cfm_power(cfm_matrix_V_tmp, threshold=0.0_dp, exponent=0.5_dp)
-
          ! save L(k) = SQRT(V(k))
-         CALL cp_cfm_to_fm(cfm_matrix_V_tmp, fm_matrix_L_kpoints(ikp, 1), fm_matrix_L_kpoints(ikp, 2))
+         CALL cp_cfm_power(cfm_matrix_L_kpoints(ikp), threshold=0.0_dp, exponent=0.5_dp)
 
          ! get K = M^(-1)*L, where L is the Cholesky decomposition of V = L^T*L
-         CALL parallel_gemm("N", "C", dimen_RI, dimen_RI, dimen_RI, z_one, cfm_matrix_M_tmp, cfm_matrix_V_tmp, &
-                            z_zero, cfm_matrix_K_tmp)
-
-         ! move
-         CALL cp_cfm_to_fm(cfm_matrix_K_tmp, fm_matrix_Minv_L_kpoints(ikp, 1), fm_matrix_Minv_L_kpoints(ikp, 2))
+         CALL cp_cfm_create(cfm_matrix_Minv_L_kpoints(ikp), matrix_struct)
+         CALL parallel_gemm("N", "C", dimen_RI, dimen_RI, dimen_RI, z_one, cfm_matrix_M_tmp, &
+                            cfm_matrix_L_kpoints(ikp), &
+                            z_zero, cfm_matrix_Minv_L_kpoints(ikp))
 
       END DO
 
       CALL cp_cfm_release(cfm_matrix_M_tmp)
-      CALL cp_cfm_release(cfm_matrix_V_tmp)
-      CALL cp_cfm_release(cfm_matrix_K_tmp)
-      CALL cp_cfm_release(cfm_matrix_Vtrunc_tmp)
 
       CALL timestop(handle)
 
@@ -1539,6 +1417,7 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: &
          routineN = 'Gamma_only_inversion_of_M_and_mult_with_chol_dec_of_Vtrunc'
+      REAL(KIND=dp), PARAMETER :: eps_eigval_S_Gamma_thre = 1.0E-18_dp
 
       INTEGER                                            :: dimen_RI, handle, ndep
       REAL(KIND=dp)                                      :: eps_eigval_S_Gamma
@@ -1556,7 +1435,7 @@ CONTAINS
 
       eps_eigval_S_Gamma = qs_env%mp2_env%ri_rpa_im_time%eps_eigval_S_Gamma
 
-      IF (eps_eigval_S_Gamma > 1.0E-18) THEN
+      IF (eps_eigval_S_Gamma > eps_eigval_S_Gamma_thre) THEN
 
          ! remove small eigenvalues
          CALL cp_fm_power(fm_matrix_Minv(1, 1), fm_matrix_RI_metric_inv_work, -0.5_dp, &
@@ -1599,7 +1478,7 @@ CONTAINS
    SUBROUTINE trunc_coulomb_for_exchange(qs_env, trunc_coulomb, rel_cutoff_trunc_coulomb_ri_x, &
                                          cell_grid, do_BvK_cell)
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(libint_potential_type), OPTIONAL              :: trunc_coulomb
+      TYPE(coulomb_operator_type), OPTIONAL              :: trunc_coulomb
       REAL(KIND=dp), OPTIONAL                            :: rel_cutoff_trunc_coulomb_ri_x
       INTEGER, DIMENSION(3), OPTIONAL                    :: cell_grid
       LOGICAL, OPTIONAL                                  :: do_BvK_cell
@@ -1720,15 +1599,15 @@ CONTAINS
 !> \param dimen_RI ...
 !> \param para_env_L ...
 !> \param name ...
-!> \param fm_matrix_L_extern ...
+!> \param fm_matrix_L_struct ...
 ! **************************************************************************************************
-   SUBROUTINE create_matrix_L(fm_matrix_L, blacs_env_L, dimen_RI, para_env_L, name, fm_matrix_L_extern)
+   SUBROUTINE create_matrix_L(fm_matrix_L, blacs_env_L, dimen_RI, para_env_L, name, fm_matrix_L_struct)
       TYPE(cp_fm_type), INTENT(OUT)                      :: fm_matrix_L
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env_L
       INTEGER, INTENT(IN)                                :: dimen_RI
       TYPE(mp_para_env_type), POINTER                    :: para_env_L
       CHARACTER(LEN=*), INTENT(IN)                       :: name
-      TYPE(cp_fm_type), INTENT(IN), OPTIONAL             :: fm_matrix_L_extern
+      TYPE(cp_fm_struct_type), OPTIONAL, POINTER         :: fm_matrix_L_struct
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'create_matrix_L'
 
@@ -1738,8 +1617,8 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       ! create the full matrix L defined in the L group
-      IF (PRESENT(fm_matrix_L_extern)) THEN
-         CALL cp_fm_create(fm_matrix_L, fm_matrix_L_extern%matrix_struct, name=name)
+      IF (PRESENT(fm_matrix_L_struct)) THEN
+         CALL cp_fm_create(fm_matrix_L, fm_matrix_L_struct, name=name)
       ELSE
          NULLIFY (fm_struct)
          CALL cp_fm_struct_create(fm_struct, context=blacs_env_L, nrow_global=dimen_RI, &

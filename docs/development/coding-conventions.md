@@ -26,6 +26,11 @@ Conventions which are easily testible by reading the source files, are tested in
   - avoid FLOAT() in favour of REAL(, KIND=dp).
   - the global number of grid points (pw_grid_type%ngpts,ngpts_cut) overflows INT(KIND=4) for large
     simulations.
+- Convert magic constants (internal ad-hoc thresholds, ...) to parameters. This documents the origin
+  and meaning of these values and allows to convert them into input parameters if necessary.
+- Each `SELECT CASE`-branching should have a `DEFAULT` branch. If another value should not be
+  allowed, use `CPABORT` to indicate that and catch programming errors from passing incorrect
+  values.
 - Every derived type needs a default initializer. This means that each of its non-allocatable
   component needs a default value. This prevents errors from accessing uninitialized and thus
   non-sensical data.
@@ -54,7 +59,7 @@ Conventions which are easily testible by reading the source files, are tested in
       TYPE(C_PTR) :: my_c_ptr = C_NULL_PTR
       ! Call the default initializer of a previously defined tpe
       TYPE(my_previously_defined_type) :: my_type = my_previously_defined_type()
-      ! No default implemented
+      ! Library types if a default initializer is not implemented
       TYPE(library_type) :: lib_type
    END TYPE my_derived_type
 ```
@@ -90,8 +95,9 @@ There are two measures of defense against
     symbols.
   - Every package should hide its content by providing only a small public API through a single
     module.
-- Each external library should be accesses using a wrapper module.
-  - The wrapper module should
+- Each external library should be accessed using a wrapper module.
+  - The wrapper module should take care of the cases of CP2K being compiled with or without support
+    for the library.
 
 ## Use existing infrastructure
 
@@ -127,6 +133,91 @@ central redirections, i.e. avoid to use direct calls to external libraries in CP
   or `error_unit` from `ISO_FORTRAN_ENV`. Beware that the respective output is not written to the
   standard output file opened by CP2K.
 - Use [CP2K's error-handling](error-handling), instead of the `STOP` statement.
+- Use the `CP_VERSION_CHECK`-macro from `base_uses.f90` if code should only (or not) be compiled
+  with certain compiler versions.
+
+## C-code and interfacing C-code in Fortran
+
+C-code is relevant for library wrappers to libraries without a suitable Fortran- or C-interface or
+in case of CUDA-code.
+
+- If a Fortran-API is not available, you should implement one using
+  [ISO-C-binding](https://fortranwiki.org/fortran/show/iso_c_binding).
+- Pass the MPI-types as Integers using their Fortran-handles and convert them on the C-side using
+  [the appropriate functions](https://www.mpi-forum.org/docs/mpi-2.2/mpi22-report/node361.htm).
+- Don't use the MPI module directly but rely instead on CP2K's C-wrapper `cp_mpi.h`. If you are
+  missing a function/type-combination, you are free to add it.
+- C-files are added to a separate variable in `CMakefiles.txt` than the Fortran-files.
+- Do not print to the streams `stdout` (including `printf`) or `stderr` directly. These streams do
+  not print by default to the CP2K output file but pass a function to print to the output file
+  instead such as in the following example
+
+```
+   SUBROUTINE print_something_in_c(output_unit)
+      INTEGER, INTENT(IN)                                :: output_unit
+
+      INTERFACE
+         SUBROUTINE function_to_call_in_c(print_func, output_unit) &
+            BIND(C, name="function_to_call_in_c")
+            IMPORT :: C_FUNPTR, C_INT
+            TYPE(C_FUNPTR), VALUE                     :: print_func
+            INTEGER(KIND=C_INT), VALUE                :: output_unit
+         END SUBROUTINE function_to_call_in_c
+      END INTERFACE
+
+      CALL function_to_call_in_c(print_func=C_FUNLOC(print_func), &
+                                 output_unit=output_unit)
+
+   END SUBROUTINE grid_library_print_stats
+
+   SUBROUTINE print_func(msg, msglen, output_unit) BIND(C)
+      CHARACTER(KIND=C_CHAR), INTENT(IN)                 :: msg(*)
+      INTEGER(KIND=C_INT), INTENT(IN), VALUE             :: msglen, output_unit
+
+      IF (output_unit <= 0) RETURN ! Omit to print the message.
+      WRITE (output_unit, FMT="(100A)", ADVANCE="NO") msg(1:msglen)
+   END SUBROUTINE print_func
+```
+
+## OpenMP-parallelization
+
+- OpenMP is a widely used and standardized parallelization paradigm on shared memory systems.
+- CP2K employs OpenMP to distribute the workload within a compute node or, more specifically, of a
+  MPI rank.
+- OpenMP is directive-based approach adding hints to the compiler.
+- The variety of compilers to support (especially GCC and Intel) and the different languages
+  (Fortran and C) require developers to obey certain rules which are the result of experience.
+- Breaking these rules does not mean that OpenMP-accelerated code does not conform the OpenMP
+  standard but may break compiler support because of poorly supported features, especially on the
+  Fortran-side.
+- We require developers to adhere to OpenMP standard 3.x.
+- General hints are:
+  - Most C-internal and Fortran-internal functions can be safely used in `OMP`-regions.
+  - CP2K's `timeset` and `timestop` functions are thread-safe.
+  - Calls to routines of `BLAS` and `Lapack` are thread-safe.
+  - CP2K requires MPI-libraries to be thread-safe (thread-level `MPI_THREAD_MULTIPLE`).
+  - Do not employ OpenMP's offloading (`OMP TARGET`) features as this may increase the already
+    complicated CP2K's dependency stack. Convert the code to C+CUDA/HIP instead.
+  - Each `!$OMP PARALLEL` (Fortran) or `#pragma omp parallel` should declare `DEFAULT(NONE)` and set
+    data scoping clauses for all variables explicitly.
+  - Each `CRITICAL` section should receive a unique name: `OMP CRITICAL(my_critical_section)`.
+  - Prefer `ATOMIC` over `CRITICAL` if possible for better performance.
+  - Use `BARRIER` only where necessary. Beware that some constructs have implied barriers.
+  - Use `NOWAIT` to ignore barriers where safely (!) possible.
+  - `OMP DO` (Fortran) and `OMP FOR` regions should receive a `SCHEDULE`-clause.
+  - Use `REDUCTION` instead of implementing them yourself.
+  - It is recommended to set the scheduling strategy explicitly (`SCHEDULE`).
+  - Use of the `MASKED`-construct is currently discouraged and, if absolutely necessary, need to be
+    guarded against compilation with GCC 11 earlier.
+  - Beware of false sharing and cache locality.
+- In addition, we require for Fortran-code:
+  - Simple array operations can be parallelized using the `WORKSHARE` construct instead of expanding
+    loops explicitly and parallelizing them with `OMP DO`.
+  - Do not use the `ASSOCIATE` construct within `OMP`-regions. This may raise compiler bugs.
+  - Make sure to write standard-compliant code. Beware of subtleties of the standard and be more
+    wordy if you are unsure.
+  - Sometimes, the Intel-compiler may OpenMP-parallelize non-OpenMP-parallelized automatically. You
+    can prevent this with `OMP PARALLEL DO IF(.FALSE.)`.
 
 ## Remove dead code
 
@@ -134,7 +225,7 @@ central redirections, i.e. avoid to use direct calls to external libraries in CP
   unnecessary burden and should be removed \[-Wunused-variable -Wunused-but-set-variable
   -Wunused-dummy-argument\].
 - Sometimes it is beneficial to keep debugging code around nevertheless. Such code should be put
-  into a `IF(debug_this_module)`-block, with a parameter set to `.FALSE.`. This way the code will
+  into a `IF(debug_this_module)`-block, with a parameter set to `.FALSE.`. This way, the code will
   stay up-to-date and easily callable. Do not hide dead code as a comment; the compiler has no
   chance to check the validity of this code.
 
@@ -156,6 +247,10 @@ central redirections, i.e. avoid to use direct calls to external libraries in CP
 - If combinations of features are relevant, prepare additional tests for them.
 
 ## Doxygen documentation
+
+```{note}
+   Procedure names should not end in `_function` or `_subroutine`. Otherwise, the prettifier will repeatedly add more keywords to the Doxygen block.
+```
 
 - Every `FUNCTION` and `SUBROUTINE` should be preceded by a valid doxygen block.
 - The following keywords are required: `\brief`, `\param` (for each parameter), `\retval` (for

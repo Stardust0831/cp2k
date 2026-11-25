@@ -79,7 +79,7 @@ CONTAINS
       TYPE(force_env_type), POINTER                      :: force_env
       TYPE(global_environment_type), POINTER             :: globenv
 
-      INTEGER                                            :: i, istart, k, num_of_conf, Num_of_Frag
+      INTEGER                                            :: i, istart, num_of_conf, Num_of_Frag
       INTEGER, DIMENSION(:, :), POINTER                  :: conf
       LOGICAL                                            :: explicit, should_stop
       REAL(KIND=dp), DIMENSION(:), POINTER               :: Em
@@ -95,10 +95,7 @@ CONTAINS
       CALL section_vals_get(n_frags, n_repetition=Num_of_Frag)
 
       ! Number of configurations
-      num_of_conf = 0
-      DO k = 1, Num_of_frag
-         num_of_conf = num_of_conf + FACT(Num_of_frag)/(FACT(k)*FACT(Num_of_frag - k))
-      END DO
+      num_of_conf = ISHFT(1, Num_of_frag) - 1
       ALLOCATE (conf(num_of_conf, Num_of_frag))
       ALLOCATE (Em(num_of_conf))
       CALL gen_Nbody_conf(Num_of_frag, conf)
@@ -115,7 +112,7 @@ CONTAINS
          END DO
       END IF
       ! Setup the iteration level for BSSE
-      CALL cp_add_iter_level(logger%iter_info, "BSSE")
+      CALL cp_add_iter_level(logger, "BSSE")
       CALL cp_iterate(logger%iter_info, last=.FALSE., iter_nr=istart)
 
       ! Evaluating the energy of the N-body cluster terms
@@ -136,7 +133,7 @@ CONTAINS
          CALL write_bsse_restart(bsse_section, root_section)
       END DO
       IF (.NOT. should_stop) CALL dump_bsse_results(conf, Em, num_of_frag, bsse_section)
-      CALL cp_rm_iter_level(logger%iter_info, "BSSE")
+      CALL cp_rm_iter_level(logger, "BSSE")
       DEALLOCATE (Em)
       DEALLOCATE (conf)
 
@@ -178,10 +175,7 @@ CONTAINS
          CALL eval_bsse_energy_low(force_env, conf, conf, n_frags, root_section, globenv, Em)
       ELSE
          my_energy = 0.0_dp
-         DO k = 1, Num_of_sub_frag
-            Num_of_sub_conf = Num_of_sub_conf + &
-                              FACT(Num_of_sub_frag)/(FACT(k)*FACT(Num_of_sub_frag - k))
-         END DO
+         Num_of_sub_conf = ISHFT(1, Num_of_sub_frag) - 1
          ALLOCATE (conf_loc(Num_of_sub_conf, Num_of_sub_frag))
          ALLOCATE (Em_loc(Num_of_sub_conf))
          Em_loc = 0.0_dp
@@ -370,10 +364,10 @@ CONTAINS
       iw = cp_print_key_unit_nr(logger, bsse_section, "PRINT%PROGRAM_RUN_INFO", &
                                 extension=".log")
       IF (iw > 0) THEN
-         WRITE (conf_s, fmt="(1000I0)", iostat=istat) conf;
+         WRITE (conf_s, fmt="(1000I0)", iostat=istat) conf
          IF (istat /= 0) conf_s = "exceeded"
          CALL compress(conf_s, full=.TRUE.)
-         WRITE (conf_loc_s, fmt="(1000I0)", iostat=istat) conf_loc;
+         WRITE (conf_loc_s, fmt="(1000I0)", iostat=istat) conf_loc
          IF (istat /= 0) conf_loc_s = "exceeded"
          CALL compress(conf_loc_s, full=.TRUE.)
 
@@ -429,15 +423,17 @@ CONTAINS
       IF (explicit) THEN
          DO i = 1, nconf
             CALL section_vals_val_get(configurations, "GLB_CONF", i_rep_section=i, i_vals=glb_conf)
-            IF (SIZE(glb_conf) /= SIZE(conf)) &
+            IF (SIZE(glb_conf) /= SIZE(conf)) THEN
                CALL cp_abort(__LOCATION__, &
                              "GLB_CONF requires a binary description of the configuration. Number of integer "// &
                              "different from the number of fragments defined!")
+            END IF
             CALL section_vals_val_get(configurations, "SUB_CONF", i_rep_section=i, i_vals=sub_conf)
-            IF (SIZE(sub_conf) /= SIZE(conf)) &
+            IF (SIZE(sub_conf) /= SIZE(conf)) THEN
                CALL cp_abort(__LOCATION__, &
                              "SUB_CONF requires a binary description of the configuration. Number of integer "// &
                              "different from the number of fragments defined!")
+            END IF
             IF (ALL(conf == glb_conf) .AND. ALL(conf_loc == sub_conf)) THEN
                CALL section_vals_val_get(configurations, "CHARGE", i_rep_section=i, &
                                          i_val=present_charge)
@@ -555,22 +551,6 @@ CONTAINS
          END DO
       END IF
    END SUBROUTINE build_Nbody_conf
-
-! **************************************************************************************************
-!> \brief ...
-!> \param num ...
-!> \return ...
-! **************************************************************************************************
-   RECURSIVE FUNCTION FACT(num) RESULT(my_fact)
-      INTEGER, INTENT(IN)                                :: num
-      INTEGER                                            :: my_fact
-
-      IF (num <= 1) THEN
-         my_fact = 1
-      ELSE
-         my_fact = num*FACT(num - 1)
-      END IF
-   END FUNCTION FACT
 
 ! **************************************************************************************************
 !> \brief ...

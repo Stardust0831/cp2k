@@ -292,8 +292,8 @@ CONTAINS
       ! the counter goes into the seed. Every new call gives a new random matrix
       randmat_counter = randmat_counter + 1
 
-      IF (sparsity > 1) THEN
-         my_sparsity = sparsity/100.0
+      IF (sparsity > 1.0_dp) THEN
+         my_sparsity = sparsity*1.0E-02_dp
       ELSE
          my_sparsity = sparsity
       END IF
@@ -439,7 +439,7 @@ CONTAINS
       INTEGER(KIND=int_8)                                :: map
 
       map = ((irow - 1 + icol*INT(nrow, int_8))*(1 + MODULO(ival, 2**16)))*2 + 1 + 0*ncol ! ncol used
-      iseed(4) = INT(MODULO(map, 2_int_8**12)); map = map/2_int_8**12; ! keep odd
+      iseed(4) = INT(MODULO(map, 2_int_8**12)); map = map/2_int_8**12 ! keep odd
       iseed(3) = INT(MODULO(IEOR(map, 3541_int_8), 2_int_8**12)); map = map/2_int_8**12
       iseed(2) = INT(MODULO(IEOR(map, 1153_int_8), 2_int_8**12)); map = map/2_int_8**12
       iseed(1) = INT(MODULO(IEOR(map, 2029_int_8), 2_int_8**12)); map = map/2_int_8**12

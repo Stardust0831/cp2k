@@ -17,13 +17,17 @@ MODULE accint_weights_forces
                                               pbc
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
-   USE grid_api,                        ONLY: integrate_pgf_product
+   USE grid_api,                        ONLY: GRID_FUNC_AB,&
+                                              collocate_pgf_product,&
+                                              integrate_pgf_product
    USE input_constants,                 ONLY: sic_none,&
                                               xc_none
    USE input_section_types,             ONLY: section_vals_type,&
                                               section_vals_val_get
    USE kinds,                           ONLY: dp
-   USE memory_utilities,                ONLY: reallocate
+   USE message_passing,                 ONLY: mp_para_env_type
+   USE orbital_pointers,                ONLY: coset,&
+                                              ncoset
    USE particle_types,                  ONLY: particle_type
    USE pw_env_types,                    ONLY: pw_env_get,&
                                               pw_env_type
@@ -40,20 +44,27 @@ MODULE accint_weights_forces
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_force_types,                  ONLY: qs_force_type
-   USE qs_fxc,                          ONLY: qs_fxc_analytic
-   USE qs_ks_types,                     ONLY: get_ks_env,&
-                                              qs_ks_env_type
-   USE qs_rho_types,                    ONLY: qs_rho_create,&
-                                              qs_rho_get,&
-                                              qs_rho_set,&
+   USE qs_fxc,                          ONLY: qs_fxc_create
+   USE qs_kind_types,                   ONLY: qs_kind_type
+   USE qs_ks_types,                     ONLY: qs_ks_env_type
+   USE qs_rho_atom_types,               ONLY: rho_atom_type
+   USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_type
    USE realspace_grid_types,            ONLY: realspace_grid_type,&
-                                              transfer_pw2rs
-   USE skala_gpw_functional,            ONLY: skala_gpw_exc_density,&
+                                              rs_grid_zero,&
+                                              transfer_pw2rs,&
+                                              transfer_rs2pw
+   USE skala_gpw_functional,            ONLY: native_skala_gapw_atom_composite_requested,&
+                                              native_skala_gapw_composite_reference,&
+                                              native_skala_uses_atom_composite_grid,&
+                                              skala_gapw_representation,&
+                                              skala_gpw_weight_derivative,&
                                               xc_section_uses_native_skala_grid
    USE virial_types,                    ONLY: virial_type
    USE xc,                              ONLY: xc_exc_pw_create,&
                                               xc_vxc_pw_create
+   USE xc_gauxc_functional,             ONLY: gauxc_gapw_has_paw_pseudopotentials
+   USE xc_input_constants,              ONLY: skala_gapw_paw_one_center
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -64,7 +75,7 @@ MODULE accint_weights_forces
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'accint_weights_forces'
 
-   PUBLIC :: accint_weight_force
+   PUBLIC :: accint_weight_force, weight_function_pwgrid
 
 CONTAINS
 
@@ -88,38 +99,63 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'accint_weight_force'
 
-      INTEGER                                            :: atom_a, handle, iatom, ikind, natom, &
-                                                            natom_of_kind, nkind, output_unit
+      INTEGER                                            :: atom_a, handle, i, iatom, ikind, natom, &
+                                                            natom_of_kind, nkind, ounit, oweight
       INTEGER, DIMENSION(:), POINTER                     :: atom_list
-      LOGICAL                                            :: lr_triplet, native_grid_diagnostics, &
+      LOGICAL                                            :: composite_reference, lr_triplet, &
+                                                            native_grid_diagnostics, &
                                                             native_skala_grid, uf_grid, use_virial
       REAL(KIND=dp)                                      :: my_force_scale
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: calpha, cvalue
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: aforce
+      REAL(KIND=dp), DIMENSION(3)                        :: tforce
       REAL(KIND=dp), DIMENSION(3, 3)                     :: avirial
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool, xc_pw_pool
       TYPE(pw_r3d_rs_type)                               :: e_force_rspace, e_rspace
       TYPE(qs_force_type), DIMENSION(:), POINTER         :: force
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
       TYPE(virial_type), POINTER                         :: virial
 
       CALL timeset(routineN, handle)
 
-      CALL get_qs_env(qs_env, dft_control=dft_control)
+      CALL get_qs_env(qs_env, dft_control=dft_control, qs_kind_set=qs_kind_set)
+
+      ! Composite references replace the PW XC quadrature and its Gaussian weight derivative.
+      ! The public selector applies only when a pseudopotential kind actually uses PAW one-center
+      ! data; it must not change all-electron GAPW integration.
+      composite_reference = native_skala_gapw_composite_reference(xc_section) .OR. &
+                            native_skala_gapw_atom_composite_requested(xc_section)
+      IF (.NOT. composite_reference) THEN
+         composite_reference = skala_gapw_representation(xc_section) == &
+            skala_gapw_paw_one_center .AND. &
+            gauxc_gapw_has_paw_pseudopotentials(qs_kind_set)
+      END IF
+      IF (.NOT. composite_reference .AND. xc_section_uses_native_skala_grid(xc_section)) THEN
+         composite_reference = native_skala_uses_atom_composite_grid(xc_section)
+      END IF
+      IF (composite_reference) THEN
+         CALL timestop(handle)
+         RETURN
+      END IF
 
       IF (dft_control%qs_control%gapw_control%accurate_xcint) THEN
 
          CALL get_qs_env(qs_env=qs_env, force=force, virial=virial)
          use_virial = virial%pv_availability .AND. (.NOT. virial%pv_numer)
 
+         ounit = cp_logger_get_default_io_unit()
+
          CALL get_qs_env(qs_env, natom=natom, nkind=nkind)
          ALLOCATE (aforce(3, natom))
          ALLOCATE (calpha(nkind), cvalue(nkind))
          cvalue = 1.0_dp
          calpha(1:nkind) = dft_control%qs_control%gapw_control%aw(1:nkind)
+         oweight = dft_control%qs_control%gapw_control%oweights
 
          CALL get_qs_env(qs_env, ks_env=ks_env, pw_env=pw_env)
          CALL pw_env_get(pw_env, auxbas_pw_pool=auxbas_pw_pool, xc_pw_pool=xc_pw_pool)
@@ -135,7 +171,7 @@ CONTAINS
          my_force_scale = 1.0_dp
          IF (PRESENT(force_scale)) my_force_scale = force_scale
 
-         CALL xc_density(ks_env, rho, rho1, order, xc_section, lr_triplet, e_rspace)
+         CALL xc_density(qs_env, rho, rho1, order, xc_section, lr_triplet, e_rspace)
 
          IF (uf_grid) THEN
             CALL auxbas_pw_pool%create_pw(e_force_rspace)
@@ -150,11 +186,13 @@ CONTAINS
                CALL xc_pw_pool%give_back_pw(e_g_xc)
             END BLOCK
             CALL pw_scale(e_force_rspace, e_force_rspace%pw_grid%dvol)
-            CALL gauss_grid_force(e_force_rspace, qs_env, calpha, cvalue, aforce, avirial)
+            ! integrate energy field to get force
+            CALL gauss_grid_force(e_force_rspace, qs_env, oweight, calpha, cvalue, aforce, avirial)
+            !
             CALL auxbas_pw_pool%give_back_pw(e_force_rspace)
          ELSE
             CALL pw_scale(e_rspace, e_rspace%pw_grid%dvol)
-            CALL gauss_grid_force(e_rspace, qs_env, calpha, cvalue, aforce, avirial)
+            CALL gauss_grid_force(e_rspace, qs_env, oweight, calpha, cvalue, aforce, avirial)
          END IF
 
          IF (uf_grid) THEN
@@ -167,7 +205,7 @@ CONTAINS
          native_skala_grid = xc_section_uses_native_skala_grid(xc_section)
          native_grid_diagnostics = .FALSE.
          IF (native_skala_grid) THEN
-            CALL section_vals_val_get(xc_section, "XC_FUNCTIONAL%GAUXC%NATIVE_GRID_DIAGNOSTICS", &
+            CALL section_vals_val_get(xc_section, "XC_FUNCTIONAL%SKALA_NATIVE%DIAGNOSTICS", &
                                       l_val=native_grid_diagnostics)
          END IF
          DO ikind = 1, nkind
@@ -175,9 +213,8 @@ CONTAINS
             DO iatom = 1, natom_of_kind
                atom_a = atom_list(iatom)
                IF (native_grid_diagnostics) THEN
-                  output_unit = cp_logger_get_default_io_unit()
-                  IF (output_unit > 0) THEN
-                     WRITE (UNIT=output_unit, FMT="(T2,A,1X,I0,3(1X,ES20.12))") &
+                  IF (ounit > 0) THEN
+                     WRITE (UNIT=ounit, FMT="(T2,A,1X,I0,3(1X,ES20.12))") &
                         "SKALA_GPW| Accurate-XCINT atom force", atom_a, my_force_scale*aforce(:, atom_a)
                   END IF
                END IF
@@ -188,6 +225,33 @@ CONTAINS
          IF (use_virial) THEN
             virial%pv_exc = virial%pv_exc + my_force_scale*avirial
             virial%pv_virial = virial%pv_virial + my_force_scale*avirial
+         END IF
+
+         IF (debug_this_module) THEN
+            CALL get_qs_env(qs_env, para_env=para_env)
+            CALL para_env%sum(aforce)
+            IF (ounit > 0) THEN
+               WRITE (UNIT=ounit, FMT="(/,T2,A)") "ACCINT| Debug Accurate-XCINT atom force [a.u.]"
+               DO i = 1, 3
+                  tforce(i) = my_force_scale*SUM(aforce(i, :))
+               END DO
+               DO iatom = 1, natom
+                  WRITE (UNIT=ounit, FMT="(T2,A,1X,I0,T24,3(1X,F18.12))") &
+                     "ACCINT| ", iatom, my_force_scale*aforce(1:3, iatom)
+               END DO
+               WRITE (UNIT=ounit, FMT="(T2,A,T24,3(1X,F18.12))") &
+                  "ACCINT| Total force ", tforce(1:3)
+            END IF
+            IF (use_virial) THEN
+               CALL para_env%sum(avirial)
+               IF (ounit > 0) THEN
+                  WRITE (UNIT=ounit, FMT="(/,T2,A)") "ACCINT| Debug Accurate-XCINT virial"
+                  DO i = 1, 3
+                     WRITE (UNIT=ounit, FMT="(T2,A,T24,3(1X,F18.8))") &
+                        "ACCINT| [a.u.] ", my_force_scale*avirial(i, 1:3)
+                  END DO
+               END IF
+            END IF
          END IF
 
          DEALLOCATE (aforce, calpha, cvalue)
@@ -202,14 +266,16 @@ CONTAINS
 !> \brief computes the forces/virial due to atomic centered Gaussian functions
 !> \param e_rspace Energy density
 !> \param qs_env ...
+!> \param order ...
 !> \param calpha ...
 !> \param cvalue ...
 !> \param aforce ...
 !> \param avirial ...
 ! **************************************************************************************************
-   SUBROUTINE gauss_grid_force(e_rspace, qs_env, calpha, cvalue, aforce, avirial)
+   SUBROUTINE gauss_grid_force(e_rspace, qs_env, order, calpha, cvalue, aforce, avirial)
       TYPE(pw_r3d_rs_type), INTENT(IN)                   :: e_rspace
       TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER, INTENT(IN)                                :: order
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: calpha, cvalue
       REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: aforce
       REAL(KIND=dp), DIMENSION(3, 3), INTENT(OUT)        :: avirial
@@ -217,8 +283,9 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'gauss_grid_force'
 
       INTEGER                                            :: atom_a, handle, iatom, igrid, ikind, j, &
-                                                            natom_of_kind, npme
-      INTEGER, DIMENSION(:), POINTER                     :: atom_list, cores
+                                                            natom_of_kind, ni, npme, on
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: cores
+      INTEGER, DIMENSION(:), POINTER                     :: atom_list
       LOGICAL                                            :: use_virial
       REAL(KIND=dp)                                      :: alpha, eps_rho_rspace, radius
       REAL(KIND=dp), DIMENSION(3)                        :: force_a, force_b, ra
@@ -235,9 +302,10 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      ALLOCATE (cores(1))
-      ALLOCATE (hab(1, 1))
-      ALLOCATE (pab(1, 1))
+      on = 2*order
+      ni = ncoset(on)
+      ALLOCATE (hab(ni, 1))
+      ALLOCATE (pab(ni, 1))
 
       NULLIFY (pw_pools, rs_grids, rs_v)
 
@@ -269,13 +337,15 @@ CONTAINS
 
       DO ikind = 1, SIZE(atomic_kind_set)
 
+         alpha = calpha(ikind)
+         IF (alpha == 0.0_dp) CYCLE
+
          CALL get_atomic_kind(atomic_kind_set(ikind), natom=natom_of_kind, atom_list=atom_list)
 
-         alpha = calpha(ikind)
-         pab(1, 1) = -cvalue(ikind)
-         IF (alpha == 0.0_dp .OR. pab(1, 1) == 0.0_dp) CYCLE
+         CALL set_polynom_coefs(pab(:, 1), order, alpha)
+         pab(:, 1) = -cvalue(ikind)*pab(:, 1)
 
-         CALL reallocate(cores, 1, natom_of_kind)
+         ALLOCATE (cores(natom_of_kind))
          npme = 0
          cores = 0
 
@@ -299,19 +369,19 @@ CONTAINS
             iatom = cores(j)
             atom_a = atom_list(iatom)
             ra(:) = pbc(particle_set(atom_a)%r, cell)
-            hab(1, 1) = 0.0_dp
+            hab(:, 1) = 0.0_dp
             force_a(:) = 0.0_dp
             force_b(:) = 0.0_dp
             my_virial_a = 0.0_dp
             my_virial_b = 0.0_dp
 
-            radius = exp_radius_very_extended(la_min=0, la_max=0, lb_min=0, lb_max=0, &
+            radius = exp_radius_very_extended(la_min=0, la_max=on, lb_min=0, lb_max=0, &
                                               ra=ra, rb=ra, rp=ra, &
                                               zetp=alpha, eps=eps_rho_rspace, &
                                               pab=pab, o1=0, o2=0, &
                                               prefactor=1.0_dp, cutoff=1.0_dp)
 
-            CALL integrate_pgf_product(0, alpha, 0, &
+            CALL integrate_pgf_product(on, alpha, 0, &
                                        0, 0.0_dp, 0, ra, [0.0_dp, 0.0_dp, 0.0_dp], &
                                        rs_v, hab, pab=pab, o1=0, o2=0, &
                                        radius=radius, &
@@ -323,32 +393,213 @@ CONTAINS
             avirial = avirial + my_virial_a
 
          END DO
+         DEALLOCATE (cores)
 
       END DO
 
-      DEALLOCATE (hab, pab, cores)
+      DEALLOCATE (hab, pab)
 
       CALL timestop(handle)
 
    END SUBROUTINE gauss_grid_force
 
 ! **************************************************************************************************
+!> \brief computes the weight function on the PW grid
+!> \param rho_core ...
+!> \param qs_env ...
+!> \param order ...
+!> \param calpha ...
+!> \param ccore ...
+! **************************************************************************************************
+   SUBROUTINE weight_function_pwgrid(rho_core, qs_env, order, calpha, ccore)
+      TYPE(pw_r3d_rs_type), INTENT(INOUT)                :: rho_core
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER, INTENT(IN)                                :: order
+      REAL(KIND=dp), DIMENSION(:)                        :: calpha, ccore
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'weight_function_pwgrid'
+
+      INTEGER                                            :: atom_a, handle, iatom, ikind, ithread, &
+                                                            j, natom, ni, npme, nthread, on, &
+                                                            subpatch_pattern
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: cores
+      INTEGER, DIMENSION(:), POINTER                     :: atom_list
+      REAL(KIND=dp)                                      :: alpha, eps_rho_rspace, radius
+      REAL(KIND=dp), DIMENSION(3)                        :: ra
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: pab
+      TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+      TYPE(pw_env_type), POINTER                         :: pw_env
+      TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool
+      TYPE(pw_r3d_rs_type)                               :: rhoc_r
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      TYPE(realspace_grid_type), POINTER                 :: rs_rho
+
+      CALL timeset(routineN, handle)
+
+      on = 2*order
+      ni = ncoset(on)
+      ALLOCATE (pab(ni, 1))
+
+      CALL get_qs_env(qs_env=qs_env, &
+                      atomic_kind_set=atomic_kind_set, &
+                      qs_kind_set=qs_kind_set, &
+                      cell=cell, &
+                      dft_control=dft_control, &
+                      particle_set=particle_set, &
+                      pw_env=pw_env)
+      CALL pw_env_get(pw_env, auxbas_rs_grid=rs_rho, &
+                      auxbas_pw_pool=auxbas_pw_pool)
+      ! be careful in parallel nsmax is chosen with multigrid in mind!
+      CALL rs_grid_zero(rs_rho)
+
+      eps_rho_rspace = dft_control%qs_control%eps_rho_rspace
+
+      DO ikind = 1, SIZE(atomic_kind_set)
+         alpha = calpha(ikind)
+         IF (alpha == 0.0_dp) CYCLE
+
+         CALL get_atomic_kind(atomic_kind_set(ikind), natom=natom, atom_list=atom_list)
+
+         CALL set_polynom_coefs(pab(:, 1), order, alpha)
+         pab(:, 1) = ccore(ikind)*pab(:, 1)
+
+         nthread = 1
+         ithread = 0
+
+         ALLOCATE (cores(natom))
+         npme = 0
+         cores = 0
+
+         DO iatom = 1, natom
+            IF (rs_rho%desc%parallel .AND. .NOT. rs_rho%desc%distributed) THEN
+               ! replicated realspace grid, split the atoms up between procs
+               IF (MODULO(iatom, rs_rho%desc%group_size) == rs_rho%desc%my_pos) THEN
+                  npme = npme + 1
+                  cores(npme) = iatom
+               END IF
+            ELSE
+               npme = npme + 1
+               cores(npme) = iatom
+            END IF
+         END DO
+
+         IF (npme > 0) THEN
+            DO j = 1, npme
+
+               iatom = cores(j)
+               atom_a = atom_list(iatom)
+               ra(:) = pbc(particle_set(atom_a)%r, cell)
+               subpatch_pattern = 0
+               radius = exp_radius_very_extended(la_min=0, la_max=on, &
+                                                 lb_min=0, lb_max=0, &
+                                                 ra=ra, rb=ra, rp=ra, &
+                                                 zetp=alpha, eps=eps_rho_rspace, &
+                                                 pab=pab, o1=0, o2=0, &  ! without map_consistent
+                                                 prefactor=-1.0_dp, cutoff=0.0_dp)
+
+               CALL collocate_pgf_product(on, alpha, 0, 0, 0.0_dp, 0, ra, &
+                                          [0.0_dp, 0.0_dp, 0.0_dp], -1.0_dp, pab, 0, 0, rs_rho, &
+                                          radius=radius, ga_gb_function=GRID_FUNC_AB, &
+                                          use_subpatch=.TRUE., subpatch_pattern=subpatch_pattern)
+
+            END DO
+         END IF
+         DEALLOCATE (cores)
+
+      END DO
+
+      DEALLOCATE (pab)
+
+      CALL auxbas_pw_pool%create_pw(rhoc_r)
+
+      CALL transfer_rs2pw(rs_rho, rhoc_r)
+
+      CALL pw_transfer(rhoc_r, rho_core)
+
+      CALL auxbas_pw_pool%give_back_pw(rhoc_r)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE weight_function_pwgrid
+
+! **************************************************************************************************
+!> \brief Set the prefactor coefficients for the expansion of the radial weight function in
+!>        cartesian spherical harmonics
+!> \param pf  output coefficients
+!> \param order  ...
+!> \param alpha  ...
+! **************************************************************************************************
+   SUBROUTINE set_polynom_coefs(pf, order, alpha)
+      REAL(kind=dp), DIMENSION(:), INTENT(OUT)           :: pf
+      INTEGER, INTENT(IN)                                :: order
+      REAL(kind=dp), INTENT(IN)                          :: alpha
+
+      INTEGER                                            :: i
+      REAL(KIND=dp)                                      :: ap
+
+      pf(:) = 0.0_dp
+
+      DO i = 0, order
+         SELECT CASE (i)
+         CASE (0)
+            pf(1) = 1.0_dp
+         CASE (1)
+            ap = alpha
+            pf(coset(2, 0, 0)) = ap
+            pf(coset(0, 2, 0)) = ap
+            pf(coset(0, 0, 2)) = ap
+         CASE (2)
+            ap = alpha**2/2.0_dp
+            pf(coset(4, 0, 0)) = ap
+            pf(coset(0, 4, 0)) = ap
+            pf(coset(0, 0, 4)) = ap
+            pf(coset(2, 2, 0)) = 2._dp*ap
+            pf(coset(2, 0, 2)) = 2._dp*ap
+            pf(coset(0, 2, 2)) = 2._dp*ap
+         CASE (3)
+            ap = alpha**3/6.0_dp
+            pf(coset(6, 0, 0)) = ap
+            pf(coset(0, 6, 0)) = ap
+            pf(coset(0, 0, 6)) = ap
+            pf(coset(4, 2, 0)) = 3._dp*ap
+            pf(coset(4, 0, 2)) = 3._dp*ap
+            pf(coset(2, 4, 0)) = 3._dp*ap
+            pf(coset(2, 0, 4)) = 3._dp*ap
+            pf(coset(0, 4, 2)) = 3._dp*ap
+            pf(coset(0, 2, 4)) = 3._dp*ap
+            pf(coset(2, 2, 2)) = 6._dp*ap
+         CASE DEFAULT
+            CALL cp_abort(__LOCATION__, &
+                          "Only 0, 1, 2, 3 are supported as the "// &
+                          "polynomial order value in accuarte XC integration.")
+         END SELECT
+      END DO
+
+   END SUBROUTINE set_polynom_coefs
+
+! **************************************************************************************************
 !> \brief calculates the XC density:
 !>        order=0: exc will contain the xc energy density E_xc(r)
 !>        order=1: exc will contain V_xc(r) * rho1(r)
 !>        order=2: exc will contain F_xc(r) * rho1(r) * rho1(r)
-!> \param ks_env to get all the needed things
+!>
+!>        Note that possible nl-vdW functionals are not included int the accurate integration scheme
+!>
+!> \param qs_env to get all the needed things
 !> \param rho_struct density
 !> \param rho1_struct response density
 !> \param order requested derivative order
 !> \param xc_section ...
 !> \param triplet ...
-!> \param exc ...
+!> \param exc Output energy density on working grid (!)
 !> \author JGH
 ! **************************************************************************************************
-   SUBROUTINE xc_density(ks_env, rho_struct, rho1_struct, order, xc_section, triplet, exc)
+   SUBROUTINE xc_density(qs_env, rho_struct, rho1_struct, order, xc_section, triplet, exc)
 
-      TYPE(qs_ks_env_type), POINTER                      :: ks_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(qs_rho_type), POINTER                         :: rho_struct, rho1_struct
       INTEGER, INTENT(IN)                                :: order
       TYPE(section_vals_type), POINTER                   :: xc_section
@@ -358,34 +609,33 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'xc_density'
 
       INTEGER                                            :: handle, ispin, myfun, nspins
-      LOGICAL :: native_skala_grid, rho1_g_valid, rho1_tau_g_valid, rho1_tau_valid, rho_g_valid, &
-         rho_tau_g_valid, rho_tau_valid, uf_grid
+      LOGICAL                                            :: native_skala_grid, rho1_g_valid, &
+                                                            rho_g_valid, tau1_valid, tau_valid, &
+                                                            uf_grid
       REAL(KIND=dp)                                      :: excint, factor
       REAL(KIND=dp), DIMENSION(3, 3)                     :: vdum
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER        :: rho1_g, rho1_g_base, rho_g, rho_g_base, &
-                                                            tau1_g, tau1_g_base, tau_g, tau_g_base
-      TYPE(pw_c1d_gs_type), POINTER                      :: rho_nlcc_g, rho_nlcc_g_use, rho_nlcc_g_xc
+      TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER        :: rho1_g, rho1_g_xc, rho_g, rho_g_xc
+      TYPE(pw_c1d_gs_type), POINTER                      :: rho_nlcc_g
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool, xc_pw_pool
-      TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho1_r, rho1_r_base, rho_r, rho_r_base, &
-                                                            tau1_r, tau1_r_base, tau_r, &
-                                                            tau_r_base, vxc_rho, vxc_tau
-      TYPE(pw_r3d_rs_type), POINTER                      :: rho_nlcc, rho_nlcc_use, rho_nlcc_xc, &
-                                                            weights
-      TYPE(qs_rho_type), POINTER                         :: rho_fxc
+      TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho1_r, rho1_r_xc, rho_r, rho_r_xc, &
+                                                            tau1_r, tau1_r_xc, tau_r, tau_r_xc, &
+                                                            vxc_rho, vxc_tau
+      TYPE(pw_r3d_rs_type), POINTER                      :: rho_nlcc, weights
+      TYPE(rho_atom_type), DIMENSION(:), POINTER         :: rho0_atom_set, rho1_atom_set
 
       CALL timeset(routineN, handle)
 
-      ! we always get true exc (not integration weighted)
-      NULLIFY (rho1_g, rho1_g_base, rho1_r, rho1_r_base, rho_fxc, tau1_g, tau1_g_base)
-      NULLIFY (rho_g, rho_g_base, rho_r, rho_r_base, tau_g, tau_g_base, tau_r, tau_r_base, &
-               tau1_r, tau1_r_base)
-      NULLIFY (particle_set, rho_nlcc_use, rho_nlcc_xc, rho_nlcc_g_use, rho_nlcc_g_xc, weights)
+      CPASSERT(ASSOCIATED(rho_struct))
+      IF (order > 0) THEN
+         CPASSERT(ASSOCIATED(rho1_struct))
+      END IF
 
-      CALL get_ks_env(ks_env, &
+      ! we always get true exc (not integration weighted)
+      CALL get_qs_env(qs_env, &
                       dft_control=dft_control, &
                       pw_env=pw_env, &
                       cell=cell, &
@@ -393,225 +643,153 @@ CONTAINS
                       rho_nlcc=rho_nlcc, &
                       rho_nlcc_g=rho_nlcc_g)
 
-      CALL qs_rho_get(rho_struct, rho_r=rho_r_base, rho_g=rho_g_base, tau_r=tau_r_base, &
-                      tau_g=tau_g_base, rho_g_valid=rho_g_valid, tau_g_valid=rho_tau_g_valid, &
-                      tau_r_valid=rho_tau_valid)
-      rho_r => rho_r_base
-      rho_g => rho_g_base
-      tau_r => tau_r_base
-      tau_g => tau_g_base
-
       nspins = dft_control%nspins
+      CPASSERT(dft_control%sic_method_id == sic_none)
 
       CALL section_vals_val_get(xc_section, "XC_FUNCTIONAL%_SECTION_PARAMETERS_", i_val=myfun)
       native_skala_grid = xc_section_uses_native_skala_grid(xc_section)
 
-      CALL pw_env_get(pw_env, xc_pw_pool=xc_pw_pool, auxbas_pw_pool=auxbas_pw_pool)
-      uf_grid = .NOT. pw_grid_compare(auxbas_pw_pool%pw_grid, xc_pw_pool%pw_grid)
-      IF (uf_grid) THEN
-         NULLIFY (rho_r, rho_g, tau_r, tau_g)
-         IF (rho_g_valid) THEN
-            CALL create_density_on_pool(xc_pw_pool, rho_g_base, rho_r, rho_g)
-         ELSEIF (ASSOCIATED(rho_r_base)) THEN
-            CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, rho_r_base, rho_r, rho_g)
-         ELSE
-            CPABORT("Fine Grid in xc_density requires rho_r or rho_g")
-         END IF
-         IF (rho_tau_valid) THEN
-            IF (rho_tau_g_valid) THEN
-               CALL create_density_on_pool(xc_pw_pool, tau_g_base, tau_r, tau_g)
-            ELSEIF (ASSOCIATED(tau_r_base)) THEN
-               CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, tau_r_base, tau_r, tau_g)
-            ELSE
-               CPABORT("Fine Grid in xc_density requires tau_r or tau_g")
-            END IF
-         END IF
-         IF (ASSOCIATED(rho_nlcc)) THEN
-            ALLOCATE (rho_nlcc_g_xc, rho_nlcc_xc)
-            CALL xc_pw_pool%create_pw(rho_nlcc_g_xc)
-            CALL xc_pw_pool%create_pw(rho_nlcc_xc)
-            CALL pw_transfer(rho_nlcc_g, rho_nlcc_g_xc)
-            CALL pw_transfer(rho_nlcc_g_xc, rho_nlcc_xc)
-            rho_nlcc_use => rho_nlcc_xc
-            rho_nlcc_g_use => rho_nlcc_g_xc
-         END IF
-      END IF
-      IF (.NOT. ASSOCIATED(rho_nlcc_use)) THEN
-         rho_nlcc_use => rho_nlcc
-         rho_nlcc_g_use => rho_nlcc_g
-      END IF
-
       CALL pw_zero(exc)
 
       IF (myfun /= xc_none) THEN
+         NULLIFY (weights)
 
-         CPASSERT(ASSOCIATED(rho_struct))
-         CPASSERT(dft_control%sic_method_id == sic_none)
+         NULLIFY (rho_r, rho_g, tau_r)
+         CALL qs_rho_get(rho_struct, rho_r=rho_r, rho_g=rho_g, tau_r=tau_r, &
+                         rho_g_valid=rho_g_valid, tau_r_valid=tau_valid)
+
+         CALL pw_env_get(pw_env, xc_pw_pool=xc_pw_pool, auxbas_pw_pool=auxbas_pw_pool)
+         uf_grid = .NOT. pw_grid_compare(auxbas_pw_pool%pw_grid, xc_pw_pool%pw_grid)
 
          ! add the nlcc densities
-         IF (ASSOCIATED(rho_nlcc_use) .AND. order <= 1) THEN
+         IF (ASSOCIATED(rho_nlcc) .AND. order <= 1) THEN
             factor = 1.0_dp
             DO ispin = 1, nspins
-               CALL pw_axpy(rho_nlcc_use, rho_r(ispin), factor)
-               CALL pw_axpy(rho_nlcc_g_use, rho_g(ispin), factor)
+               CALL pw_axpy(rho_nlcc, rho_r(ispin), factor)
+               CALL pw_axpy(rho_nlcc_g, rho_g(ispin), factor)
             END DO
+         END IF
+
+         NULLIFY (rho_r_xc, rho_g_xc, tau_r_xc)
+         IF (uf_grid .AND. order <= 1) THEN
+            IF (rho_g_valid) THEN
+               CALL create_density_on_pool(xc_pw_pool, rho_g, rho_r_xc, rho_g_xc)
+            ELSE
+               CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, rho_r, rho_r_xc, rho_g_xc)
+            END IF
+            IF (tau_valid) THEN
+               CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, tau_r, tau_r_xc)
+            END IF
+         ELSE
+            rho_r_xc => rho_r
+            rho_g_xc => rho_g
+            tau_r_xc => tau_r
+         END IF
+
+         NULLIFY (rho1_r_xc, rho1_g_xc, tau1_r_xc)
+         IF (order >= 1) THEN
+            CALL qs_rho_get(rho1_struct, rho_r=rho1_r, rho_g=rho1_g, tau_r=tau1_r, &
+                            rho_g_valid=rho1_g_valid, tau_r_valid=tau1_valid)
+            IF (uf_grid) THEN
+               IF (rho1_g_valid) THEN
+                  CALL create_density_on_pool(xc_pw_pool, rho1_g, rho1_r_xc, rho1_g_xc)
+               ELSE
+                  CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, rho1_r, rho1_r_xc, rho1_g_xc)
+               END IF
+               IF (tau1_valid) THEN
+                  CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, tau1_r, tau1_r_xc)
+               END IF
+            ELSE
+               rho1_r_xc => rho1_r
+               rho1_g_xc => rho1_g
+               tau1_r_xc => tau1_r
+            END IF
          END IF
 
          NULLIFY (vxc_rho, vxc_tau)
          SELECT CASE (order)
          CASE (0)
             IF (native_skala_grid) THEN
-               CALL skala_gpw_exc_density(exc, rho_r, rho_g, tau_r, xc_section, weights, &
-                                          xc_pw_pool, particle_set, cell)
+               CALL skala_gpw_weight_derivative(exc, rho_r, rho_g, tau_r, xc_section, weights, &
+                                                xc_pw_pool, particle_set, cell)
             ELSE
-               ! we could reduce to energy only here
-               CALL xc_exc_pw_create(rho_r, rho_g, tau_r, xc_section, weights, xc_pw_pool, exc)
+               CALL xc_exc_pw_create(rho_r_xc, rho_g_xc, tau_r_xc, xc_section, weights, xc_pw_pool, exc)
             END IF
          CASE (1)
             IF (native_skala_grid) THEN
                CALL cp_abort(__LOCATION__, &
                              "Native SKALA GAPW accurate-XCINT response forces are not implemented.")
+            ELSE
+               CALL xc_vxc_pw_create(vxc_rho, vxc_tau, exc=excint, &
+                                     rho_r=rho_r_xc, rho_g=rho_g_xc, tau=tau_r_xc, &
+                                     xc_section=xc_section, weights=weights, pw_pool=xc_pw_pool, &
+                                     compute_virial=.FALSE., virial_xc=vdum)
             END IF
-            CALL qs_rho_get(rho1_struct, rho_r=rho1_r_base, rho_g=rho1_g_base, tau_r=tau1_r_base, &
-                            tau_g=tau1_g_base, rho_g_valid=rho1_g_valid, &
-                            tau_g_valid=rho1_tau_g_valid, tau_r_valid=rho1_tau_valid)
-            rho1_r => rho1_r_base
-            tau1_g => tau1_g_base
-            tau1_r => tau1_r_base
-            IF (uf_grid) THEN
-               NULLIFY (rho1_r, rho1_g, tau1_r, tau1_g)
-               IF (rho1_g_valid) THEN
-                  CALL create_density_on_pool(xc_pw_pool, rho1_g_base, rho1_r, rho1_g)
-               ELSEIF (ASSOCIATED(rho1_r_base)) THEN
-                  CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, rho1_r_base, rho1_r, rho1_g)
-               ELSE
-                  CPABORT("Fine Grid in xc_density requires rho1_r or rho1_g")
-               END IF
-               IF (rho1_tau_valid) THEN
-                  IF (rho1_tau_g_valid) THEN
-                     CALL create_density_on_pool(xc_pw_pool, tau1_g_base, tau1_r, tau1_g)
-                  ELSEIF (ASSOCIATED(tau1_r_base)) THEN
-                     CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, tau1_r_base, tau1_r, tau1_g)
-                  ELSE
-                     CPABORT("Fine Grid in xc_density requires tau1_r or tau1_g")
-                  END IF
-               END IF
-            END IF
-            CALL xc_vxc_pw_create(vxc_rho=vxc_rho, vxc_tau=vxc_tau, rho_r=rho_r, &
-                                  rho_g=rho_g, tau=tau_r, exc=excint, &
-                                  xc_section=xc_section, &
-                                  weights=weights, pw_pool=xc_pw_pool, &
-                                  compute_virial=.FALSE., &
-                                  virial_xc=vdum)
          CASE (2)
             IF (native_skala_grid) THEN
                CALL cp_abort(__LOCATION__, &
                              "Native SKALA GAPW accurate-XCINT response forces are not implemented.")
-            END IF
-            CALL qs_rho_get(rho1_struct, rho_r=rho1_r_base, rho_g=rho1_g_base, tau_r=tau1_r_base, &
-                            tau_g=tau1_g_base, rho_g_valid=rho1_g_valid, &
-                            tau_g_valid=rho1_tau_g_valid, tau_r_valid=rho1_tau_valid)
-            rho1_r => rho1_r_base
-            tau1_g => tau1_g_base
-            tau1_r => tau1_r_base
-            IF (uf_grid) THEN
-               NULLIFY (rho1_r, rho1_g, tau1_r, tau1_g)
-               IF (rho1_g_valid) THEN
-                  CALL create_density_on_pool(xc_pw_pool, rho1_g_base, rho1_r, rho1_g)
-               ELSEIF (ASSOCIATED(rho1_r_base)) THEN
-                  CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, rho1_r_base, rho1_r, rho1_g)
-               ELSE
-                  CPABORT("Fine Grid in xc_density requires rho1_r or rho1_g")
-               END IF
-               IF (rho1_tau_valid) THEN
-                  IF (rho1_tau_g_valid) THEN
-                     CALL create_density_on_pool(xc_pw_pool, tau1_g_base, tau1_r, tau1_g)
-                  ELSEIF (ASSOCIATED(tau1_r_base)) THEN
-                     CALL create_density_on_pool_from_r(auxbas_pw_pool, xc_pw_pool, tau1_r_base, tau1_r, tau1_g)
-                  ELSE
-                     CPABORT("Fine Grid in xc_density requires tau1_r or tau1_g")
-                  END IF
-               END IF
-               ALLOCATE (rho_fxc)
-               CALL qs_rho_create(rho_fxc)
-               IF (rho_tau_valid) THEN
-                  CALL qs_rho_set(rho_fxc, rho_r=rho_r, rho_g=rho_g, tau_r=tau_r, &
-                                  rho_r_valid=.TRUE., rho_g_valid=.TRUE., tau_r_valid=.TRUE.)
-               ELSE
-                  CALL qs_rho_set(rho_fxc, rho_r=rho_r, rho_g=rho_g, &
-                                  rho_r_valid=.TRUE., rho_g_valid=.TRUE.)
-               END IF
             ELSE
-               rho_fxc => rho_struct
+               CALL qs_fxc_create(qs_env, rho_struct, rho1_struct, rho0_atom_set, xc_section, .FALSE., &
+                                  vxc_rho, vxc_tau, rho1_atom_set, is_triplet=triplet, &
+                                  no_weights=.TRUE., uf_grid_results=uf_grid)
             END IF
-            CALL qs_fxc_analytic(rho_fxc, rho1_r, tau1_r, xc_section, weights, xc_pw_pool, &
-                                 triplet, vxc_rho, vxc_tau)
-            IF (uf_grid) DEALLOCATE (rho_fxc)
          CASE DEFAULT
             CPABORT("Derivative order not available in xc_density")
          END SELECT
 
-         ! remove the nlcc densities (keep stuff in original state)
-         IF (ASSOCIATED(rho_nlcc_use) .AND. order <= 1) THEN
-            factor = -1.0_dp
-            DO ispin = 1, dft_control%nspins
-               CALL pw_axpy(rho_nlcc_use, rho_r(ispin), factor)
-               CALL pw_axpy(rho_nlcc_g_use, rho_g(ispin), factor)
-            END DO
-         END IF
-         !
-         SELECT CASE (order)
-         CASE (0)
-            !
-         CASE (1, 2)
+         IF (order >= 1) THEN
             CALL pw_zero(exc)
             IF (ASSOCIATED(vxc_rho)) THEN
                DO ispin = 1, nspins
-                  CALL pw_multiply_with(vxc_rho(ispin), rho1_r(ispin))
+                  CALL pw_multiply_with(vxc_rho(ispin), rho1_r_xc(ispin))
                   CALL pw_axpy(vxc_rho(ispin), exc, 1.0_dp)
                   CALL vxc_rho(ispin)%release()
                END DO
                DEALLOCATE (vxc_rho)
             END IF
             IF (ASSOCIATED(vxc_tau)) THEN
-               IF (.NOT. ASSOCIATED(tau1_r)) &
-                  CPABORT("Tau response density required for mGGA xc_density")
                DO ispin = 1, nspins
-                  CALL pw_multiply_with(vxc_tau(ispin), tau1_r(ispin))
+                  CALL pw_multiply_with(vxc_tau(ispin), tau1_r_xc(ispin))
                   CALL pw_axpy(vxc_tau(ispin), exc, 1.0_dp)
                   CALL vxc_tau(ispin)%release()
                END DO
                DEALLOCATE (vxc_tau)
             END IF
-         CASE DEFAULT
-            CPABORT("Derivative order not available in xc_density")
-         END SELECT
+         END IF
 
          IF (order == 2) THEN
             CALL pw_scale(exc, 0.5_dp)
          END IF
 
-      END IF
+         IF (uf_grid .AND. order <= 1) THEN
+            CALL give_back_density_on_pool(xc_pw_pool, rho_r_xc, rho_g_xc)
+            IF (tau_valid) THEN
+               CALL give_back_density_on_pool(xc_pw_pool, tau_r_xc)
+            END IF
+         END IF
 
-      IF (uf_grid) THEN
-         CALL give_back_density_on_pool(xc_pw_pool, rho_r, rho_g)
-         IF (ASSOCIATED(tau_r)) CALL give_back_density_on_pool(xc_pw_pool, tau_r, tau_g)
-         IF (ASSOCIATED(rho1_r)) CALL give_back_density_on_pool(xc_pw_pool, rho1_r, rho1_g)
-         IF (ASSOCIATED(tau1_r)) CALL give_back_density_on_pool(xc_pw_pool, tau1_r, tau1_g)
-         IF (ASSOCIATED(rho_nlcc_xc)) THEN
-            CALL xc_pw_pool%give_back_pw(rho_nlcc_xc)
-            DEALLOCATE (rho_nlcc_xc)
+         IF (uf_grid .AND. order >= 1) THEN
+            CALL give_back_density_on_pool(xc_pw_pool, rho1_r_xc, rho1_g_xc)
+            IF (tau1_valid) THEN
+               CALL give_back_density_on_pool(xc_pw_pool, tau1_r_xc)
+            END IF
          END IF
-         IF (ASSOCIATED(rho_nlcc_g_xc)) THEN
-            CALL xc_pw_pool%give_back_pw(rho_nlcc_g_xc)
-            DEALLOCATE (rho_nlcc_g_xc)
+
+         ! romove the nlcc densities
+         IF (ASSOCIATED(rho_nlcc) .AND. order <= 1) THEN
+            factor = -1.0_dp
+            DO ispin = 1, nspins
+               CALL pw_axpy(rho_nlcc, rho_r(ispin), factor)
+               CALL pw_axpy(rho_nlcc_g, rho_g(ispin), factor)
+            END DO
          END IF
+
       END IF
 
       CALL timestop(handle)
 
    END SUBROUTINE xc_density
-
 ! **************************************************************************************************
 !> \brief transfers a g-space density to a given PW pool and creates its r-space representation
 !> \param pw_pool ...
@@ -652,26 +830,41 @@ CONTAINS
    SUBROUTINE create_density_on_pool_from_r(source_pw_pool, target_pw_pool, rho_r_in, rho_r_out, rho_g_out)
       TYPE(pw_pool_type), POINTER                        :: source_pw_pool, target_pw_pool
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho_r_in, rho_r_out
-      TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER        :: rho_g_out
+      TYPE(pw_c1d_gs_type), DIMENSION(:), OPTIONAL, &
+         POINTER                                         :: rho_g_out
 
       INTEGER                                            :: ispin, nspins
-      TYPE(pw_c1d_gs_type)                               :: rho_g_in
+      TYPE(pw_c1d_gs_type)                               :: rho_g_aux, rho_g_in
 
       CPASSERT(ASSOCIATED(source_pw_pool))
       CPASSERT(ASSOCIATED(target_pw_pool))
       CPASSERT(ASSOCIATED(rho_r_in))
 
       nspins = SIZE(rho_r_in)
-      ALLOCATE (rho_r_out(nspins), rho_g_out(nspins))
-      DO ispin = 1, nspins
-         CALL source_pw_pool%create_pw(rho_g_in)
-         CALL target_pw_pool%create_pw(rho_g_out(ispin))
-         CALL target_pw_pool%create_pw(rho_r_out(ispin))
-         CALL pw_transfer(rho_r_in(ispin), rho_g_in)
-         CALL pw_transfer(rho_g_in, rho_g_out(ispin))
-         CALL pw_transfer(rho_g_out(ispin), rho_r_out(ispin))
-         CALL source_pw_pool%give_back_pw(rho_g_in)
-      END DO
+      IF (PRESENT(rho_g_out)) THEN
+         ALLOCATE (rho_r_out(nspins), rho_g_out(nspins))
+         DO ispin = 1, nspins
+            CALL source_pw_pool%create_pw(rho_g_in)
+            CALL target_pw_pool%create_pw(rho_g_out(ispin))
+            CALL target_pw_pool%create_pw(rho_r_out(ispin))
+            CALL pw_transfer(rho_r_in(ispin), rho_g_in)
+            CALL pw_transfer(rho_g_in, rho_g_out(ispin))
+            CALL pw_transfer(rho_g_out(ispin), rho_r_out(ispin))
+            CALL source_pw_pool%give_back_pw(rho_g_in)
+         END DO
+      ELSE
+         ALLOCATE (rho_r_out(nspins))
+         DO ispin = 1, nspins
+            CALL source_pw_pool%create_pw(rho_g_in)
+            CALL target_pw_pool%create_pw(rho_g_aux)
+            CALL target_pw_pool%create_pw(rho_r_out(ispin))
+            CALL pw_transfer(rho_r_in(ispin), rho_g_in)
+            CALL pw_transfer(rho_g_in, rho_g_aux)
+            CALL pw_transfer(rho_g_aux, rho_r_out(ispin))
+            CALL source_pw_pool%give_back_pw(rho_g_in)
+            CALL source_pw_pool%give_back_pw(rho_g_aux)
+         END DO
+      END IF
 
    END SUBROUTINE create_density_on_pool_from_r
 
@@ -684,7 +877,8 @@ CONTAINS
    SUBROUTINE give_back_density_on_pool(pw_pool, rho_r, rho_g)
       TYPE(pw_pool_type), POINTER                        :: pw_pool
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho_r
-      TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER        :: rho_g
+      TYPE(pw_c1d_gs_type), DIMENSION(:), OPTIONAL, &
+         POINTER                                         :: rho_g
 
       INTEGER                                            :: ispin
 
@@ -696,11 +890,13 @@ CONTAINS
          END DO
          DEALLOCATE (rho_r)
       END IF
-      IF (ASSOCIATED(rho_g)) THEN
-         DO ispin = 1, SIZE(rho_g)
-            CALL pw_pool%give_back_pw(rho_g(ispin))
-         END DO
-         DEALLOCATE (rho_g)
+      IF (PRESENT(rho_g)) THEN
+         IF (ASSOCIATED(rho_g)) THEN
+            DO ispin = 1, SIZE(rho_g)
+               CALL pw_pool%give_back_pw(rho_g(ispin))
+            END DO
+            DEALLOCATE (rho_g)
+         END IF
       END IF
 
    END SUBROUTINE give_back_density_on_pool

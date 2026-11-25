@@ -345,8 +345,13 @@ md_step, time[fs], e_kin[hartree], temp[K], e_pot[hartree], e_tot[hartree], elap
 ```
 
 For thermostatted or barostatted simulations, also inspect the corresponding conserved quantity or
-cell output when available. For production runs, write restart files frequently enough that the
-trajectory can be continued without losing significant sampling time.
+cell output when available.
+
+Restart files come in several flavors and generally will be helpful for restarting or continuing
+different types of calculations. MD tasks make use of motion restart files, and specific to AIMD
+there are wavefunction restart files; details about them can be found at [](../restarting). For
+production runs, writing restart files frequently enough can be helpful for extending the trajectory
+and sampling time, both for normal terminations and for erroneous or interrupted tasks.
 
 ## Validation checklist
 

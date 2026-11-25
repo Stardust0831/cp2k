@@ -5,9 +5,6 @@
 [ "${BASH_SOURCE[0]}" ] && SCRIPT_NAME="${BASH_SOURCE[0]}" || SCRIPT_NAME=$0
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_NAME")" && pwd -P)"
 
-# Load module environment if exists
-LOADEDMODULES_AT_BUILD="${LOADEDMODULES-}"
-
 TOOLCHAIN_ROOTDIR="${PWD}"
 # Exit this script if it is not called from the ./tools/toolchain directory
 if [ "${TOOLCHAIN_ROOTDIR}" != "${SCRIPT_DIR}" ]; then
@@ -23,7 +20,6 @@ EOF
   exit 1
 fi
 TOOLCHAIN_SCRIPTS_DIR="${TOOLCHAIN_ROOTDIR}/scripts"
-source "${TOOLCHAIN_ROOTDIR}/toolchain_settings"
 source "${TOOLCHAIN_SCRIPTS_DIR}/tool_kit.sh"
 
 # ====================== Parameter parsing ======================
@@ -35,6 +31,8 @@ BUILD_SHARED_LIBS="ON"
 DRY_RUN="__FALSE__"
 REBUILD_ONLY="__FALSE__"
 PREFIX_SET="__FALSE__"
+PRESET_SET="__FALSE__"
+CMAKE_PRESET=""
 DEBUG_SET="__FALSE__"
 BUILD_STATIC_SET="__FALSE__"
 
@@ -47,8 +45,11 @@ Generate CMake options from the toolchain configuration and build CP2K.
 Options:
   -h, --help            Show this help message and exit
   -j N, -jN             Number of parallel build jobs
-  --prefix              Set CMAKE_INSTALL_PREFIX (default is ${CP2K_ROOT}/install)
+  --prefix=<path>       Set CMAKE_INSTALL_PREFIX
+                        (default is ${CP2K_ROOT}/install)
   --dry-run             Show generated CMake options only and then exit
+  --preset=<name>       Use a CMake configure preset
+                        See "cmake -S ${CP2K_ROOT} --list-presets"
   --debug               Build debug version of CP2K (-DCMAKE_BUILD_TYPE=Debug)
   --build-static        Set -DBUILD_SHARED_LIBS=OFF (default is ON)
   --rebuild-only        Skip CMake configuration and only rebuild/install CP2K
@@ -73,13 +74,15 @@ while [ $# -ge 1 ]; do
     -j[0-9]*)
       BUILD_JOBS="${1#-j}"
       ;;
-    --prefix)
+    --prefix=*)
       PREFIX_SET="__TRUE__"
-      if [[ "${2}" != /* ]]; then
-        report_error "The path for --prefix must be an absolute path."
+      CMAKE_INSTALL_PREFIX="$(real_path "${1#--prefix=}")"
+      ;;
+    --preset=*)
+      CMAKE_PRESET="${1#--preset=}"
+      if [ ! -z "${CMAKE_PRESET}" ]; then
+        PRESET_SET="__TRUE__"
       fi
-      CMAKE_INSTALL_PREFIX="${2}"
-      shift
       ;;
     --debug)
       DEBUG_SET="__TRUE__"
@@ -105,6 +108,7 @@ done
 if [ "${REBUILD_ONLY}" = "__TRUE__" ]; then
   if [ "${DRY_RUN}" = "__TRUE__" ] ||
     [ "${PREFIX_SET}" = "__TRUE__" ] ||
+    [ "${PRESET_SET}" = "__TRUE__" ] ||
     [ "${DEBUG_SET}" = "__TRUE__" ] ||
     [ "${BUILD_STATIC_SET}" = "__TRUE__" ]; then
     cat << EOF
@@ -113,6 +117,9 @@ Please run this script without "--rebuild-only" if you want to change CMake sett
 EOF
     exit 1
   fi
+elif [ "${PRESET_SET}" = "__FALSE__" ]; then
+  echo "No CMake preset is specified; default to \"none\"."
+  CMAKE_PRESET="none"
 fi
 
 # ====================== Pre-checks ======================
@@ -121,9 +128,13 @@ fi
 # cp2k                                  <- variable ${CP2K_ROOT}; CMake option -S
 # ├── CMakeLists.txt                    <- file to be parsed for generating cmake options
 # ├── cmake                             <- directory containing CMake files
-# ├── data                              <- CP2K data directory; CMake option -DCP2K_DATA_DIR\
-# ├── build                             <- to-be-created; CMake option -B
+# ├── data                              <- CP2K data directory; CMake option -DCP2K_DATA_DIR
+# ├── build                             <- to-be-created; CMake option -B or --build
 # ├── install                           <- to-be-created; CMake option -DCMAKE_INSTALL_PREFIX
+# |   ├── bin                           <- CP2K binaries will be installed here
+# |   ├── include                       <- CP2K header and module files will be installed here
+# |   ├── lib                           <- CP2K library files will be installed here; CMake option -DCMAKE_INSTALL_LIBDIR
+# |   └── share                         <- Other files such as CP2K data
 # ├── src                               <- CP2K source code directory
 # └── tools
 #     └── toolchain                     <- working directory; variable ${TOOLCHAIN_ROOTDIR}
@@ -154,6 +165,7 @@ else
 fi
 
 # Require finished toolchain
+source "${TOOLCHAIN_ROOTDIR}/toolchain_settings"
 if [ ! -f "${TOOLCHAIN_INSTALL_DIR}/setup" ]; then
   echo "Error: Toolchain is not installed. Please run ./install_cp2k_toolchain.sh first."
   exit 1
@@ -178,11 +190,19 @@ source "${TOOLCHAIN_INSTALL_DIR}/setup"
 source "${TOOLCHAIN_INSTALL_DIR}/toolchain.conf"
 
 # Generate cmake options for compiling cp2k
-CMAKE_OPTIONS="-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX} -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}"
+CMAKE_OPTIONS="-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX} -DCMAKE_INSTALL_LIBDIR=lib"
+CMAKE_OPTIONS+=" -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}"
+# On macOS the installed executables cannot rely on cp2k_env to find libcp2k:
+# LD_LIBRARY_PATH is ignored there, and System Integrity Protection removes
+# DYLD_LIBRARY_PATH whenever a system binary (/usr/bin/env, /bin/bash) starts,
+# e.g. do_regtest.py or a job script. Give them a run path to ../lib instead.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  CMAKE_OPTIONS+=" -DCMAKE_INSTALL_RPATH=@loader_path/../lib"
+fi
 if [[ ${CMAKE_INSTALL_PREFIX} == ${CP2K_ROOT}/* ]]; then
   CMAKE_OPTIONS+=" -DCP2K_DATA_DIR=${CP2K_ROOT}/data"
 fi
-if [ ${DEBUG_BUILD} == "__TRUE__" ]; then
+if [ "${DEBUG_BUILD}" = "__TRUE__" ]; then
   CMAKE_OPTIONS+=" -DCMAKE_BUILD_TYPE=Debug"
 fi
 if [ -n "$(grep -- "--install-all" "${TOOLCHAIN_ROOTDIR}/toolchain_settings")" ]; then
@@ -192,10 +212,6 @@ if [ -n "$(grep -- "--install-all" "${TOOLCHAIN_ROOTDIR}/toolchain_settings")" ]
     CMAKE_OPTIONS+=" -DCP2K_USE_MPI=OFF"
   fi
   # Some options that should be specially considered:
-  # Intel MKL includes FFTW
-  if [ "${with_fftw}" = "__DONTUSE__" ] && [ "${math_mode}" != "mkl" ]; then
-    CMAKE_OPTIONS+=" -DCP2K_USE_FFTW3=OFF"
-  fi
   # MiMic-MCL (MiMiC Communication Library)
   if [ "${with_mcl}" = "__DONTUSE__" ]; then
     CMAKE_OPTIONS+=" -DCP2K_USE_MIMIC=OFF"
@@ -215,10 +231,6 @@ else
     CMAKE_OPTIONS+=" -DCP2K_USE_MPI=ON -DCP2K_USE_MPI_F08=ON"
   fi
   # Some options that should be specially considered:
-  # Intel MKL includes FFTW
-  if [ "${with_fftw}" != "__DONTUSE__" ] || [ "${math_mode}" = "mkl" ]; then
-    CMAKE_OPTIONS+=" -DCP2K_USE_FFTW3=ON"
-  fi
   # MiMic-MCL (MiMiC Communication Library)
   if [ "${with_mcl}" != "__DONTUSE__" ]; then
     CMAKE_OPTIONS+=" -DCP2K_USE_MIMIC=ON"
@@ -329,13 +341,17 @@ EOF
     mkdir -p "${BUILD_DIR}"
 
     log_cmake "================== CMake configuration ==================="
-    log_cmake "Source dir : ${CP2K_ROOT}"
-    log_cmake "Build  dir : ${BUILD_DIR}"
-    log_cmake "Install dir: ${CMAKE_INSTALL_PREFIX}"
-    log_cmake "Shared libs: ${BUILD_SHARED_LIBS}"
+    log_cmake "Source dir  : ${CP2K_ROOT}"
+    log_cmake "Build  dir  : ${BUILD_DIR}"
+    log_cmake "Install dir : ${CMAKE_INSTALL_PREFIX}"
+    log_cmake "Shared libs : ${BUILD_SHARED_LIBS}"
+    if [ "${PRESET_SET}" = "__TRUE__" ]; then
+      log_cmake "CMake preset: ${CMAKE_PRESET}"
+    fi
 
     set -o pipefail
-    cmake -S "${CP2K_ROOT}" -B "${BUILD_DIR}" ${CMAKE_OPTIONS} 2>&1 | tee -a cmake.log
+    cmake -S "${CP2K_ROOT}" -B "${BUILD_DIR}" --preset "${CMAKE_PRESET}" \
+      ${CMAKE_OPTIONS} 2>&1 | tee -a cmake.log
   fi
 
   log_build "==================== Building CP2K ======================="
@@ -347,6 +363,8 @@ EOF
   # Export variable for CMake options to cp2k_env file
   if [ "${REBUILD_ONLY}" != "__TRUE__" ]; then
     echo "#!/bin/bash" > "${CMAKE_INSTALL_PREFIX}/cp2k_env"
+    # Detect module environment and write it to cp2k_env if exists
+    LOADEDMODULES_AT_BUILD="${LOADEDMODULES-}"
     if [ -n "${LOADEDMODULES_AT_BUILD}" ]; then
       printf "Detected module environment; writing to cp2k_env.\n\n"
       printf 'module load %s\n' "${LOADEDMODULES_AT_BUILD//:/ }" \
@@ -374,7 +392,7 @@ EOF
 Please always source this script to load CP2K environment before running CP2K:
   source ${CMAKE_INSTALL_PREFIX}/cp2k_env
 
-It's suggested to run regtests after installation:
+It is suggested to run regtests after installation:
   ${CP2K_ROOT}/tests/do_regtest.py ${CMAKE_INSTALL_PREFIX}/bin psmp
 Run \`${CP2K_ROOT}/tests/do_regtest.py --help\` for help message.
 

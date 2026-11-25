@@ -32,7 +32,6 @@ MODULE mc_types
                                               force_env_type,&
                                               use_fist_force,&
                                               use_qs_force
-   USE global_types,                    ONLY: global_environment_type
    USE input_constants,                 ONLY: do_fist,&
                                               do_qs
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
@@ -114,7 +113,6 @@ MODULE mc_types
       CHARACTER(LEN=default_path_length) :: dat_file = ""
       CHARACTER(LEN=default_path_length) :: data_file = ""
       CHARACTER(LEN=default_path_length) :: box2_file = ""
-      CHARACTER(LEN=200) :: fft_lib = ""
       CHARACTER(LEN=50) :: PROGRAM = ""
       REAL(dp), DIMENSION(:), POINTER :: pmtraion_mol => NULL(), pmtrans_mol => NULL(), &
                                          pmrot_mol => NULL(), pmswap_mol => NULL(), &
@@ -358,7 +356,6 @@ CONTAINS
 !> \param dat_file ...
 !> \param data_file ...
 !> \param box2_file ...
-!> \param fft_lib ...
 !> \param iprint ...
 !> \param rcut ...
 !> \param ldiscrete ...
@@ -397,7 +394,7 @@ CONTAINS
                          rmrot, rmtrans, temperature, pressure, rclus, BETA, pmswap, pmvolume, pmtraion, pmtrans, &
                          pmcltrans, ensemble, PROGRAM, restart_file_name, molecules_file, moves_file, coords_file, &
                          energy_file, displacement_file, cell_file, dat_file, data_file, box2_file, &
-                         fft_lib, iprint, rcut, ldiscrete, discrete_step, &
+                         iprint, rcut, ldiscrete, discrete_step, &
                          pmavbmc, pbias, avbmc_atom, avbmc_rmin, avbmc_rmax, rmdihedral, &
                          input_file, mc_molecule_info, pmswap_mol, pmavbmc_mol, pmtrans_mol, pmrot_mol, &
                          pmtraion_mol, mc_input_file, mc_bias_file, pmvol_box, pmclus_box, virial_temps, &
@@ -422,7 +419,7 @@ CONTAINS
                                                             pmcltrans
       CHARACTER(LEN=*), INTENT(OUT), OPTIONAL :: ensemble, PROGRAM, restart_file_name, &
          molecules_file, moves_file, coords_file, energy_file, displacement_file, cell_file, &
-         dat_file, data_file, box2_file, fft_lib
+         dat_file, data_file, box2_file
       INTEGER, INTENT(OUT), OPTIONAL                     :: iprint
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: rcut
       LOGICAL, INTENT(OUT), OPTIONAL                     :: ldiscrete
@@ -521,7 +518,6 @@ CONTAINS
       IF (PRESENT(dat_file)) dat_file = mc_par%dat_file
       IF (PRESENT(data_file)) data_file = mc_par%data_file
       IF (PRESENT(box2_file)) box2_file = mc_par%box2_file
-      IF (PRESENT(fft_lib)) fft_lib = mc_par%fft_lib
 
       IF (PRESENT(input_file)) input_file => mc_par%input_file
       IF (PRESENT(mc_molecule_info)) mc_molecule_info => mc_par%mc_molecule_info
@@ -1199,17 +1195,15 @@ CONTAINS
 !> \brief reads in the Monte Carlo simulation parameters from an input file
 !> \param mc_par the structure that will store the parameters
 !> \param para_env ...
-!> \param globenv the global environment for the simulation
 !> \param input_file_name the name of the input_file
 !> \param input_file the structure that contains all the keywords in the input file
 !> \param force_env_section used to grab the type of force_env
 !> \author MJM
 ! **************************************************************************************************
-   SUBROUTINE read_mc_section(mc_par, para_env, globenv, input_file_name, input_file, force_env_section)
+   SUBROUTINE read_mc_section(mc_par, para_env, input_file_name, input_file, force_env_section)
 
       TYPE(mc_simpar_type), POINTER                      :: mc_par
       TYPE(mp_para_env_type), POINTER                    :: para_env
-      TYPE(global_environment_type), POINTER             :: globenv
       CHARACTER(LEN=*), INTENT(IN)                       :: input_file_name
       TYPE(section_vals_type), POINTER                   :: input_file, force_env_section
 
@@ -1290,10 +1284,6 @@ CONTAINS
                                 c_val=mc_par%molecules_file)
       CALL section_vals_val_set(mc_section, "ENERGY_FILE_NAME", &
                                 c_val=mc_par%energy_file)
-
-! grab the FFT library name and print level...this is used for writing the dat file
-! and hopefully will be changed
-      mc_par%fft_lib = globenv%default_fft_library
 
 ! get all the move probabilities first...if we are not doing certain types of moves, we don't care
 ! if the values for those move parameters are strange
@@ -1751,8 +1741,9 @@ CONTAINS
       rcutsq_max = 0.0e0_dp
       DO itype = 1, SIZE(potparm%pot, 1)
          DO jtype = itype, SIZE(potparm%pot, 2)
-            IF (potparm%pot(itype, jtype)%pot%rcutsq > rcutsq_max) &
+            IF (potparm%pot(itype, jtype)%pot%rcutsq > rcutsq_max) THEN
                rcutsq_max = potparm%pot(itype, jtype)%pot%rcutsq
+            END IF
          END DO
       END DO
 
@@ -1865,8 +1856,9 @@ CONTAINS
       DO itype = 1, ntypes
          lnew_type = .TRUE.
          DO jtype = 1, itype - 1
-            IF (TRIM(names_init(itype)) == TRIM(names_init(jtype))) &
+            IF (TRIM(names_init(itype)) == TRIM(names_init(jtype))) THEN
                lnew_type = .FALSE.
+            END IF
          END DO
          IF (lnew_type) THEN
             nmol_types = nmol_types + 1
@@ -2068,19 +2060,24 @@ CONTAINS
       ! some ensembles require multiple boxes or molecule types
       SELECT CASE (mc_par%ensemble)
       CASE ("GEMC_NPT")
-         IF (nmol_types <= 1) &
+         IF (nmol_types <= 1) THEN
             CPABORT('Cannot have GEMC-NPT simulation with only one molecule type')
-         IF (nboxes <= 1) &
+         END IF
+         IF (nboxes <= 1) THEN
             CPABORT('Cannot have GEMC-NPT simulation with only one box')
+         END IF
       CASE ("GEMC_NVT")
-         IF (nboxes <= 1) &
+         IF (nboxes <= 1) THEN
             CPABORT('Cannot have GEMC-NVT simulation with only one box')
+         END IF
       CASE ("TRADITIONAL")
-         IF (mc_par%pmswap > 0.0E0_dp) &
+         IF (mc_par%pmswap > 0.0E0_dp) THEN
             CPABORT('You cannot do swap moves in a system with only one box')
+         END IF
       CASE ("VIRIAL")
-         IF (nchain_total /= 2) &
+         IF (nchain_total /= 2) THEN
             CPABORT('You need exactly two molecules in the box to compute the second virial.')
+         END IF
       END SELECT
 
 ! can't choose an AVBMC target atom number higher than the number

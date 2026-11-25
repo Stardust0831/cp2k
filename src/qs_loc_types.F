@@ -151,7 +151,8 @@ MODULE qs_loc_types
 ! *** Public ***
    PUBLIC :: qs_loc_env_create, qs_loc_env_release, &
              get_qs_loc_env, set_qs_loc_env, &
-             localized_wfn_control_create, localized_wfn_control_release
+             localized_wfn_control_create, localized_wfn_control_release, &
+             loc_coeff_index
    PUBLIC :: qs_loc_env_type, localized_wfn_control_type
 
 CONTAINS
@@ -196,8 +197,9 @@ CONTAINS
       INTEGER                                            :: i, ii, j
 
       IF (ASSOCIATED(qs_loc_env%cell)) CALL cell_release(qs_loc_env%cell)
-      IF (ASSOCIATED(qs_loc_env%local_molecules)) &
+      IF (ASSOCIATED(qs_loc_env%local_molecules)) THEN
          CALL distribution_1d_release(qs_loc_env%local_molecules)
+      END IF
       IF (ASSOCIATED(qs_loc_env%localized_wfn_control)) THEN
          CALL localized_wfn_control_release(qs_loc_env%localized_wfn_control)
       END IF
@@ -336,8 +338,9 @@ CONTAINS
       IF (PRESENT(cell)) cell => qs_loc_env%cell
       IF (PRESENT(moloc_coeff)) moloc_coeff => qs_loc_env%moloc_coeff
       IF (PRESENT(local_molecules)) local_molecules => qs_loc_env%local_molecules
-      IF (PRESENT(localized_wfn_control)) &
+      IF (PRESENT(localized_wfn_control)) THEN
          localized_wfn_control => qs_loc_env%localized_wfn_control
+      END IF
       IF (PRESENT(op_sm_set)) op_sm_set => qs_loc_env%op_sm_set
       IF (PRESENT(op_fm_set)) op_fm_set => qs_loc_env%op_fm_set
       IF (PRESENT(para_env)) para_env => qs_loc_env%para_env
@@ -392,8 +395,9 @@ CONTAINS
 
       IF (PRESENT(local_molecules)) THEN
          CALL distribution_1d_retain(local_molecules)
-         IF (ASSOCIATED(qs_loc_env%local_molecules)) &
+         IF (ASSOCIATED(qs_loc_env%local_molecules)) THEN
             CALL distribution_1d_release(qs_loc_env%local_molecules)
+         END IF
          qs_loc_env%local_molecules => local_molecules
       END IF
 
@@ -426,6 +430,27 @@ CONTAINS
       END IF
 
    END SUBROUTINE set_qs_loc_env
+
+! **************************************************************************************************
+!> \brief Index of the (real) MO coefficients of a spin in an array of MO coefficients.
+!>        In RTP the array holds the real and imaginary parts of each spin,
+!>        interleaved as (re_1, im_1, re_2, im_2), otherwise one matrix per spin.
+!> \param ncoeff number of matrices in the array
+!> \param nspins number of spins
+!> \param ispin spin
+!> \return index of the real part of spin ispin
+! **************************************************************************************************
+   PURE FUNCTION loc_coeff_index(ncoeff, nspins, ispin) RESULT(icoeff)
+      INTEGER, INTENT(IN)                                :: ncoeff, nspins, ispin
+      INTEGER                                            :: icoeff
+
+      IF (ncoeff == 2*nspins) THEN
+         icoeff = 2*ispin - 1
+      ELSE
+         icoeff = ispin
+      END IF
+
+   END FUNCTION loc_coeff_index
 
 END MODULE qs_loc_types
 

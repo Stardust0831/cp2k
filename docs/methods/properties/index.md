@@ -11,4 +11,7 @@ infrared
 raman
 nmr
 stm_images
+inversion_topology
+spectral_localizer
+quadratic_pseudospectrum
 ```

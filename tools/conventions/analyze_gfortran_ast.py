@@ -3,17 +3,18 @@
 # author: Ole Schuett
 
 import argparse
-import re
 import collections
+import io
+import re
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import redirect_stdout
 from os import path
 from typing import Dict, TextIO, List
-
-USE_EXCEPTIONS = ("omp_lib", "omp_lib_kinds", "lapack")
 
 # precompile regex
 re_symbol = re.compile(r"^\s*symtree.* symbol: '([^']+)'.*$")
 re_derived_type = re.compile(r"^\s*type spec\s*:\s*\(DERIVED ([^']+)\).*$")
-re_use = re.compile(r" USE-ASSOC\(([^)]+)\)")
 re_conv = re.compile(
     r"__(real_[48]_r8|real_4_c8|cmplx1_4_r8_r8)\[\["
 )  # ignores integers
@@ -21,14 +22,11 @@ re_conv = re.compile(
 
 # ======================================================================================
 def process_log_file(fhandle: TextIO) -> None:
-    public_symbols = set()
-    used_symbols = set()
+    short_filename = path.basename(fhandle.name)[:-4]
+    is_unittest = short_filename.endswith("_unittest.F")
 
     def msg(message: str, conv_num: int) -> None:
-        short_filename = path.basename(fhandle.name)[:-4]
         print(f"{short_filename}: {message} https://cp2k.org/conv#c{conv_num:03}")
-
-    module_name = None
 
     cur_sym = cur_proc = cur_derived_type = cur_value = stat_var = stat_stm = None
     skip_until_DT_END = inside_omp_parallel = False
@@ -60,8 +58,6 @@ def process_log_file(fhandle: TextIO) -> None:
         elif line.startswith("procedure name ="):
             assert not inside_omp_parallel
             cur_proc = line.split("=")[1].strip()
-            if not module_name:
-                module_name = cur_proc
 
         elif line.startswith("symtree: ") or len(line) == 0:
             # Found new symbole, check default initializers of previous symbole.
@@ -99,36 +95,9 @@ def process_log_file(fhandle: TextIO) -> None:
             cur_value = line
 
         elif line.startswith("attributes:"):
-            assert module_name and cur_sym
-            is_imported = "USE-ASSOC" in line
-            is_param = "PARAMETER" in line
-            is_func = "FUNCTION" in line
-            is_impl_save = "IMPLICIT-SAVE" in line
-            is_impl_type = "IMPLICIT-TYPE" in line
-            is_module_name = cur_proc == module_name
-
-            if is_imported:
-                match = re_use.search(line)
-                assert match
-                mod = match.group(1)
-                used_symbols.add(mod + "::" + cur_sym)
-                if "MODULE  USE-ASSOC" in line and mod.lower() not in USE_EXCEPTIONS:
-                    msg(f'Module "{mod}" USEd without ONLY clause or not PRIVATE', 2)
-
-            # if(("SAVE" in line) and ("PARAMETER" not in line) and ("PUBLIC" in line)):
-            #    print(loc+': Symbol "'+cur_sym+'" in procedure "'+cur_proc+'" is PUBLIC-SAVE')
-
-            if is_impl_save and not is_param and not is_imported and not is_module_name:
-                msg(f'Symbol "{cur_sym}" in procedure "{cur_proc}" is IMPLICIT-SAVE', 3)
-
-            if is_impl_type and not is_imported and not is_func:
-                msg(f'Symbol "{cur_sym}" in procedure "{cur_proc}" is IMPLICIT-TYPE', 4)
-
+            assert cur_sym
             if "THREADPRIVATE" in line:
                 msg(f'Symbol "{cur_sym}" in procedure "{cur_proc}" is THREADPRIVATE', 5)
-
-            if "PUBLIC" in line:
-                public_symbols.add(module_name + "::" + cur_sym)
 
         elif line.startswith("!$OMP PARALLEL"):
             assert not inside_omp_parallel
@@ -159,19 +128,22 @@ def process_log_file(fhandle: TextIO) -> None:
                 msg(f'Found CALL RANDOM_SEED in procedure "{cur_proc}"', 105)
             elif tokens[1].lower().startswith("_gfortran_execute_command_line"):
                 msg(f'Found CALL EXECUTE_COMMAND_LINE in procedure "{cur_proc}"', 106)
+            elif tokens[1].lower().startswith("_gfortran_get_environment_variable"):
+                msg(
+                    f'Found CALL GET_ENVIRONMENT_VARIABLE in procedure "{cur_proc}"',
+                    107,
+                )
 
         elif line.startswith("GOTO"):
             msg(f'Found GOTO statement in procedure "{cur_proc}"', 201)
-        elif line.startswith("FORALL"):
-            msg(f'Found FORALL statement in procedure "{cur_proc}"', 202)
-        elif line.startswith("OPEN"):
+        elif line.startswith("OPEN") and not is_unittest:
             msg(f'Found OPEN statement in procedure "{cur_proc}"', 203)
-        elif line.startswith("CLOSE"):
+        elif line.startswith("CLOSE") and not is_unittest:
             msg(f'Found CLOSE statement in procedure "{cur_proc}"', 204)
         elif line.startswith("STOP"):
             msg(f'Found STOP statement in procedure "{cur_proc}"', 205)
 
-        elif line.startswith("WRITE"):
+        elif line.startswith("WRITE") and not is_unittest:
             unit = tokens[1].split("=")[1]
             if unit.isdigit():
                 msg(f'Found WRITE statement with hardcoded unit in "{cur_proc}"', 12)
@@ -197,6 +169,15 @@ def process_log_file(fhandle: TextIO) -> None:
 
     # check for run-away DT_END search
     assert skip_until_DT_END is False
+
+
+# ======================================================================================
+def process_file(fn: str) -> str:
+    assert fn.endswith(".ast")
+    output = io.StringIO()
+    with open(fn, encoding="utf8") as fhandle, redirect_stdout(output):
+        process_log_file(fhandle)
+    return output.getvalue()
 
 
 # ======================================================================================
@@ -238,12 +219,27 @@ in the cp2k arch-file.
         nargs="+",
         help="files containing dumps of the AST",
     )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        help="number of worker processes (0: auto, default: 1)",
+    )
     args = parser.parse_args()
 
-    for fn in args.files:
-        assert fn.endswith(".ast")
+    if args.jobs < 0:
+        parser.error("--jobs must be non-negative")
 
-        with open(fn, encoding="utf8") as fhandle:
-            process_log_file(fhandle)
+    if args.jobs == 1 or len(args.files) == 1:
+        for fn in args.files:
+            assert fn.endswith(".ast")
+            with open(fn, encoding="utf8") as fhandle:
+                process_log_file(fhandle)
+    else:
+        max_workers = None if args.jobs == 0 else min(args.jobs, len(args.files))
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            for output in executor.map(process_file, args.files):
+                sys.stdout.write(output)
 
 # EOF

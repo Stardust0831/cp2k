@@ -9,7 +9,8 @@
 !> \brief Utility methods to build 3-center integral tensors of various types.
 ! **************************************************************************************************
 MODULE qs_tensors
-   USE OMP_LIB,                         ONLY: omp_get_num_threads,&
+   USE OMP_LIB,                         ONLY: omp_get_max_threads,&
+                                              omp_get_num_threads,&
                                               omp_get_thread_num
    USE ai_contraction,                  ONLY: block_add
    USE ai_contraction_sphi,             ONLY: ab_contract,&
@@ -21,6 +22,13 @@ MODULE qs_tensors
    USE block_p_types,                   ONLY: block_p_type
    USE cell_types,                      ONLY: cell_type,&
                                               real_to_scaled
+   USE coulomb_integral_interface,      ONLY: compute_coulomb_2c,&
+                                              compute_coulomb_2c_derivs,&
+                                              compute_coulomb_3c,&
+                                              compute_coulomb_3c_derivs,&
+                                              coulomb_integral_cleanup,&
+                                              coulomb_integral_context_type,&
+                                              coulomb_integral_init
    USE cp_array_utils,                  ONLY: cp_2d_r_p_type
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_filter,&
@@ -32,8 +40,6 @@ MODULE qs_tensors
                                               dbcsr_type_antisymmetric,&
                                               dbcsr_type_no_symmetry
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
-   USE cp_files,                        ONLY: close_file,&
-                                              open_file
    USE dbt_api,                         ONLY: &
         dbt_blk_sizes, dbt_clear, dbt_copy, dbt_create, dbt_destroy, dbt_filter, dbt_get_block, &
         dbt_get_info, dbt_get_num_blocks, dbt_get_nze_total, dbt_iterator_next_block, &
@@ -41,40 +47,29 @@ MODULE qs_tensors
         dbt_ndims, dbt_put_block, dbt_reserve_blocks, dbt_type
    USE distribution_1d_types,           ONLY: distribution_1d_type
    USE distribution_2d_types,           ONLY: distribution_2d_type
-   USE gamma,                           ONLY: init_md_ftable
-   USE hfx_compression_methods,         ONLY: hfx_add_mult_cache_elements,&
-                                              hfx_add_single_cache_element,&
-                                              hfx_decompress_first_cache,&
-                                              hfx_flush_last_cache,&
-                                              hfx_get_mult_cache_elements,&
-                                              hfx_get_single_cache_element,&
-                                              hfx_reset_cache_and_container
-   USE hfx_types,                       ONLY: alloc_containers,&
-                                              dealloc_containers,&
-                                              hfx_cache_type,&
+   USE hfx_compression_methods,         ONLY: hfx_add_mult_real_elements,&
+                                              hfx_decompress_first_real_cache,&
+                                              hfx_flush_last_real_cache,&
+                                              hfx_get_mult_real_elements,&
+                                              hfx_reset_real_cache_and_container
+   USE hfx_types,                       ONLY: dealloc_containers,&
                                               hfx_compression_type,&
                                               hfx_container_type,&
-                                              hfx_init_container
+                                              hfx_init_container,&
+                                              hfx_real_cache_type
    USE input_constants,                 ONLY: do_potential_coulomb,&
                                               do_potential_id,&
                                               do_potential_mix_cl_trunc,&
                                               do_potential_short,&
                                               do_potential_truncated
    USE input_section_types,             ONLY: section_vals_val_get
+   USE integral_library_types,          ONLY: coulomb_operator_type,&
+                                              cutoff_screen_factor,&
+                                              library_libint
    USE kinds,                           ONLY: dp,&
                                               int_8
    USE kpoint_types,                    ONLY: get_kpoint_info,&
                                               kpoint_type
-   USE libint_2c_3c,                    ONLY: cutoff_screen_factor,&
-                                              eri_2center,&
-                                              eri_2center_derivs,&
-                                              eri_3center,&
-                                              eri_3center_derivs,&
-                                              libint_potential_type
-   USE libint_wrapper,                  ONLY: &
-        cp_libint_cleanup_2eri, cp_libint_cleanup_2eri1, cp_libint_cleanup_3eri, &
-        cp_libint_cleanup_3eri1, cp_libint_init_2eri, cp_libint_init_2eri1, cp_libint_init_3eri, &
-        cp_libint_init_3eri1, cp_libint_set_contrdepth, cp_libint_t
    USE message_passing,                 ONLY: mp_para_env_type
    USE molecule_types,                  ONLY: molecule_type
    USE orbital_pointers,                ONLY: ncoset
@@ -96,8 +91,7 @@ MODULE qs_tensors
         distribution_3d_destroy, distribution_3d_type, neighbor_list_3c_iterator_type, &
         neighbor_list_3c_type, symmetric_ij, symmetric_ijk, symmetric_jk, symmetric_none, &
         symmetrik_ik
-   USE t_c_g0,                          ONLY: get_lmax_init,&
-                                              init
+   USE r12_fundamentals,                ONLY: r12_fundamentals_init
    USE util,                            ONLY: get_limit
 
 !$ USE OMP_LIB, ONLY: omp_get_max_threads, omp_get_thread_num
@@ -144,7 +138,7 @@ CONTAINS
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: ij_list
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       CHARACTER(LEN=*), INTENT(IN)                       :: name
       TYPE(qs_environment_type), POINTER                 :: qs_env
       LOGICAL, INTENT(IN), OPTIONAL                      :: sym_ij, molecular
@@ -280,7 +274,7 @@ CONTAINS
       TYPE(neighbor_list_3c_type), INTENT(OUT)           :: ijk_list
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j, basis_k
       TYPE(distribution_3d_type), INTENT(IN)             :: dist_3d
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       CHARACTER(LEN=*), INTENT(IN)                       :: name
       TYPE(qs_environment_type), POINTER                 :: qs_env
       LOGICAL, INTENT(IN), OPTIONAL                      :: sym_ij, sym_jk, sym_ik, molecular
@@ -290,7 +284,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'build_3c_neighbor_lists'
 
       INTEGER                                            :: handle, op_pos_prv, sym_level
-      TYPE(libint_potential_type)                        :: pot_par_1, pot_par_2
+      TYPE(coulomb_operator_type)                        :: pot_par_1, pot_par_2
 
       CALL timeset(routineN, handle)
 
@@ -414,6 +408,9 @@ CONTAINS
       iterator%bounds_j = 0
       iterator%bounds_k = 0
 
+      iterator%ipair = -1
+      iterator%my_pair = -1
+
       CALL timestop(handle)
    END SUBROUTINE neighbor_list_3c_iterator_create
 
@@ -459,84 +456,93 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Iterate 3c-nl iterator
 !> \param iterator ...
+!> \param next_pair counter shared by the threads that iterate the same list: each takes the next
+!>        untaken (i,j) pair (within the bounds) and only then iterates its k
 !> \return 0 if successful; 1 if end was reached
 ! **************************************************************************************************
-   RECURSIVE FUNCTION neighbor_list_3c_iterate(iterator) RESULT(iter_stat)
+   FUNCTION neighbor_list_3c_iterate(iterator, next_pair) RESULT(iter_stat)
       TYPE(neighbor_list_3c_iterator_type), &
          INTENT(INOUT)                                   :: iterator
+      INTEGER, INTENT(INOUT), OPTIONAL                   :: next_pair
       INTEGER                                            :: iter_stat
 
-      INTEGER                                            :: iatom, iter_level, jatom, jatom_1, &
-                                                            jatom_2, katom
-      LOGICAL                                            :: skip_this
+      INTEGER                                            :: iatom, jatom, jatom_1, jatom_2, katom
+      LOGICAL                                            :: found, skip_this
 
-      iter_level = iterator%iter_level
+      ! skipped entries are a loop (not a recursion): the stack does not grow with their number
+      found = .FALSE.
+      iter_stat = 0
+      DO WHILE (.NOT. found .AND. iter_stat == 0)
+         skip_this = .FALSE.
 
-      IF (iter_level == 0) THEN
-         iter_stat = neighbor_list_iterate(iterator%iter_ij)
+         IF (iterator%iter_level == 0) THEN
+            iter_stat = neighbor_list_iterate(iterator%iter_ij)
 
-         IF (iter_stat /= 0) THEN
-            RETURN
+            IF (iter_stat == 0) THEN
+               CALL get_iterator_info(iterator%iter_ij, iatom=iatom, jatom=jatom)
+               IF ((iterator%bounds_i(1) > 0 .AND. iatom < iterator%bounds_i(1)) &
+                   .OR. (iterator%bounds_i(2) > 0 .AND. iatom > iterator%bounds_i(2))) skip_this = .TRUE.
+               IF ((iterator%bounds_j(1) > 0 .AND. jatom < iterator%bounds_j(1)) &
+                   .OR. (iterator%bounds_j(2) > 0 .AND. jatom > iterator%bounds_j(2))) skip_this = .TRUE.
+
+               IF (PRESENT(next_pair) .AND. .NOT. skip_this) THEN
+                  IF (iterator%my_pair < 0) THEN ! first ticket
+!$OMP ATOMIC CAPTURE
+                     iterator%my_pair = next_pair
+                     next_pair = next_pair + 1
+!$OMP END ATOMIC
+                  END IF
+                  iterator%ipair = iterator%ipair + 1
+                  IF (iterator%ipair == iterator%my_pair) THEN ! take this pair, and a ticket for later
+!$OMP ATOMIC CAPTURE
+                     iterator%my_pair = next_pair
+                     next_pair = next_pair + 1
+!$OMP END ATOMIC
+                  ELSE
+                     skip_this = .TRUE.
+                  END IF
+               END IF
+            END IF
          END IF
 
-         CALL get_iterator_info(iterator%iter_ij, iatom=iatom, jatom=jatom)
-         skip_this = .FALSE.
-         IF ((iterator%bounds_i(1) > 0 .AND. iatom < iterator%bounds_i(1)) &
-             .OR. (iterator%bounds_i(2) > 0 .AND. iatom > iterator%bounds_i(2))) skip_this = .TRUE.
-         IF ((iterator%bounds_j(1) > 0 .AND. jatom < iterator%bounds_j(1)) &
-             .OR. (iterator%bounds_j(2) > 0 .AND. jatom > iterator%bounds_j(2))) skip_this = .TRUE.
+         IF (iter_stat == 0 .AND. .NOT. skip_this) THEN
+            iter_stat = nl_sub_iterate(iterator%iter_jk, iterator%iter_ij)
+            IF (iter_stat /= 0) THEN ! no further k for this pair: next pair
+               iterator%iter_level = 0
+               iter_stat = 0
+            ELSE
+               iterator%iter_level = 1
 
-         IF (skip_this) THEN
-            iter_stat = neighbor_list_3c_iterate(iterator)
-            RETURN
+               CALL get_iterator_info(iterator%iter_ij, iatom=iatom, jatom=jatom_1)
+               CALL get_iterator_info(iterator%iter_jk, iatom=jatom_2, jatom=katom)
+
+               CPASSERT(jatom_1 == jatom_2)
+               jatom = jatom_1
+
+               IF ((iterator%bounds_k(1) > 0 .AND. katom < iterator%bounds_k(1)) &
+                   .OR. (iterator%bounds_k(2) > 0 .AND. katom > iterator%bounds_k(2))) skip_this = .TRUE.
+
+               IF (.NOT. skip_this) THEN
+                  SELECT CASE (iterator%ijk_nl%sym)
+                  CASE (symmetric_none)
+                     skip_this = .FALSE.
+                  CASE (symmetric_ij)
+                     skip_this = .NOT. include_symmetric(iatom, jatom)
+                  CASE (symmetric_jk)
+                     skip_this = .NOT. include_symmetric(jatom, katom)
+                  CASE (symmetrik_ik)
+                     skip_this = .NOT. include_symmetric(iatom, katom)
+                  CASE (symmetric_ijk)
+                     skip_this = .NOT. include_symmetric(iatom, jatom) .OR. .NOT. include_symmetric(jatom, katom)
+                  CASE DEFAULT
+                     CPABORT("should not happen")
+                  END SELECT
+               END IF
+
+               found = .NOT. skip_this
+            END IF
          END IF
-      END IF
-
-      iter_stat = nl_sub_iterate(iterator%iter_jk, iterator%iter_ij)
-      IF (iter_stat /= 0) THEN
-         iterator%iter_level = 0
-         iter_stat = neighbor_list_3c_iterate(iterator)
-         RETURN
-      ELSE
-         iterator%iter_level = 1
-      END IF
-
-      CPASSERT(iter_stat == 0)
-      CPASSERT(iterator%iter_level == 1)
-      CALL get_iterator_info(iterator%iter_ij, iatom=iatom, jatom=jatom_1)
-      CALL get_iterator_info(iterator%iter_jk, iatom=jatom_2, jatom=katom)
-
-      CPASSERT(jatom_1 == jatom_2)
-      jatom = jatom_1
-
-      skip_this = .FALSE.
-      IF ((iterator%bounds_k(1) > 0 .AND. katom < iterator%bounds_k(1)) &
-          .OR. (iterator%bounds_k(2) > 0 .AND. katom > iterator%bounds_k(2))) skip_this = .TRUE.
-
-      IF (skip_this) THEN
-         iter_stat = neighbor_list_3c_iterate(iterator)
-         RETURN
-      END IF
-
-      SELECT CASE (iterator%ijk_nl%sym)
-      CASE (symmetric_none)
-         skip_this = .FALSE.
-      CASE (symmetric_ij)
-         skip_this = .NOT. include_symmetric(iatom, jatom)
-      CASE (symmetric_jk)
-         skip_this = .NOT. include_symmetric(jatom, katom)
-      CASE (symmetrik_ik)
-         skip_this = .NOT. include_symmetric(iatom, katom)
-      CASE (symmetric_ijk)
-         skip_this = .NOT. include_symmetric(iatom, jatom) .OR. .NOT. include_symmetric(jatom, katom)
-      CASE DEFAULT
-         CPABORT("should not happen")
-      END SELECT
-
-      IF (skip_this) THEN
-         iter_stat = neighbor_list_3c_iterate(iterator)
-         RETURN
-      END IF
+      END DO
 
    END FUNCTION neighbor_list_3c_iterate
 
@@ -627,7 +633,7 @@ CONTAINS
       TYPE(neighbor_list_3c_type), INTENT(INOUT)         :: nl_3c
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j, basis_k
       TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       INTEGER, INTENT(IN), OPTIONAL                      :: op_pos
       LOGICAL, INTENT(IN), OPTIONAL                      :: do_kpoints, do_hfx_kpoints
       INTEGER, DIMENSION(2), INTENT(IN), OPTIONAL        :: bounds_i, bounds_j, bounds_k
@@ -713,7 +719,7 @@ CONTAINS
           .OR. op_ij == do_potential_mix_cl_trunc) THEN
          dr_ij = potential_parameter%cutoff_radius*cutoff_screen_factor
          dr_ik = potential_parameter%cutoff_radius*cutoff_screen_factor
-      ELSEIF (op_ij == do_potential_coulomb) THEN
+      ELSE IF (op_ij == do_potential_coulomb) THEN
          dr_ij = 1000000.0_dp
          dr_ik = 1000000.0_dp
       END IF
@@ -722,7 +728,7 @@ CONTAINS
           .OR. op_jk == do_potential_mix_cl_trunc) THEN
          dr_jk = potential_parameter%cutoff_radius*cutoff_screen_factor
          dr_ik = potential_parameter%cutoff_radius*cutoff_screen_factor
-      ELSEIF (op_jk == do_potential_coulomb) THEN
+      ELSE IF (op_jk == do_potential_coulomb) THEN
          dr_jk = 1000000.0_dp
          dr_ik = 1000000.0_dp
       END IF
@@ -929,7 +935,7 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(neighbor_list_3c_type), INTENT(INOUT)         :: nl_3c
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j, basis_k
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: der_eps
       INTEGER, INTENT(IN), OPTIONAL                      :: op_pos
       LOGICAL, INTENT(IN), OPTIONAL                      :: do_kpoints, do_hfx_kpoints
@@ -943,8 +949,7 @@ CONTAINS
          block_start_k, egfi, handle, handle2, i, i_img, i_xyz, iatom, ibasis, ikind, ilist, imax, &
          iset, j_img, jatom, jcell, jkind, jset, katom, kcell, kkind, kset, m_max, max_ncoj, &
          max_nset, max_nsgfi, maxli, maxlj, maxlk, mepos, natom, nbasis, ncell_RI, ncoi, ncoj, &
-         ncok, nimg, nseti, nsetj, nsetk, nthread, op_ij, op_jk, op_pos_prv, sgfi, sgfj, sgfk, &
-         unit_id
+         ncok, nimg, nseti, nsetj, nsetk, nthread, op_ij, op_jk, op_pos_prv, sgfi, sgfj, sgfk
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: img_to_RI_cell_prv
       INTEGER, DIMENSION(2)                              :: bo
       INTEGER, DIMENSION(3)                              :: blk_idx, blk_size, cell_j, cell_k, &
@@ -973,8 +978,8 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: rpgf_i, rpgf_j, rpgf_k, sphi_i, sphi_j, &
                                                             sphi_k, zeti, zetj, zetk
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
+      TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(cp_2d_r_p_type), DIMENSION(:, :), POINTER     :: spi, spk, tspj
-      TYPE(cp_libint_t)                                  :: lib
       TYPE(dbt_type)                                     :: t3c_tmp
       TYPE(dbt_type), ALLOCATABLE, DIMENSION(:, :)       :: t3c_template
       TYPE(dbt_type), ALLOCATABLE, DIMENSION(:, :, :)    :: t3c_der_j
@@ -1030,7 +1035,7 @@ CONTAINS
           .OR. op_ij == do_potential_mix_cl_trunc) THEN
          dr_ij = potential_parameter%cutoff_radius*cutoff_screen_factor
          dr_ik = potential_parameter%cutoff_radius*cutoff_screen_factor
-      ELSEIF (op_ij == do_potential_coulomb) THEN
+      ELSE IF (op_ij == do_potential_coulomb) THEN
          dr_ij = 1000000.0_dp
          dr_ik = 1000000.0_dp
       END IF
@@ -1039,7 +1044,7 @@ CONTAINS
           .OR. op_jk == do_potential_mix_cl_trunc) THEN
          dr_jk = potential_parameter%cutoff_radius*cutoff_screen_factor
          dr_ik = potential_parameter%cutoff_radius*cutoff_screen_factor
-      ELSEIF (op_jk == do_potential_coulomb) THEN
+      ELSE IF (op_jk == do_potential_coulomb) THEN
          dr_jk = 1000000.0_dp
          dr_ik = 1000000.0_dp
       END IF
@@ -1181,22 +1186,7 @@ CONTAINS
          END DO !ibasis
       END DO !ilist
 
-      !Init the truncated Coulomb operator
-      IF (op_ij == do_potential_truncated .OR. op_jk == do_potential_truncated .OR. &
-          op_ij == do_potential_mix_cl_trunc .OR. op_jk == do_potential_mix_cl_trunc) THEN
-
-         IF (m_max > get_lmax_init()) THEN
-            IF (para_env%mepos == 0) THEN
-               CALL open_file(unit_number=unit_id, file_name=potential_parameter%filename)
-            END IF
-            CALL init(m_max, unit_id, para_env%mepos, para_env)
-            IF (para_env%mepos == 0) THEN
-               CALL close_file(unit_id)
-            END IF
-         END IF
-      END IF
-
-      CALL init_md_ftable(nmax=m_max)
+      CALL r12_fundamentals_init(m_max, potential_parameter, para_env)
 
       IF (do_kpoints_prv) THEN
          kp_index_lbounds = LBOUND(cell_to_index)
@@ -1211,7 +1201,7 @@ CONTAINS
 !$OMP         bounds_j,bounds_k,nimg,basis_i,basis_j,basis_k,dr_ij,dr_jk,dr_ik,ncoset,op_pos_prv,&
 !$OMP         potential_parameter,der_eps,tspj,spi,spk,cell_to_index,RI_range,natom,nl_3c,&
 !$OMP         t3c_der_i,t3c_der_k,t3c_der_j,ncell_RI,img_to_RI_cell_prv,do_hfx_kpoints_prv) &
-!$OMP PRIVATE (lib,nl_3c_iter,ikind,jkind,kkind,iatom,jatom,katom,rij,rjk,rik,cell_j,cell_k,&
+!$OMP PRIVATE (integral_context,nl_3c_iter,ikind,jkind,kkind,iatom,jatom,katom,rij,rjk,rik,cell_j,cell_k,&
 !$OMP          prefac,jcell,kcell,first_sgf_i,lmax_i,lmin_i,npgfi,nseti,nsgfi,rpgf_i,set_radius_i,&
 !$OMP          sphi_i,zeti,kind_radius_i,first_sgf_j,lmax_j,lmin_j,npgfj,nsetj,nsgfj,rpgf_j,&
 !$OMP          set_radius_j,sphi_j,zetj,kind_radius_j,first_sgf_k,lmax_k,lmin_k,npgfk,nsetk,nsgfk,&
@@ -1225,8 +1215,9 @@ CONTAINS
       mepos = 0
 !$    mepos = omp_get_thread_num()
 
-      CALL cp_libint_init_3eri1(lib, MAX(maxli, maxlj, maxlk))
-      CALL cp_libint_set_contrdepth(lib, 1)
+      integral_context = coulomb_integral_context_type()
+      CALL coulomb_integral_init(integral_context, max_am_3c=MAX(maxli, maxlj, maxlk), &
+                                 derivative_order=1, library=library_libint)
       CALL neighbor_list_3c_iterator_create(nl_3c_iter, nl_3c)
 
       !We split the provided bounds among the threads such that each threads works on a different set of atoms
@@ -1262,7 +1253,7 @@ CONTAINS
 
          IF (do_kpoints_prv) THEN
             prefac = 0.5_dp
-         ELSEIF (nl_3c%sym == symmetric_jk) THEN
+         ELSE IF (nl_3c%sym == symmetric_jk) THEN
             IF (jatom == katom) THEN
                prefac = 0.5_dp
             ELSE
@@ -1378,22 +1369,22 @@ CONTAINS
                      rk = rik ! ri + rik
 
                      IF (op_pos_prv == 1) THEN
-                        CALL eri_3center_derivs(dijk_j, dijk_k, &
-                                                lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), rpgf_j(:, jset), rj, &
-                                                lmin_k(kset), lmax_k(kset), npgfk(kset), zetk(:, kset), rpgf_k(:, kset), rk, &
-                                                lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), rpgf_i(:, iset), ri, &
-                                                djk, dij, dik, lib, potential_parameter, &
-                                                der_abc_1_ext=der_ext_j, der_abc_2_ext=der_ext_k)
+                        CALL compute_coulomb_3c_derivs(dijk_j, dijk_k, &
+                                                      lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), rpgf_j(:, jset), rj, &
+                                                      lmin_k(kset), lmax_k(kset), npgfk(kset), zetk(:, kset), rpgf_k(:, kset), rk, &
+                                                      lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), rpgf_i(:, iset), ri, &
+                                                       djk, dij, dik, integral_context, potential_parameter, &
+                                                       der_abc_1_ext=der_ext_j, der_abc_2_ext=der_ext_k)
                      ELSE
                         ALLOCATE (tmp_ijk_i(ncoi, ncoj, ncok, 3), SOURCE=0.0_dp)
                         ALLOCATE (tmp_ijk_j(ncoi, ncoj, ncok, 3), SOURCE=0.0_dp)
 
-                        CALL eri_3center_derivs(tmp_ijk_i, tmp_ijk_j, &
-                                                lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), rpgf_i(:, iset), ri, &
-                                                lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), rpgf_j(:, jset), rj, &
-                                                lmin_k(kset), lmax_k(kset), npgfk(kset), zetk(:, kset), rpgf_k(:, kset), rk, &
-                                                dij, dik, djk, lib, potential_parameter, &
-                                                der_abc_1_ext=der_ext_i, der_abc_2_ext=der_ext_j)
+                        CALL compute_coulomb_3c_derivs(tmp_ijk_i, tmp_ijk_j, &
+                                                      lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), rpgf_i(:, iset), ri, &
+                                                      lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), rpgf_j(:, jset), rj, &
+                                                      lmin_k(kset), lmax_k(kset), npgfk(kset), zetk(:, kset), rpgf_k(:, kset), rk, &
+                                                       dij, dik, djk, integral_context, potential_parameter, &
+                                                       der_abc_1_ext=der_ext_i, der_abc_2_ext=der_ext_j)
 
                         !TODO: is that inefficient?
                         der_ext_k = 0
@@ -1533,7 +1524,7 @@ CONTAINS
       IF (ALLOCATED(ccp_buffer)) DEALLOCATE (ccp_buffer)
       IF (ALLOCATED(cpp_buffer)) DEALLOCATE (cpp_buffer)
 
-      CALL cp_libint_cleanup_3eri1(lib)
+      CALL coulomb_integral_cleanup(integral_context)
       CALL neighbor_list_3c_iterator_destroy(nl_3c_iter)
 !$OMP END PARALLEL
 
@@ -1548,7 +1539,7 @@ CONTAINS
             END DO
          END DO
 
-      ELSEIF (nl_3c%sym == symmetric_jk) THEN
+      ELSE IF (nl_3c%sym == symmetric_jk) THEN
          !Add the transpose of t3c_der_j to t3c_der_k to get the fully populated tensor
          CALL dbt_create(t3c_der_k(1, 1, 1), t3c_tmp)
          DO i_xyz = 1, 3
@@ -1567,7 +1558,7 @@ CONTAINS
          END DO
          CALL dbt_destroy(t3c_tmp)
 
-      ELSEIF (nl_3c%sym == symmetric_none) THEN
+      ELSE IF (nl_3c%sym == symmetric_none) THEN
          DO i_xyz = 1, 3
             DO kcell = 1, ncell_RI
                DO jcell = 1, nimg
@@ -1630,7 +1621,7 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(neighbor_list_3c_type), INTENT(INOUT)         :: nl_3c
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j, basis_k
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: der_eps
       INTEGER, INTENT(IN), OPTIONAL                      :: op_pos
 
@@ -1640,7 +1631,7 @@ CONTAINS
          block_start_k, egfi, handle, i, i_xyz, iatom, ibasis, ikind, ilist, imax, iset, j_xyz, &
          jatom, jkind, jset, katom, kkind, kset, m_max, max_ncoj, max_nset, max_nsgfi, maxli, &
          maxlj, maxlk, mepos, natom, nbasis, ncoi, ncoj, ncok, nseti, nsetj, nsetk, nthread, &
-         op_ij, op_jk, op_pos_prv, sgfi, sgfj, sgfk, unit_id
+         op_ij, op_jk, op_pos_prv, sgfi, sgfj, sgfk
       INTEGER, DIMENSION(2)                              :: bo
       INTEGER, DIMENSION(3)                              :: blk_size, sp
       INTEGER, DIMENSION(:), POINTER                     :: lmax_i, lmax_j, lmax_k, lmin_i, lmin_j, &
@@ -1667,8 +1658,8 @@ CONTAINS
                                                             sphi_k, zeti, zetj, zetk
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
+      TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(cp_2d_r_p_type), DIMENSION(:, :), POINTER     :: spi, spk, tspj
-      TYPE(cp_libint_t)                                  :: lib
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_type), POINTER                  :: basis_set
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -1701,7 +1692,7 @@ CONTAINS
           .OR. op_ij == do_potential_mix_cl_trunc) THEN
          dr_ij = potential_parameter%cutoff_radius*cutoff_screen_factor
          dr_ik = potential_parameter%cutoff_radius*cutoff_screen_factor
-      ELSEIF (op_ij == do_potential_coulomb) THEN
+      ELSE IF (op_ij == do_potential_coulomb) THEN
          dr_ij = 1000000.0_dp
          dr_ik = 1000000.0_dp
       END IF
@@ -1710,7 +1701,7 @@ CONTAINS
           .OR. op_jk == do_potential_mix_cl_trunc) THEN
          dr_jk = potential_parameter%cutoff_radius*cutoff_screen_factor
          dr_ik = potential_parameter%cutoff_radius*cutoff_screen_factor
-      ELSEIF (op_jk == do_potential_coulomb) THEN
+      ELSE IF (op_jk == do_potential_coulomb) THEN
          dr_jk = 1000000.0_dp
          dr_ik = 1000000.0_dp
       END IF
@@ -1796,22 +1787,7 @@ CONTAINS
          END DO !ibasis
       END DO !ilist
 
-      !Init the truncated Coulomb operator
-      IF (op_ij == do_potential_truncated .OR. op_jk == do_potential_truncated .OR. &
-          op_ij == do_potential_mix_cl_trunc .OR. op_jk == do_potential_mix_cl_trunc) THEN
-
-         IF (m_max > get_lmax_init()) THEN
-            IF (para_env%mepos == 0) THEN
-               CALL open_file(unit_number=unit_id, file_name=potential_parameter%filename)
-            END IF
-            CALL init(m_max, unit_id, para_env%mepos, para_env)
-            IF (para_env%mepos == 0) THEN
-               CALL close_file(unit_id)
-            END IF
-         END IF
-      END IF
-
-      CALL init_md_ftable(nmax=m_max)
+      CALL r12_fundamentals_init(m_max, potential_parameter, para_env)
 
       nthread = 1
 !$    nthread = omp_get_max_threads()
@@ -1819,7 +1795,7 @@ CONTAINS
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED (nthread,maxli,maxlk,maxlj,work_virial,pref,basis_i,basis_j,basis_k,dr_ij,dr_jk,dr_ik,&
 !$OMP         ncoset,potential_parameter,der_eps,tspj,spi,spk,natom,nl_3c,t3c_trace,cell,particle_set) &
-!$OMP PRIVATE (lib,nl_3c_iter,ikind,jkind,kkind,iatom,jatom,katom,rij,rjk,rik,i_xyz,j_xyz,first_sgf_i,&
+!$OMP PRIVATE (integral_context,nl_3c_iter,ikind,jkind,kkind,iatom,jatom,katom,rij,rjk,rik,i_xyz,j_xyz,first_sgf_i,&
 !$OMP          lmax_i,lmin_i,npgfi,nseti,nsgfi,rpgf_i,set_radius_i,sphi_i,zeti,kind_radius_i,first_sgf_j,&
 !$OMP          lmax_j,lmin_j,npgfj,nsetj,nsgfj,rpgf_j,set_radius_j,sphi_j,zetj,kind_radius_j,first_sgf_k,&
 !$OMP          lmax_k,lmin_k,npgfk,nsetk,nsgfk,rpgf_k,set_radius_k,sphi_k,zetk,kind_radius_k,djk,dij,dik,&
@@ -1832,8 +1808,9 @@ CONTAINS
       mepos = 0
 !$    mepos = omp_get_thread_num()
 
-      CALL cp_libint_init_3eri1(lib, MAX(maxli, maxlj, maxlk))
-      CALL cp_libint_set_contrdepth(lib, 1)
+      integral_context = coulomb_integral_context_type()
+      CALL coulomb_integral_init(integral_context, max_am_3c=MAX(maxli, maxlj, maxlk), &
+                                 derivative_order=1, library=library_libint)
       CALL neighbor_list_3c_iterator_create(nl_3c_iter, nl_3c)
 
       !We split the provided bounds among the threads such that each threads works on a different set of atoms
@@ -1942,12 +1919,12 @@ CONTAINS
                      rj = rij ! ri + rij
                      rk = rik ! ri + rik
 
-                     CALL eri_3center_derivs(dijk_j, dijk_k, &
-                                             lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), rpgf_j(:, jset), rj, &
-                                             lmin_k(kset), lmax_k(kset), npgfk(kset), zetk(:, kset), rpgf_k(:, kset), rk, &
-                                             lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), rpgf_i(:, iset), ri, &
-                                             djk, dij, dik, lib, potential_parameter, &
-                                             der_abc_1_ext=der_ext_j, der_abc_2_ext=der_ext_k)
+                     CALL compute_coulomb_3c_derivs(dijk_j, dijk_k, &
+                                                    lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), rpgf_j(:, jset), rj, &
+                                                    lmin_k(kset), lmax_k(kset), npgfk(kset), zetk(:, kset), rpgf_k(:, kset), rk, &
+                                                    lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), rpgf_i(:, iset), ri, &
+                                                    djk, dij, dik, integral_context, potential_parameter, &
+                                                    der_abc_1_ext=der_ext_j, der_abc_2_ext=der_ext_k)
 
                      IF (PRESENT(der_eps)) THEN
                         DO i_xyz = 1, 3
@@ -2068,7 +2045,7 @@ CONTAINS
       IF (ALLOCATED(ccp_buffer)) DEALLOCATE (ccp_buffer)
       IF (ALLOCATED(cpp_buffer)) DEALLOCATE (cpp_buffer)
 
-      CALL cp_libint_cleanup_3eri1(lib)
+      CALL coulomb_integral_cleanup(integral_context)
       CALL neighbor_list_3c_iterator_destroy(nl_3c_iter)
 !$OMP END PARALLEL
 
@@ -2125,7 +2102,7 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(neighbor_list_3c_type), INTENT(INOUT)         :: nl_3c
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j, basis_k
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: int_eps
       INTEGER, INTENT(IN), OPTIONAL                      :: op_pos
       LOGICAL, INTENT(IN), OPTIONAL                      :: do_kpoints, do_hfx_kpoints, &
@@ -2138,12 +2115,11 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_3c_integrals'
 
       INTEGER :: block_end_i, block_end_j, block_end_k, block_start_i, block_start_j, &
-         block_start_k, egfi, handle, handle2, i, iatom, ibasis, ikind, ilist, imax, iset, jatom, &
-         jcell, jkind, jset, katom, kcell, kkind, kset, m_max, max_ncoj, max_nset, max_nsgfi, &
-         maxli, maxlj, maxlk, mepos, natom, nbasis, ncell_RI, ncoi, ncoj, ncok, nimg, nseti, &
-         nsetj, nsetk, nthread, op_ij, op_jk, op_pos_prv, sgfi, sgfj, sgfk, unit_id
+         block_start_k, eg_local, handle, handle2, i, iatom, ibasis, ikind, ilist, imax, iset, &
+         jatom, jcell, jkind, jset, katom, kcell, kkind, kset, m_max, max_ncoj, max_nset, &
+         max_nsgfi, maxli, maxlj, maxlk, natom, nbasis, ncell_RI, ncoi, ncoj, ncok, next_pair, &
+         nimg, nseti, nsetj, nsetk, nsgf, op_ij, op_jk, op_pos_prv, sg_local, sgfi, sgfj, sgfk
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: img_to_RI_cell_prv
-      INTEGER, DIMENSION(2)                              :: bo
       INTEGER, DIMENSION(3)                              :: blk_idx, blk_size, cell_j, cell_k, &
                                                             kp_index_lbounds, kp_index_ubounds, sp
       INTEGER, DIMENSION(:), POINTER                     :: lmax_i, lmax_j, lmax_k, lmin_i, lmin_j, &
@@ -2153,13 +2129,13 @@ CONTAINS
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: block_not_zero, cell_sym_prv, debug, &
                                                             desymmetrize_prv, do_hfx_kpoints_prv, &
-                                                            do_kpoints_prv, found, skip
-      REAL(KIND=dp)                                      :: dij, dik, djk, dr_ij, dr_ik, dr_jk, &
-                                                            kind_radius_i, kind_radius_j, &
-                                                            kind_radius_k, max_contraction_i, &
-                                                            prefac, sijk_ext
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: ccp_buffer, cpp_buffer, &
-                                                            max_contraction_j, max_contraction_k
+                                                            do_kpoints_prv, found
+      REAL(KIND=dp) :: dij, dik, djk, dr_ij, dr_ik, dr_jk, kind_radius_i, kind_radius_j, &
+         kind_radius_k, max_contraction_i, max_contraction_j, max_contraction_k, prefac, sijk_ext
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: ccp_buffer, cpp_buffer
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         TARGET                                          :: max_sphi_norm_i, max_sphi_norm_j, &
+                                                            max_sphi_norm_k
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: block_t, dummy_block_t, sijk, &
                                                             sijk_contr, tmp_ijk
       REAL(KIND=dp), DIMENSION(1, 1, 1)                  :: counter
@@ -2167,10 +2143,12 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: set_radius_i, set_radius_j, set_radius_k
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: rpgf_i, rpgf_j, rpgf_k, sphi_i, sphi_j, &
                                                             sphi_k, zeti, zetj, zetk
+      REAL(KIND=dp), POINTER                             :: max_contr_i_ptr(:), max_contr_j_ptr(:), &
+                                                            max_contr_k_ptr(:)
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
+      TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(cp_2d_r_p_type), DIMENSION(:, :), POINTER     :: spi, spk, tspj
-      TYPE(cp_libint_t)                                  :: lib
       TYPE(dbt_type)                                     :: t_3c_tmp
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_type), POINTER                  :: basis_set
@@ -2238,7 +2216,7 @@ CONTAINS
           .OR. op_ij == do_potential_mix_cl_trunc) THEN
          dr_ij = potential_parameter%cutoff_radius*cutoff_screen_factor
          dr_ik = potential_parameter%cutoff_radius*cutoff_screen_factor
-      ELSEIF (op_ij == do_potential_coulomb) THEN
+      ELSE IF (op_ij == do_potential_coulomb) THEN
          dr_ij = 1000000.0_dp
          dr_ik = 1000000.0_dp
       END IF
@@ -2247,7 +2225,7 @@ CONTAINS
           .OR. op_jk == do_potential_mix_cl_trunc) THEN
          dr_jk = potential_parameter%cutoff_radius*cutoff_screen_factor
          dr_ik = potential_parameter%cutoff_radius*cutoff_screen_factor
-      ELSEIF (op_jk == do_potential_coulomb) THEN
+      ELSE IF (op_jk == do_potential_coulomb) THEN
          dr_jk = 1000000.0_dp
          dr_ik = 1000000.0_dp
       END IF
@@ -2324,6 +2302,7 @@ CONTAINS
       !contiguous sphi arrays (and transposed in the case of sphi_i)
 
       NULLIFY (tspj, spi, spk)
+      NULLIFY (max_contr_i_ptr, max_contr_j_ptr, max_contr_k_ptr)
       ALLOCATE (spi(max_nset, nbasis), tspj(max_nset, nbasis), spk(max_nset, nbasis))
 
       DO ibasis = 1, nbasis
@@ -2335,51 +2314,82 @@ CONTAINS
          END DO
       END DO
 
+      IF (PRESENT(int_eps)) THEN
+         ALLOCATE (max_sphi_norm_i(max_nset, nbasis), SOURCE=0.0_dp)
+         ALLOCATE (max_sphi_norm_j(max_nset, nbasis), SOURCE=0.0_dp)
+         ALLOCATE (max_sphi_norm_k(max_nset, nbasis), SOURCE=0.0_dp)
+      END IF
+
       DO ilist = 1, 3
          DO ibasis = 1, nbasis
-            IF (ilist == 1) basis_set => basis_i(ibasis)%gto_basis_set
-            IF (ilist == 2) basis_set => basis_j(ibasis)%gto_basis_set
-            IF (ilist == 3) basis_set => basis_k(ibasis)%gto_basis_set
+            SELECT CASE (ilist)
+            CASE (1)
+               basis_set => basis_i(ibasis)%gto_basis_set
+            CASE (2)
+               basis_set => basis_j(ibasis)%gto_basis_set
+            CASE (3)
+               basis_set => basis_k(ibasis)%gto_basis_set
+            END SELECT
 
             DO iset = 1, basis_set%nset
-
+               nsgf = basis_set%nsgf_set(iset)
                ncoi = basis_set%npgf(iset)*ncoset(basis_set%lmax(iset))
-               sgfi = basis_set%first_sgf(1, iset)
-               egfi = sgfi + basis_set%nsgf_set(iset) - 1
+               sg_local = basis_set%first_sgf(1, iset)
+               eg_local = sg_local + nsgf - 1
 
-               IF (ilist == 1) THEN
-                  ALLOCATE (spi(iset, ibasis)%array(ncoi, basis_set%nsgf_set(iset)))
-                  spi(iset, ibasis)%array(:, :) = basis_set%sphi(1:ncoi, sgfi:egfi)
-
-               ELSE IF (ilist == 2) THEN
-                  ALLOCATE (tspj(iset, ibasis)%array(basis_set%nsgf_set(iset), ncoi))
-                  tspj(iset, ibasis)%array(:, :) = TRANSPOSE(basis_set%sphi(1:ncoi, sgfi:egfi))
-
-               ELSE
-                  ALLOCATE (spk(iset, ibasis)%array(ncoi, basis_set%nsgf_set(iset)))
-                  spk(iset, ibasis)%array(:, :) = basis_set%sphi(1:ncoi, sgfi:egfi)
-               END IF
+               SELECT CASE (ilist)
+               CASE (1)
+                  ALLOCATE (spi(iset, ibasis)%array(ncoi, nsgf))
+                  IF (ncoi > 0 .AND. nsgf > 0) THEN
+                     spi(iset, ibasis)%array(:, :) = basis_set%sphi(1:ncoi, sg_local:eg_local)
+                  ELSE
+                     spi(iset, ibasis)%array(:, :) = 0.0_dp
+                  END IF
+                  IF (PRESENT(int_eps)) THEN
+                     IF (ncoi > 0 .AND. nsgf > 0) THEN
+                        max_sphi_norm_i(iset, ibasis) = MAXVAL(SUM(ABS(basis_set%sphi(1:ncoi, sg_local:eg_local)), &
+                                                                   DIM=1))
+                     ELSE
+                        max_sphi_norm_i(iset, ibasis) = 0.0_dp
+                     END IF
+                  END IF
+               CASE (2)
+                  ALLOCATE (tspj(iset, ibasis)%array(nsgf, ncoi))
+                  IF (ncoi > 0 .AND. nsgf > 0) THEN
+                     tspj(iset, ibasis)%array(:, :) = TRANSPOSE(basis_set%sphi(1:ncoi, sg_local:eg_local))
+                  ELSE
+                     tspj(iset, ibasis)%array(:, :) = 0.0_dp
+                  END IF
+                  IF (PRESENT(int_eps)) THEN
+                     IF (ncoi > 0 .AND. nsgf > 0) THEN
+                        max_sphi_norm_j(iset, ibasis) = MAXVAL(SUM(ABS(basis_set%sphi(1:ncoi, sg_local:eg_local)), &
+                                                                   DIM=1))
+                     ELSE
+                        max_sphi_norm_j(iset, ibasis) = 0.0_dp
+                     END IF
+                  END IF
+               CASE (3)
+                  ALLOCATE (spk(iset, ibasis)%array(ncoi, nsgf))
+                  IF (ncoi > 0 .AND. nsgf > 0) THEN
+                     spk(iset, ibasis)%array(:, :) = basis_set%sphi(1:ncoi, sg_local:eg_local)
+                  ELSE
+                     spk(iset, ibasis)%array(:, :) = 0.0_dp
+                  END IF
+                  IF (PRESENT(int_eps)) THEN
+                     IF (ncoi > 0 .AND. nsgf > 0) THEN
+                        max_sphi_norm_k(iset, ibasis) = MAXVAL(SUM(ABS(basis_set%sphi(1:ncoi, sg_local:eg_local)), &
+                                                                   DIM=1))
+                     ELSE
+                        max_sphi_norm_k(iset, ibasis) = 0.0_dp
+                     END IF
+                  END IF
+               END SELECT
 
             END DO !iset
          END DO !ibasis
       END DO !ilist
 
-      !Init the truncated Coulomb operator
-      IF (op_ij == do_potential_truncated .OR. op_jk == do_potential_truncated &
-          .OR. op_ij == do_potential_mix_cl_trunc .OR. op_jk == do_potential_mix_cl_trunc) THEN
-
-         IF (m_max > get_lmax_init()) THEN
-            IF (para_env%mepos == 0) THEN
-               CALL open_file(unit_number=unit_id, file_name=potential_parameter%filename)
-            END IF
-            CALL init(m_max, unit_id, para_env%mepos, para_env)
-            IF (para_env%mepos == 0) THEN
-               CALL close_file(unit_id)
-            END IF
-         END IF
-      END IF
-
-      CALL init_md_ftable(nmax=m_max)
+      CALL r12_fundamentals_init(m_max, potential_parameter, para_env)
 
       IF (do_kpoints_prv) THEN
          kp_index_lbounds = LBOUND(cell_to_index)
@@ -2387,17 +2397,15 @@ CONTAINS
       END IF
 
       counter = 1.0_dp
-
-      nthread = 1
-!$    nthread = omp_get_max_threads()
+      next_pair = 0
 
 !$OMP PARALLEL DEFAULT(NONE) &
-!$OMP SHARED (nthread,do_kpoints_prv,kp_index_lbounds,kp_index_ubounds,maxli,maxlk,maxlj,bounds_i,&
+!$OMP SHARED (next_pair,do_kpoints_prv,kp_index_lbounds,kp_index_ubounds,maxli,maxlk,maxlj,bounds_i,&
 !$OMP         bounds_j,bounds_k,nimg,basis_i,basis_j,basis_k,dr_ij,dr_jk,dr_ik,ncoset,&
 !$OMP         potential_parameter,int_eps,t3c,tspj,spi,spk,debug,cell_to_index,&
 !$OMP         natom,nl_3c,cell,op_pos_prv,do_hfx_kpoints_prv,RI_range,ncell_RI, &
-!$OMP         img_to_RI_cell_prv, cell_sym_prv) &
-!$OMP PRIVATE (lib,nl_3c_iter,ikind,jkind,kkind,iatom,jatom,katom,rij,rjk,rik,cell_j,cell_k,&
+!$OMP         img_to_RI_cell_prv, cell_sym_prv, max_sphi_norm_i, max_sphi_norm_j, max_sphi_norm_k) &
+!$OMP PRIVATE (integral_context,nl_3c_iter,ikind,jkind,kkind,iatom,jatom,katom,rij,rjk,rik,cell_j,cell_k,&
 !$OMP          prefac,jcell,kcell,first_sgf_i,lmax_i,lmin_i,npgfi,nseti,nsgfi,rpgf_i,set_radius_i,&
 !$OMP          sphi_i,zeti,kind_radius_i,first_sgf_j,lmax_j,lmin_j,npgfj,nsetj,nsgfj,rpgf_j,&
 !$OMP          set_radius_j,sphi_j,zetj,kind_radius_j,first_sgf_k,lmax_k,lmin_k,npgfk,nsetk,nsgfk,&
@@ -2405,42 +2413,22 @@ CONTAINS
 !$OMP          sgfk,sijk,ri,rj,rk,sijk_ext,block_not_zero,max_contraction_i,max_contraction_j,&
 !$OMP          max_contraction_k,iset,jset,kset,block_t,blk_size,sijk_contr,cpp_buffer,ccp_buffer,&
 !$OMP          block_start_j,block_end_j,block_start_k,block_end_k,block_start_i,block_end_i,found,&
-!$OMP          dummy_block_t,sp,handle2,mepos,bo,skip,tmp_ijk,i,blk_idx)
+!$OMP          dummy_block_t,sp,handle2,tmp_ijk,i,blk_idx,&
+!$OMP          max_contr_i_ptr, max_contr_j_ptr, max_contr_k_ptr)
 
-      mepos = 0
-!$    mepos = omp_get_thread_num()
-
-      CALL cp_libint_init_3eri(lib, MAX(maxli, maxlj, maxlk))
-      CALL cp_libint_set_contrdepth(lib, 1)
+      integral_context = coulomb_integral_context_type()
+      CALL coulomb_integral_init(integral_context, max_am_3c=MAX(maxli, maxlj, maxlk), &
+                                 derivative_order=0, library=library_libint)
       CALL neighbor_list_3c_iterator_create(nl_3c_iter, nl_3c)
 
-      !We split the provided bounds among the threads such that each threads works on a different set of atoms
-      IF (PRESENT(bounds_i)) THEN
-         bo = get_limit(bounds_i(2) - bounds_i(1) + 1, nthread, mepos)
-         bo(:) = bo(:) + bounds_i(1) - 1
-         CALL nl_3c_iter_set_bounds(nl_3c_iter, bo, bounds_j, bounds_k)
-      ELSE IF (PRESENT(bounds_j)) THEN
+      ! the threads take the (i,j) pairs in turn (dynamic): a static split of the atoms leaves
+      ! threads idle when the triples per atom vary or are not local
+      CALL nl_3c_iter_set_bounds(nl_3c_iter, bounds_i, bounds_j, bounds_k)
 
-         bo = get_limit(bounds_j(2) - bounds_j(1) + 1, nthread, mepos)
-         bo(:) = bo(:) + bounds_j(1) - 1
-         CALL nl_3c_iter_set_bounds(nl_3c_iter, bounds_i, bo, bounds_k)
-      ELSE IF (PRESENT(bounds_k)) THEN
-         bo = get_limit(bounds_k(2) - bounds_k(1) + 1, nthread, mepos)
-         bo(:) = bo(:) + bounds_k(1) - 1
-         CALL nl_3c_iter_set_bounds(nl_3c_iter, bounds_i, bounds_j, bo)
-      ELSE
-         bo = get_limit(natom, nthread, mepos)
-         CALL nl_3c_iter_set_bounds(nl_3c_iter, bo, bounds_j, bounds_k)
-      END IF
-
-      skip = .FALSE.
-      IF (bo(1) > bo(2)) skip = .TRUE.
-
-      DO WHILE (neighbor_list_3c_iterate(nl_3c_iter) == 0)
+      DO WHILE (neighbor_list_3c_iterate(nl_3c_iter, next_pair) == 0)
          CALL get_3c_iterator_info(nl_3c_iter, ikind=ikind, jkind=jkind, kkind=kkind, &
                                    iatom=iatom, jatom=jatom, katom=katom, &
                                    rij=rij, rjk=rjk, rik=rik, cell_j=cell_j, cell_k=cell_k)
-         IF (skip) EXIT
 
          djk = NORM2(rjk)
          dij = NORM2(rij)
@@ -2454,7 +2442,7 @@ CONTAINS
             ELSE
                prefac = 1.0_dp
             END IF
-         ELSEIF (nl_3c%sym == symmetric_ij) THEN
+         ELSE IF (nl_3c%sym == symmetric_ij) THEN
             IF (iatom == jatom) THEN
                ! factor 0.5 due to double-counting of diagonal blocks
                ! (we desymmetrize by adding transpose)
@@ -2468,7 +2456,6 @@ CONTAINS
          IF (do_kpoints_prv) prefac = 1.0_dp
 
          IF (do_kpoints_prv) THEN
-
             IF (ANY([cell_j(1), cell_j(2), cell_j(3)] < kp_index_lbounds) .OR. &
                 ANY([cell_j(1), cell_j(2), cell_j(3)] > kp_index_ubounds)) CYCLE
 
@@ -2512,17 +2499,10 @@ CONTAINS
          IF (kind_radius_k + kind_radius_i + dr_ik < dik) CYCLE
 
          IF (PRESENT(int_eps)) THEN
-            ALLOCATE (max_contraction_j(nsetj))
-            DO jset = 1, nsetj
-               sgfj = first_sgf_j(1, jset)
-               max_contraction_j(jset) = MAXVAL([(SUM(ABS(sphi_j(:, i))), i=sgfj, sgfj + nsgfj(jset) - 1)])
-            END DO
-
-            ALLOCATE (max_contraction_k(nsetk))
-            DO kset = 1, nsetk
-               sgfk = first_sgf_k(1, kset)
-               max_contraction_k(kset) = MAXVAL([(SUM(ABS(sphi_k(:, i))), i=sgfk, sgfk + nsgfk(kset) - 1)])
-            END DO
+            NULLIFY (max_contr_i_ptr, max_contr_j_ptr, max_contr_k_ptr)
+            IF (nseti > 0) max_contr_i_ptr => max_sphi_norm_i(1:nseti, ikind)
+            IF (nsetj > 0) max_contr_j_ptr => max_sphi_norm_j(1:nsetj, jkind)
+            IF (nsetk > 0) max_contr_k_ptr => max_sphi_norm_k(1:nsetk, kkind)
          END IF
 
          CALL dbt_blk_sizes(t3c(jcell, kcell), blk_idx, blk_size)
@@ -2533,14 +2513,12 @@ CONTAINS
          DO iset = 1, nseti
 
             sgfi = first_sgf_i(1, iset)
-            max_contraction_i = MAXVAL([(SUM(ABS(sphi_i(:, i))), i=sgfi, sgfi + nsgfi(iset) - 1)])
+            IF (PRESENT(int_eps)) max_contraction_i = max_contr_i_ptr(iset)
 
             DO jset = 1, nsetj
-
                IF (set_radius_j(jset) + set_radius_i(iset) + dr_ij < dij) CYCLE
 
                DO kset = 1, nsetk
-
                   IF (set_radius_j(jset) + set_radius_k(kset) + dr_jk < djk) CYCLE
                   IF (set_radius_k(kset) + set_radius_i(iset) + dr_ik < dik) CYCLE
 
@@ -2559,18 +2537,18 @@ CONTAINS
                   ALLOCATE (sijk(ncoj, ncok, ncoi))
                   IF (op_pos_prv == 1) THEN
                      sijk(:, :, :) = 0.0_dp
-                     CALL eri_3center(sijk, &
-                                      lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), rpgf_j(:, jset), rj, &
-                                      lmin_k(kset), lmax_k(kset), npgfk(kset), zetk(:, kset), rpgf_k(:, kset), rk, &
-                                      lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), rpgf_i(:, iset), ri, &
-                                      djk, dij, dik, lib, potential_parameter, int_abc_ext=sijk_ext)
+                     CALL compute_coulomb_3c(integral_context, lmin_j(jset), lmax_j(jset), lmin_k(kset), &
+                                             lmax_k(kset), lmin_i(iset), lmax_i(iset), npgfj(jset), npgfk(kset), npgfi(iset), &
+                                             zetj(:, jset), zetk(:, kset), zeti(:, iset), rpgf_j(:, jset), rpgf_k(:, kset), &
+                                             rpgf_i(:, iset), rj, rk, ri, sijk, potential_parameter, dab=djk, dac=dij, dbc=dik, &
+                                             int_abc_ext=sijk_ext)
                   ELSE
                      ALLOCATE (tmp_ijk(ncoi, ncoj, ncok), SOURCE=0.0_dp)
-                     CALL eri_3center(tmp_ijk, &
-                                      lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), rpgf_i(:, iset), ri, &
-                                      lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), rpgf_j(:, jset), rj, &
-                                      lmin_k(kset), lmax_k(kset), npgfk(kset), zetk(:, kset), rpgf_k(:, kset), rk, &
-                                      dij, dik, djk, lib, potential_parameter, int_abc_ext=sijk_ext)
+                     CALL compute_coulomb_3c(integral_context, lmin_i(iset), lmax_i(iset), lmin_j(jset), &
+                                             lmax_j(jset), lmin_k(kset), lmax_k(kset), npgfi(iset), npgfj(jset), npgfk(kset), &
+                                             zeti(:, iset), zetj(:, jset), zetk(:, kset), rpgf_i(:, iset), rpgf_j(:, jset), &
+                                             rpgf_k(:, kset), ri, rj, rk, tmp_ijk, potential_parameter, dab=dij, dac=dik, dbc=djk, &
+                                             int_abc_ext=sijk_ext)
 
                      !F08: sijk = RESHAPE(tmp_ijk, [ncoj, ncok, ncoi], ORDER=[2, 3, 1]) with sijk not allocated
                      DO i = 1, ncoi !TODO: revise/check for efficiency
@@ -2580,9 +2558,11 @@ CONTAINS
                   END IF
 
                   IF (PRESENT(int_eps)) THEN
+                     max_contraction_j = max_contr_j_ptr(jset)
+                     max_contraction_k = max_contr_k_ptr(kset)
                      IF (int_eps > sijk_ext*(max_contraction_i* &
-                                             max_contraction_j(jset)* &
-                                             max_contraction_k(kset))) THEN
+                                             max_contraction_j* &
+                                             max_contraction_k)) THEN
                         DEALLOCATE (sijk)
                         CYCLE
                      END IF
@@ -2640,15 +2620,12 @@ CONTAINS
          END IF
 
          DEALLOCATE (block_t)
-         IF (PRESENT(int_eps)) THEN
-            DEALLOCATE (max_contraction_j, max_contraction_k)
-         END IF
       END DO
 
       IF (ALLOCATED(ccp_buffer)) DEALLOCATE (ccp_buffer)
       IF (ALLOCATED(cpp_buffer)) DEALLOCATE (cpp_buffer)
 
-      CALL cp_libint_cleanup_3eri(lib)
+      CALL coulomb_integral_cleanup(integral_context)
       CALL neighbor_list_3c_iterator_destroy(nl_3c_iter)
 !$OMP END PARALLEL
 
@@ -2689,13 +2666,13 @@ CONTAINS
             END DO
             CALL dbt_destroy(t_3c_tmp)
          END IF
-      ELSEIF (nl_3c%sym == symmetric_ij) THEN
+      ELSE IF (nl_3c%sym == symmetric_ij) THEN
          DO kcell = 1, nimg
             DO jcell = 1, nimg
                CALL dbt_filter(t3c(jcell, kcell), filter_eps/2)
             END DO
          END DO
-      ELSEIF (nl_3c%sym == symmetric_none) THEN
+      ELSE IF (nl_3c%sym == symmetric_none) THEN
          DO kcell = 1, nimg
             DO jcell = 1, nimg
                CALL dbt_filter(t3c(jcell, kcell), filter_eps)
@@ -2704,6 +2681,10 @@ CONTAINS
       ELSE
          CPABORT("requested symmetric case not implemented")
       END IF
+
+      IF (ALLOCATED(max_sphi_norm_i)) DEALLOCATE (max_sphi_norm_i)
+      IF (ALLOCATED(max_sphi_norm_j)) DEALLOCATE (max_sphi_norm_j)
+      IF (ALLOCATED(max_sphi_norm_k)) DEALLOCATE (max_sphi_norm_k)
 
       DO ibasis = 1, nbasis
          DO iset = 1, max_nset
@@ -2739,14 +2720,13 @@ CONTAINS
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: nl_2c
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       LOGICAL, INTENT(IN), OPTIONAL                      :: do_kpoints
 
       CHARACTER(len=*), PARAMETER :: routineN = 'build_2c_derivatives'
 
       INTEGER :: handle, i_xyz, iatom, ibasis, icol, ikind, imax, img, irow, iset, jatom, jkind, &
-         jset, m_max, maxli, maxlj, natom, ncoi, ncoj, nimg, nseti, nsetj, op_prv, sgfi, sgfj, &
-         unit_id
+         jset, m_max, maxli, maxlj, natom, ncoi, ncoj, nimg, nseti, nsetj, op_prv, sgfi, sgfj
       INTEGER, DIMENSION(3)                              :: cell_j, kp_index_lbounds, &
                                                             kp_index_ubounds
       INTEGER, DIMENSION(:), POINTER                     :: lmax_i, lmax_j, lmin_i, lmin_j, npgfi, &
@@ -2764,7 +2744,7 @@ CONTAINS
                                                             zetj
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(block_p_type), DIMENSION(3)                   :: block_t
-      TYPE(cp_libint_t)                                  :: lib
+      TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -2835,24 +2815,10 @@ CONTAINS
 
       m_max = maxli + maxlj + 1
 
-      !Init the truncated Coulomb operator
-      IF (op_prv == do_potential_truncated .OR. op_prv == do_potential_mix_cl_trunc) THEN
+      CALL r12_fundamentals_init(m_max, potential_parameter, para_env)
 
-         IF (m_max > get_lmax_init()) THEN
-            IF (para_env%mepos == 0) THEN
-               CALL open_file(unit_number=unit_id, file_name=potential_parameter%filename)
-            END IF
-            CALL init(m_max, unit_id, para_env%mepos, para_env)
-            IF (para_env%mepos == 0) THEN
-               CALL close_file(unit_id)
-            END IF
-         END IF
-      END IF
-
-      CALL init_md_ftable(nmax=m_max)
-
-      CALL cp_libint_init_2eri1(lib, MAX(maxli, maxlj))
-      CALL cp_libint_set_contrdepth(lib, 1)
+      CALL coulomb_integral_init(integral_context, max_am_2c=MAX(maxli, maxlj), &
+                                 derivative_order=1, library=library_libint)
 
       CALL neighbor_list_iterator_create(nl_iterator, nl_2c)
       DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
@@ -2915,9 +2881,9 @@ CONTAINS
                   ri = 0.0_dp
                   rj = rij
 
-                  CALL eri_2center_derivs(dij, lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), &
-                                          rpgf_i(:, iset), ri, lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), &
-                                          rpgf_j(:, jset), rj, dab, lib, potential_parameter)
+                  CALL compute_coulomb_2c_derivs(dij, lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), &
+                                                 rpgf_i(:, iset), ri, lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), &
+                                                 rpgf_j(:, jset), rj, dab, integral_context, potential_parameter)
 
                   DO i_xyz = 1, 3
 
@@ -2947,7 +2913,7 @@ CONTAINS
          END DO
       END DO
 
-      CALL cp_libint_cleanup_2eri1(lib)
+      CALL coulomb_integral_cleanup(integral_context)
       CALL neighbor_list_iterator_release(nl_iterator)
 
       DO img = 1, nimg
@@ -2981,12 +2947,12 @@ CONTAINS
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: nl_2c
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'calc_2c_virial'
 
       INTEGER :: handle, i_xyz, iatom, ibasis, ikind, imax, iset, j_xyz, jatom, jkind, jset, &
-         m_max, maxli, maxlj, natom, ncoi, ncoj, nseti, nsetj, op_prv, sgfi, sgfj, unit_id
+         m_max, maxli, maxlj, natom, ncoi, ncoj, nseti, nsetj, op_prv, sgfi, sgfj
       INTEGER, DIMENSION(:), POINTER                     :: lmax_i, lmax_j, lmin_i, lmin_j, npgfi, &
                                                             npgfj, nsgfi, nsgfj
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgf_i, first_sgf_j
@@ -3002,7 +2968,7 @@ CONTAINS
                                                             zetj
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(cp_libint_t)                                  :: lib
+      TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_iterator_p_type), &
@@ -3039,24 +3005,10 @@ CONTAINS
 
       m_max = maxli + maxlj + 1
 
-      !Init the truncated Coulomb operator
-      IF (op_prv == do_potential_truncated .OR. op_prv == do_potential_mix_cl_trunc) THEN
+      CALL r12_fundamentals_init(m_max, potential_parameter, para_env)
 
-         IF (m_max > get_lmax_init()) THEN
-            IF (para_env%mepos == 0) THEN
-               CALL open_file(unit_number=unit_id, file_name=potential_parameter%filename)
-            END IF
-            CALL init(m_max, unit_id, para_env%mepos, para_env)
-            IF (para_env%mepos == 0) THEN
-               CALL close_file(unit_id)
-            END IF
-         END IF
-      END IF
-
-      CALL init_md_ftable(nmax=m_max)
-
-      CALL cp_libint_init_2eri1(lib, MAX(maxli, maxlj))
-      CALL cp_libint_set_contrdepth(lib, 1)
+      CALL coulomb_integral_init(integral_context, max_am_2c=MAX(maxli, maxlj), &
+                                 derivative_order=1, library=library_libint)
 
       CALL neighbor_list_iterator_create(nl_iterator, nl_2c)
       DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
@@ -3094,9 +3046,9 @@ CONTAINS
                   ri = 0.0_dp
                   rj = rij
 
-                  CALL eri_2center_derivs(dij, lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), &
-                                          rpgf_i(:, iset), ri, lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), &
-                                          rpgf_j(:, jset), rj, dab, lib, potential_parameter)
+                  CALL compute_coulomb_2c_derivs(dij, lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), &
+                                                 rpgf_i(:, iset), ri, lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), &
+                                                 rpgf_j(:, jset), rj, dab, integral_context, potential_parameter)
 
                   DO i_xyz = 1, 3
 
@@ -3128,7 +3080,7 @@ CONTAINS
       END DO
 
       CALL neighbor_list_iterator_release(nl_iterator)
-      CALL cp_libint_cleanup_2eri1(lib)
+      CALL coulomb_integral_cleanup(integral_context)
 
       CALL timestop(handle)
 
@@ -3160,7 +3112,7 @@ CONTAINS
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: nl_2c
       TYPE(gto_basis_set_p_type), DIMENSION(:)           :: basis_i, basis_j
-      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      TYPE(coulomb_operator_type), INTENT(IN)            :: potential_parameter
       LOGICAL, INTENT(IN), OPTIONAL                      :: do_kpoints, do_hfx_kpoints
       TYPE(kpoint_type), OPTIONAL, POINTER               :: ext_kpoints
       REAL(KIND=dp), OPTIONAL                            :: regularization_RI
@@ -3168,8 +3120,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'build_2c_integrals'
 
       INTEGER :: handle, i_diag, iatom, ibasis, icol, ikind, imax, img, irow, iset, jatom, jkind, &
-         jset, m_max, maxli, maxlj, natom, ncoi, ncoj, nimg, nseti, nsetj, op_prv, sgfi, sgfj, &
-         unit_id
+         jset, m_max, maxli, maxlj, natom, ncoi, ncoj, nimg, nseti, nsetj, op_prv, sgfi, sgfj
       INTEGER, DIMENSION(3)                              :: cell_j, kp_index_lbounds, &
                                                             kp_index_ubounds
       INTEGER, DIMENSION(:), POINTER                     :: lmax_i, lmax_j, lmin_i, lmin_j, npgfi, &
@@ -3187,7 +3138,7 @@ CONTAINS
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(block_p_type)                                 :: block_t
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(cp_libint_t)                                  :: lib
+      TYPE(coulomb_integral_context_type)                :: integral_context
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -3262,24 +3213,10 @@ CONTAINS
 
       m_max = maxli + maxlj
 
-      !Init the truncated Coulomb operator
-      IF (op_prv == do_potential_truncated .OR. op_prv == do_potential_mix_cl_trunc) THEN
+      CALL r12_fundamentals_init(m_max, potential_parameter, para_env)
 
-         IF (m_max > get_lmax_init()) THEN
-            IF (para_env%mepos == 0) THEN
-               CALL open_file(unit_number=unit_id, file_name=potential_parameter%filename)
-            END IF
-            CALL init(m_max, unit_id, para_env%mepos, para_env)
-            IF (para_env%mepos == 0) THEN
-               CALL close_file(unit_id)
-            END IF
-         END IF
-      END IF
-
-      CALL init_md_ftable(nmax=m_max)
-
-      CALL cp_libint_init_2eri(lib, MAX(maxli, maxlj))
-      CALL cp_libint_set_contrdepth(lib, 1)
+      CALL coulomb_integral_init(integral_context, max_am_2c=MAX(maxli, maxlj), &
+                                 derivative_order=0, library=library_libint)
 
       CALL neighbor_list_iterator_create(nl_iterator, nl_2c)
       DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
@@ -3340,9 +3277,9 @@ CONTAINS
                   ri = 0.0_dp
                   rj = rij
 
-                  CALL eri_2center(sij, lmin_i(iset), lmax_i(iset), npgfi(iset), zeti(:, iset), &
-                                   rpgf_i(:, iset), ri, lmin_j(jset), lmax_j(jset), npgfj(jset), zetj(:, jset), &
-                                   rpgf_j(:, jset), rj, dab, lib, potential_parameter)
+                  CALL compute_coulomb_2c(integral_context, lmin_i(iset), lmax_i(iset), lmin_j(jset), lmax_j(jset), &
+                                         npgfi(iset), npgfj(jset), zeti(:, iset), zetj(:, jset), rpgf_i(:, iset), rpgf_j(:, jset), &
+                                          ri, rj, sij, potential_parameter, dab=dab)
 
                   CALL ab_contract(sij_contr, sij, &
                                    sphi_i(:, sgfi:), sphi_j(:, sgfj:), &
@@ -3381,7 +3318,7 @@ CONTAINS
          END DO
       END DO
 
-      CALL cp_libint_cleanup_2eri(lib)
+      CALL coulomb_integral_cleanup(integral_context)
 
       CALL neighbor_list_iterator_release(nl_iterator)
       DO img = 1, nimg
@@ -3409,35 +3346,29 @@ CONTAINS
       REAL(dp), INTENT(IN)                               :: eps
       REAL(dp), INTENT(INOUT)                            :: memory
 
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compress_tensor'
+
       INTEGER                                            :: buffer_left, buffer_size, buffer_start, &
-                                                            i, iblk, memory_usage, nbits, nblk, &
-                                                            nints, offset, shared_offset
-      INTEGER(int_8)                                     :: estimate_to_store_int, &
-                                                            storage_counter_integrals
+                                                            handle, i, ibin, iblk, memory_usage, &
+                                                            nbins, nblk, nints, offset, &
+                                                            shared_offset
+      INTEGER(int_8)                                     :: storage_counter_integrals
       INTEGER, DIMENSION(3)                              :: ind
       LOGICAL                                            :: found
-      REAL(dp)                                           :: spherical_estimate
       REAL(dp), ALLOCATABLE, DIMENSION(:, :, :), TARGET  :: blk_data
       REAL(dp), DIMENSION(:), POINTER                    :: blk_data_1d
       TYPE(dbt_iterator_type)                            :: iter
-      TYPE(hfx_cache_type), DIMENSION(:), POINTER        :: integral_caches
-      TYPE(hfx_cache_type), POINTER                      :: maxval_cache
-      TYPE(hfx_container_type), DIMENSION(:), POINTER    :: integral_containers
-      TYPE(hfx_container_type), POINTER                  :: maxval_container
+      TYPE(hfx_container_type), POINTER                  :: integral_container
+      TYPE(hfx_real_cache_type)                          :: real_cache
+
+      CALL timeset(routineN, handle)
 
       CALL dealloc_containers(compressed, memory_usage)
-      CALL alloc_containers(compressed, 1)
-
-      maxval_container => compressed%maxval_container(1)
-      integral_containers => compressed%integral_containers(:, 1)
-
-      CALL hfx_init_container(maxval_container, memory_usage, .FALSE.)
-      DO i = 1, 64
-         CALL hfx_init_container(integral_containers(i), memory_usage, .FALSE.)
-      END DO
-
-      maxval_cache => compressed%maxval_cache(1)
-      integral_caches => compressed%integral_caches(:, 1)
+      ! one bin (independent stream) per thread lets decompress_tensor run in parallel
+      nbins = omp_get_max_threads()
+      ! Only containers (in the shape dealloc_containers expects): a bin uses its first container,
+      ! and its cache exists while a (de)compression runs, which keeps the fixed cost per bin low.
+      ALLOCATE (compressed%maxval_container(nbins), compressed%integral_containers(64, nbins))
 
       IF (ALLOCATED(blk_indices)) DEALLOCATE (blk_indices)
       ALLOCATE (blk_indices(dbt_get_num_blocks(tensor), 3))
@@ -3458,67 +3389,55 @@ CONTAINS
 !$OMP END PARALLEL
 
       ! Can not use the tensor iterator here because the order of the blocks is not guaranteed.
-      DO i = 1, SIZE(blk_indices, 1)
-         ind = blk_indices(i, :)
-         CALL dbt_get_block(tensor, ind, blk_data, found)
-         CPASSERT(found)
-         nints = SIZE(blk_data)
-         blk_data_1d(1:nints) => blk_data
-         spherical_estimate = MAXVAL(ABS(blk_data_1d))
-         IF (spherical_estimate == 0.0_dp) spherical_estimate = TINY(spherical_estimate)
-         estimate_to_store_int = EXPONENT(spherical_estimate)
-         estimate_to_store_int = MAX(estimate_to_store_int, -15_int_8)
+      nblk = SIZE(blk_indices, 1)
+      storage_counter_integrals = 0
+      ! values as they are, quantized and packed within eps (one stream per bin)
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(tensor,blk_indices,compressed,eps,nbins,nblk) &
+!$OMP PRIVATE(ibin,i,ind,blk_data,blk_data_1d,found,nints,buffer_left,buffer_size,buffer_start) &
+!$OMP PRIVATE(memory_usage,integral_container,real_cache) &
+!$OMP REDUCTION(+:storage_counter_integrals) SCHEDULE(STATIC,1)
+      DO ibin = 1, nbins
+         integral_container => compressed%integral_containers(1, ibin)
+         CALL hfx_init_container(integral_container, memory_usage, .FALSE.)
+         real_cache%element_counter = 1
 
-         CALL hfx_add_single_cache_element(estimate_to_store_int, 6, &
-                                           maxval_cache, maxval_container, memory_usage, &
-                                           .FALSE.)
+         DO i = (ibin - 1)*nblk/nbins + 1, ibin*nblk/nbins
+            ind = blk_indices(i, :)
+            CALL dbt_get_block(tensor, ind, blk_data, found)
+            CPASSERT(found)
+            nints = SIZE(blk_data)
+            blk_data_1d(1:nints) => blk_data
 
-         spherical_estimate = SET_EXPONENT(1.0_dp, estimate_to_store_int + 1)
+            buffer_left = nints
+            buffer_start = 1
 
-         nbits = EXPONENT(ANINT(spherical_estimate/eps)) + 1
-         IF (nbits > 64) THEN
-            CALL cp_abort(__LOCATION__, &
-                          "Overflow during tensor compression. Please use a larger EPS_FILTER or EPS_STORAGE_SCALING")
-         END IF
+            DO WHILE (buffer_left > 0)
+               buffer_size = MIN(buffer_left, cache_size)
+               CALL hfx_add_mult_real_elements(blk_data_1d(buffer_start:), buffer_size, real_cache, &
+                                               integral_container, eps, memory_usage, .FALSE.)
+               buffer_left = buffer_left - buffer_size
+               buffer_start = buffer_start + buffer_size
+            END DO
 
-         buffer_left = nints
-         buffer_start = 1
-
-         DO WHILE (buffer_left > 0)
-            buffer_size = MIN(buffer_left, cache_size)
-            CALL hfx_add_mult_cache_elements(blk_data_1d(buffer_start:), &
-                                             buffer_size, nbits, &
-                                             integral_caches(nbits), &
-                                             integral_containers(nbits), &
-                                             eps, 1.0_dp, &
-                                             memory_usage, &
-                                             .FALSE.)
-            buffer_left = buffer_left - buffer_size
-            buffer_start = buffer_start + buffer_size
+            NULLIFY (blk_data_1d); DEALLOCATE (blk_data)
          END DO
 
-         NULLIFY (blk_data_1d); DEALLOCATE (blk_data)
+         CALL hfx_flush_last_real_cache(real_cache, integral_container, eps, memory_usage, .FALSE.)
+
+         ! all of the bin (before the reset restarts memory_usage): the first node and the nodes added since
+         storage_counter_integrals = storage_counter_integrals + INT(memory_usage, int_8)*cache_size
+
+         CALL hfx_reset_real_cache_and_container(real_cache, integral_container, memory_usage, .FALSE.)
       END DO
+!$OMP END PARALLEL DO
 
       CALL dbt_clear(tensor)
 
-      storage_counter_integrals = memory_usage*cache_size
       memory = memory + REAL(storage_counter_integrals, dp)/1024/128
       !WRITE (UNIT=iw, FMT="((T3,A,T60,I21))") &
       !   "HFX_MEM_INFO| Total memory consumption ERI's RAM [MiB]:            ", memory
 
-      CALL hfx_flush_last_cache(6, maxval_cache, maxval_container, memory_usage, &
-                                .FALSE.)
-      DO i = 1, 64
-         CALL hfx_flush_last_cache(i, integral_caches(i), integral_containers(i), &
-                                   memory_usage, .FALSE.)
-      END DO
-
-      CALL hfx_reset_cache_and_container(maxval_cache, maxval_container, memory_usage, .FALSE.)
-      DO i = 1, 64
-         CALL hfx_reset_cache_and_container(integral_caches(i), integral_containers(i), &
-                                            memory_usage, .FALSE.)
-      END DO
+      CALL timestop(handle)
 
    END SUBROUTINE compress_tensor
 
@@ -3536,32 +3455,19 @@ CONTAINS
       TYPE(hfx_compression_type), INTENT(INOUT)          :: compressed
       REAL(dp), INTENT(IN)                               :: eps
 
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'decompress_tensor'
+
       INTEGER                                            :: A, b, buffer_left, buffer_size, &
-                                                            buffer_start, i, memory_usage, nbits, &
+                                                            buffer_start, handle, i, ibin, &
+                                                            memory_usage, nbins, nblk, &
                                                             nblk_per_thread, nints
-      INTEGER(int_8)                                     :: estimate_to_store_int
       INTEGER, DIMENSION(3)                              :: blk_size, ind
-      REAL(dp)                                           :: spherical_estimate
       REAL(dp), ALLOCATABLE, DIMENSION(:), TARGET        :: blk_data
       REAL(dp), DIMENSION(:, :, :), POINTER              :: blk_data_3d
-      TYPE(hfx_cache_type), DIMENSION(:), POINTER        :: integral_caches
-      TYPE(hfx_cache_type), POINTER                      :: maxval_cache
-      TYPE(hfx_container_type), DIMENSION(:), POINTER    :: integral_containers
-      TYPE(hfx_container_type), POINTER                  :: maxval_container
+      TYPE(hfx_container_type), POINTER                  :: integral_container
+      TYPE(hfx_real_cache_type)                          :: real_cache
 
-      maxval_cache => compressed%maxval_cache(1)
-      maxval_container => compressed%maxval_container(1)
-      integral_caches => compressed%integral_caches(:, 1)
-      integral_containers => compressed%integral_containers(:, 1)
-
-      memory_usage = 0
-
-      CALL hfx_decompress_first_cache(6, maxval_cache, maxval_container, memory_usage, .FALSE.)
-
-      DO i = 1, 64
-         CALL hfx_decompress_first_cache(i, integral_caches(i), integral_containers(i), &
-                                         memory_usage, .FALSE.)
-      END DO
+      CALL timeset(routineN, handle)
 
 !TODO: Parallelize creation of block list.
 !$OMP PARALLEL DEFAULT(NONE) SHARED(tensor,blk_indices) PRIVATE(nblk_per_thread,A,b)
@@ -3571,47 +3477,44 @@ CONTAINS
       CALL dbt_reserve_blocks(tensor, blk_indices(a:b, :))
 !$OMP END PARALLEL
 
-      ! Can not use the tensor iterator here because the order of the blocks is not guaranteed.
-      DO i = 1, SIZE(blk_indices, 1)
-         ind = blk_indices(i, :)
-         CALL dbt_blk_sizes(tensor, ind, blk_size)
-         nints = PRODUCT(blk_size)
-         CALL hfx_get_single_cache_element( &
-            estimate_to_store_int, 6, &
-            maxval_cache, maxval_container, memory_usage, &
-            .FALSE.)
+      ! bins are independent streams, each holding a contiguous range of blk_indices
+      nbins = SIZE(compressed%integral_containers, 2)
+      nblk = SIZE(blk_indices, 1)
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(tensor,blk_indices,compressed,eps,nbins,nblk) &
+!$OMP PRIVATE(ibin,i,ind,blk_size,nints,buffer_left,buffer_size,buffer_start,blk_data,blk_data_3d) &
+!$OMP PRIVATE(memory_usage,integral_container,real_cache) SCHEDULE(STATIC,1)
+      DO ibin = 1, nbins
+         integral_container => compressed%integral_containers(1, ibin)
+         memory_usage = 0
+         CALL hfx_decompress_first_real_cache(real_cache, integral_container, eps, memory_usage, .FALSE.)
 
-         spherical_estimate = SET_EXPONENT(1.0_dp, estimate_to_store_int + 1)
+         DO i = (ibin - 1)*nblk/nbins + 1, ibin*nblk/nbins
+            ind = blk_indices(i, :)
+            CALL dbt_blk_sizes(tensor, ind, blk_size)
+            nints = PRODUCT(blk_size)
 
-         nbits = EXPONENT(ANINT(spherical_estimate/eps)) + 1
+            buffer_left = nints
+            buffer_start = 1
 
-         buffer_left = nints
-         buffer_start = 1
+            ALLOCATE (blk_data(nints))
+            DO WHILE (buffer_left > 0)
+               buffer_size = MIN(buffer_left, cache_size)
+               CALL hfx_get_mult_real_elements(blk_data(buffer_start), buffer_size, real_cache, &
+                                               integral_container, eps, memory_usage, .FALSE.)
+               buffer_left = buffer_left - buffer_size
+               buffer_start = buffer_start + buffer_size
+            END DO
 
-         ALLOCATE (blk_data(nints))
-         DO WHILE (buffer_left > 0)
-            buffer_size = MIN(buffer_left, cache_size)
-            CALL hfx_get_mult_cache_elements(blk_data(buffer_start), &
-                                             buffer_size, nbits, &
-                                             integral_caches(nbits), &
-                                             integral_containers(nbits), &
-                                             eps, 1.0_dp, &
-                                             memory_usage, &
-                                             .FALSE.)
-            buffer_left = buffer_left - buffer_size
-            buffer_start = buffer_start + buffer_size
+            blk_data_3d(1:blk_size(1), 1:blk_size(2), 1:blk_size(3)) => blk_data
+            CALL dbt_put_block(tensor, ind, blk_size, blk_data_3d)
+            NULLIFY (blk_data_3d); DEALLOCATE (blk_data)
          END DO
 
-         blk_data_3d(1:blk_size(1), 1:blk_size(2), 1:blk_size(3)) => blk_data
-         CALL dbt_put_block(tensor, ind, blk_size, blk_data_3d)
-         NULLIFY (blk_data_3d); DEALLOCATE (blk_data)
+         CALL hfx_reset_real_cache_and_container(real_cache, integral_container, memory_usage, .FALSE.)
       END DO
+!$OMP END PARALLEL DO
 
-      CALL hfx_reset_cache_and_container(maxval_cache, maxval_container, memory_usage, .FALSE.)
-      DO i = 1, 64
-         CALL hfx_reset_cache_and_container(integral_caches(i), integral_containers(i), &
-                                            memory_usage, .FALSE.)
-      END DO
+      CALL timestop(handle)
    END SUBROUTINE decompress_tensor
 
 ! **************************************************************************************************

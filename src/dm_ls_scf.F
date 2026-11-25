@@ -19,11 +19,12 @@ MODULE dm_ls_scf
                                               cite_reference
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_add, dbcsr_binary_read, dbcsr_binary_write, dbcsr_copy, dbcsr_create, &
-        dbcsr_distribution_type, dbcsr_filter, dbcsr_get_info, dbcsr_get_occupation, &
-        dbcsr_multiply, dbcsr_p_type, dbcsr_release, dbcsr_scale, dbcsr_set, dbcsr_type, &
-        dbcsr_type_no_symmetry
+        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_distribution_type, dbcsr_filter, &
+        dbcsr_get_info, dbcsr_get_occupation, dbcsr_multiply, dbcsr_p_type, dbcsr_release, &
+        dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
    USE cp_dbcsr_contrib,                ONLY: dbcsr_checksum
+   USE cp_dbcsr_io,                     ONLY: dbcsr_binary_read,&
+                                              dbcsr_binary_write
    USE cp_external_control,             ONLY: external_control
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_unit_nr,&
@@ -588,7 +589,7 @@ CONTAINS
             DO ispin = 1, nspin
                IF (nonscf) THEN
                   CALL dbcsr_copy(matrix_mixing_old(ispin), ls_scf_env%matrix_ks(ispin))
-               ELSEIF (ls_scf_env%do_rho_mixing) THEN
+               ELSE IF (ls_scf_env%do_rho_mixing) THEN
                   CALL dbcsr_copy(matrix_mixing_old(ispin), ls_scf_env%matrix_ks(ispin))
                ELSE
                   IF (iscf == 1) THEN
@@ -657,10 +658,12 @@ CONTAINS
                IF (ls_scf_env%nspins == 1) nelectron_spin_real = nelectron_spin_real/2
 
                IF (do_transport) THEN
-                  IF (ls_scf_env%has_s_preconditioner) &
+                  IF (ls_scf_env%has_s_preconditioner) THEN
                      CPABORT("NOT YET IMPLEMENTED with S preconditioner. ")
-                  IF (ls_scf_env%ls_mstruct%cluster_type /= ls_cluster_atomic) &
+                  END IF
+                  IF (ls_scf_env%ls_mstruct%cluster_type /= ls_cluster_atomic) THEN
                      CPABORT("NOT YET IMPLEMENTED with molecular clustering. ")
+                  END IF
 
                   extra_scf = maxscf_reached .OR. scf_converged
                   ! get the current Kohn-Sham matrix (ks) and return matrix_p evaluated using an external C routine
@@ -691,11 +694,13 @@ CONTAINS
                                               eps_lanczos=ls_scf_env%eps_lanczos, max_iter_lanczos=ls_scf_env%max_iter_lanczos, &
                                               iounit=-1)
                   CASE (ls_scf_pexsi)
-                     IF (ls_scf_env%has_s_preconditioner) &
+                     IF (ls_scf_env%has_s_preconditioner) THEN
                         CPABORT("S preconditioning not implemented in combination with the PEXSI library. ")
-                     IF (ls_scf_env%ls_mstruct%cluster_type /= ls_cluster_atomic) &
+                     END IF
+                     IF (ls_scf_env%ls_mstruct%cluster_type /= ls_cluster_atomic) THEN
                         CALL cp_abort(__LOCATION__, &
                                       "Molecular clustering not implemented in combination with the PEXSI library. ")
+                     END IF
                      CALL density_matrix_pexsi(ls_scf_env%pexsi, ls_scf_env%matrix_p(ispin), ls_scf_env%pexsi%matrix_w(ispin), &
                                                ls_scf_env%pexsi%kTS(ispin), matrix_mixing_old(ispin), ls_scf_env%matrix_s, &
                                                nelectron_spin_real, ls_scf_env%mu_spin(ispin), iscf, ispin)
@@ -834,8 +839,9 @@ CONTAINS
       END IF
 
       ! store the matrix for a next scf run
-      IF (.NOT. ls_scf_env%do_pao) &
+      IF (.NOT. ls_scf_env%do_pao) THEN
          CALL ls_scf_store_result(ls_scf_env)
+      END IF
 
       ! write homo and lumo energy and occupation (if not already part of the output)
       IF (ls_scf_env%curvy_steps) THEN
@@ -908,8 +914,9 @@ CONTAINS
       END DO
       DEALLOCATE (ls_scf_env%matrix_ks)
 
-      IF (ls_scf_env%do_pexsi) &
+      IF (ls_scf_env%do_pexsi) THEN
          CALL pexsi_finalize_scf(ls_scf_env%pexsi, ls_scf_env%mu_spin)
+      END IF
 
       CALL timestop(handle)
 

@@ -14,7 +14,7 @@
 MODULE input_cp2k_md
    USE bibliography,                    ONLY: &
         Evans1983, Guidon2008, Kantorovich2008, Kantorovich2008a, Kuhne2007, Minary2003, &
-        Rengaraj2020, Ricci2003, Tuckerman1992, VandeVondele2002, West2006
+        Rengaraj2020, Ricci2003, Tuckerman1992, VandeVondele2002, West2006, Zhang2026
    USE cp_output_handling,              ONLY: add_last_numeric,&
                                               cp_print_key_section_create,&
                                               debug_print_level,&
@@ -22,7 +22,7 @@ MODULE input_cp2k_md
                                               low_print_level,&
                                               medium_print_level
    USE cp_units,                        ONLY: cp_unit_to_cp2k
-   USE fparser,                         ONLY: docf
+   USE generic_function_input,          ONLY: create_function_section
    USE input_constants,                 ONLY: &
         do_constr_atomic, do_constr_molec, do_constr_none, isokin_ensemble, langevin_ensemble, &
         md_init_default, md_init_vib, npe_f_ensemble, npe_i_ensemble, nph_ensemble, &
@@ -319,6 +319,10 @@ CONTAINS
       CALL section_release(subsection)
 
       CALL create_vib_init_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+      CALL create_electrons_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
@@ -1116,55 +1120,31 @@ CONTAINS
       CALL keyword_release(keyword)
 
       ! Define temperature function start
-      CALL section_create(tfunc_section, __LOCATION__, name="TFUNC", &
-                          description="This section specifies the target temperature by using "// &
-                          "the time step and the temperature of the last step, allowing for "// &
-                          "simple region-wise simulated annealing (heating/cooling) controls. "// &
-                          "When the absolute difference between target and actual temperature "// &
-                          "is larger than TEMP_TOL value, the atomic velocities in this region "// &
-                          "are rescaled to match the target temperature. However, note that "// &
-                          "the actual temperature is subject to thermostat coupling as well "// &
-                          "and a small restrictive TEMP_TOL together with a rapidly varying "// &
-                          "target temperature function leaves little time for the system to "// &
-                          "adjust itself, possibly showing unphysical relaxation behaviors. "// &
-                          newline//newline//"Further notes about temperature. "//docf(), &
-                          n_keywords=4, n_subsections=0, repeats=.FALSE.)
-
-      NULLIFY (keyword)
-      CALL keyword_create(keyword, __LOCATION__, name="FUNCTION", &
-                          description="Specifies the functional form of the temperature "// &
-                          "in Kelvin in mathematical notation. Two variables are available "// &
-                          "with one denoted S for the integer time step and another denoted "// &
-                          "T for the temperature of the last step in Kelvin respectively. When "// &
-                          "DEFINE_REGION%TEMPERATURE is not explicitly set, the function "// &
-                          "will be evaluated at S set in MD%STEP_START_VAL and T = 0.0 "// &
-                          "to initialize the velocities of atoms in the region.", &
-                          usage="FUNCTION  A*T+(1-A)*B*(2/(1+EXP(-0.001*S))-1)", &
-                          type_of_var=lchar_t, n_var=1)
-      CALL section_add_keyword(tfunc_section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="PARAMETERS", &
-                          description="Defines the parameters of the functional form", &
-                          usage="PARAMETERS A B", type_of_var=char_t, &
-                          n_var=-1, repeats=.TRUE.)
-      CALL section_add_keyword(tfunc_section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="UNITS", &
-                          description="Optionally, allows to define valid CP2K unit strings for each parameter value. "// &
-                          "It is assumed that the corresponding parameter value is specified in this unit.", &
-                          usage="UNITS ", type_of_var=char_t, &
-                          n_var=-1, repeats=.TRUE.)
-      CALL section_add_keyword(tfunc_section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="VALUES", &
-                          description="Defines the values of the parameter of the functional form", &
-                          usage="VALUES 0.75 3.00E+2", type_of_var=real_t, &
-                          n_var=-1, repeats=.TRUE., unit_str="internal_cp2k")
-      CALL section_add_keyword(tfunc_section, keyword)
-      CALL keyword_release(keyword)
+      CALL create_function_section(tfunc_section, section_name="TFUNC", func_name="FUNCTION", &
+                                   description="This section specifies the target temperature by "// &
+                                   "using the time step `S` and the temperature of the last step "// &
+                                   "in Kelvin `T` in a functional form, thus allowing for a simple "// &
+                                   "region-wise annealing (heating/cooling) controls in the absence "// &
+                                   "of a thermostat. Specifically, if the absolute difference between "// &
+                                   "target and actual temperature is larger than the TEMP_TOL value "// &
+                                   "on each step, the atomic velocities will be rescaled to match "// &
+                                   "the target temperature. However, note that a small restrictive "// &
+                                   "TEMP_TOL together with a rapidly varying target temperature "// &
+                                   "function and a large timestep leaves little time for the system to "// &
+                                   "adjust itself, possibly leading to unphysical relaxation behaviors "// &
+                                   "and structural artifacts."//newline//newline// &
+                                   "When DEFINE_REGION%TEMPERATURE is not set for this region explicitly, "// &
+                                   "the function will be evaluated at `S` set in MD%STEP_START_VAL and "// &
+                                   "`T = 0.00` to obtain the initial temperature (assumed positive) for "// &
+                                   "initialization of the atomic velocities in the region; if the result "// &
+                                   "of function evaluation is not positive, the MD%TEMPERATURE will be "// &
+                                   "used as a fallback."//newline//newline// &
+                                   "The function is interpreted directly as in Kelvin, with no need to "// &
+                                   "specify the UNITS keyword for the parameters. For instance, defining "// &
+                                   "`FUNCTION (ABS(S/N+M)-ABS(S/N-M))/2`, `PARAMETERS N M` and "// &
+                                   "`VALUES 50/3 300.0`, the target temperature will rise linearly and "// &
+                                   "reach 300.0 K at step `S = 5000`.", &
+                                   repeats=.FALSE., input_variables=["S", "T"])
 
       CALL section_add_subsection(region_section, tfunc_section)
       CALL section_release(tfunc_section)
@@ -1316,6 +1296,241 @@ CONTAINS
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
    END SUBROUTINE create_avgs_section
+
+! **************************************************************************************************
+!> \brief Defines the ELECTRONS section: settings for the standalone electronic
+!>      potentiostat (constant-potential / Ne-electrode) driver.
+!> \param section ...
+! **************************************************************************************************
+   SUBROUTINE create_electrons_section(section)
+      TYPE(section_type), POINTER                        :: section
+
+      TYPE(keyword_type), POINTER                        :: keyword
+
+      CPASSERT(.NOT. ASSOCIATED(section))
+      CALL section_create(section, __LOCATION__, name="ELECTRONS", &
+                          description="Settings for the electronic potentiostat driving a "// &
+                          "constant-potential / Ne-electrode MD run.", &
+                          citations=[Zhang2026], &
+                          n_keywords=3, n_subsections=0, repeats=.FALSE.)
+
+      NULLIFY (keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
+                          description="Controls the activation of the electronic potentiostat. "// &
+                          "There are three states, not two. Section ABSENT: nothing happens, no "// &
+                          ".cpcont file. Section present with T (or 1): full constant-potential "// &
+                          "dynamics -- q is propagated by the potentiostat, requires ENSEMBLE NVT "// &
+                          "or LANGEVIN. Section present with 0 (or F): REPORT-ONLY -- an ordinary "// &
+                          "MD run that additionally computes the Fermi level and work function "// &
+                          "every step and writes the .cpcont file, with q held at the system's "// &
+                          "electron count and TARGET_WORKFUNCTION reported as 0. Report-only needs "// &
+                          "only POTENTIAL_AVERAGE_AXIS and POTENTIAL_AVERAGE_REGION, works under "// &
+                          "any ensemble, and requires a plain FORCE_EVAL (not METHOD MIXED). Use "// &
+                          "it to measure the work function of a fixed-charge system -- for example "// &
+                          "to find the neutral work function before choosing TARGET_WORKFUNCTION "// &
+                          "and Q_INIT for a constant-potential run.", &
+                          usage="&ELECTRONS T", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="POTENTIAL_AVERAGE_AXIS", &
+                          description="Lattice axis along which the planar Hartree-potential "// &
+                          "average is computed for the work-function readback.", &
+                          usage="POTENTIAL_AVERAGE_AXIS Z", &
+                          default_i_val=3, &
+                          enum_c_vals=s2a("X", "Y", "Z"), &
+                          enum_desc=s2a("average along the x axis", &
+                                        "average along the y axis", &
+                                        "average along the z axis"), &
+                          enum_i_vals=[1, 2, 3])
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="POTENTIAL_AVERAGE_REGION", &
+                          description="Minimum and maximum coordinate, along POTENTIAL_AVERAGE_AXIS, "// &
+                          "of the vacuum region over which the Hartree potential is averaged to "// &
+                          "obtain the work function.", &
+                          usage="POTENTIAL_AVERAGE_REGION 27.0 30.0", &
+                          type_of_var=real_t, n_var=2, unit_str="angstrom")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="NEUTRAL_ELECTRONS", &
+                          description="Reference (neutral-system) total electron count. Must match "// &
+                          "the actual DFT electron count of the simulated system -- there is no "// &
+                          "physically meaningful universal default. Plain number, not unit-converted.", &
+                          usage="NEUTRAL_ELECTRONS 1329.0", &
+                          default_r_val=1329.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="Q_INIT", &
+                          description="Initial value of the potentiostat's electron-count variable q. "// &
+                          "Normally equal to NEUTRAL_ELECTRONS for a neutral start. Plain number, not "// &
+                          "unit-converted.", &
+                          usage="Q_INIT 1329.0", &
+                          default_r_val=1329.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="TARGET_WORKFUNCTION", &
+                          description="Target work function the potentiostat drives toward. "// &
+                          "Accepts CP2K's usual [unit] qualifier, e.g. "// &
+                          "TARGET_WORKFUNCTION [eV] 4.81 or [hartree] 0.1768; a bare number is "// &
+                          "read as eV, so existing input decks are unaffected. The value is "// &
+                          "stored in atomic units and converted back to eV in md_run.F, because "// &
+                          "the potentiostat works in eV throughout.", &
+                          usage="TARGET_WORKFUNCTION [eV] 4.81", &
+                          default_r_val=cp_unit_to_cp2k(value=5.0_dp, unit_str="eV"), &
+                          unit_str="eV")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MASS", &
+                          description="Fictitious mass of the electron-count degree of freedom, in "// &
+                          "atomic units. Plain number, not unit-converted.", &
+                          usage="MASS 400.0", &
+                          default_r_val=400.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="TAU_POTENTIOSTAT", &
+                          description="Langevin relaxation time of the electronic potentiostat, in "// &
+                          "femtoseconds. Plain number, not unit-converted.", &
+                          usage="TAU_POTENTIOSTAT 200.0", &
+                          default_r_val=200.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="TEMP_POTENTIOSTAT", &
+                          description="Target temperature of the electronic potentiostat Langevin "// &
+                          "thermostat, in kelvin. Plain number, not unit-converted. Set to 0.0 to "// &
+                          "disable stochastic noise (deterministic/damped dynamics only).", &
+                          usage="TEMP_POTENTIOSTAT 300.0", &
+                          default_r_val=300.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CHARGE_MIXING_INPLACE", &
+                          description="At a boundary crossing, mutate the stale endpoint's "// &
+                          "electron count IN PLACE instead of tearing it down and re-running "// &
+                          "qs_init. Only the electron count of the existing endpoint is changed. "// &
+                          "The converged wavefunction, "// &
+                          "the dispersion neighbour lists, pw_env and the atomic distributions "// &
+                          "all survive, so a crossing no longer cold-starts an SCF. Strongly "// &
+                          "recommended; FALSE only to fall back to the original rebuild path for "// &
+                          "comparison.", &
+                          usage="CHARGE_MIXING_INPLACE T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="LAMBDA", &
+                          description="Freeze the mixing weight at this value instead of deriving "// &
+                          "it from q. When given: q(t) is NOT propagated, the potentiostat is "// &
+                          "inactive, and the endpoints are never rebuilt -- the run becomes "// &
+                          "ordinary MD on the fixed combination (1-LAMBDA)*E(N_lo) + LAMBDA*E(N_hi) "// &
+                          "of the two integer-charge FORCE_EVALs, with N_lo/N_hi exactly as the "// &
+                          "input CHARGE keywords built them. Intended as a control experiment: it "// &
+                          "separates the charge mixing from the constant-potential dynamics. "// &
+                          "A run with LAMBDA set contains no constant-potential physics at all.", &
+                          usage="LAMBDA 0.5", &
+                          type_of_var=real_t, default_r_val=HUGE(0.0_dp))
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="TARGET_FERMI_LEVEL", &
+                          description="Target Fermi level in eV. Setting this switches the "// &
+                          "potentiostat from work-function control to FERMI-LEVEL control: the "// &
+                          "generalized force becomes (TARGET_FERMI_LEVEL - current Fermi level) "// &
+                          "instead of (current work function - TARGET_WORKFUNCTION), and the "// &
+                          "grand-canonical potential becomes E - e_F_target*(q - N_neutral). "// &
+                          "TAKES PRECEDENCE over TARGET_WORKFUNCTION when both are present, so "// &
+                          "a restart file written in work-function mode can be switched to Fermi "// &
+                          "control by adding this one keyword. The two modes are NOT "// &
+                          "interchangeable: they differ by the vacuum level, whose derivative "// &
+                          "with respect to q is not zero for a charged slab, so holding one "// &
+                          "constant does not hold the other constant. "// &
+                          "Unset by default (sentinel HUGE). "// &
+                          "REFERENCE: this is an ABSOLUTE Kohn-Sham eigenvalue on CP2K's "// &
+                          "internal energy scale, NOT a shift relative to the neutral cell. "// &
+                          "In a periodic cell the G=0 Hartree term is set to zero, so that "// &
+                          "scale is referenced to the CELL-AVERAGE electrostatic potential: "// &
+                          "not to vacuum, and not to the Fermi level of the neutral system. "// &
+                          "To target a potential a known amount away from the neutral cell, "// &
+                          "first run the neutral cell once, read its Fermi level e_F(N0) from "// &
+                          "the output, and set TARGET_FERMI_LEVEL = e_F(N0) + your shift.", &
+                          usage="TARGET_FERMI_LEVEL -0.5", &
+                          type_of_var=real_t, default_r_val=HUGE(0.0_dp))
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CHARGE_MIXING", &
+                          description="Use dual integer-endpoint charge mixing (CP2K METHOD MIXED "// &
+                          "LINEAR_COMBINATION over two integer-charge FORCE_EVAL sections) instead "// &
+                          "of the Ne-electrode core correction. Q_INIT is the initial mixing "// &
+                          "coordinate q. NEUTRAL_ELECTRONS is REQUIRED here, contrary to what an "// &
+                          "earlier version of this text said: it sets the CHARGE of every rebuilt "// &
+                          "endpoint via NINT(neutral_electrons) - N, and defines the reference "// &
+                          "point of the grand-canonical potential.", &
+                          usage="CHARGE_MIXING T", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CHARGE_MIXING_SPAN", &
+                          description="Integer span S between the two mixed FORCE_EVAL endpoints: "// &
+                          "N_lo=S*floor(q/S), N_hi=N_lo+S. Only used when CHARGE_MIXING is TRUE. "// &
+                          "S=2 keeps the endpoint parity fixed, which UKS with an explicit "// &
+                          "MULTIPLICITY requires. With CHARGE_MIXING_INPLACE, ADDED_MOS must "// &
+                          "cover every endpoint the run reaches (each crossing moves one by S).", &
+                          usage="CHARGE_MIXING_SPAN 1", type_of_var=integer_t, default_i_val=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! ------------------------------------------------------------------
+      ! Restartable runtime state of the electronic extended variable.
+      ! These are rewritten into the input tree every step by md_run.F, so
+      ! CP2K's ordinary restart dump carries them and a continued run picks
+      ! up the electronic dynamics exactly where it left off.  Without them
+      ! a restart silently resets q to its original Q_INIT with p = 0 in the
+      ! middle of a trajectory.  Q_INIT above doubles as the restart slot for
+      ! q, exactly as CP2K reuses the input coordinates for the positions.
+      ! ------------------------------------------------------------------
+
+      CALL keyword_create(keyword, __LOCATION__, name="P_INIT", &
+                          description="Initial (or restarted) momentum conjugate to the electronic "// &
+                          "coordinate q, in atomic units. Normally left at zero for a fresh run and "// &
+                          "written automatically into restart files.", &
+                          usage="P_INIT 0.0", default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="POTENTIOSTAT_ENERGY", &
+                          description="Accumulated heat exchanged with the electronic potentiostat, "// &
+                          "in atomic units, for conserved-quantity bookkeeping across restarts. "// &
+                          "Written automatically into restart files.", &
+                          usage="POTENTIOSTAT_ENERGY 0.0", default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CURRENT_FERMI_LEVEL", &
+                          description="Last Fermi level in eV. Restart bookkeeping only: it is "// &
+                          "recomputed from the density at the first force evaluation, and exists so "// &
+                          "that the .cpcont column is meaningful on the restart step itself.", &
+                          usage="CURRENT_FERMI_LEVEL 0.0", default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CURRENT_WORKFUNCTION", &
+                          description="Last work function in eV. Restart bookkeeping only, as for "// &
+                          "CURRENT_FERMI_LEVEL: md_run.F recomputes it at the initial force "// &
+                          "evaluation before the first electronic kick.", &
+                          usage="CURRENT_WORKFUNCTION 0.0", default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+   END SUBROUTINE create_electrons_section
 
 ! **************************************************************************************************
 !> \brief Defines the AVERAGES RESTART section
@@ -1535,13 +1750,13 @@ CONTAINS
       NULLIFY (keyword)
       CALL keyword_create(keyword, __LOCATION__, name="PHASE", &
                           description="Controls the initial ratio of potential and kinetic "// &
-                          "contribution to the total energy. The contribution is determined by "// &
-                          "COS**2(2*pi*PHASE) for potential energy, and SIN**2(2*pi*PHASE) "// &
-                          "for kinetic energy. If PHASE is negative, then for each vibration "// &
-                          "mode the phase is determined randomly. Otherwise, PHASE must be "// &
-                          "between 0.0 and 1.0 and will be the same for all vibration modes. "// &
-                          "If value > 1.0 it will just be treated as 1.0. "// &
-                          "For example, setting PHASE = 0.25 would set all modes to "// &
+                          "contribution to the total energy. Denote the input value as $p$; "// &
+                          "the contribution is determined by $\cos^2(2\pi p)$ for potential "// &
+                          "energy and $\sin^2(2\pi p)$ for kinetic energy. A negative $p$ "// &
+                          "means that for each vibration mode the phase is determined randomly. "// &
+                          "A value of $0.0 \lt p \lt 1.0$ will be the same for all vibration "// &
+                          "modes; a value of $p \gt 1.0$ will just be treated as 1.0. "// &
+                          "For example, setting $p = 0.25$ would set all modes to "// &
                           "begin with entirely kinetic energy --- in other words, the initial "// &
                           "atomic positions will remain at their optimised location", &
                           default_r_val=-1.0_dp, &

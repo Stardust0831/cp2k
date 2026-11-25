@@ -76,7 +76,6 @@ MODULE xas_tdp_methods
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
-   USE libint_wrapper,                  ONLY: cp_libint_static_init
    USE machine,                         ONLY: m_flush
    USE mathlib,                         ONLY: get_diag
    USE memory_utilities,                ONLY: reallocate
@@ -117,8 +116,8 @@ MODULE xas_tdp_methods
                                               get_mo_set,&
                                               init_mo_set,&
                                               mo_set_type
-   USE qs_operators_ao,                 ONLY: p_xyz_ao,&
-                                              rRc_xyz_ao
+   USE qs_moments,                      ONLY: build_local_moment_matrix
+   USE qs_operators_ao,                 ONLY: build_lin_mom_matrix
    USE qs_pdos,                         ONLY: calculate_projected_dos
    USE qs_scf_types,                    ONLY: ot_method_nr
    USE rixs_types,                      ONLY: rixs_env_type
@@ -800,8 +799,9 @@ CONTAINS
       IF (do_uks) nspins = 2 !in roks, same MOs for both spins
 
       ! by default, all (doubly occupied) homo are localized
-      IF (xas_tdp_control%n_search < 0 .OR. xas_tdp_control%n_search > MINVAL(homo)) &
+      IF (xas_tdp_control%n_search < 0 .OR. xas_tdp_control%n_search > MINVAL(homo)) THEN
          xas_tdp_control%n_search = MINVAL(homo)
+      END IF
       CALL qs_loc_control_init(qs_loc_env, loc_section, do_homo=.TRUE., do_xas=.TRUE., &
                                nloc_xas=xas_tdp_control%n_search, spin_xas=1)
 
@@ -904,7 +904,7 @@ CONTAINS
 !     Precompute it in the velocity representation, if so chosen
       IF (xas_tdp_control%dipole_form == xas_dip_vel) THEN
          !enforce minimum image to avoid any PBCs related issues. Ok because very localized densities
-         CALL p_xyz_ao(xas_tdp_env%dipmat, qs_env, minimum_image=.TRUE.)
+         CALL build_lin_mom_matrix(qs_env, xas_tdp_env%dipmat, minimum_image=.TRUE.)
       END IF
 
 !  Allocate SOC in AO basis matrices
@@ -917,9 +917,6 @@ CONTAINS
 
 !  Check that everything is allowed
       CALL safety_check(xas_tdp_control, qs_env)
-
-!  Initialize libint for the 3-center integrals
-      CALL cp_libint_static_init()
 
 !  Compute LUMOs as guess for OT solver and/or for GW2X correction
       IF (xas_tdp_control%do_ot .OR. xas_tdp_control%do_gw2x) THEN
@@ -1077,6 +1074,8 @@ CONTAINS
       TYPE(xas_tdp_control_type), POINTER                :: xas_tdp_control
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
+      REAL(KIND=dp), PARAMETER                           :: eps_screen_thre = 1.0E-16_dp
+
       INTEGER                                            :: i
       REAL(dp)                                           :: occ
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s
@@ -1195,7 +1194,7 @@ CONTAINS
                "EXACT_EXCHANGE| Effective Range: ", xas_tdp_control%x_potential%cutoff_radius*angstrom, ", (Ang)", &
                "EXACT_EXCHANGE| EPS_RANGE: ", xas_tdp_control%eps_range
          END IF
-         IF (xas_tdp_control%eps_screen > 1.0E-16) THEN
+         IF (xas_tdp_control%eps_screen > eps_screen_thre) THEN
             WRITE (UNIT=ou, FMT="(T3,A,ES7.1)") &
                "EXACT_EXCHANGE| EPS_SCREENING: ", xas_tdp_control%eps_screen
          END IF
@@ -2048,7 +2047,7 @@ CONTAINS
       TYPE(xas_tdp_control_type), POINTER                :: xas_tdp_control
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
-      INTEGER                                            :: i, order
+      INTEGER                                            :: i
       REAL(dp), DIMENSION(3)                             :: rc
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: work
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
@@ -2064,19 +2063,17 @@ CONTAINS
             CALL dbcsr_set(xas_tdp_env%dipmat(i)%matrix, 0.0_dp)
             work(i)%matrix => xas_tdp_env%dipmat(i)%matrix
          END DO
-         order = 1
+         CALL build_local_moment_matrix(qs_env, work, 1, ref_point=rc, &
+                                        all_images=.TRUE., minimum_image=.TRUE.)
       END IF
       IF (xas_tdp_control%do_quad) THEN
          DO i = 1, 6
             CALL dbcsr_set(xas_tdp_env%quadmat(i)%matrix, 0.0_dp)
             work(3 + i)%matrix => xas_tdp_env%quadmat(i)%matrix
          END DO
-         order = 2
-         IF (xas_tdp_control%dipole_form == xas_dip_vel) order = -2
+         CALL build_local_moment_matrix(qs_env, work, 2, ref_point=rc, &
+                                        all_images=.TRUE., minimum_image=.TRUE., first_component=4)
       END IF
-
-      !enforce minimum image to avoid PBCs related issues, ok because localized densities
-      CALL rRc_xyz_ao(work, qs_env, rc, order=order, minimum_image=.TRUE.)
       DEALLOCATE (work)
 
    END SUBROUTINE compute_lenrep_multipole
@@ -2649,9 +2646,11 @@ CONTAINS
 
                DO ispin = 1, 2
                   CALL duplicate_mo_set(restart_mos(ispin), mos(1))
-                  ! Set the new occupation number in the case of spin-independent based calculation since the restart is spin-depedent
-                  IF (SIZE(mos) == 1) &
+                  ! Set the new occupation number in the case of spin-independent based calculation
+                  ! since the restart is spin-depedent
+                  IF (SIZE(mos) == 1) THEN
                      restart_mos(ispin)%occupation_numbers = mos(1)%occupation_numbers/2
+                  END IF
                END DO
 
                CALL cp_fm_to_fm_submat(msource=lr_coeffs, mtarget=restart_mos(1)%mo_coeff, nrow=nao, &

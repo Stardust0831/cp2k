@@ -37,13 +37,17 @@ MODULE rt_propagation
                                               cp_print_key_should_output,&
                                               cp_print_key_unit_nr,&
                                               cp_rm_iter_level
-   USE efield_utils,                    ONLY: calculate_ecore_efield
+   USE efield_utils,                    ONLY: calculate_ecore_efield,&
+                                              efield_potential_lengh_gauge
    USE force_env_methods,               ONLY: force_env_calc_energy_force
    USE force_env_types,                 ONLY: force_env_get,&
                                               force_env_type
    USE global_types,                    ONLY: global_environment_type
    USE hfx_admm_utils,                  ONLY: hfx_admm_init
-   USE input_constants,                 ONLY: real_time_propagation,&
+   USE input_constants,                 ONLY: do_admm_basis_projection,&
+                                              do_admm_exch_scaling_none,&
+                                              do_admm_purify_none,&
+                                              real_time_propagation,&
                                               use_restart_wfn,&
                                               use_rt_restart,&
                                               use_scf_wfn
@@ -99,6 +103,7 @@ MODULE rt_propagation
                                               get_restart_wfn,&
                                               read_moments,&
                                               recalculate_fields,&
+                                              rt_localize_initial_mos,&
                                               warn_section_unused
    USE rt_propagation_velocity_gauge,   ONLY: velocity_gauge_ks_matrix
    USE rt_propagator_init,              ONLY: init_propagators,&
@@ -126,23 +131,48 @@ CONTAINS
       TYPE(force_env_type), POINTER                      :: force_env
 
       INTEGER                                            :: aspc_order
-      LOGICAL                                            :: magnetic, vel_reprs
+      LOGICAL                                            :: do_kpoints, magnetic, track_current, &
+                                                            track_current_int, vel_reprs
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(global_environment_type), POINTER             :: globenv
       TYPE(qs_energy_type), POINTER                      :: energy
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(rt_prop_type), POINTER                        :: rtp
       TYPE(rtp_control_type), POINTER                    :: rtp_control
-      TYPE(section_vals_type), POINTER :: hfx_sections, input, ls_scf_section, md_section, &
-         motion_section, print_moments_section, rtp_print_section, rtp_section
+      TYPE(section_vals_type), POINTER :: current_int_section, current_section, hfx_sections, &
+         input, ls_scf_section, md_section, motion_section, print_moments_section, &
+         rtp_print_section, rtp_section
 
       NULLIFY (qs_env, rtp_control, dft_control)
 
       CALL cite_reference(Andermatt2016)
 
       CALL force_env_get(force_env=force_env, qs_env=qs_env, globenv=globenv)
-      CALL get_qs_env(qs_env, dft_control=dft_control, energy=energy)
+      CALL get_qs_env(qs_env, dft_control=dft_control, energy=energy, do_kpoints=do_kpoints)
       rtp_control => dft_control%rtp_control
+
+      ! The propagation works with the Gamma-point MOs and matrices only
+      IF (do_kpoints) THEN
+         CALL cp_abort(__LOCATION__, "RTP/EMD is not implemented with k-points: "// &
+                       "remove the DFT%KPOINTS section")
+      END IF
+
+      ! The RTP/EMD ADMM implementation (density fit, KS merge and forces) only supports
+      ! basis projection without purification and without exchange scaling
+      IF (dft_control%do_admm) THEN
+         IF (dft_control%admm_control%purification_method /= do_admm_purify_none) THEN
+            CALL cp_abort(__LOCATION__, "RTP/EMD with ADMM requires ADMM_PURIFICATION_METHOD NONE "// &
+                          "(the default is MO_DIAG). Use e.g. ADMM_TYPE ADMM2.")
+         END IF
+         IF (dft_control%admm_control%method /= do_admm_basis_projection) THEN
+            CALL cp_abort(__LOCATION__, "RTP/EMD with ADMM requires METHOD BASIS_PROJECTION. "// &
+                          "ADMMQ and ADMMS are not implemented for RTP/EMD.")
+         END IF
+         IF (dft_control%admm_control%scaling_model /= do_admm_exch_scaling_none) THEN
+            CALL cp_abort(__LOCATION__, "RTP/EMD with ADMM requires EXCH_SCALING_MODEL NONE. "// &
+                          "ADMMP and ADMMS are not implemented for RTP/EMD.")
+         END IF
+      END IF
 
       ! Takes care that an initial wavefunction/density is available
       ! Can either be by performing an scf loop or reading a restart
@@ -177,13 +207,25 @@ CONTAINS
       CALL section_vals_val_get(print_moments_section, "MAGNETIC", l_val=magnetic)
       CALL section_vals_val_get(print_moments_section, "VEL_REPRS", l_val=vel_reprs)
 
+      ! The imaginary part of the density matrix (needed for the current) is generically
+      ! nonzero whenever the propagated state is not stationary, independently of whether
+      ! an explicit time-dependent field/vector potential is applied: e.g. an excited
+      ! state prepared by occupation swap, from LR-TDDFT, or via a MOM-constrained SCF.
+      ! Rather than trying to detect every possible way of preparing such a state, track
+      ! the imaginary density whenever the user actually requests output that needs it.
+      rtp_print_section => section_vals_get_subs_vals(rtp_section, "PRINT")
+      current_section => section_vals_get_subs_vals(rtp_print_section, "CURRENT")
+      current_int_section => section_vals_get_subs_vals(rtp_print_section, "CURRENT_INT")
+      CALL section_vals_get(current_section, explicit=track_current)
+      CALL section_vals_get(current_int_section, explicit=track_current_int)
+
       rtp%track_imag_density = (magnetic) .OR. (vel_reprs) .OR. (rtp_control%velocity_gauge) &
-                               .OR. (rtp%do_hfx) .OR. (.NOT. rtp_control%fixed_ions)
+                               .OR. (rtp%do_hfx) .OR. (.NOT. rtp_control%fixed_ions) &
+                               .OR. (track_current) .OR. (track_current_int)
       rtp%propagate_complex_ks = rtp%do_hfx .OR. rtp_control%velocity_gauge
 
       ! Marek : In case some print sections that apply so far only to RTBSE are present,
       !         warn the user that the quantities will not be in fact printed out
-      rtp_print_section => section_vals_get_subs_vals(rtp_section, "PRINT")
       CALL warn_section_unused(rtp_print_section, "DENSITY_MATRIX", &
                                "DENSITY_MATRIX printing not implemented for non-RTBSE code.")
 
@@ -255,6 +297,10 @@ CONTAINS
       rtp_control => dft_control%rtp_control
 
       IF (rtp_control%initial_wfn == use_scf_wfn) THEN
+         IF (rtp_control%localize_initial_wfn .AND. .NOT. rtp%linear_scaling) THEN
+            CALL get_qs_env(qs_env, mos=mos)
+            CALL rt_localize_initial_mos(qs_env, mos)
+         END IF
          IF (rtp_control%apply_delta_pulse .OR. rtp_control%apply_delta_pulse_mag) THEN
             CALL apply_delta_pulse(qs_env, rtp, rtp_control)
          ELSE
@@ -294,7 +340,8 @@ CONTAINS
                   CALL rt_initialize_rho_from_mos(rtp, mos)
                END IF
             ELSE
-               !The wavefunction was minimized using a linear scaling method. The density matrix is therefore taken from the ls_scf_env.
+               ! The wavefunction was minimized using a linear scaling method.
+               ! The density matrix is therefore taken from the ls_scf_env.
                CALL get_rtp(rtp=rtp, rho_old=rho_old, rho_new=rho_new)
                DO ispin = 1, SIZE(rho_old)/2
                   re = 2*ispin - 1
@@ -305,8 +352,11 @@ CONTAINS
             CALL calc_update_rho_sparse(qs_env)
          END IF
       END IF
-      ! Modify KS matrix to include the additional terms in the velocity gauge
-      IF (rtp_control%velocity_gauge) THEN
+      ! Modify KS matrix to include the electric field in the length gauge
+      ! or the additional terms in the velocity gauge
+      IF (dft_control%apply_efield_field) THEN
+         CALL efield_potential_lengh_gauge(qs_env)
+      ELSE IF (rtp_control%velocity_gauge) THEN
          ! As matrix_h and matrix_h_im are not updated by qs_ks_update_qs_env()
          ! the non-gauge transformed non-local part has to be subtracted here
          CALL velocity_gauge_ks_matrix(qs_env, subtract_nl_term=.TRUE.)
@@ -330,11 +380,15 @@ CONTAINS
       TYPE(global_environment_type), POINTER             :: globenv
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'run_propagation'
+      CHARACTER(len=17), DIMENSION(9), PARAMETER :: loc_print_keys = ["MOLECULAR_DIPOLES", &
+         "TOTAL_DIPOLE     ", "WANNIER_CENTERS  ", "WANNIER_SPREADS  ", "WANNIER_CUBES    ", &
+         "MOLECULAR_STATES ", "MOLECULAR_MOMENTS", "LOCALIZED_MOMENTS", "WANNIER_STATES   "]
 
       INTEGER                                            :: aspc_order, handle, i_iter, i_step, &
-                                                            max_iter, max_steps, output_unit, &
-                                                            unit_nr
-      LOGICAL                                            :: moments_read, should_stop
+                                                            ikey, max_iter, max_steps, &
+                                                            output_unit, unit_nr
+      LOGICAL                                            :: explicit, loc_print, moments_read, &
+                                                            should_stop
       REAL(Kind=dp)                                      :: eps_ener, time_iter_start, &
                                                             time_iter_stop, used_time
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -344,7 +398,10 @@ CONTAINS
       TYPE(qs_energy_type), POINTER                      :: energy
       TYPE(rt_prop_type), POINTER                        :: rtp
       TYPE(rtp_control_type), POINTER                    :: rtp_control
-      TYPE(section_vals_type), POINTER                   :: input, moments_section, rtp_section
+      TYPE(section_vals_type), POINTER                   :: input, loc_print_section, &
+                                                            moments_section, print_key, rtp_section
+
+! print keys of DFT%LOCALIZE%PRINT that trigger the localization in rtp_localize
 
       should_stop = .FALSE.
       CALL timeset(routineN, handle)
@@ -370,7 +427,7 @@ CONTAINS
 
       rtp%energy_old = energy%total
       time_iter_start = m_walltime()
-      CALL cp_add_iter_level(logger%iter_info, "MD")
+      CALL cp_add_iter_level(logger, "MD")
       CALL cp_iterate(logger%iter_info, iter_nr=0)
       IF (rtp%i_start >= max_steps) CALL cp_abort(__LOCATION__, &
                                                   "maximum step number smaller than initial step value")
@@ -378,6 +435,23 @@ CONTAINS
       rtp_section => section_vals_get_subs_vals(input, "DFT%REAL_TIME_PROPAGATION")
       output_unit = cp_print_key_unit_nr(logger, rtp_section, "PRINT%PROGRAM_RUN_INFO", &
                                          extension=".scfLog")
+
+      ! The localization along the propagation (rtp_localize) acts on the real part of the MOs only
+      loc_print_section => section_vals_get_subs_vals(input, "DFT%LOCALIZE%PRINT")
+      loc_print = .FALSE.
+      DO ikey = 1, SIZE(loc_print_keys)
+         print_key => section_vals_get_subs_vals(loc_print_section, TRIM(loc_print_keys(ikey)))
+         CALL section_vals_get(print_key, explicit=explicit)
+         loc_print = loc_print .OR. explicit
+      END DO
+      IF (loc_print .AND. .NOT. rtp%linear_scaling) THEN
+         CALL cp_warn(__LOCATION__, "DFT%LOCALIZE%PRINT along RTP: the localization uses only the "// &
+                      "real part of the propagated MOs, and always the occupied MOs (STATES and "// &
+                      "LIST_UNOCCUPIED are ignored). The localized properties (Wannier centers and "// &
+                      "spreads, dipoles, moments) can deviate strongly from those of the time-dependent "// &
+                      "density, compare e.g. LOCALIZE%PRINT%TOTAL_DIPOLE with DFT%PRINT%MOMENTS.")
+      END IF
+
       ! Add the zero iteration moments to the moment trace
       IF (rtp_control%save_local_moments) THEN
          CALL get_rtp(rtp, rho_new=rho_new)
@@ -417,8 +491,9 @@ CONTAINS
          CALL cp_iterate(logger%iter_info, last=(i_step == max_steps), iter_nr=i_step)
          rtp%converged = .FALSE.
          DO i_iter = 1, max_iter
-            IF (i_step == rtp%i_start + 1 .AND. i_iter == 2 .AND. rtp_control%hfx_redistribute) &
+            IF (i_step == rtp%i_start + 1 .AND. i_iter == 2 .AND. rtp_control%hfx_redistribute) THEN
                CALL qs_ks_did_change(qs_env%ks_env, s_mstruct_changed=.TRUE.)
+            END IF
             rtp%iter = i_iter
             CALL propagation_step(qs_env, rtp, rtp_control)
             CALL qs_ks_update_qs_env(qs_env, calculate_forces=.FALSE.)
@@ -442,11 +517,12 @@ CONTAINS
             EXIT
          END IF
       END DO
-      CALL cp_rm_iter_level(logger%iter_info, "MD")
+      CALL cp_rm_iter_level(logger, "MD")
 
-      IF (.NOT. rtp%converged) &
+      IF (.NOT. rtp%converged) THEN
          CALL cp_abort(__LOCATION__, "propagation did not converge, "// &
                        "either increase MAX_ITER or use a smaller TIMESTEP")
+      END IF
 
       CALL timestop(handle)
 
@@ -617,8 +693,9 @@ CONTAINS
       CALL set_ks_env(ks_env, complex_ks=imag_ks)
       IF (imag_ks) THEN
          CALL qs_ks_allocate_basics(qs_env, is_complex=imag_ks)
-         IF (.NOT. dft_control%rtp_control%fixed_ions) &
+         IF (.NOT. dft_control%rtp_control%fixed_ions) THEN
             CALL rtp_create_SinvH_imag(rtp, dft_control%nspins)
+         END IF
       END IF
 
       ! h

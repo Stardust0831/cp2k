@@ -31,7 +31,8 @@ MODULE molecule_kind_types
         hydronium_shell_colvar_id, mindist_colvar_id, no_colvar_id, plane_distance_colvar_id, &
         plane_plane_angle_colvar_id, population_colvar_id, qparm_colvar_id, &
         reaction_path_colvar_id, ring_puckering_colvar_id, rmsd_colvar_id, rotation_colvar_id, &
-        torsion_colvar_id, u_colvar_id, xyz_diag_colvar_id, xyz_outerdiag_colvar_id
+        torsion_colvar_id, u_colvar_id, voronoiipz_colvar_id, xyz_diag_colvar_id, &
+        xyz_outerdiag_colvar_id
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_type
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
@@ -114,6 +115,7 @@ MODULE molecule_kind_types
       LOGICAL                        :: use_points = .FALSE.
       REAL(KIND=dp)                  :: expected_value = 0.0_dp
       REAL(KIND=dp)                  :: expected_value_growth_speed = 0.0_dp
+      REAL(KIND=dp)                  :: target_velocity = 0.0_dp
       INTEGER, POINTER, DIMENSION(:) :: i_atoms => NULL()
       TYPE(restraint_type)           :: restraint = restraint_type()
    END TYPE colvar_constraint_type
@@ -286,6 +288,8 @@ CONTAINS
                ncolv%nreactionpath = ncolv%nreactionpath + 1
             CASE (combine_colvar_id)
                ncolv%ncombinecvs = ncolv%ncombinecvs + 1
+            CASE (voronoiipz_colvar_id)
+               ncolv%nvoronoiipz = ncolv%nvoronoiipz + 1
             CASE DEFAULT
                CPABORT("Unknown colvar type")
             END SELECT
@@ -309,7 +313,8 @@ CONTAINS
                    ncolv%nreactionpath + &
                    ncolv%ncombinecvs + &
                    ncolv%npopulation + &
-                   ncolv%ngyration
+                   ncolv%ngyration + &
+                   ncolv%nvoronoiipz
 
    END SUBROUTINE setup_colvar_counters
 
@@ -365,8 +370,9 @@ CONTAINS
             END IF
             IF (ASSOCIATED(molecule_kind_set(imolecule_kind)%bend_kind_set)) THEN
                DO i = 1, SIZE(molecule_kind_set(imolecule_kind)%bend_kind_set)
-                  IF (ASSOCIATED(molecule_kind_set(imolecule_kind)%bend_kind_set(i)%legendre%coeffs)) &
+                  IF (ASSOCIATED(molecule_kind_set(imolecule_kind)%bend_kind_set(i)%legendre%coeffs)) THEN
                      DEALLOCATE (molecule_kind_set(imolecule_kind)%bend_kind_set(i)%legendre%coeffs)
+                  END IF
                END DO
                DEALLOCATE (molecule_kind_set(imolecule_kind)%bend_kind_set)
             END IF
@@ -934,24 +940,30 @@ CONTAINS
             WRITE (UNIT=output_unit, FMT="(T9,A,I6,/,T9,A,(T30,5I10))") &
                "Number of molecules: ", nmolecule, "Molecule list:", &
                (molecule_kind%molecule_list(imolecule), imolecule=1, nmolecule)
-            IF (molecule_kind%nbond > 0) &
+            IF (molecule_kind%nbond > 0) THEN
                WRITE (UNIT=output_unit, FMT="(1X,A30,I6)") &
-               "Number of bonds:       ", molecule_kind%nbond
-            IF (molecule_kind%nbend > 0) &
+                  "Number of bonds:       ", molecule_kind%nbond
+            END IF
+            IF (molecule_kind%nbend > 0) THEN
                WRITE (UNIT=output_unit, FMT="(1X,A30,I6)") &
-               "Number of bends:       ", molecule_kind%nbend
-            IF (molecule_kind%nub > 0) &
+                  "Number of bends:       ", molecule_kind%nbend
+            END IF
+            IF (molecule_kind%nub > 0) THEN
                WRITE (UNIT=output_unit, FMT="(1X,A30,I6)") &
-               "Number of Urey-Bradley:", molecule_kind%nub
-            IF (molecule_kind%ntorsion > 0) &
+                  "Number of Urey-Bradley:", molecule_kind%nub
+            END IF
+            IF (molecule_kind%ntorsion > 0) THEN
                WRITE (UNIT=output_unit, FMT="(1X,A30,I6)") &
-               "Number of torsions:    ", molecule_kind%ntorsion
-            IF (molecule_kind%nimpr > 0) &
+                  "Number of torsions:    ", molecule_kind%ntorsion
+            END IF
+            IF (molecule_kind%nimpr > 0) THEN
                WRITE (UNIT=output_unit, FMT="(1X,A30,I6)") &
-               "Number of improper:    ", molecule_kind%nimpr
-            IF (molecule_kind%nopbend > 0) &
+                  "Number of improper:    ", molecule_kind%nimpr
+            END IF
+            IF (molecule_kind%nopbend > 0) THEN
                WRITE (UNIT=output_unit, FMT="(1X,A30,I6)") &
-               "Number of out opbends:    ", molecule_kind%nopbend
+                  "Number of out opbends:    ", molecule_kind%nopbend
+            END IF
          END IF
       END IF
    END SUBROUTINE write_molecule_kind
@@ -1108,6 +1120,8 @@ CONTAINS
             type_string = "Acid hydronium shell"
          CASE (hydronium_dist_colvar_id)
             type_string = "Hydronium distance"
+         CASE (voronoiipz_colvar_id)
+            type_string = "Voronoi ion position"
          CASE DEFAULT
             CPABORT("Invalid collective variable ID specified. Check the code!")
          END SELECT

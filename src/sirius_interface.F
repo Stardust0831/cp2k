@@ -123,7 +123,7 @@ CONTAINS
 !> \author JHU
 ! **************************************************************************************************
    SUBROUTINE cp_sirius_finalize()
-      CALL sirius_finalize(.FALSE., .FALSE., .FALSE.)
+      CALL sirius_finalize(call_mpi_fin=.FALSE., call_device_reset=.FALSE.)
    END SUBROUTINE cp_sirius_finalize
 
 !***************************************************************************************************
@@ -327,7 +327,7 @@ CONTAINS
                                       symbol=element_symbol, &
                                       mass=REAL(mass/massunit, KIND=C_DOUBLE))
 
-         ELSEIF (ASSOCIATED(gth_potential)) THEN
+         ELSE IF (ASSOCIATED(gth_potential)) THEN
 !
             NULLIFY (atom_grid)
             CALL allocate_grid_atom(atom_grid)
@@ -442,7 +442,8 @@ CONTAINS
                      corden(:) = corden(:) + fe(:)*rc(:)**(2*j - 2)*cval
                   END DO
                END DO
-               fun(1:nmesh) = corden(1:nmesh)*rp(1:nmesh)
+               ! SIRIUS expects the volume density rho_core(r), not r*rho_core(r).
+               fun(1:nmesh) = corden(1:nmesh)
                CALL sirius_add_atom_type_radial_function(sctx, label, "ps_rho_core", &
                                                          fun(1), nmesh)
                DEALLOCATE (corden, fe, rc)

@@ -20,6 +20,9 @@ MODULE input_cp2k_global
    USE cp_blacs_env,                    ONLY: BLACS_GRID_COL,&
                                               BLACS_GRID_ROW,&
                                               BLACS_GRID_SQUARE
+   USE cp_cfm_elpa,                     ONLY: elpa_c_kernel_descriptions,&
+                                              elpa_c_kernel_ids,&
+                                              elpa_c_kernel_names
    USE cp_dbcsr_cp2k_link,              ONLY: create_dbcsr_section
    USE cp_fm_cholesky,                  ONLY: FM_CHOLESKY_TYPE_DEFAULT,&
                                               FM_CHOLESKY_TYPE_DLAF,&
@@ -37,6 +40,9 @@ MODULE input_cp2k_global
                                               elpa_qr
    USE cp_fm_struct,                    ONLY: cp_fm_struct_get_ncol_block,&
                                               cp_fm_struct_get_nrow_block
+   USE cp_iter_types,                   ONLY: iter_notice,&
+                                              iter_silent,&
+                                              iter_stack
    USE cp_output_handling,              ONLY: add_last_numeric,&
                                               cp_print_key_section_create,&
                                               debug_print_level,&
@@ -44,6 +50,13 @@ MODULE input_cp2k_global
                                               low_print_level,&
                                               medium_print_level,&
                                               silent_print_level
+   USE fft_api,                         ONLY: FFT_LIBRARY_BACKEND_DEFAULT,&
+                                              FFT_LIBRARY_BACKEND_FFTW,&
+                                              FFT_LIBRARY_BACKEND_GPU,&
+                                              FFT_LIBRARY_FFTW_MODE_ESTIMATE,&
+                                              FFT_LIBRARY_FFTW_MODE_EXHAUSTIVE,&
+                                              FFT_LIBRARY_FFTW_MODE_MEASURE,&
+                                              FFT_LIBRARY_FFTW_MODE_PATIENT
    USE grid_api,                        ONLY: GRID_BACKEND_AUTO,&
                                               GRID_BACKEND_CPU,&
                                               GRID_BACKEND_DGEMM,&
@@ -52,11 +65,10 @@ MODULE input_cp2k_global
    USE input_constants,                 ONLY: &
         bsse_run, callgraph_all, callgraph_master, callgraph_none, cell_opt_run, debug_run, &
         do_atom, do_band, do_cosma, do_cp2k, do_dgemm_blas, do_dgemm_spla, do_farming, &
-        do_fft_fftw3, do_fft_sg, do_opt_basis, do_optimize_input, do_scalapack, do_swarm, do_tamc, &
-        do_test, do_tree_mc, do_tree_mc_ana, driver_run, ehrenfest, energy_force_run, energy_run, &
-        fftw_plan_estimate, fftw_plan_exhaustive, fftw_plan_measure, fftw_plan_patient, gaussian, &
-        geo_opt_run, linear_response_run, mimic_run, mol_dyn_run, mon_car_run, negf_run, none_run, &
-        pint_run, real_time_propagation, tree_mc_run, vib_anal
+        do_opt_basis, do_optimize_input, do_scalapack, do_swarm, do_tamc, do_test, do_tree_mc, &
+        do_tree_mc_ana, driver_run, ehrenfest, energy_force_run, energy_run, gaussian, &
+        geo_opt_run, linear_response_run, mimic_run, mol_dyn_run, mon_car_run, mtlr_run, negf_run, &
+        none_run, pint_run, real_time_propagation, tree_mc_run, vib_anal
    USE input_keyword_types,             ONLY: keyword_create,&
                                               keyword_release,&
                                               keyword_type
@@ -68,6 +80,9 @@ MODULE input_cp2k_global
    USE input_val_types,                 ONLY: char_t,&
                                               integer_t,&
                                               logical_t
+   USE integral_library_types,          ONLY: default_coulomb_library,&
+                                              library_libint,&
+                                              library_native
    USE kinds,                           ONLY: dp
    USE string_utilities,                ONLY: s2a
    USE timings,                         ONLY: default_timings_level
@@ -100,7 +115,7 @@ CONTAINS
       CALL section_create(section, __LOCATION__, name="GLOBAL", &
                           description="Section with general information on which kind "// &
                           "of simulation to perform and parameters for the whole PROGRAM", &
-                          n_keywords=7, n_subsections=0, repeats=.FALSE.)
+                          n_keywords=7, n_subsections=1, repeats=.FALSE.)
 
       NULLIFY (keyword)
       CALL keyword_create(keyword, __LOCATION__, name="BLACS_GRID", &
@@ -123,7 +138,8 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="PREFERRED_DIAG_LIBRARY", &
                           description="Specifies the diagonalization library to be used. If not available, "// &
-                          "the ScaLAPACK library is used", &
+                          "the ScaLAPACK library is used. Complex (k-point) matrices use ELPA only when it is "// &
+                          "requested explicitly", &
                           usage="PREFERRED_DIAG_LIBRARY ELPA", &
                           enum_i_vals=[FM_DIAG_TYPE_ELPA, &
                                        FM_DIAG_TYPE_SCALAPACK, &
@@ -170,9 +186,9 @@ CONTAINS
       default_dgemm = do_dgemm_blas
 #endif
       CALL keyword_create(keyword, __LOCATION__, name="PREFERRED_DGEMM_LIBRARY", &
-                          description="Specifies the DGEMM library to be used. If not available, "// &
-                          "the BLAS routine is used. This keyword affects some DGEMM calls in the WFC code and turns on their "// &
-                          "acceleration with SpLA. This keyword affects only local DGEMM calls, not the calls to PDGEMM "// &
+                          description="Specifies the library for supported local real and complex matrix multiplications, "// &
+                          "including wavefunction correlation and k-point calculations. SPLA enables GPU acceleration "// &
+                          "when available; otherwise BLAS is used. This does not affect distributed matrix multiplications "// &
                           "(see keyword FM%TYPE_OF_MATRIX_MULTIPLICATION).", &
                           usage="PREFERRED_DGEMM_LIBRARY SPLA", &
                           default_i_val=default_dgemm, &
@@ -191,11 +207,22 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="ELPA_KERNEL", &
-                          description="Specifies the kernel to be used when ELPA is in use", &
+                          description="Specifies the kernel to be used when ELPA is in use for real "// &
+                          "symmetric matrices", &
                           default_i_val=elpa_kernel_ids(1), &
                           enum_i_vals=elpa_kernel_ids, &
                           enum_c_vals=elpa_kernel_names, &
                           enum_desc=elpa_kernel_descriptions)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ELPA_COMPLEX_KERNEL", &
+                          description="Specifies the kernel to be used when ELPA is in use for complex "// &
+                          "Hermitian matrices (k-points)", &
+                          default_i_val=elpa_c_kernel_ids(1), &
+                          enum_i_vals=elpa_c_kernel_ids, &
+                          enum_c_vals=elpa_c_kernel_names, &
+                          enum_desc=elpa_c_kernel_descriptions)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -254,26 +281,52 @@ CONTAINS
 
       CALL keyword_create( &
          keyword, __LOCATION__, name="PREFERRED_FFT_LIBRARY", &
-         description="Specifies the FFT library which should be preferred. "// &
-         "If it is not available, use FFTW3 if this is linked in, if FFTW3 is not available use FFTSG. "// &
-         "Improved performance with FFTW3 can be obtained specifying a proper value for FFTW_PLAN_TYPE. "// &
-         "Contrary to earlier CP2K versions, all libraries will result in the same grids, "// &
-         "i.e. the subset of grids which all FFT libraries can transform. "// &
-         "See EXTENDED_FFT_LENGTHS if larger FFTs or grids that more precisely match a given cutoff are needed, "// &
-         "or older results need to be reproduced. "// &
-         "FFTW3 is often (close to) optimal, and well tested with CP2K.", &
+         description="Specifies the preferred FFT library for local FFTs. "// &
+         "Distributed FFTs are unaffected if CP2K was compiled with support for FFT offloading. "// &
+         "Improved performance with FFTW3 can be obtained specifying a proper value for FFTW_PLAN_TYPE. ", &
          usage="PREFERRED_FFT_LIBRARY FFTW3", &
          citations=[Frigo2005], &
-         default_i_val=do_fft_fftw3, &
-         enum_i_vals=[do_fft_sg, do_fft_fftw3, do_fft_fftw3], &
-         enum_c_vals=s2a("FFTSG", "FFTW3", "FFTW"), &
-         enum_desc=s2a("Stefan Goedecker's FFT (FFTSG), always available, "// &
-                       "will be used in case a FFT library is specified and not available.", &
-                       "a fast portable FFT library. Recommended. "// &
+         default_i_val=FFT_LIBRARY_BACKEND_DEFAULT, &
+         enum_i_vals=[FFT_LIBRARY_BACKEND_DEFAULT, FFT_LIBRARY_BACKEND_FFTW, FFT_LIBRARY_BACKEND_GPU], &
+         enum_c_vals=s2a("DEFAULT", "FFTW3", "GPU"), &
+         enum_desc=s2a("Equivalent to GPU if offloading was enabled, FFTW otherwise.", &
+                       "A fast portable FFT library. Recommended. "// &
                        "See also the FFTW_PLAN_TYPE, and FFTW_WISDOM_FILE_NAME keywords.", &
-                       "Same as FFTW3 (for compatibility with CP2K 2.3)"))
+                       "CUFFT/HIPFFT-based backend if offloading was enabled."))
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
+
+      NULLIFY (sub_section)
+      CALL section_create(sub_section, __LOCATION__, name="preferred_integral_library", &
+                          description="Selects the implementation of individual Gaussian integral operations.", &
+                          n_keywords=2, n_subsections=0, repeats=.FALSE.)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COULOMB_2C", &
+                          description="Preferred library for two-center Coulomb integrals (Coulomb_2c). "// &
+                          "Libint is used by default when available; otherwise the native implementation is used.", &
+                          usage="COULOMB_2C LIBINT", &
+                          enum_c_vals=s2a("NATIVE", "LIBINT"), &
+                          enum_i_vals=[library_native, library_libint], &
+                          enum_desc=s2a("Use CP2K's native implementation.", &
+                                        "Use the Libint implementation."), &
+                          default_i_val=default_coulomb_library)
+      CALL section_add_keyword(sub_section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COULOMB_3C", &
+                          description="Preferred library for three-center Coulomb integrals (Coulomb_3c). "// &
+                          "Libint is used by default when available; otherwise the native implementation is used.", &
+                          usage="COULOMB_3C LIBINT", &
+                          enum_c_vals=s2a("NATIVE", "LIBINT"), &
+                          enum_i_vals=[library_native, library_libint], &
+                          enum_desc=s2a("Use CP2K's native implementation.", &
+                                        "Use the Libint implementation."), &
+                          default_i_val=default_coulomb_library)
+      CALL section_add_keyword(sub_section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL section_add_subsection(section, sub_section)
+      CALL section_release(sub_section)
 
       CALL keyword_create(keyword, __LOCATION__, name="FFTW_WISDOM_FILE_NAME", &
                           description="The name of the file that contains wisdom (pre-planned FFTs) for use with FFTW3. "// &
@@ -281,7 +334,9 @@ CONTAINS
                           "Note that wisdom is not transferable between different computer (architectures). "// &
                           "Wisdom can be generated using the fftw-wisdom tool that is part of the fftw installation. "// &
                           "cp2k/tools/cp2k-wisdom is a script that contains some additional info, and can help "// &
-                          "to generate a useful default for /etc/fftw/wisdom or particular values for a given simulation.", &
+                          "to generate a useful default for /etc/fftw/wisdom or particular values for a given simulation. "// &
+                          "The wisdom is read from the file, if it exists. The updated wisdom is written back to "// &
+                          "the file at the end of the run only if this keyword is specified explicitly.", &
                           usage="FFTW_WISDOM_FILE_NAME wisdom.dat", default_lc_val="/etc/fftw/wisdom")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -292,11 +347,13 @@ CONTAINS
                           "While a plan based on measurements is generally faster, "// &
                           "differences in machine load will lead to different plans for the same input file, "// &
                           "and thus numerics for the FFTs will be slightly different from run to run. "// &
-                          "PATIENT planning is recommended for long ab initio MD runs.", &
+                          "PATIENT planning is recommended for long ab initio MD runs. Ignored if PREFERRED_FFT_LIBRARY "// &
+                          "was set to DEFAULT or GPU and offloading was enabled.", &
                           usage="FFTW_PLAN_TYPE PATIENT", &
                           citations=[Frigo2005], &
-                          default_i_val=fftw_plan_estimate, &
-                          enum_i_vals=[fftw_plan_estimate, fftw_plan_measure, fftw_plan_patient, fftw_plan_exhaustive], &
+                          default_i_val=FFT_LIBRARY_FFTW_MODE_ESTIMATE, &
+                          enum_i_vals=[FFT_LIBRARY_FFTW_MODE_ESTIMATE, FFT_LIBRARY_FFTW_MODE_MEASURE, &
+                                       FFT_LIBRARY_FFTW_MODE_PATIENT, FFT_LIBRARY_FFTW_MODE_EXHAUSTIVE], &
                           enum_c_vals=s2a("ESTIMATE", &
                                           "MEASURE", &
                                           "PATIENT", &
@@ -308,18 +365,12 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="EXTENDED_FFT_LENGTHS", &
-                          description="Use fft library specific values for the allows number of points in FFTs. "// &
-                          "The default is to use the internal FFT lengths. For external fft libraries this may "// &
-                          "create an error at the external library level, because the length provided by cp2k is "// &
-                          "not supported by the external library. In this case switch on this keyword "// &
-                          "to obtain, with certain fft libraries, lengths matching the external fft library lengths, or "// &
-                          "larger allowed grids, or grids that more precisely match a given cutoff. "// &
-                          "IMPORTANT NOTE: in this case, the actual grids used in CP2K depends on the FFT library. "// &
-                          "A change of FFT library must therefore be considered equivalent to a change of basis, "// &
-                          "which implies a change of total energy.", &
-                          usage="EXTENDED_FFT_LENGTHS", &
-                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL keyword_create(keyword, __LOCATION__, name="FFTW_USE_GURU_INTERFACE", &
+                          description="Use the FFTW guru interface for local FFTs when it is available. "// &
+                          "This can enable additional optimized plans, but disabling it may help when "// &
+                          "the regular FFTW interface is preferred.", &
+                          usage="FFTW_USE_GURU_INTERFACE .TRUE.", &
+                          default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -401,14 +452,15 @@ CONTAINS
                          "BAND", "CELL_OPT", "WFN_OPT", "WAVEFUNCTION_OPTIMIZATION", &
                          "MOLECULAR_DYNAMICS", "GEOMETRY_OPTIMIZATION", "MONTECARLO", &
                          "LINEAR_RESPONSE", "NORMAL_MODES", "RT_PROPAGATION", &
-                         "EHRENFEST_DYN", "TAMC", "TMC", "DRIVER", "NEGF", "MIMIC", "RTP"), &
+                         "EHRENFEST_DYN", "TAMC", "TMC", "DRIVER", "NEGF", "MIMIC", "RTP", &
+                         "MTLR"), &
          enum_i_vals=[none_run, energy_run, energy_force_run, mol_dyn_run, &
                       geo_opt_run, mon_car_run, debug_run, &
                       bsse_run, linear_response_run, pint_run, vib_anal, do_band, &
                       cell_opt_run, energy_run, energy_run, mol_dyn_run, geo_opt_run, &
                       mon_car_run, linear_response_run, &
                       vib_anal, real_time_propagation, ehrenfest, do_tamc, tree_mc_run, &
-                      driver_run, negf_run, mimic_run, real_time_propagation], &
+                      driver_run, negf_run, mimic_run, real_time_propagation, mtlr_run], &
          enum_desc=s2a("Perform no tasks", "Computes energy", "Computes energy and forces", &
                        "Molecular Dynamics", "Geometry Optimization", "Monte Carlo", &
                        "Performs a Debug analysis", "Basis set superposition error", "Linear Response", &
@@ -423,7 +475,8 @@ CONTAINS
                        "i-PI driver mode", &
                        "Non-equilibrium Green's function method", &
                        "Run as a client in a simulation through the MiMiC framework", &
-                       "Alias for RT_PROPAGATION"))
+                       "Alias for RT_PROPAGATION", &
+                       "Minimum tracking linear response calculation for Hubbard U and Hund's J"))
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -489,6 +542,21 @@ CONTAINS
          description="Flush output regularly, enabling this option might degrade performance significantly on certain machines.", &
          usage="FLUSH_SHOULD_FLUSH", &
          default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ITER_LEVEL_VERBOSITY", &
+                          description="Controls the verbosity of information about iteration levels "// &
+                          "printed upon entry or exit of one. Iteration levels are defined by type "// &
+                          "of task; the names and descriptions of iteration levels are listed under "// &
+                          "the EACH section of printkeys. The default is dependent on PRINT_LEVEL: "// &
+                          "SILENT for MEDIUM or lower, NOTICE for HIGH, STACK for DEBUG.", &
+                          usage="ITER_LEVEL_VERBOSITY NOTICE", default_i_val=iter_silent, &
+                          enum_c_vals=s2a("SILENT", "NOTICE", "STACK"), &
+                          enum_desc=s2a("Do not print anything about iter levels", &
+                                        "Print a notice when entering or exiting an iter level", &
+                                        "Print a notice and also the full stack of iter levels"), &
+                          enum_i_vals=[iter_silent, iter_notice, iter_stack])
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -707,6 +775,9 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="TYPE_OF_MATRIX_MULTIPLICATION", &
                           description="Allows to switch between scalapack pxgemm and COSMA pxgemm. "// &
                           "COSMA reduces the communication costs but increases the memory demands. "// &
+                          "For large dense products the COSMA buffers can set the peak memory; "// &
+                          "the environment variable COSMA_CPU_MAX_MEMORY caps them per MPI rank "// &
+                          "(in MB), at some cost in runtime. "// &
                           "The performance of Scalapack's pxgemm on GPU's depends "// &
                           "crucially on the BLOCK_SIZES. Make sure optimized kernels are available.", &
                           default_i_val=default_matmul, &
@@ -774,11 +845,11 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="ELPA_FORCE_REDISTRIBUTE", &
                           description="Controls how to perform redistribution when ELPA is used for diagonalization. "// &
-                          "By default, redistribution is always performed using the defined rules. "// &
-                          "By turning off this keyword, matrices are redistributed only to prevent crashes in the ELPA "// &
-                          "library which happens when the original matrix is distributed over too many processors.", &
+                          "By default, matrices are redistributed only when required by the ELPA layout. "// &
+                          "Turning on this keyword also applies the defined rules to reduce the number of "// &
+                          "processors, using a layout without empty process rows or columns.", &
                           usage="ELPA_FORCE_REDISTRIBUTE", type_of_var=logical_t, &
-                          default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

@@ -33,12 +33,12 @@ MODULE thermal_region_utils
                                               cp_unit_to_cp2k
    USE force_env_types,                 ONLY: force_env_get,&
                                               force_env_type
-   USE force_fields_util,               ONLY: get_generic_info
    USE fparser,                         ONLY: EvalErrType,&
                                               evalf,&
                                               finalizef,&
                                               initf,&
                                               parsef
+   USE generic_function_input,          ONLY: parse_function_section
    USE input_constants,                 ONLY: do_region_thermal,&
                                               langevin_ensemble,&
                                               npt_f_ensemble,&
@@ -165,7 +165,6 @@ CONTAINS
                CALL integer_to_string(ireg, my_region)
                t_region => thermal_regions%thermal_region(ireg)
                t_region%region_index = ireg
-               NULLIFY (t_region%part_index)
 
                ! Set up thermal region mapping to particles
                CALL section_vals_val_get(region_sections, "LIST", &
@@ -235,11 +234,11 @@ CONTAINS
                tfunc_section => section_vals_get_subs_vals(region_sections, "TFUNC", i_rep_section=ireg)
                CALL section_vals_get(tfunc_section, explicit=use_tfunc)
                IF (use_tfunc) THEN
-                  CALL get_generic_info(tfunc_section, "FUNCTION", &
-                                        t_region%temperature_function, &
-                                        t_region%temperature_function_parameters, &
-                                        t_region%temperature_function_values, &
-                                        input_variables=["S", "T"], i_rep_sec=1)
+                  CALL parse_function_section(tfunc_section, "FUNCTION", &
+                                              t_region%temperature_function, &
+                                              t_region%temperature_function_parameters, &
+                                              t_region%temperature_function_values, &
+                                              input_variables=["S", "T"], i_rep_sec=1)
                END IF
 
                ! Set up t_region%temp_expected
@@ -263,7 +262,7 @@ CONTAINS
                      CALL parsef(1, TRIM(t_region%temperature_function), &
                                  t_region%temperature_function_parameters)
                      CALL section_vals_val_get(md_section, "STEP_START_VAL", i_val=itimes)
-                     t_region%temperature_function_values(1) = itimes*1.0_dp
+                     t_region%temperature_function_values(1) = REAL(itimes, KIND=dp)
                      t_region%temperature_function_values(2) = 0.0_dp
                      temp = cp_unit_to_cp2k(evalf(1, t_region%temperature_function_values), "K")
                      CPASSERT(EvalErrType <= 0)
@@ -425,12 +424,14 @@ CONTAINS
                           TRIM(my_reg)//" which is not allowed!")
          END IF
       ELSE
-         IF (.NOT. ipart > 0) &
+         IF (.NOT. ipart > 0) THEN
             CALL cp_abort(__LOCATION__, &
                           "Input atom index "//TRIM(my_part)//" is non-positive!")
-         IF (.NOT. ipart <= particles%n_els) &
+         END IF
+         IF (.NOT. ipart <= particles%n_els) THEN
             CALL cp_abort(__LOCATION__, &
                           "Input atom index "//TRIM(my_part)//" is out of bounds!")
+         END IF
       END IF
 
    END SUBROUTINE set_t_region_index

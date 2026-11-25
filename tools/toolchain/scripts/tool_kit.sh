@@ -157,7 +157,7 @@ get_nprocs() {
   if [ -n "${NPROCS_OVERWRITE}" ]; then
     echo ${NPROCS_OVERWRITE} | sed 's/^0*//'
   elif $(command -v nproc > /dev/null 2>&1); then
-    echo $(nproc --all)
+    echo $(nproc)
   elif $(command -v sysctl > /dev/null 2>&1); then
     echo $(sysctl -n hw.ncpu)
   else
@@ -650,7 +650,7 @@ download_pkg_from_urlpath() {
   local __filename="$2"
   local __url="$3/${__filename}"
   local __outfile="${4:-${__filename}}"
-  local __command="wget ${DOWNLOADER_FLAGS} --quiet ${__url} -O ${__outfile}"
+  local __command="wget ${DOWNLOADER_FLAGS} --tries=5 --quiet ${__url} -O ${__outfile}"
   echo "${__command}"
   # download
   if ! eval "${__command}"; then
@@ -738,7 +738,7 @@ filter_setup() {
   local target_file="$2"
 
   # Check if setup_xxx file exists
-  if [[ ! -f "$source_file" ]]; then
+  if [ ! -f "$source_file" ]; then
     report_error "File '$source_file' does not exist."
   fi
 

@@ -50,7 +50,6 @@ PROGRAM cp2k
    USE cp2k_runs,                       ONLY: run_input,&
                                               write_xml_file
    USE cp2k_shell,                      ONLY: launch_cp2k_shell
-   USE cp_files,                        ONLY: open_file
    USE f77_interface,                   ONLY: check_input,&
                                               default_para_env,&
                                               finalize_cp2k,&
@@ -58,10 +57,16 @@ PROGRAM cp2k
    USE input_cp2k,                      ONLY: create_cp2k_root_section
    USE input_section_types,             ONLY: section_release,&
                                               section_type
+   USE iso_c_binding,                   ONLY: C_NULL_CHAR
    USE iso_fortran_env,                 ONLY: compiler_options,&
                                               compiler_version
    USE kinds,                           ONLY: default_path_length
-   USE machine,                         ONLY: default_output_unit
+   USE machine,                         ONLY: default_error_unit,&
+                                              default_output_unit,&
+                                              m_cpuid,&
+                                              m_cpuid_name,&
+                                              m_cpuid_static,&
+                                              m_cpuid_vlen
 #include "../base/base_uses.f90"
 
    IMPLICIT NONE
@@ -71,7 +76,7 @@ PROGRAM cp2k
    CHARACTER(LEN=default_path_length), &
       DIMENSION(:, :), ALLOCATABLE      :: initial_variables, initial_variables_tmp
    CHARACTER(LEN=:), ALLOCATABLE        :: compiler_options_string
-   INTEGER                              :: output_unit, l, i, var_set_sep, inp_var_idx
+   INTEGER                              :: cpuid, cpuid_static, output_unit, l, i, var_set_sep, inp_var_idx
    INTEGER                              :: ierr, i_arg
    LOGICAL                              :: check, usage, echo_input, command_line_error
    LOGICAL                              :: run_it, force_run, has_input, xml, print_version, print_license, shell_mode
@@ -126,12 +131,15 @@ PROGRAM cp2k
                command_line_error = .TRUE.
             ELSE
                output_file_name = arg_att
-               CALL open_file(file_name=output_file_name, &
-                              file_status="UNKNOWN", &
-                              file_action="WRITE", &
-                              file_position="APPEND", &
-                              skip_get_unit_number=.TRUE., &
-                              unit_number=output_unit)
+               ! Redirect the standard output (default_output_unit) to the output file
+               OPEN (UNIT=output_unit, FILE=TRIM(output_file_name), STATUS="UNKNOWN", &
+                     FORM="FORMATTED", ACTION="WRITE", POSITION="APPEND", IOSTAT=ierr)
+               IF (ierr /= 0) THEN
+                  ! The standard output might not be connected anymore
+                  WRITE (default_error_unit, "(/,T2,A)") &
+                     "ERROR: The output file "//TRIM(output_file_name)//" cannot be opened"
+                  command_line_error = .TRUE.
+               END IF
             END IF
          ELSE
             i_arg = i_arg + 1
@@ -167,8 +175,9 @@ PROGRAM cp2k
          INTEGER :: veclib_max_threads, ierr
          CALL get_environment_variable("VECLIB_MAXIMUM_THREADS", env_var, status=ierr)
          veclib_max_threads = 0
-         IF (ierr == 0) &
+         IF (ierr == 0) THEN
             READ (env_var, *) veclib_max_threads
+         END IF
          IF (ierr == 1 .OR. (ierr == 0 .AND. veclib_max_threads > 1)) THEN
             CALL cp_warn(__LOCATION__, &
                          "macOS' Accelerate framework has its own threading enabled which may interfere"// &
@@ -236,8 +245,9 @@ PROGRAM cp2k
 
          DO inp_var_idx = 1, SIZE(initial_variables, 2)
             ! check whether the variable was already set, in this case, overwrite
-            IF (TRIM(initial_variables(1, inp_var_idx)) == arg_att(:var_set_sep - 1)) &
+            IF (TRIM(initial_variables(1, inp_var_idx)) == arg_att(:var_set_sep - 1)) THEN
                EXIT
+            END IF
          END DO
 
          IF (inp_var_idx > SIZE(initial_variables, 2)) THEN
@@ -330,12 +340,33 @@ PROGRAM cp2k
                WRITE (output_unit, "(T2,A)") cp2k_version, &
                   "Source code revision "//TRIM(compile_revision), &
                   TRIM(cp2k_flags())
-               compiler_options_string = compiler_options()
+               ! The trailing NUL character bounds the in-place prefix replacement of
+               ! package managers like conda to this string, which would otherwise
+               ! shift and corrupt the subsequent string literals in the binary
+               compiler_options_string = compiler_options()//C_NULL_CHAR
+               l = INDEX(compiler_options_string, C_NULL_CHAR) - 1
                WRITE (output_unit, "(T2,A,A)") "compiler: ", compiler_version()
+               cpuid = m_cpuid()
+               cpuid_static = m_cpuid_static()
+               IF ((cpuid > 0) .OR. (cpuid_static > 0)) THEN
+                  WRITE (output_unit, "(T2,A,1X,I6,1X,A)") &
+                     "compiler target: cpuid", cpuid_static, "("//TRIM(m_cpuid_name(cpuid_static))//")"
+                  IF (cpuid /= cpuid_static) THEN
+                     WRITE (output_unit, "(T2,A,1X,I6,1X,A)") &
+                        "current: cpuid", cpuid, "("//TRIM(m_cpuid_name(cpuid))//")"
+                  END IF
+               END IF
+               IF (m_cpuid_vlen(cpuid_static) < m_cpuid_vlen(cpuid)) THEN
+                  WRITE (output_unit, "(T2,A)") &
+                     "WARNING: The compiler target used to build this binary does not "// &
+                     "enable all instruction-set extensions available on this CPU. "// &
+                     "Consider reconfiguring and rebuilding CP2K for this target system "// &
+                     "to enable them."
+               END IF
                WRITE (output_unit, "(T2,A)") "compiler options:"
-               DO i = 0, (LEN(compiler_options_string) - 1)/68
+               DO i = 0, (l - 1)/68
                   WRITE (output_unit, "(T4,A)") &
-                     compiler_options_string(i*68 + 1:MIN(LEN(compiler_options_string), (i + 1)*68))
+                     compiler_options_string(i*68 + 1:MIN(l, (i + 1)*68))
                END DO
                DEALLOCATE (compiler_options_string)
             END IF

@@ -39,7 +39,7 @@ MODULE molsym
                          maxsn = 2*maxcn
 
    PUBLIC :: molsym_type
-   PUBLIC :: release_molsym, molecular_symmetry, print_symmetry
+   PUBLIC :: release_molsym, molecular_symmetry, print_symmetry, get_symmetry_number
 
 ! **************************************************************************************************
 !> \brief Container for information about molecular symmetry
@@ -932,6 +932,43 @@ CONTAINS
    END SUBROUTINE get_point_group_symbol
 
 ! **************************************************************************************************
+!> \brief Rotational symmetry number, i.e. the order of the pure rotation subgroup (including E).
+!> \param sym ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION get_symmetry_number(sym) RESULT(sym_num)
+      TYPE(molsym_type), INTENT(in)                      :: sym
+      INTEGER                                            :: sym_num
+
+      IF (sym%linear) THEN
+         IF (sym%invers) THEN
+            sym_num = 2
+         ELSE
+            sym_num = 1
+         END IF
+      ELSE IF (sym%cubic) THEN
+         IF (sym%igroup) THEN
+            sym_num = 60
+         ELSE IF (sym%ogroup) THEN
+            sym_num = 24
+         ELSE
+            sym_num = 12
+         END IF
+      ELSE IF (sym%maxis) THEN
+         IF (sym%dgroup) THEN
+            sym_num = 2*sym%ncn
+         ELSE IF (sym%sgroup) THEN
+            sym_num = MAX(1, sym%nsn/2)
+         ELSE
+            sym_num = sym%ncn
+         END IF
+      ELSE
+         sym_num = 1
+      END IF
+
+   END FUNCTION get_symmetry_number
+
+! **************************************************************************************************
 !> \brief Initialization of the global variables of module symmetry.
 !> \param sym ...
 !> \param atype ...
@@ -1210,10 +1247,12 @@ CONTAINS
       IF (.NOT. sym%linear) THEN
          DO icn = 2, sym%ncn
             DO isec = 1, sym%nsec(icn)
-               IF (saxis(icn, sym%sec(:, isec, icn), sym, coord)) &
+               IF (saxis(icn, sym%sec(:, isec, icn), sym, coord)) THEN
                   CALL addses(icn, sym%sec(:, isec, icn), sym)
-               IF (saxis(2*icn, sym%sec(:, isec, icn), sym, coord)) &
+               END IF
+               IF (saxis(2*icn, sym%sec(:, isec, icn), sym, coord)) THEN
                   CALL addses(2*icn, sym%sec(:, isec, icn), sym)
+               END IF
             END DO
          END DO
       END IF

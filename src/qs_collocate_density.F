@@ -95,14 +95,14 @@ MODULE qs_collocate_density
    USE qs_ks_types, ONLY: get_ks_env, &
                           qs_ks_env_type
    USE qs_neighbor_list_types, ONLY: neighbor_list_set_p_type
+   USE qs_nlcc_methods, ONLY: get_nlcc_gaussians
    USE realspace_grid_types, ONLY: map_gaussian_here, &
                                    realspace_grid_desc_p_type, &
                                    realspace_grid_type, &
                                    rs_grid_zero, &
                                    transfer_rs2pw
    USE rs_pw_interface, ONLY: density_rs2pw
-   USE task_list_methods, ONLY: rs_copy_to_buffer, &
-                                rs_distribute_matrix, &
+   USE task_list_methods, ONLY: rs_distribute_matrix, &
                                 rs_scatter_matrices
    USE task_list_types, ONLY: atom_pair_type, &
                               task_list_type, &
@@ -159,18 +159,18 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'calculate_rho_nlcc'
 
       INTEGER                                            :: atom_a, handle, iatom, iexp_nlcc, ikind, &
-                                                            ithread, j, n, natom, nc, nexp_nlcc, &
-                                                            ni, npme, nthread, subpatch_pattern
-      INTEGER, DIMENSION(:), POINTER                     :: atom_list, cores, nct_nlcc
-      LOGICAL                                            :: nlcc
+                                                            j, n, natom, nc, nexp_nlcc, &
+                                                            ni, npme, subpatch_pattern
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: nct_nlcc
+      INTEGER, DIMENSION(:), POINTER                     :: atom_list, cores
       REAL(KIND=dp)                                      :: alpha, eps_rho_rspace, radius
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: alpha_nlcc
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: cval_nlcc
       REAL(KIND=dp), DIMENSION(3)                        :: ra
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: alpha_nlcc
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: cval_nlcc, pab
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: pab
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(gth_potential_type), POINTER                  :: gth_potential
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool
@@ -198,13 +198,8 @@ CONTAINS
 
       DO ikind = 1, SIZE(atomic_kind_set)
          CALL get_atomic_kind(atomic_kind_set(ikind), natom=natom, atom_list=atom_list)
-         CALL get_qs_kind(qs_kind_set(ikind), gth_potential=gth_potential)
-
-         IF (.NOT. ASSOCIATED(gth_potential)) CYCLE
-         CALL get_potential(potential=gth_potential, nlcc_present=nlcc, nexp_nlcc=nexp_nlcc, &
-                            alpha_nlcc=alpha_nlcc, nct_nlcc=nct_nlcc, cval_nlcc=cval_nlcc)
-
-         IF (.NOT. nlcc) CYCLE
+         CALL get_nlcc_gaussians(qs_kind_set(ikind), alpha_nlcc, nct_nlcc, cval_nlcc)
+         nexp_nlcc = SIZE(alpha_nlcc)
 
          DO iexp_nlcc = 1, nexp_nlcc
 
@@ -214,9 +209,6 @@ CONTAINS
             ni = ncoset(2*nc - 2)
             ALLOCATE (pab(ni, 1))
             pab = 0._dp
-
-            nthread = 1
-            ithread = 0
 
             CALL reallocate(cores, 1, natom)
             npme = 0
@@ -1245,9 +1237,10 @@ CONTAINS
 
       CALL transfer_rs2pw(rs_rho, rhoc_r)
 
-      IF (PRESENT(total_rho_metal)) &
+      IF (PRESENT(total_rho_metal)) THEN
          !minus sign: account for the fact that rho_metal has opposite sign
          total_rho_metal = pw_integrate_function(rhoc_r, isign=-1)
+      END IF
 
       CALL pw_transfer(rhoc_r, rho_metal)
       CALL auxbas_pw_pool%give_back_pw(rhoc_r)
@@ -1496,9 +1489,8 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'calculate_rho_elec'
 
       CHARACTER(LEN=default_string_length)               :: my_basis_type
-      INTEGER                                            :: ga_gb_function, handle, ilevel, img, &
-                                                            nimages, nlevels
-      LOGICAL                                            :: any_distributed, my_compute_grad, &
+      INTEGER                                            :: ga_gb_function, handle, img, nimages
+      LOGICAL                                            :: my_compute_grad, &
                                                             my_compute_tau, my_soft_valid
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_images
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -1569,7 +1561,7 @@ CONTAINS
       IF (PRESENT(soft_valid)) my_soft_valid = soft_valid
       IF (PRESENT(task_list_external)) THEN
          task_list => task_list_external
-      ELSEIF (my_soft_valid) THEN
+      ELSE IF (my_soft_valid) THEN
          CALL get_ks_env(ks_env, task_list_soft=task_list)
       ELSE
          CALL get_ks_env(ks_env, task_list=task_list)
@@ -1586,14 +1578,7 @@ CONTAINS
 
       ! Get grids.
       CALL pw_env_get(pw_env, rs_grids=rs_rho)
-      nlevels = SIZE(rs_rho)
       group = rs_rho(1)%desc%group
-
-      ! Check if any of the grids is distributed.
-      any_distributed = .FALSE.
-      DO ilevel = 1, nlevels
-         any_distributed = any_distributed .OR. rs_rho(ilevel)%desc%distributed
-      END DO
 
       ! Gather all matrix images in a single array.
       CALL get_ks_env(ks_env, dft_control=dft_control)
@@ -1610,11 +1595,7 @@ CONTAINS
       END IF
 
       ! Distribute matrix blocks.
-      IF (any_distributed) THEN
-         CALL rs_scatter_matrices(matrix_images, task_list%pab_buffer, task_list, group)
-      ELSE
-         CALL rs_copy_to_buffer(matrix_images, task_list%pab_buffer, task_list)
-      END IF
+      CALL rs_scatter_matrices(matrix_images, task_list%pab_buffer, task_list, group)
       DEALLOCATE (matrix_images)
 
       ! Map all tasks onto the grids
@@ -1665,7 +1646,7 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, lb_max, lb_min, npgfa, &
                                                             npgfb, nsgfa, nsgfb
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa, first_sgfb
-      LOGICAL                                            :: atom_pair_changed, distributed_rs_grids, &
+      LOGICAL                                            :: atom_pair_changed, redistribute_matrices, &
                                                             do_kp, found, my_soft, use_subpatch
       REAL(KIND=dp)                                      :: eps_rho_rspace, f, prefactor, radius, &
                                                             scale, zetp
@@ -1758,18 +1739,16 @@ CONTAINS
       ! *** set up the rs multi-grids
       CPASSERT(ASSOCIATED(pw_env))
       CALL pw_env_get(pw_env, rs_descs=rs_descs, rs_grids=rs_rho)
-      DO igrid_level = 1, gridlevel_info%ngrid_levels
-         distributed_rs_grids = rs_rho(igrid_level)%desc%distributed
-      END DO
+      redistribute_matrices = ASSOCIATED(task_list%atom_pair_send)
 
       eps_rho_rspace = dft_control%qs_control%eps_rho_rspace
 
       !   *** Initialize working density matrix ***
-      ! distributed rs grids require a matrix that will be changed
-      ! whereas this is not the case for replicated grids
+      ! Remote tasks need a working matrix containing the received density blocks.
       ALLOCATE (deltap(nimages))
-      IF (distributed_rs_grids) THEN
+      IF (redistribute_matrices) THEN
          DO img = 1, nimages
+            ALLOCATE (deltap(img)%matrix)
          END DO
          ! this matrix has no strict sparsity pattern in parallel
          ! deltap%sparsity_id=-1
@@ -1792,7 +1771,7 @@ CONTAINS
       END IF
 
       ! distribute the matrix
-      IF (distributed_rs_grids) THEN
+      IF (redistribute_matrices) THEN
          CALL rs_distribute_matrix(rs_descs=rs_descs, pmats=deltap, &
                                    atom_pair_send=atom_pair_send, atom_pair_recv=atom_pair_recv, &
                                    nimages=nimages, scatter=.TRUE.)
@@ -2000,7 +1979,7 @@ CONTAINS
       END DO loop_xyz
 
       !   *** Release work storage ***
-      IF (distributed_rs_grids) THEN
+      IF (redistribute_matrices) THEN
          CALL dbcsr_deallocate_matrix_set(deltap)
       ELSE
          DO img = 1, nimages
@@ -2053,7 +2032,7 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, lb_max, lb_min, npgfa, &
                                                             npgfb, nsgfa, nsgfb
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa, first_sgfb
-      LOGICAL                                            :: atom_pair_changed, distributed_rs_grids, &
+      LOGICAL                                            :: atom_pair_changed, redistribute_matrices, &
                                                             do_kp, found, my_soft, use_subpatch
       REAL(KIND=dp)                                      :: eps_rho_rspace, f, prefactor, radius, &
                                                             scale, zetp
@@ -2143,18 +2122,16 @@ CONTAINS
       ! *** set up the rs multi-grids
       CPASSERT(ASSOCIATED(pw_env))
       CALL pw_env_get(pw_env, rs_descs=rs_descs, rs_grids=rs_rho)
-      DO igrid_level = 1, gridlevel_info%ngrid_levels
-         distributed_rs_grids = rs_rho(igrid_level)%desc%distributed
-      END DO
+      redistribute_matrices = ASSOCIATED(task_list%atom_pair_send)
 
       eps_rho_rspace = dft_control%qs_control%eps_rho_rspace
 
       !   *** Initialize working density matrix ***
-      ! distributed rs grids require a matrix that will be changed
-      ! whereas this is not the case for replicated grids
+      ! Remote tasks need a working matrix containing the received density blocks.
       ALLOCATE (deltap(nimages))
-      IF (distributed_rs_grids) THEN
+      IF (redistribute_matrices) THEN
          DO img = 1, nimages
+            ALLOCATE (deltap(img)%matrix)
          END DO
          ! this matrix has no strict sparsity pattern in parallel
          ! deltap%sparsity_id=-1
@@ -2177,7 +2154,7 @@ CONTAINS
       END IF
 
       ! distribute the matrix
-      IF (distributed_rs_grids) THEN
+      IF (redistribute_matrices) THEN
          CALL rs_distribute_matrix(rs_descs=rs_descs, pmats=deltap, &
                                    atom_pair_send=atom_pair_send, atom_pair_recv=atom_pair_recv, &
                                    nimages=nimages, scatter=.TRUE.)
@@ -2262,7 +2239,6 @@ CONTAINS
 
             CALL dbcsr_get_block_p(matrix=deltap(img)%matrix, &
                                    row=brow, col=bcol, BLOCK=p_block, found=found)
-            CPASSERT(found)
 
             iatom_old = iatom
             jatom_old = jatom
@@ -2276,6 +2252,9 @@ CONTAINS
             atom_pair_changed = .FALSE.
 
          END IF
+
+         ! A missing sparse matrix block represents an all-zero atom pair.
+         IF (.NOT. found) CYCLE loop_tasks
 
          IF (atom_pair_changed .OR. iset_old /= iset .OR. jset_old /= jset) THEN
 
@@ -2358,44 +2337,48 @@ CONTAINS
          END SELECT
 
          IF (iatom <= jatom) THEN
-            IF (iatom == lambda) &
+            IF (iatom == lambda) THEN
                CALL collocate_pgf_product( &
-               la_max(iset), zeta(ipgf, iset), la_min(iset), &
-               lb_max(jset), zetb(jpgf, jset), lb_min(jset), &
-               ra, rab, scale, pab, na1 - 1, nb1 - 1, &
-               rsgrid=rs_rho(igrid_level), &
-               ga_gb_function=dabqadb_func, radius=radius, &
-               use_subpatch=use_subpatch, &
-               subpatch_pattern=tasks(itask)%subpatch_pattern)
-            IF (jatom == lambda) &
+                  la_max(iset), zeta(ipgf, iset), la_min(iset), &
+                  lb_max(jset), zetb(jpgf, jset), lb_min(jset), &
+                  ra, rab, scale, pab, na1 - 1, nb1 - 1, &
+                  rsgrid=rs_rho(igrid_level), &
+                  ga_gb_function=dabqadb_func, radius=radius, &
+                  use_subpatch=use_subpatch, &
+                  subpatch_pattern=tasks(itask)%subpatch_pattern)
+            END IF
+            IF (jatom == lambda) THEN
                CALL collocate_pgf_product( &
-               la_max(iset), zeta(ipgf, iset), la_min(iset), &
-               lb_max(jset), zetb(jpgf, jset), lb_min(jset), &
-               ra, rab, scale, pab, na1 - 1, nb1 - 1, &
-               rsgrid=rs_rho(igrid_level), &
-               ga_gb_function=dabqadb_func + 3, radius=radius, &
-               use_subpatch=use_subpatch, &
-               subpatch_pattern=tasks(itask)%subpatch_pattern)
+                  la_max(iset), zeta(ipgf, iset), la_min(iset), &
+                  lb_max(jset), zetb(jpgf, jset), lb_min(jset), &
+                  ra, rab, scale, pab, na1 - 1, nb1 - 1, &
+                  rsgrid=rs_rho(igrid_level), &
+                  ga_gb_function=dabqadb_func + 3, radius=radius, &
+                  use_subpatch=use_subpatch, &
+                  subpatch_pattern=tasks(itask)%subpatch_pattern)
+            END IF
          ELSE
             rab_inv = -rab
-            IF (jatom == lambda) &
+            IF (jatom == lambda) THEN
                CALL collocate_pgf_product( &
-               lb_max(jset), zetb(jpgf, jset), lb_min(jset), &
-               la_max(iset), zeta(ipgf, iset), la_min(iset), &
-               rb, rab_inv, scale, pab, nb1 - 1, na1 - 1, &
-               rs_rho(igrid_level), &
-               ga_gb_function=dabqadb_func, radius=radius, &
-               use_subpatch=use_subpatch, &
-               subpatch_pattern=tasks(itask)%subpatch_pattern)
-            IF (iatom == lambda) &
+                  lb_max(jset), zetb(jpgf, jset), lb_min(jset), &
+                  la_max(iset), zeta(ipgf, iset), la_min(iset), &
+                  rb, rab_inv, scale, pab, nb1 - 1, na1 - 1, &
+                  rs_rho(igrid_level), &
+                  ga_gb_function=dabqadb_func, radius=radius, &
+                  use_subpatch=use_subpatch, &
+                  subpatch_pattern=tasks(itask)%subpatch_pattern)
+            END IF
+            IF (iatom == lambda) THEN
                CALL collocate_pgf_product( &
-               lb_max(jset), zetb(jpgf, jset), lb_min(jset), &
-               la_max(iset), zeta(ipgf, iset), la_min(iset), &
-               rb, rab_inv, scale, pab, nb1 - 1, na1 - 1, &
-               rs_rho(igrid_level), &
-               ga_gb_function=dabqadb_func + 3, radius=radius, &
-               use_subpatch=use_subpatch, &
-               subpatch_pattern=tasks(itask)%subpatch_pattern)
+                  lb_max(jset), zetb(jpgf, jset), lb_min(jset), &
+                  la_max(iset), zeta(ipgf, iset), la_min(iset), &
+                  rb, rab_inv, scale, pab, nb1 - 1, na1 - 1, &
+                  rs_rho(igrid_level), &
+                  ga_gb_function=dabqadb_func + 3, radius=radius, &
+                  use_subpatch=use_subpatch, &
+                  subpatch_pattern=tasks(itask)%subpatch_pattern)
+            END IF
          END IF
 
       END DO loop_tasks
@@ -2403,7 +2386,7 @@ CONTAINS
       CALL density_rs2pw(pw_env, rs_rho, drho, drho_gspace)
 
       !   *** Release work storage ***
-      IF (distributed_rs_grids) THEN
+      IF (redistribute_matrices) THEN
          CALL dbcsr_deallocate_matrix_set(deltap)
       ELSE
          DO img = 1, nimages

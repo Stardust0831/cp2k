@@ -44,23 +44,22 @@ MODULE qs_dispersion_d4
 
 #if defined(__DFTD4)
 !&<
+   USE cp_control_types,                ONLY: dft_control_type
    USE dftd4,                           ONLY: d4_model, &
                                               damping_param, &
                                               get_dispersion, &
                                               get_rational_damping, &
                                               new, &
                                               new_d4_model, &
+                                              new_work_partition, &
                                               realspace_cutoff, &
                                               structure_type, &
+                                              work_partition, &
                                               rational_damping_param, &
                                               get_coordination_number, &
                                               get_lattice_points
-#if defined(__DFTD4_V3)
-   USE dftd4_charge,                    ONLY: get_charges
-#else
    USE multicharge,                     ONLY: get_charges
    USE mctc_env,                        ONLY: error_type
-#endif
 !&>
 #endif
 #include "./base/base_uses.f90"
@@ -78,39 +77,6 @@ MODULE qs_dispersion_d4
 CONTAINS
 
 #if defined(__DFTD4)
-! **************************************************************************************************
-!> \brief Read smooth-cutoff width override from environment.
-!> \param primary primary environment variable name
-!> \param fallback fallback environment variable name
-!> \param cutoff real-space cutoff used to validate the width
-!> \param width smooth-cutoff width to update
-! **************************************************************************************************
-   SUBROUTINE d4_smooth_width_from_env(primary, fallback, cutoff, width)
-      CHARACTER(LEN=*), INTENT(IN)                       :: primary, fallback
-      REAL(KIND=dp), INTENT(IN)                          :: cutoff
-      REAL(KIND=dp), INTENT(INOUT)                       :: width
-
-      CHARACTER(LEN=64)                                  :: env
-      INTEGER                                            :: io, stat
-      REAL(KIND=dp)                                      :: env_width
-
-      CALL GET_ENVIRONMENT_VARIABLE(primary, env, STATUS=stat)
-      IF (stat /= 0 .OR. LEN_TRIM(env) == 0) THEN
-         CALL GET_ENVIRONMENT_VARIABLE(fallback, env, STATUS=stat)
-      END IF
-      IF (stat == 0 .AND. LEN_TRIM(env) > 0) THEN
-         READ (env, *, IOSTAT=io) env_width
-         IF (io == 0) THEN
-            IF (env_width > 0.0_dp .AND. env_width < cutoff) THEN
-               width = env_width
-            ELSE
-               width = 0.0_dp
-            END IF
-         END IF
-      END IF
-
-   END SUBROUTINE d4_smooth_width_from_env
-
 ! **************************************************************************************************
 !> \brief ...
 !> \param qs_env ...
@@ -131,14 +97,9 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'calculate_dispersion_d4_pairpot'
 
-      INTEGER                                            :: atoma, cnfun, enshift, handle, i, iatom
-#if defined(__DFTD4_V3)
-      INTEGER                                            :: ifull, ikind, mref, natom, &
-                                                            natom_full, nghost
-#else
-      INTEGER                                            :: ifull, ikind, mref, natom, ncoup, &
-                                                            natom_full, nghost
-#endif
+      INTEGER                                            :: atoma, cnfun, enshift, handle, i, iatom, &
+                                                            ifull, ikind, mref, natom, natom_full, &
+                                                            ncoup, nghost
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_map, atom_map_back, atom_of_kind, &
                                                             atomtype, kind_of, species, t_atomtype
       INTEGER, DIMENSION(3)                              :: periodic
@@ -148,22 +109,17 @@ CONTAINS
       LOGICAL, DIMENSION(3)                              :: lperiod
       REAL(KIND=dp)                                      :: ed2, ed3, ev1, ev2, ev3, ev4, pd2, pd3, &
                                                             ta, tb, tc, td, te, ts
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cn, cn_red, cnd, dEdcn, dEdq, &
-                                                            edcn, edq, enerd2, &
-                                                            enerd3, energies, energies3, q_red, qd
-#if defined(__DFTD4_V3)
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: ga, gradient, gwdcn, gwdq, &
-                                                            gwvec, t_xyz, tvec, xyz
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: gdeb
-#else
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cn, cn_red, cnd, dEdcn, dEdq, edcn, edq, &
+                                                            enerd2, enerd3, energies, energies3, &
+                                                            q_red, qd
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: ga, gradient, t_xyz, tvec, xyz
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: gdeb, gwdcn, gwdq, gwvec
-#endif
       REAL(KIND=dp), DIMENSION(3, 3)                     :: sigma, stress
       REAL(KIND=dp), DIMENSION(3, 3, 4)                  :: sdeb
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
       TYPE(dcnum_type), ALLOCATABLE, DIMENSION(:)        :: dcnum
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_force_type), DIMENSION(:), POINTER         :: force
@@ -174,17 +130,16 @@ CONTAINS
       TYPE(d4_model)                                     :: disp
       TYPE(structure_type)                               :: mol
       TYPE(realspace_cutoff)                             :: cutoff
+      TYPE(work_partition)                               :: partition
 
-#if !defined(__DFTD4_V3)
       TYPE(error_type), ALLOCATABLE                      :: error
-#endif
 
       CALL timeset(routineN, handle)
 
       debug = dispersion_env%d4_debug
 
       CALL get_qs_env(qs_env=qs_env, particle_set=particle_set, atomic_kind_set=atomic_kind_set, &
-                      cell=cell, force=force, virial=virial, para_env=para_env)
+                      cell=cell, dft_control=dft_control, force=force, virial=virial, para_env=para_env)
       CALL get_atomic_kind_set(atomic_kind_set, atom_of_kind=atom_of_kind, kind_of=kind_of)
 
       !get information about particles
@@ -228,10 +183,7 @@ CONTAINS
       !IF (ALL(periodic == 0)) enshift = 1
 
       !prepare for the call to the dispersion function
-      CALL new(mol, atomtype, xyz, lattice=cell%hmat, periodic=lperiod)
-#if defined(__DFTD4_V3)
-      CALL new_d4_model(disp, mol)
-#else
+      CALL new(mol, atomtype, xyz, charge=REAL(dft_control%charge, dp), lattice=cell%hmat, periodic=lperiod)
       CALL new_d4_model(error, disp, mol)
       IF (ALLOCATED(error)) THEN
          CPABORT(error%message)
@@ -239,7 +191,6 @@ CONTAINS
 
       ! Number of coupling
       ncoup = disp%ncoup
-#endif
 
       ! Build species mapping: full atom index -> D4 species ID (0 for ghost)
       ALLOCATE (species(natom_full))
@@ -293,16 +244,14 @@ CONTAINS
       IF (cutoff%disp3 > cutoff%disp2) THEN
          CPABORT("D4: Three-body cutoff should be smaller than two-body cutoff")
       END IF
-#if defined(__DFTD4_V4_2)
-      ! DFTD4 4.2 introduced explicit smooth-cutoff widths.
-      ! Keep the same narrow two-body smoothing used by the toolchain patch.
-      cutoff%width2 = 0.05_dp
-      cutoff%width3 = 0.0_dp
-      CALL d4_smooth_width_from_env("DFTD4_DISP2_SMOOTH_WIDTH", "TBLITE_D4_DISP2_SMOOTH_WIDTH", &
-                                    cutoff%disp2, cutoff%width2)
-      CALL d4_smooth_width_from_env("DFTD4_DISP3_SMOOTH_WIDTH", "TBLITE_D4_DISP3_SMOOTH_WIDTH", &
-                                    cutoff%disp3, cutoff%width3)
-#endif
+      cutoff%width2 = dispersion_env%d4_cutoff_width
+      cutoff%width3 = dispersion_env%d4_3b_cutoff_width
+      IF (cutoff%width2 < 0.0_dp .OR. cutoff%width2 >= cutoff%disp2) THEN
+         CPABORT("D4: Two-body cutoff width must be non-negative and smaller than the cutoff")
+      END IF
+      IF (cutoff%width3 < 0.0_dp .OR. cutoff%width3 >= cutoff%disp3) THEN
+         CPABORT("D4: Three-body cutoff width must be non-negative and smaller than the cutoff")
+      END IF
 
       IF (calculate_forces) THEN
          grad = .TRUE.
@@ -310,6 +259,11 @@ CONTAINS
       ELSE
          grad = .FALSE.
          use_virial = .FALSE.
+      END IF
+
+      IF (dispersion_env%d4_reference_code .OR. debug) THEN
+         CALL new_work_partition(error, partition, para_env%mepos, para_env%num_pe)
+         IF (ALLOCATED(error)) CPABORT(error%message)
       END IF
 
       IF (dispersion_env%d4_reference_code) THEN
@@ -320,25 +274,27 @@ CONTAINS
          END IF
          IF (grad) THEN
             ALLOCATE (gradient(3, natom))
-            CALL get_dispersion(mol, disp, param, cutoff, evdw, gradient, stress)
+            CALL get_dispersion(mol, disp, param, cutoff, evdw, gradient, stress, &
+                                partition=partition, error=error)
+            IF (ALLOCATED(error)) CPABORT(error%message)
             IF (calculate_forces) THEN
                IF (use_virial) THEN
-                  virial%pv_virial = virial%pv_virial - stress/para_env%num_pe
+                  virial%pv_virial = virial%pv_virial - stress
                END IF
                DO iatom = 1, natom
                   ifull = atom_map_back(iatom)
                   ikind = kind_of(ifull)
                   atoma = atom_of_kind(ifull)
                   force(ikind)%dispersion(:, atoma) = &
-                     force(ikind)%dispersion(:, atoma) + gradient(:, iatom)/para_env%num_pe
+                     force(ikind)%dispersion(:, atoma) + gradient(:, iatom)
                END DO
             END IF
             DEALLOCATE (gradient)
          ELSE
-            CALL get_dispersion(mol, disp, param, cutoff, evdw)
+            CALL get_dispersion(mol, disp, param, cutoff, evdw, partition=partition, error=error)
+            IF (ALLOCATED(error)) CPABORT(error%message)
          END IF
-         !dispersion energy is computed by every MPI process
-         evdw = evdw/para_env%num_pe
+         ! Energy, forces and virial remain local until CP2K's existing reductions.
          IF (dispersion_env%ext_charges) dispersion_env%dcharges = 0.0_dp
          IF (PRESENT(atomic_energy)) THEN
             CPWARN("Atomic energies not available for D4 reference code")
@@ -364,12 +320,22 @@ CONTAINS
          END IF
 
          td = 0.0_dp
-         IF (debug .AND. iw > 0) THEN
+         IF (debug) THEN
             ts = m_walltime()
-            CALL refd4_debug(param, disp, mol, cutoff, grad, dispersion_env%doabc, &
+            CALL refd4_debug(param, disp, mol, cutoff, partition, grad, dispersion_env%doabc, &
                              enerd2, enerd3, cnd, qd, Edcn, Edq, gdeb, sdeb)
+            ! Compare complete results; CN and charges are already replicated.
+            CALL para_env%sum(enerd2)
+            IF (dispersion_env%doabc) CALL para_env%sum(enerd3)
+            IF (grad) THEN
+               CALL para_env%sum(Edcn)
+               CALL para_env%sum(Edq)
+               CALL para_env%sum(gdeb)
+               CALL para_env%sum(sdeb)
+            END IF
             te = m_walltime()
             td = te - ts
+            CALL para_env%max(td)
          END IF
 
          tc = 0.0_dp
@@ -419,13 +385,8 @@ CONTAINS
             WRITE (iw, '(A,T71,F10.6)') " DEBUG D4| Charge differences (ave)", SUM(ABS(q_red - qd))/natom
          END IF
          ! Weights for C6 calculation (reduced space)
-#if defined(__DFTD4_V3)
-         ALLOCATE (gwvec(mref, natom))
-         IF (grad) ALLOCATE (gwdcn(mref, natom), gwdq(mref, natom))
-#else
          ALLOCATE (gwvec(mref, natom, ncoup))
          IF (grad) ALLOCATE (gwdcn(mref, natom, ncoup), gwdq(mref, natom, ncoup))
-#endif
          CALL disp%weight_references(mol, cn_red, q_red, gwvec, gwdcn, gwdq)
 
          ! Energies and derivatives (full-size for CP2K infrastructure compatibility)
@@ -438,7 +399,7 @@ CONTAINS
             ga(:, :) = 0.0_dp
             sigma(:, :) = 0.0_dp
          END IF
-         CALL dispersion_2b(dispersion_env, cutoff%disp2, disp%r4r2, &
+         CALL dispersion_2b(dispersion_env, cutoff%disp2, cutoff%width2, disp%r4r2, &
                             gwvec, gwdcn, gwdq, disp%c6, disp%ref, &
                             energies, dEdcn, dEdq, grad, ga, sigma, &
                             atom_map, species)
@@ -566,12 +527,13 @@ CONTAINS
          tc = tc + te - ts
 
          IF (debug) THEN
+            CALL para_env%max(tc)
             ta = SUM(energies)
             CALL para_env%sum(ta)
             IF (iw > 0) THEN
                tb = SUM(enerd2)
                ed2 = ta - tb
-               pd2 = ABS(ed2)/ABS(tb)*100.
+               pd2 = ABS(ed2)/ABS(tb)*100._dp
                WRITE (iw, '(A,T51,F14.8,T69,F10.4,A)') " DEBUG D4| Energy error 2-body", ed2, pd2, " %"
             END IF
             IF (dispersion_env%doabc) THEN
@@ -580,7 +542,7 @@ CONTAINS
                IF (iw > 0) THEN
                   tb = SUM(enerd3)
                   ed3 = ta - tb
-                  pd3 = ABS(ed3)/ABS(tb)*100.
+                  pd3 = ABS(ed3)/ABS(tb)*100._dp
                   WRITE (iw, '(A,T51,F14.8,T69,F10.4,A)') " DEBUG D4| Energy error 3-body", ed3, pd3, " %"
                END IF
             END IF
@@ -631,6 +593,7 @@ CONTAINS
 !> \param disp ...
 !> \param mol ...
 !> \param cutoff ...
+!> \param partition ...
 !> \param grad ...
 !> \param doabc ...
 !> \param enerd2 ...
@@ -642,38 +605,27 @@ CONTAINS
 !> \param gradient ...
 !> \param stress ...
 ! **************************************************************************************************
-   SUBROUTINE refd4_debug(param, disp, mol, cutoff, grad, doabc, &
+   SUBROUTINE refd4_debug(param, disp, mol, cutoff, partition, grad, doabc, &
                           enerd2, enerd3, cnd, qd, dEdcn, dEdq, gradient, stress)
       CLASS(damping_param)                               :: param
       TYPE(d4_model)                                     :: disp
       TYPE(structure_type)                               :: mol
       TYPE(realspace_cutoff)                             :: cutoff
-#if !defined(__DFTD4_V3)
+      TYPE(work_partition), INTENT(IN)                   :: partition
       TYPE(error_type), ALLOCATABLE                      :: error
-#endif
       LOGICAL, INTENT(IN)                                :: grad, doabc
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: enerd2, enerd3, cnd, qd, dEdcn, dEdq
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: gradient
       REAL(KIND=dp), DIMENSION(3, 3, 4)                  :: stress
 
-#if defined(__DFTD4_V3)
-      INTEGER                                            :: mref, natom, i
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: q, qq
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: lattr, gwdcn, gwdq, gwvec, &
-                                                            c6, dc6dcn, dc6dq
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: cndr, cndL, qdr, qdL
-#else
       INTEGER                                            :: mref, natom, i, ncoup
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: q, qq
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: lattr, c6, dc6dcn, dc6dq
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: cndr, cndL, qdr, qdL, gwdcn, gwdq, gwvec
-#endif
 
       mref = MAXVAL(disp%ref)
       natom = mol%nat
-#if !defined(__DFTD4_V3)
       ncoup = disp%ncoup
-#endif
 
       ! Coordination numbers
       ALLOCATE (cnd(natom))
@@ -684,22 +636,13 @@ CONTAINS
       ! EEQ charges
       ALLOCATE (qd(natom))
       IF (grad) ALLOCATE (qdr(3, natom, natom), qdL(3, 3, natom))
-#if defined(__DFTD4_V3)
-      CALL get_charges(mol, qd, qdr, qdL)
-#else
       CALL get_charges(disp%mchrg, mol, error, qd, qdr, qdL)
       IF (ALLOCATED(error)) THEN
          CPABORT(error%message)
       END IF
-#endif
       ! C6 interpolation
-#if defined(__DFTD4_V3)
-      ALLOCATE (gwvec(mref, natom))
-      IF (grad) ALLOCATE (gwdcn(mref, natom), gwdq(mref, natom))
-#else
       ALLOCATE (gwvec(mref, natom, ncoup))
       IF (grad) ALLOCATE (gwdcn(mref, natom, ncoup), gwdq(mref, natom, ncoup))
-#endif
       CALL disp%weight_references(mol, cnd, qd, gwvec, gwdcn, gwdq)
       ALLOCATE (c6(natom, natom))
       IF (grad) ALLOCATE (dc6dcn(natom, natom), dc6dq(natom, natom))
@@ -718,20 +661,17 @@ CONTAINS
          ALLOCATE (dEdcn(natom), dEdq(natom))
          dEdcn(:) = 0.0_dp; dEdq(:) = 0.0_dp
       END IF
-#if defined(__DFTD4_V4_2)
-      CALL param%get_dispersion2(mol, lattr, cutoff%disp2, cutoff%width2, disp%r4r2, c6, &
-                                 dc6dcn, dc6dq, enerd2, dEdcn, dEdq, gradient(:, :, 1), &
-                                 stress(:, :, 1))
-#else
-      CALL param%get_dispersion2(mol, lattr, cutoff%disp2, disp%r4r2, c6, dc6dcn, dc6dq, &
-                                 enerd2, dEdcn, dEdq, gradient(:, :, 1), stress(:, :, 1))
-#endif
-      !
       IF (grad) THEN
+         CALL param%get_dispersion2(mol, lattr, cutoff%disp2, cutoff%width2, disp%r4r2, c6, &
+                                    dc6dcn, dc6dq, enerd2, dEdcn, dEdq, gradient(:, :, 1), &
+                                    stress(:, :, 1), partition=partition)
          DO i = 1, 3
             gradient(i, :, 2) = MATMUL(qdr(i, :, :), dEdq(:))
             stress(i, :, 2) = MATMUL(qdL(i, :, :), dEdq(:))
          END DO
+      ELSE
+         CALL param%get_dispersion2(mol, lattr, cutoff%disp2, cutoff%width2, disp%r4r2, c6, &
+                                    energy=enerd2, partition=partition)
       END IF
       !
       IF (doabc) THEN
@@ -742,14 +682,14 @@ CONTAINS
          CALL disp%weight_references(mol, cnd, q, gwvec, gwdcn, gwdq)
          CALL disp%get_atomic_c6(mol, gwvec, gwdcn, gwdq, c6, dc6dcn, dc6dq)
          CALL get_lattice_points(mol%periodic, mol%lattice, cutoff%disp3, lattr)
-#if defined(__DFTD4_V4_2)
-         CALL param%get_dispersion3(mol, lattr, cutoff%disp3, cutoff%width3, disp%r4r2, c6, &
-                                    dc6dcn, dc6dq, enerd3, dEdcn, qq, gradient(:, :, 3), &
-                                    stress(:, :, 3))
-#else
-         CALL param%get_dispersion3(mol, lattr, cutoff%disp3, disp%r4r2, c6, dc6dcn, dc6dq, &
-                                    enerd3, dEdcn, qq, gradient(:, :, 3), stress(:, :, 3))
-#endif
+         IF (grad) THEN
+            CALL param%get_dispersion3(mol, lattr, cutoff%disp3, cutoff%width3, disp%r4r2, c6, &
+                                       dc6dcn, dc6dq, enerd3, dEdcn, qq, gradient(:, :, 3), &
+                                       stress(:, :, 3), partition=partition)
+         ELSE
+            CALL param%get_dispersion3(mol, lattr, cutoff%disp3, cutoff%width3, disp%r4r2, c6, &
+                                       energy=enerd3, partition=partition)
+         END IF
       END IF
       IF (grad) THEN
          DO i = 1, 3
@@ -794,9 +734,45 @@ CONTAINS
 #endif
 
 ! **************************************************************************************************
+!> \brief Quintic Hermite switching function used by the D4 two-body cutoff.
+!> \param r interatomic distance
+!> \param cutoff real-space cutoff
+!> \param width width of the smooth cutoff region
+!> \param sw switching function value
+!> \param dswdr derivative of the switching function with respect to r
+! **************************************************************************************************
+   SUBROUTINE d4_smooth_cutoff(r, cutoff, width, sw, dswdr)
+      REAL(KIND=dp), INTENT(IN)                          :: r, cutoff, width
+      REAL(KIND=dp), INTENT(OUT)                         :: sw, dswdr
+
+      REAL(KIND=dp)                                      :: effective_width, inner, x
+
+      IF (width <= 0.0_dp .OR. cutoff <= 0.0_dp) THEN
+         sw = 1.0_dp
+         dswdr = 0.0_dp
+      ELSE
+         effective_width = MIN(width, cutoff)
+         inner = cutoff - effective_width
+         IF (r <= inner) THEN
+            sw = 1.0_dp
+            dswdr = 0.0_dp
+         ELSE IF (r >= cutoff) THEN
+            sw = 0.0_dp
+            dswdr = 0.0_dp
+         ELSE
+            x = (cutoff - r)/effective_width
+            sw = x**3*(10.0_dp + x*(-15.0_dp + 6.0_dp*x))
+            dswdr = -30.0_dp*x**2*(1.0_dp - x)**2/effective_width
+         END IF
+      END IF
+
+   END SUBROUTINE d4_smooth_cutoff
+
+! **************************************************************************************************
 !> \brief ...
 !> \param dispersion_env ...
 !> \param cutoff ...
+!> \param width ...
 !> \param r4r2 ...
 !> \param gwvec ...
 !> \param gwdcn ...
@@ -812,19 +788,15 @@ CONTAINS
 !> \param atom_map ...
 !> \param species ...
 ! **************************************************************************************************
-   SUBROUTINE dispersion_2b(dispersion_env, cutoff, r4r2, &
+   SUBROUTINE dispersion_2b(dispersion_env, cutoff, width, r4r2, &
                             gwvec, gwdcn, gwdq, c6ref, mrefs, &
                             energies, dEdcn, dEdq, &
                             calculate_forces, gradient, stress, &
                             atom_map, species)
       TYPE(qs_dispersion_type), POINTER                  :: dispersion_env
-      REAL(KIND=dp), INTENT(IN)                          :: cutoff
+      REAL(KIND=dp), INTENT(IN)                          :: cutoff, width
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: r4r2
-#if defined(__DFTD4_V3)
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: gwvec, gwdcn, gwdq
-#else
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: gwvec, gwdcn, gwdq
-#endif
       REAL(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN)   :: c6ref
       INTEGER, DIMENSION(:), INTENT(IN)                  :: mrefs
       REAL(KIND=dp), DIMENSION(:), INTENT(INOUT)         :: energies, dEdcn, dEdq
@@ -835,8 +807,9 @@ CONTAINS
       INTEGER                                            :: ia, iatom, ik, ikind, ja, jatom, jk, &
                                                             jkind, mepos, num_pe
       REAL(KINd=dp)                                      :: a1, a2, c6ij, cutoff2, d6, d8, dE, dr2, &
-                                                            edisp, fac, gdisp, r0ij, rrij, s6, s8, &
-                                                            t6, t8
+                                                            dswdr, edisp, edisp0, fac, gdisp, &
+                                                            gdisp0, r, r0ij, rrij, s6, s8, sw, t6, &
+                                                            t8
       REAL(KINd=dp), DIMENSION(2)                        :: dcdcn, dcdq
       REAL(KINd=dp), DIMENSION(3)                        :: dG, rij
       REAL(KINd=dp), DIMENSION(3, 3)                     :: dS
@@ -880,10 +853,14 @@ CONTAINS
             END IF
             fac = 1._dp
             IF (iatom == jatom) fac = 0.5_dp
+            r = SQRT(dr2)
+            CALL d4_smooth_cutoff(r, cutoff, width, sw, dswdr)
+            IF (sw <= 0.0_dp) CYCLE
             t6 = 1.0_dp/(dr2**3 + r0ij**6)
             t8 = 1.0_dp/(dr2**4 + r0ij**8)
 
-            edisp = (s6*t6 + s8*rrij*t8)*fac
+            edisp0 = s6*t6 + s8*rrij*t8
+            edisp = sw*edisp0*fac
             dE = -c6ij*edisp
             energies(iatom) = energies(iatom) + dE*0.5_dp
             energies(jatom) = energies(jatom) + dE*0.5_dp
@@ -891,7 +868,8 @@ CONTAINS
             IF (calculate_forces) THEN
                d6 = -6.0_dp*dr2**2*t6**2
                d8 = -8.0_dp*dr2**3*t8**2
-               gdisp = (s6*d6 + s8*rrij*d8)*fac
+               gdisp0 = s6*d6 + s8*rrij*d8
+               gdisp = (sw*gdisp0 + dswdr*edisp0/r)*fac
                dG(:) = -c6ij*gdisp*rij(:)
                gradient(:, iatom) = gradient(:, iatom) - dG
                gradient(:, jatom) = gradient(:, jatom) + dG
@@ -940,11 +918,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: tvec
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: r4r2
-#if defined(__DFTD4_V3)
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: gwvec, gwdcn, gwdq
-#else
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: gwvec, gwdcn, gwdq
-#endif
       REAL(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN)   :: c6ref
       INTEGER, DIMENSION(:), INTENT(IN)                  :: mrefs
       REAL(KIND=dp), DIMENSION(:), INTENT(INOUT)         :: energies, dEdcn, dEdq
@@ -1223,11 +1197,7 @@ CONTAINS
    SUBROUTINE get_c6value(c6ij, ia, ja, ik, jk, gwvec, c6ref, mrefs)
       REAL(KIND=dp), INTENT(OUT)                         :: c6ij
       INTEGER, INTENT(IN)                                :: ia, ja, ik, jk
-#if defined(__DFTD4_V3)
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: gwvec
-#else
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: gwvec
-#endif
       REAL(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN)   :: c6ref
       INTEGER, DIMENSION(:), INTENT(IN)                  :: mrefs
 
@@ -1238,11 +1208,7 @@ CONTAINS
       DO jref = 1, mrefs(jk)
          DO iref = 1, mrefs(ik)
             refc6 = c6ref(iref, jref, ik, jk)
-#if defined(__DFTD4_V3)
-            c6ij = c6ij + gwvec(iref, ia)*gwvec(jref, ja)*refc6
-#else
             c6ij = c6ij + gwvec(iref, ia, 1)*gwvec(jref, ja, 1)*refc6
-#endif
          END DO
       END DO
 
@@ -1268,11 +1234,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(OUT)                         :: c6ij
       REAL(KIND=dp), DIMENSION(2), INTENT(OUT)           :: dc6dcn, dc6dq
       INTEGER, INTENT(IN)                                :: ia, ja, ik, jk
-#if defined(__DFTD4_V3)
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: gwvec, gwdcn, gwdq
-#else
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: gwvec, gwdcn, gwdq
-#endif
       REAL(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN)   :: c6ref
       INTEGER, DIMENSION(:), INTENT(IN)                  :: mrefs
 
@@ -1285,19 +1247,11 @@ CONTAINS
       DO jref = 1, mrefs(jk)
          DO iref = 1, mrefs(ik)
             refc6 = c6ref(iref, jref, ik, jk)
-#if defined(__DFTD4_V3)
-            c6ij = c6ij + gwvec(iref, ia)*gwvec(jref, ja)*refc6
-            dc6dcn(1) = dc6dcn(1) + gwdcn(iref, ia)*gwvec(jref, ja)*refc6
-            dc6dcn(2) = dc6dcn(2) + gwvec(iref, ia)*gwdcn(jref, ja)*refc6
-            dc6dq(1) = dc6dq(1) + gwdq(iref, ia)*gwvec(jref, ja)*refc6
-            dc6dq(2) = dc6dq(2) + gwvec(iref, ia)*gwdq(jref, ja)*refc6
-#else
             c6ij = c6ij + gwvec(iref, ia, 1)*gwvec(jref, ja, 1)*refc6
             dc6dcn(1) = dc6dcn(1) + gwdcn(iref, ia, 1)*gwvec(jref, ja, 1)*refc6
             dc6dcn(2) = dc6dcn(2) + gwvec(iref, ia, 1)*gwdcn(jref, ja, 1)*refc6
             dc6dq(1) = dc6dq(1) + gwdq(iref, ia, 1)*gwvec(jref, ja, 1)*refc6
             dc6dq(2) = dc6dq(2) + gwvec(iref, ia, 1)*gwdq(jref, ja, 1)*refc6
-#endif
          END DO
       END DO
 
@@ -1324,7 +1278,7 @@ CONTAINS
       np = MAXLOC(ABS(gd - ga))
       ev3 = ABS(gd(np(1), np(2)) - ga(np(1), np(2)))
       ev4 = ABS(gd(np(1), np(2)))
-      IF (ev4 > 1.E-6) THEN
+      IF (ev4 > 1.E-6_dp) THEN
          ev4 = ev3/ev4*100._dp
       ELSE
          ev4 = 100.0_dp

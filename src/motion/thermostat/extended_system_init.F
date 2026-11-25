@@ -126,9 +126,10 @@ CONTAINS
             restart = explicit
             work_section2 => section_vals_get_subs_vals(work_section, "MASS")
             CALL section_vals_get(work_section2, explicit=explicit)
-            IF (restart .NEQV. explicit) &
+            IF (restart .NEQV. explicit) THEN
                CALL cp_abort(__LOCATION__, "You need to define both VELOCITY and "// &
                              "MASS section (or none) in the BAROSTAT section")
+            END IF
             restart = explicit .AND. restart
          END IF
 
@@ -616,21 +617,24 @@ CONTAINS
             restart = explicit
             work_section => section_vals_get_subs_vals(nose_section, "COORD")
             CALL section_vals_get(work_section, explicit=explicit)
-            IF (.NOT. restart .AND. explicit) &
+            IF (.NOT. restart .AND. explicit) THEN
                CALL cp_abort(__LOCATION__, "You need to define both VELOCITY and "// &
                              "COORD and MASS and FORCE section (or none) in the NOSE section")
+            END IF
             restart = explicit .AND. restart
             work_section => section_vals_get_subs_vals(nose_section, "MASS")
             CALL section_vals_get(work_section, explicit=explicit)
-            IF (.NOT. restart .AND. explicit) &
+            IF (.NOT. restart .AND. explicit) THEN
                CALL cp_abort(__LOCATION__, "You need to define both VELOCITY and "// &
                              "COORD and MASS and FORCE section (or none) in the NOSE section")
+            END IF
             restart = explicit .AND. restart
             work_section => section_vals_get_subs_vals(nose_section, "FORCE")
             CALL section_vals_get(work_section, explicit=explicit)
-            IF (.NOT. restart .AND. explicit) &
+            IF (.NOT. restart .AND. explicit) THEN
                CALL cp_abort(__LOCATION__, "You need to define both VELOCITY and "// &
                              "COORD and MASS and FORCE section (or none) in the NOSE section")
+            END IF
             restart = explicit .AND. restart
          END IF
 
@@ -789,7 +793,6 @@ CONTAINS
             DO j = 1, nhc%nhc_len
                icount = icount + 1
                nhc%nvt(j, i)%v = array_of_rn(icount)
-               ! WRITE ( *, * ) 'VEL', para_env%mepos, i,j, nhc%nvt(j,i)%v
                nhc%nvt(j, i)%eta = 0.0_dp
             END DO
          END DO
@@ -905,7 +908,6 @@ CONTAINS
             IF (debug_isotropic_limit) THEN
                npt(j, i)%v = 0.0_dp
                npt(i, j)%v = 0.0_dp
-               WRITE (*, *) 'DEBUG ISOTROPIC LIMIT| INITIAL v_eps', npt(j, i)%v
             END IF
          END DO
       END DO

@@ -1,0 +1,1753 @@
+!--------------------------------------------------------------------------------------------------!
+!   CP2K: A general program to perform molecular dynamics simulations                              !
+!   Copyright 2000-2026 CP2K developers group <https://cp2k.org>                                   !
+!                                                                                                  !
+!   SPDX-License-Identifier: GPL-2.0-or-later                                                      !
+!--------------------------------------------------------------------------------------------------!
+
+! **************************************************************************************************
+!> \brief Routines from paper [Graml2024]
+!> \par History
+!>      01.2026 Maximilian Graml: add more bounds to exploit sparsity in 3c integrals, fixes
+!> \author Jan Wilhelm
+!> \date 07.2023
+! **************************************************************************************************
+MODULE gw_tensor_large_cell_Gamma
+   USE bibliography,                    ONLY: Graml2024,&
+                                              cite_reference
+   USE cell_types,                      ONLY: cell_type,&
+                                              pbc
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_get_diag
+   USE cp_cfm_diag,                     ONLY: cp_cfm_geeig
+   USE cp_cfm_types,                    ONLY: cp_cfm_create,&
+                                              cp_cfm_release,&
+                                              cp_cfm_type
+   USE cp_dbcsr_api,                    ONLY: dbcsr_create,&
+                                              dbcsr_p_type,&
+                                              dbcsr_release,&
+                                              dbcsr_type
+   USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
+                                              copy_fm_to_dbcsr,&
+                                              dbcsr_deallocate_matrix_set
+   USE cp_fm_types,                     ONLY: cp_fm_create,&
+                                              cp_fm_release,&
+                                              cp_fm_type
+   USE dbt_api,                         ONLY: dbt_clear,&
+                                              dbt_contract,&
+                                              dbt_copy,&
+                                              dbt_create,&
+                                              dbt_destroy,&
+                                              dbt_filter,&
+                                              dbt_get_nze,&
+                                              dbt_type
+   USE dbt_matrix_redistribution,       ONLY: cp_dbt_to_dbcsr,&
+                                              cp_fm_to_dbt
+   USE gw_compute_V_and_W,              ONLY: fm_read,&
+                                              fm_write,&
+                                              get_W_MIC
+   USE gw_nevanlinna,                   ONLY: gw_qp_summary_type
+   USE gw_utils,                        ONLY: G_occ_vir,&
+                                              analyt_conti_and_print,&
+                                              de_init_bs_env
+   USE gw_utils_fm,                     ONLY: cfm_contract_ABA,&
+                                              fm_contract_ABA
+   USE hfx_types,                       ONLY: alloc_containers
+   USE input_constants,                 ONLY: G0W0
+   USE kinds,                           ONLY: default_path_length,&
+                                              dp,&
+                                              int_8
+   USE machine,                         ONLY: m_walltime
+   USE message_passing,                 ONLY: mp_file_delete,&
+                                              mp_mem_avail_per_rank_GB
+   USE mp2_ri_2c,                       ONLY: RI_2c_integral_mat
+   USE particle_types,                  ONLY: particle_type
+   USE post_scf_bandstructure_types,    ONLY: post_scf_bandstructure_type,&
+                                              store_3c_release,&
+                                              store_3c_type
+   USE post_scf_bandstructure_utils,    ONLY: cfm_ikp_from_fm_Gamma,&
+                                              get_all_VBM_CBM_bandgaps
+   USE qs_environment_types,            ONLY: get_qs_env,&
+                                              qs_environment_type
+   USE qs_tensors,                      ONLY: build_3c_integrals,&
+                                              compress_tensor,&
+                                              decompress_tensor
+   USE time_frequency_grids,            ONLY: negative_time,&
+                                              positive_time,&
+                                              transform_time_to_frequency
+#include "./base/base_uses.f90"
+
+   IMPLICIT NONE
+
+   PRIVATE
+
+   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'gw_tensor_large_cell_Gamma'
+
+   ! shares of memory that the kept 3-center integrals may take (estimated uncompressed): compressed
+   ! below a share of MEMORY_PER_PROC, kept as tensors (used in place) only below a small share of
+   ! MEMORY_PER_PROC and of the memory free at that time, since they add to the working set of the
+   ! tensor contractions that the estimate does not cover
+   REAL(KIND=dp), PARAMETER, PRIVATE :: store_3c_share_uncompressed = 0.1_dp, &
+                                        store_3c_share_compressed = 0.5_dp
+   ! compression stores multiples of EPS_FILTER times this (and drops smaller entries), as the
+   ! default EPS_STORAGE_SCALING of low-scaling RPA/GW
+   REAL(KIND=dp), PARAMETER, PRIVATE :: store_3c_eps_scaling = 1.0E-3_dp
+
+   PUBLIC :: gw_calc_tensor_large_cell_Gamma, &
+             compute_3c_integrals, &
+             G_occ_vir, &
+             delete_unnecessary_files, &
+             compute_QP_energies, &
+             get_mat_chi_Gamma_tau, &
+             get_Sigma_x, &
+             create_mat_for_Sigma_c, &
+             destroy_mat_Sigma_c, &
+             compute_Sigma_c_occ_vir, &
+             print_skipping
+
+CONTAINS
+
+! **************************************************************************************************
+!> \brief Perform GW band structure calculation
+!> \param qs_env ...
+!> \param bs_env Band-structure environment containing GW parameters.
+!> \par History
+!>    * 07.2023 created [Jan Wilhelm]
+! **************************************************************************************************
+   SUBROUTINE gw_calc_tensor_large_cell_Gamma(qs_env, bs_env)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'gw_calc_tensor_large_cell_Gamma'
+
+      INTEGER                                            :: handle
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma, fm_W_MIC_time
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: fm_Sigma_c_Gamma_time
+
+      CALL timeset(routineN, handle)
+
+      CALL cite_reference(Graml2024)
+
+      ! G^occ_µλ(i|τ|,k=0) = sum_n^occ C_µn(k=0) e^(-|(ϵ_nk=0-ϵ_F)τ|) C_λn(k=0)
+      ! G^vir_µλ(i|τ|,k=0) = sum_n^vir C_µn(k=0) e^(-|(ϵ_nk=0-ϵ_F)τ|) C_λn(k=0)
+      ! χ_PQ(iτ,k=0) = sum_λν [sum_µ (µν|P) G^occ_µλ(i|τ|)] [sum_σ (σλ|Q) G^vir_σν(i|τ|)]
+      ! (µν|P) does not depend on τ: kept (compressed) for the time points of χ if it fits
+      CALL store_3c_init(bs_env, bs_env%store_3c_chi, bs_env%n_intervals_i + bs_env%n_intervals_j)
+      CALL get_mat_chi_Gamma_tau(bs_env, qs_env, bs_env%mat_chi_Gamma_tau)
+      CALL store_3c_finish(bs_env, bs_env%store_3c_chi)
+
+      ! χ_PQ(iτ,k=0) -> χ_PQ(iω,k) -> ε_PQ(iω,k) -> W_PQ(iω,k) -> W^MIC_PQ(iτ) -> M^-1*W^MIC*M^-1
+      CALL get_W_MIC(bs_env, qs_env, bs_env%mat_chi_Gamma_tau, fm_W_MIC_time)
+
+      ! (νσ|P) and (λµ|Q) kept (compressed) for Σ^x and the time points of Σ^c if they fit
+      CALL store_3c_init(bs_env, bs_env%store_3c_W, bs_env%n_intervals_i)
+      CALL store_3c_init(bs_env, bs_env%store_3c_Sigma, bs_env%n_intervals_j)
+
+      ! D_µν = sum_n^occ C_µn(k=0) C_νn(k=0), V^trunc_PQ = sum_cell_R <phi_P,0|V^trunc|phi_Q,R>
+      ! Σ^x_λσ(k=0) = sum_νQ [sum_P (νσ|P) V^trunc_PQ] [sum_µ (λµ|Q) D_µν)]
+      CALL get_Sigma_x(bs_env, qs_env, fm_Sigma_x_Gamma)
+
+      ! Σ^c_λσ(iτ,k=0) = sum_νQ [sum_P (νσ|P) W^MIC_PQ(iτ)] [sum_µ (λµ|Q) G^occ_µν(i|τ|)], τ < 0
+      ! Σ^c_λσ(iτ,k=0) = sum_νQ [sum_P (νσ|P) W^MIC_PQ(iτ)] [sum_µ (λµ|Q) G^vir_µν(i|τ|)], τ > 0
+      CALL get_Sigma_c(bs_env, qs_env, fm_W_MIC_time, fm_Sigma_c_Gamma_time)
+      CALL store_3c_finish(bs_env, bs_env%store_3c_W, bs_env%store_3c_Sigma)
+
+      ! Σ^c_λσ(iτ,k=0) -> Σ^c_nn(ϵ,k); ϵ_nk^GW = ϵ_nk^DFT + Σ^c_nn(ϵ,k) + Σ^x_nn(k) - v^xc_nn(k)
+      CALL compute_QP_energies(bs_env, qs_env, fm_Sigma_x_Gamma, fm_Sigma_c_Gamma_time)
+
+      CALL de_init_bs_env(qs_env, bs_env)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE gw_calc_tensor_large_cell_Gamma
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param mat_chi_Gamma_tau ...
+! **************************************************************************************************
+   SUBROUTINE get_mat_chi_Gamma_tau(bs_env, qs_env, mat_chi_Gamma_tau)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: mat_chi_Gamma_tau
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'get_mat_chi_Gamma_tau'
+
+      INTEGER :: handle, i_intval_idx, i_t, inner_loop_atoms_interval_index, ispin, j_intval_idx
+      INTEGER(KIND=int_8)                                :: flop
+      INTEGER, DIMENSION(2)                              :: bounds_P, bounds_Q, i_atoms, IL_atoms, &
+                                                            j_atoms
+      INTEGER, DIMENSION(2, 2)                           :: bounds_comb
+      LOGICAL                                            :: dist_too_long_i, dist_too_long_j
+      REAL(KIND=dp)                                      :: t1, tau
+      TYPE(dbt_type)                                     :: t_2c_Gocc, t_2c_Gvir, t_3c_x_Gocc, &
+                                                            t_3c_x_Gocc_2, t_3c_x_Gvir, &
+                                                            t_3c_x_Gvir_2
+      TYPE(dbt_type), POINTER                            :: t_3c_use
+      TYPE(dbt_type), TARGET                             :: t_3c_for_Gocc, t_3c_for_Gvir
+
+      CALL timeset(routineN, handle)
+
+      DO i_t = 1, bs_env%num_time_freq_points
+
+         t1 = m_walltime()
+
+         IF (bs_env%read_chi(i_t)) THEN
+
+            CALL fm_read(bs_env%fm_RI_RI, bs_env, bs_env%chi_name, i_t)
+
+            CALL copy_fm_to_dbcsr(bs_env%fm_RI_RI, mat_chi_Gamma_tau(i_t)%matrix, &
+                                  keep_sparsity=.FALSE.)
+
+            IF (bs_env%unit_nr > 0) THEN
+               WRITE (bs_env%unit_nr, '(T2,A,I5,A,I3,A,F10.1,A)') &
+                  'Read χ(iτ,k=0) from file for time point  ', i_t, ' /', &
+                  bs_env%num_time_freq_points, &
+                  ', Execution time', m_walltime() - t1, ' s'
+            END IF
+
+            CYCLE
+
+         END IF
+
+         IF (.NOT. bs_env%calc_chi(i_t)) CYCLE
+
+         CALL create_tensors_chi(t_2c_Gocc, t_2c_Gvir, t_3c_for_Gocc, t_3c_for_Gvir, &
+                                 t_3c_x_Gocc, t_3c_x_Gvir, t_3c_x_Gocc_2, t_3c_x_Gvir_2, bs_env)
+
+         ! 1. compute G^occ and G^vir
+         !    Background: G^σ(iτ) = G^occ,σ(iτ) * Θ(-τ) + G^vir,σ(iτ) * Θ(τ), σ ∈ {↑,↓}
+         !    G^occ,σ_µλ(i|τ|,k=0) = sum_n^occ C^σ_µn(k=0) e^(-|(ϵ^σ_nk=0-ϵ_F)τ|) C^σ_λn(k=0)
+         !    G^vir,σ_µλ(i|τ|,k=0) = sum_n^vir C^σ_µn(k=0) e^(-|(ϵ^σ_nk=0-ϵ_F)τ|) C^σ_λn(k=0)
+         tau = bs_env%time_frequency_grid%imaginary_time(i_t)
+
+         DO ispin = 1, bs_env%n_spin
+            CALL G_occ_vir(bs_env, tau, bs_env%fm_Gocc, ispin, occ=.TRUE., vir=.FALSE.)
+            CALL G_occ_vir(bs_env, tau, bs_env%fm_Gvir, ispin, occ=.FALSE., vir=.TRUE.)
+
+            CALL cp_fm_to_dbt(bs_env%fm_Gocc, bs_env%mat_ao_ao%matrix, bs_env%mat_ao_ao_tensor%matrix, t_2c_Gocc, &
+                              bs_env%para_env, bs_env%para_env_tensor%num_pe, bs_env%eps_filter, &
+                              bs_env%atoms_j_t_group)
+            CALL cp_fm_to_dbt(bs_env%fm_Gvir, bs_env%mat_ao_ao%matrix, bs_env%mat_ao_ao_tensor%matrix, t_2c_Gvir, &
+                              bs_env%para_env, bs_env%para_env_tensor%num_pe, bs_env%eps_filter, &
+                              bs_env%atoms_i_t_group)
+
+            ! every group has its own range of i_atoms and j_atoms; only deal with a
+            ! limited number of i_atom-j_atom pairs simultaneously in a group to save memory
+            DO i_intval_idx = 1, bs_env%n_intervals_i
+               DO j_intval_idx = 1, bs_env%n_intervals_j
+                  i_atoms = bs_env%i_atom_intervals(1:2, i_intval_idx)
+                  j_atoms = bs_env%j_atom_intervals(1:2, j_intval_idx)
+
+                  IF (bs_env%skip_chi(i_intval_idx, j_intval_idx)) THEN
+                     ! Do that only after first timestep to avoid skips due to vanishing G
+                     ! caused by gaps
+                     IF (i_t == 2) THEN
+                        bs_env%n_skip_chi = bs_env%n_skip_chi + 1
+                     END IF
+                     CYCLE
+                  END IF
+
+                  DO inner_loop_atoms_interval_index = 1, bs_env%n_intervals_inner_loop_atoms
+
+                     IL_atoms = bs_env%inner_loop_atom_intervals(1:2, inner_loop_atoms_interval_index)
+                     ! Idea: Use sparsity in 3c integrals behind χ_PQ(iτ,k=0)
+                     !   ->  λ   bounds from j_atoms -> sparse in IL_atoms through σ in
+                     !                                   N_Qλν(iτ) = sum_σ (Qλ|σ) G^vir_νσ(i|τ|,k=0)
+                     !   ->  ν   bounds from i_atoms -> sparse in IL_atoms through µ in
+                     !                                   M_Pνλ(iτ) = sum_µ (Pν|µ) G^occ_λµ(i|τ|,k=0)
+                     CALL check_dist(i_atoms, IL_atoms, qs_env, bs_env, dist_too_long_i)
+                     CALL check_dist(j_atoms, IL_atoms, qs_env, bs_env, dist_too_long_j)
+                     IF (.NOT. dist_too_long_i) THEN
+                        ! 2. compute 3-center integrals (Pν|µ) ("|": truncated Coulomb operator)
+                        CALL get_3c_integrals(qs_env, bs_env, bs_env%store_3c_chi, t_3c_for_Gocc, &
+                                              t_3c_use, atoms_AO_1=i_atoms, atoms_AO_2=IL_atoms)
+                        ! 3. tensor operation M_Pνλ(iτ) = sum_µ (Pν|µ) G^occ_λµ(i|τ|,k=0)
+                        CALL G_times_3c(t_3c_use, t_2c_Gocc, t_3c_x_Gocc, bs_env, &
+                                        j_atoms, i_atoms, IL_atoms)
+                        CALL dbt_clear(t_3c_for_Gocc)
+                     END IF
+                     IF (.NOT. dist_too_long_j) THEN
+                        ! 4. compute 3-center integrals (Qλ|σ) ("|": truncated Coulomb operator)
+                        CALL get_3c_integrals(qs_env, bs_env, bs_env%store_3c_chi, t_3c_for_Gvir, &
+                                              t_3c_use, atoms_AO_1=j_atoms, atoms_AO_2=IL_atoms)
+                        ! 5. tensor operation N_Qλν(iτ) = sum_σ (Qλ|σ) G^vir_νσ(i|τ|,k=0)
+                        CALL G_times_3c(t_3c_use, t_2c_Gvir, t_3c_x_Gvir, bs_env, &
+                                        i_atoms, j_atoms, IL_atoms)
+                        CALL dbt_clear(t_3c_for_Gvir)
+                     END IF
+                  END DO ! IL_atoms
+
+                  ! 6. reorder tensors: M_Pνλ -> M_Pλν
+                  CALL dbt_copy(t_3c_x_Gocc, t_3c_x_Gocc_2, move_data=.TRUE., order=[1, 3, 2])
+                  CALL dbt_copy(t_3c_x_Gvir, t_3c_x_Gvir_2, move_data=.TRUE.)
+
+                  ! 7. tensor operation χ_PQ(iτ,k=0) = sum_λν M_Pλν(iτ) N_Qλν(iτ),
+                  ! Bounds:
+                  ! "comb" (combined index)
+                  !   ->  λ   bounds from j_atoms
+                  !   ->  ν   bounds from i_atoms
+                  ! P   -> sparse in ν (see 3.)
+                  ! Q   -> sparse in λ (see 5.)
+                  bounds_comb(1:2, 1) = [bs_env%i_ao_start_from_atom(j_atoms(1)), &
+                                         bs_env%i_ao_end_from_atom(j_atoms(2))]
+                  bounds_comb(1:2, 2) = [bs_env%i_ao_start_from_atom(i_atoms(1)), &
+                                         bs_env%i_ao_end_from_atom(i_atoms(2))]
+
+                  CALL get_bounds_from_atoms(bounds_P, i_atoms, [1, bs_env%n_atom], &
+                                             bs_env%min_RI_idx_from_AO_AO_atom, &
+                                             bs_env%max_RI_idx_from_AO_AO_atom)
+                  CALL get_bounds_from_atoms(bounds_Q, [1, bs_env%n_atom], j_atoms, &
+                                             bs_env%min_RI_idx_from_AO_AO_atom, &
+                                             bs_env%max_RI_idx_from_AO_AO_atom)
+
+                  IF (bounds_Q(1) > bounds_Q(2) .OR. bounds_P(1) > bounds_P(2)) THEN
+                     flop = 0_int_8
+                  ELSE
+                     CALL dbt_contract(alpha=bs_env%spin_degeneracy, &
+                                       tensor_1=t_3c_x_Gocc_2, tensor_2=t_3c_x_Gvir_2, &
+                                       beta=1.0_dp, tensor_3=bs_env%t_chi, &
+                                       contract_1=[2, 3], notcontract_1=[1], map_1=[1], &
+                                       contract_2=[2, 3], notcontract_2=[1], map_2=[2], &
+                                       bounds_1=bounds_comb, &
+                                       bounds_2=bounds_P, &
+                                       bounds_3=bounds_Q, &
+                                       filter_eps=bs_env%eps_filter, move_data=.FALSE., flop=flop)
+                  END IF
+                  IF (flop == 0_int_8) bs_env%skip_chi(i_intval_idx, j_intval_idx) = .TRUE.
+
+               END DO ! j_atoms
+            END DO ! i_atoms
+         END DO ! ispin
+
+         ! 8. communicate data of χ_PQ(iτ,k=0) in tensor bs_env%t_chi (which local in the
+         !    subgroup) to the global dbcsr matrix mat_chi_Gamma_tau (which stores
+         !    χ_PQ(iτ,k=0) for all time points)
+         CALL cp_dbt_to_dbcsr(bs_env%t_chi, bs_env%mat_RI_RI_tensor%matrix, &
+                              mat_chi_Gamma_tau(i_t)%matrix, bs_env%para_env)
+
+         CALL fm_write(bs_env%fm_RI_RI, i_t, bs_env%chi_name, qs_env, &
+                       matrix=mat_chi_Gamma_tau(i_t)%matrix)
+
+         CALL destroy_tensors_chi(t_2c_Gocc, t_2c_Gvir, t_3c_for_Gocc, t_3c_for_Gvir, &
+                                  t_3c_x_Gocc, t_3c_x_Gvir, t_3c_x_Gocc_2, t_3c_x_Gvir_2)
+
+         IF (bs_env%unit_nr > 0) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,I13,A,I3,A,F10.1,A)') &
+               'Computed χ(iτ,k=0) for time point', i_t, ' /', bs_env%num_time_freq_points, &
+               ', Execution time', m_walltime() - t1, ' s'
+         END IF
+
+      END DO ! i_t
+
+      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(A)') ' '
+
+      CALL timestop(handle)
+
+   END SUBROUTINE get_mat_chi_Gamma_tau
+
+! **************************************************************************************************
+!> \brief ...
+!> \param t_2c_Gocc ...
+!> \param t_2c_Gvir ...
+!> \param t_3c_for_Gocc ...
+!> \param t_3c_for_Gvir ...
+!> \param t_3c_x_Gocc ...
+!> \param t_3c_x_Gvir ...
+!> \param t_3c_x_Gocc_2 ...
+!> \param t_3c_x_Gvir_2 ...
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE create_tensors_chi(t_2c_Gocc, t_2c_Gvir, t_3c_for_Gocc, t_3c_for_Gvir, &
+                                 t_3c_x_Gocc, t_3c_x_Gvir, t_3c_x_Gocc_2, t_3c_x_Gvir_2, bs_env)
+
+      TYPE(dbt_type)                                     :: t_2c_Gocc, t_2c_Gvir, t_3c_for_Gocc, &
+                                                            t_3c_for_Gvir, t_3c_x_Gocc, &
+                                                            t_3c_x_Gvir, t_3c_x_Gocc_2, &
+                                                            t_3c_x_Gvir_2
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'create_tensors_chi'
+
+      INTEGER                                            :: handle
+
+      CALL timeset(routineN, handle)
+
+      CALL dbt_create(bs_env%t_G, t_2c_Gocc, name="Gocc 2c (AO|AO)")
+      CALL dbt_create(bs_env%t_G, t_2c_Gvir, name="Gvir 2c (AO|AO)")
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_for_Gocc, name="Gocc 3c (RI AO|AO)")
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_for_Gvir, name="Gvir 3c (RI AO|AO)")
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_x_Gocc, name="xGocc 3c (RI AO|AO)")
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_x_Gvir, name="xGvir 3c (RI AO|AO)")
+      CALL dbt_create(bs_env%t_RI__AO_AO, t_3c_x_Gocc_2, name="x2Gocc 3c (RI AO|AO)")
+      CALL dbt_create(bs_env%t_RI__AO_AO, t_3c_x_Gvir_2, name="x2Gvir 3c (RI AO|AO)")
+
+      CALL timestop(handle)
+
+   END SUBROUTINE create_tensors_chi
+
+! **************************************************************************************************
+!> \brief ...
+!> \param t_2c_Gocc ...
+!> \param t_2c_Gvir ...
+!> \param t_3c_for_Gocc ...
+!> \param t_3c_for_Gvir ...
+!> \param t_3c_x_Gocc ...
+!> \param t_3c_x_Gvir ...
+!> \param t_3c_x_Gocc_2 ...
+!> \param t_3c_x_Gvir_2 ...
+! **************************************************************************************************
+   SUBROUTINE destroy_tensors_chi(t_2c_Gocc, t_2c_Gvir, t_3c_for_Gocc, t_3c_for_Gvir, &
+                                  t_3c_x_Gocc, t_3c_x_Gvir, t_3c_x_Gocc_2, t_3c_x_Gvir_2)
+      TYPE(dbt_type)                                     :: t_2c_Gocc, t_2c_Gvir, t_3c_for_Gocc, &
+                                                            t_3c_for_Gvir, t_3c_x_Gocc, &
+                                                            t_3c_x_Gvir, t_3c_x_Gocc_2, &
+                                                            t_3c_x_Gvir_2
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'destroy_tensors_chi'
+
+      INTEGER                                            :: handle
+
+      CALL timeset(routineN, handle)
+
+      CALL dbt_destroy(t_2c_Gocc)
+      CALL dbt_destroy(t_2c_Gvir)
+      CALL dbt_destroy(t_3c_for_Gocc)
+      CALL dbt_destroy(t_3c_for_Gvir)
+      CALL dbt_destroy(t_3c_x_Gocc)
+      CALL dbt_destroy(t_3c_x_Gvir)
+      CALL dbt_destroy(t_3c_x_Gocc_2)
+      CALL dbt_destroy(t_3c_x_Gvir_2)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE destroy_tensors_chi
+
+! **************************************************************************************************
+!> \brief ...
+!> \param qs_env ...
+!> \param bs_env ...
+!> \param t_3c ...
+!> \param atoms_AO_1 ...
+!> \param atoms_AO_2 ...
+!> \param atoms_RI ...
+! **************************************************************************************************
+   SUBROUTINE compute_3c_integrals(qs_env, bs_env, t_3c, atoms_AO_1, atoms_AO_2, atoms_RI)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbt_type)                                     :: t_3c
+      INTEGER, DIMENSION(2), OPTIONAL                    :: atoms_AO_1, atoms_AO_2, atoms_RI
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_3c_integrals'
+
+      INTEGER                                            :: handle
+      TYPE(dbt_type), ALLOCATABLE, DIMENSION(:, :)       :: t_3c_array
+
+      CALL timeset(routineN, handle)
+
+      ! free memory (not clear whether memory has been freed previously)
+      CALL dbt_clear(t_3c)
+
+      ALLOCATE (t_3c_array(1, 1))
+      CALL dbt_create(t_3c, t_3c_array(1, 1))
+
+      CALL build_3c_integrals(t_3c_array, &
+                              bs_env%eps_filter, &
+                              qs_env, &
+                              bs_env%nl_3c, &
+                              int_eps=bs_env%eps_filter, &
+                              basis_i=bs_env%basis_set_RI, &
+                              basis_j=bs_env%basis_set_AO, &
+                              basis_k=bs_env%basis_set_AO, &
+                              potential_parameter=bs_env%ri_metric, &
+                              bounds_i=atoms_RI, &
+                              bounds_j=atoms_AO_1, &
+                              bounds_k=atoms_AO_2, &
+                              desymmetrize=.FALSE.)
+
+      CALL dbt_filter(t_3c_array(1, 1), bs_env%eps_filter)
+
+      CALL dbt_copy(t_3c_array(1, 1), t_3c, move_data=.TRUE.)
+
+      CALL dbt_destroy(t_3c_array(1, 1))
+      DEALLOCATE (t_3c_array)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_3c_integrals
+
+! **************************************************************************************************
+!> \brief Provides the 3-center integrals of the given atom ranges. If the store is in use, a set
+!>        is computed at its first use and kept: as a tensor that every use takes in place, or
+!>        compressed and decompressed into t_3c at every use (also the first), so that all uses
+!>        see the same integrals. Otherwise, the integrals are computed into t_3c.
+!> \param qs_env ...
+!> \param bs_env ...
+!> \param store integrals kept for the phase (store_3c_init)
+!> \param t_3c work tensor
+!> \param t_3c_use the integrals: t_3c or a kept tensor (to be read only)
+!> \param atoms_AO_1 ...
+!> \param atoms_AO_2 ...
+!> \param atoms_RI ...
+! **************************************************************************************************
+   SUBROUTINE get_3c_integrals(qs_env, bs_env, store, t_3c, t_3c_use, atoms_AO_1, atoms_AO_2, &
+                               atoms_RI)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(store_3c_type), INTENT(INOUT), TARGET         :: store
+      TYPE(dbt_type), TARGET                             :: t_3c
+      TYPE(dbt_type), POINTER                            :: t_3c_use
+      INTEGER, DIMENSION(2), OPTIONAL                    :: atoms_AO_1, atoms_AO_2, atoms_RI
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'get_3c_integrals'
+
+      INTEGER                                            :: handle, i, iset
+      INTEGER, DIMENSION(2, 3)                           :: atoms
+
+      CALL timeset(routineN, handle)
+
+      atoms = 0
+      IF (PRESENT(atoms_RI)) atoms(:, 1) = atoms_RI
+      IF (PRESENT(atoms_AO_1)) atoms(:, 2) = atoms_AO_1
+      IF (PRESENT(atoms_AO_2)) atoms(:, 3) = atoms_AO_2
+
+      t_3c_use => t_3c
+      iset = 0
+      IF (ALLOCATED(store%sets)) THEN
+         DO i = 1, store%nsets
+            IF (ALL(store%sets(i)%atoms == atoms)) iset = i
+         END DO
+         IF (iset == 0 .AND. store%nsets < SIZE(store%sets)) THEN
+            iset = store%nsets + 1
+            store%nsets = iset
+            store%sets(iset)%atoms = atoms
+            IF (store%uncompressed) THEN
+               CALL dbt_create(t_3c, store%sets(iset)%t_3c)
+               CALL compute_3c_integrals(qs_env, bs_env, store%sets(iset)%t_3c, atoms_AO_1, &
+                                         atoms_AO_2, atoms_RI)
+               store%memory = store%memory + &
+                              REAL(dbt_get_nze(store%sets(iset)%t_3c), KIND=dp)*8.0_dp/1024.0_dp**2
+            ELSE
+               CALL compute_3c_integrals(qs_env, bs_env, t_3c, atoms_AO_1, atoms_AO_2, atoms_RI)
+               CALL alloc_containers(store%sets(iset)%compressed, 1)
+               CALL compress_tensor(t_3c, store%sets(iset)%blk_indices, store%sets(iset)%compressed, &
+                                    store_3c_eps_scaling*bs_env%eps_filter, store%memory)
+            END IF
+         END IF
+      END IF
+
+      IF (iset > 0) THEN
+         IF (store%uncompressed) THEN
+            t_3c_use => store%sets(iset)%t_3c
+         ELSE
+            CALL dbt_clear(t_3c)
+            CALL decompress_tensor(t_3c, store%sets(iset)%blk_indices, store%sets(iset)%compressed, &
+                                   store_3c_eps_scaling*bs_env%eps_filter)
+         END IF
+      ELSE
+         CALL compute_3c_integrals(qs_env, bs_env, t_3c, atoms_AO_1, atoms_AO_2, atoms_RI)
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE get_3c_integrals
+
+! **************************************************************************************************
+!> \brief Puts a store of 3-center integrals in use if the integrals of the group's i and j atoms
+!>        (estimated uncompressed) fit into a share of memory: compressed into
+!>        store_3c_share_compressed of MEMORY_PER_PROC, uncompressed into
+!>        store_3c_share_uncompressed of MEMORY_PER_PROC and of the free memory.
+!> \param bs_env ...
+!> \param store ...
+!> \param n_intervals number of atom intervals the integral sets are keyed by (besides the
+!>        inner loop intervals)
+! **************************************************************************************************
+   SUBROUTINE store_3c_init(bs_env, store, n_intervals)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(store_3c_type), INTENT(INOUT)                 :: store
+      INTEGER, INTENT(IN)                                :: n_intervals
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'store_3c_init'
+
+      INTEGER                                            :: handle
+      REAL(KIND=dp)                                      :: free_GB, memory_GB
+
+      CALL timeset(routineN, handle)
+
+      CALL store_3c_release(store)
+
+      ! free memory per process (zero if not detected), the same on all processes
+      CALL mp_mem_avail_per_rank_GB(bs_env%para_env, free_GB)
+
+      ! non-zero (µν|P) of the group's i and j atoms per process
+      memory_GB = 8.0E-9_dp*bs_env%occupation_3c_int*REAL(bs_env%n_RI, KIND=dp)* &
+                  REAL(bs_env%n_ao, KIND=dp)**2*REAL(bs_env%n_atom_i + bs_env%n_atom_j, KIND=dp)/ &
+                  REAL(bs_env%n_atom, KIND=dp)/REAL(bs_env%para_env_tensor%num_pe, KIND=dp)
+
+      ! a negative estimate is an unknown occupation (not kept)
+      IF (0.0_dp <= memory_GB .AND. memory_GB <= store_3c_share_compressed*bs_env%input_memory_per_proc_GB) THEN
+         ALLOCATE (store%sets(n_intervals*bs_env%n_intervals_inner_loop_atoms))
+         store%uncompressed = (memory_GB <= store_3c_share_uncompressed* &
+                               MIN(bs_env%input_memory_per_proc_GB, free_GB))
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE store_3c_init
+
+! **************************************************************************************************
+!> \brief Prints the memory the kept 3-center integrals took and releases them.
+!> \param bs_env ...
+!> \param store ...
+!> \param store_2 a second store of the same phase
+! **************************************************************************************************
+   SUBROUTINE store_3c_finish(bs_env, store, store_2)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(store_3c_type), INTENT(INOUT)                 :: store
+      TYPE(store_3c_type), INTENT(INOUT), OPTIONAL       :: store_2
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'store_3c_finish'
+
+      INTEGER                                            :: handle
+      LOGICAL                                            :: kept, uncompressed
+      REAL(KIND=dp)                                      :: memory
+
+      CALL timeset(routineN, handle)
+
+      kept = ALLOCATED(store%sets)
+      uncompressed = store%uncompressed
+      memory = store%memory
+      IF (PRESENT(store_2)) memory = memory + store_2%memory
+      CALL bs_env%para_env%max(memory)
+
+      IF (bs_env%unit_nr > 0) THEN
+         IF (kept .AND. uncompressed) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,F19.1,A)') &
+               'Kept 3-center integrals (µν|P), uncompressed, per process', memory/1024.0_dp, ' GB'
+         ELSE IF (kept) THEN
+            WRITE (bs_env%unit_nr, '(T2,A,F21.1,A)') &
+               'Kept 3-center integrals (µν|P), compressed, per process', memory/1024.0_dp, ' GB'
+         ELSE
+            WRITE (bs_env%unit_nr, '(T2,A,A24)') &
+               'Kept 3-center integrals (µν|P), compressed, per process', 'no'
+         END IF
+      END IF
+
+      CALL store_3c_release(store)
+      IF (PRESENT(store_2)) CALL store_3c_release(store_2)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE store_3c_finish
+
+! **************************************************************************************************
+!> \brief ...
+!> \param t_3c_for_G ...
+!> \param t_G ...
+!> \param t_M ...
+!> \param bs_env ...
+!> \param atoms_AO_1 ...
+!> \param atoms_AO_2 ...
+!> \param atoms_IL ...
+! **************************************************************************************************
+   SUBROUTINE G_times_3c(t_3c_for_G, t_G, t_M, bs_env, atoms_AO_1, atoms_AO_2, atoms_IL)
+      TYPE(dbt_type)                                     :: t_3c_for_G, t_G, t_M
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      INTEGER, DIMENSION(2)                              :: atoms_AO_1, atoms_AO_2, atoms_IL
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'G_times_3c'
+
+      INTEGER                                            :: handle
+      INTEGER(KIND=int_8)                                :: flop
+      INTEGER, DIMENSION(2)                              :: bounds_ao_1, bounds_IL
+      INTEGER, DIMENSION(2, 2)                           :: bounds_comb
+
+      CALL timeset(routineN, handle)
+
+      ! Bounds reduce needed memory and therefore scaling behavior
+      ! Operations are of the form, e.g, M_Pνλ = sum_µ (Pν|µ) G_λµ
+      ! "comb" (combined index)
+      !   ->  P   sparse in ν and µ
+      !   ->  λ   bounds from j_atoms (via atoms_AO_1)
+      ! µ   bounds from inner loop "IL" indices and sparse in P and ν
+      ! ν   bounds from i_atoms (via atoms_AO_2) and sparse in P and µ
+
+      ! µ index
+      CALL get_bounds_from_atoms(bounds_IL, [1, bs_env%n_atom], atoms_AO_2, &
+                                 bs_env%min_AO_idx_from_RI_AO_atom, &
+                                 bs_env%max_AO_idx_from_RI_AO_atom, &
+                                 atoms_3=atoms_IL, &
+                                 indices_3_start=bs_env%i_ao_start_from_atom, &
+                                 indices_3_end=bs_env%i_ao_end_from_atom)
+
+      ! P index
+      CALL get_bounds_from_atoms(bounds_comb(:, 1), atoms_IL, atoms_AO_2, &
+                                 bs_env%min_RI_idx_from_AO_AO_atom, &
+                                 bs_env%max_RI_idx_from_AO_AO_atom)
+
+      ! ν index
+      CALL get_bounds_from_atoms(bounds_comb(:, 2), [1, bs_env%n_atom], atoms_IL, &
+                                 bs_env%min_AO_idx_from_RI_AO_atom, &
+                                 bs_env%max_AO_idx_from_RI_AO_atom, &
+                                 atoms_3=atoms_AO_2, &
+                                 indices_3_start=bs_env%i_ao_start_from_atom, &
+                                 indices_3_end=bs_env%i_ao_end_from_atom)
+
+      ! λ index
+      bounds_ao_1(1:2) = [bs_env%i_ao_start_from_atom(atoms_AO_1(1)), &
+                          bs_env%i_ao_end_from_atom(atoms_AO_1(2))]
+
+      IF (bounds_IL(1) > bounds_IL(2) .OR. bounds_comb(1, 2) > bounds_comb(2, 2)) THEN
+         flop = 0_int_8
+      ELSE
+         CALL dbt_contract(alpha=1.0_dp, &
+                           tensor_1=t_3c_for_G, &
+                           tensor_2=t_G, &
+                           beta=1.0_dp, &
+                           tensor_3=t_M, &
+                           contract_1=[3], notcontract_1=[1, 2], map_1=[1, 2], &
+                           contract_2=[2], notcontract_2=[1], map_2=[3], &
+                           bounds_1=bounds_IL, &
+                           bounds_2=bounds_comb, &
+                           bounds_3=bounds_ao_1, &
+                           flop=flop, &
+                           filter_eps=bs_env%eps_filter)
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE G_times_3c
+
+! **************************************************************************************************
+!> \brief ...
+!> \param atoms_1 ...
+!> \param atoms_2 ...
+!> \param qs_env ...
+!> \param bs_env ...
+!> \param dist_too_long ...
+! **************************************************************************************************
+   SUBROUTINE check_dist(atoms_1, atoms_2, qs_env, bs_env, dist_too_long)
+      INTEGER, DIMENSION(2)                              :: atoms_1, atoms_2
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      LOGICAL                                            :: dist_too_long
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'check_dist'
+
+      INTEGER                                            :: atom_1, atom_2, handle
+      REAL(dp)                                           :: abs_rab, min_dist_AO_atoms
+      REAL(KIND=dp), DIMENSION(3)                        :: rab
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
+
+      CALL timeset(routineN, handle)
+
+      CALL get_qs_env(qs_env, cell=cell, particle_set=particle_set)
+
+      min_dist_AO_atoms = HUGE(1.0_dp)
+      DO atom_1 = atoms_1(1), atoms_1(2)
+         DO atom_2 = atoms_2(1), atoms_2(2)
+            rab = pbc(particle_set(atom_1)%r(1:3), particle_set(atom_2)%r(1:3), cell)
+
+            abs_rab = SQRT(rab(1)**2 + rab(2)**2 + rab(3)**2)
+
+            min_dist_AO_atoms = MIN(min_dist_AO_atoms, abs_rab)
+         END DO
+      END DO
+
+      dist_too_long = (min_dist_AO_atoms > bs_env%max_dist_AO_atoms)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE check_dist
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param fm_Sigma_x_Gamma ...
+! **************************************************************************************************
+   SUBROUTINE get_Sigma_x(bs_env, qs_env, fm_Sigma_x_Gamma)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'get_Sigma_x'
+
+      INTEGER                                            :: handle, ispin
+
+      CALL timeset(routineN, handle)
+
+      ALLOCATE (fm_Sigma_x_Gamma(bs_env%n_spin))
+      DO ispin = 1, bs_env%n_spin
+         CALL cp_fm_create(fm_Sigma_x_Gamma(ispin), bs_env%fm_s_Gamma%matrix_struct)
+      END DO
+
+      IF (bs_env%Sigma_x_exists) THEN
+         DO ispin = 1, bs_env%n_spin
+            CALL fm_read(fm_Sigma_x_Gamma(ispin), bs_env, bs_env%Sigma_x_name, ispin)
+         END DO
+      ELSE
+         CALL compute_Sigma_x(bs_env, qs_env, fm_Sigma_x_Gamma)
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE get_Sigma_x
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param fm_Sigma_x_Gamma ...
+! **************************************************************************************************
+   SUBROUTINE compute_Sigma_x(bs_env, qs_env, fm_Sigma_x_Gamma)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'compute_Sigma_x'
+
+      INTEGER                                            :: handle, i_intval_idx, ispin, j_intval_idx
+      INTEGER, DIMENSION(2)                              :: i_atoms, j_atoms
+      REAL(KIND=dp)                                      :: t1
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_Vtr_Gamma
+      TYPE(dbcsr_type)                                   :: mat_Sigma_x_Gamma
+      TYPE(dbt_type)                                     :: t_2c_D, t_2c_Sigma_x, t_2c_V, t_3c_x_V
+
+      CALL timeset(routineN, handle)
+
+      t1 = m_walltime()
+
+      CALL dbt_create(bs_env%t_G, t_2c_D)
+      CALL dbt_create(bs_env%t_W, t_2c_V)
+      CALL dbt_create(bs_env%t_G, t_2c_Sigma_x)
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_x_V)
+      CALL dbcsr_create(mat_Sigma_x_Gamma, template=bs_env%mat_ao_ao%matrix)
+
+      ! 1. Compute truncated Coulomb operator matrix V^tr(k=0) (cutoff rad: cellsize/2)
+      CALL RI_2c_integral_mat(qs_env, fm_Vtr_Gamma, bs_env%fm_RI_RI%matrix_struct, bs_env%n_RI, &
+                              bs_env%trunc_coulomb)
+
+      ! M^-1(k=0) V^tr M^-1(k=0) -> fm_Vtr_Gamma
+      CALL fm_contract_ABA(bs_env%fm_Minv_Gamma, fm_Vtr_Gamma(:, 1))
+
+      DO ispin = 1, bs_env%n_spin
+
+         ! 3. Compute density matrix D_µν
+         CALL G_occ_vir(bs_env, 0.0_dp, bs_env%fm_work_mo(2), ispin, occ=.TRUE., vir=.FALSE.)
+
+         CALL cp_fm_to_dbt(bs_env%fm_work_mo(2), bs_env%mat_ao_ao%matrix, bs_env%mat_ao_ao_tensor%matrix, t_2c_D, &
+                           bs_env%para_env, bs_env%para_env_tensor%num_pe, bs_env%eps_filter, &
+                           bs_env%atoms_i_t_group)
+
+         CALL cp_fm_to_dbt(fm_Vtr_Gamma(1, 1), bs_env%mat_RI_RI%matrix, bs_env%mat_RI_RI_tensor%matrix, t_2c_V, &
+                           bs_env%para_env, bs_env%para_env_tensor%num_pe, bs_env%eps_filter, &
+                           bs_env%atoms_j_t_group)
+
+         ! every group has its own range of i_atoms and j_atoms; only deal with a
+         ! limited number of i_atom-j_atom pairs simultaneously in a group to save memory
+         DO i_intval_idx = 1, bs_env%n_intervals_i
+            DO j_intval_idx = 1, bs_env%n_intervals_j
+               i_atoms = bs_env%i_atom_intervals(1:2, i_intval_idx)
+               j_atoms = bs_env%j_atom_intervals(1:2, j_intval_idx)
+
+               ! 4. compute 3-center integrals (µν|P) ("|": truncated Coulomb operator)
+               ! 5. M_Qνσ(iτ) = sum_P (νσ|P) (M^-1(k=0)*V^tr(k=0)*M^-1(k=0))_QP(iτ)
+               CALL compute_3c_and_contract_W(qs_env, bs_env, i_atoms, j_atoms, t_3c_x_V, t_2c_V)
+
+               ! 6. tensor operations with D and computation of Σ^x
+               !    Σ^x_λσ(k=0) = sum_νQ M_Qνσ(iτ) sum_µ (Qλ|µ) D_νµ
+               CALL contract_to_Sigma(t_2c_D, t_3c_x_V, t_2c_Sigma_x, i_atoms, j_atoms, &
+                                      qs_env, bs_env, occ=.TRUE., vir=.FALSE.)
+
+            END DO ! j_atoms
+         END DO ! i_atoms
+
+         CALL cp_dbt_to_dbcsr(t_2c_Sigma_x, bs_env%mat_ao_ao_tensor%matrix, &
+                              mat_Sigma_x_Gamma, bs_env%para_env)
+
+         CALL fm_write(bs_env%fm_work_mo(1), ispin, bs_env%Sigma_x_name, qs_env, &
+                       matrix=mat_Sigma_x_Gamma)
+
+         CALL copy_dbcsr_to_fm(mat_Sigma_x_Gamma, fm_Sigma_x_Gamma(ispin))
+
+      END DO ! ispin
+
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A,T55,A,F10.1,A)') &
+            'Computed Σ^x(k=0),', ' Execution time', m_walltime() - t1, ' s'
+         WRITE (bs_env%unit_nr, '(A)') ' '
+      END IF
+
+      CALL dbcsr_release(mat_Sigma_x_Gamma)
+      CALL dbt_destroy(t_2c_D)
+      CALL dbt_destroy(t_2c_V)
+      CALL dbt_destroy(t_2c_Sigma_x)
+      CALL dbt_destroy(t_3c_x_V)
+      CALL cp_fm_release(fm_Vtr_Gamma)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_Sigma_x
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param fm_W_MIC_time ...
+!> \param fm_Sigma_c_Gamma_time ...
+! **************************************************************************************************
+   SUBROUTINE get_Sigma_c(bs_env, qs_env, fm_W_MIC_time, fm_Sigma_c_Gamma_time)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_W_MIC_time
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: fm_Sigma_c_Gamma_time
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'get_Sigma_c'
+
+      INTEGER                                            :: handle, i_t, ispin, read_write_index
+      REAL(KIND=dp)                                      :: t1, tau
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: mat_Sigma_neg_tau, mat_Sigma_pos_tau
+      TYPE(dbt_type)                                     :: t_2c_Gocc, t_2c_Gvir, &
+                                                            t_2c_Sigma_neg_tau, &
+                                                            t_2c_Sigma_pos_tau, t_2c_W, t_3c_x_W
+
+      CALL timeset(routineN, handle)
+
+      CALL create_mat_for_Sigma_c(bs_env, t_2c_Gocc, t_2c_Gvir, t_2c_W, t_2c_Sigma_neg_tau, &
+                                  t_2c_Sigma_pos_tau, t_3c_x_W, &
+                                  mat_Sigma_neg_tau, mat_Sigma_pos_tau)
+
+      DO i_t = 1, bs_env%num_time_freq_points
+
+         DO ispin = 1, bs_env%n_spin
+
+            t1 = m_walltime()
+
+            read_write_index = i_t + (ispin - 1)*bs_env%num_time_freq_points
+
+            ! read self-energy from restart
+            IF (bs_env%Sigma_c_exists(i_t, ispin)) THEN
+               CALL fm_read(bs_env%fm_work_mo(1), bs_env, bs_env%Sigma_p_name, read_write_index)
+               CALL copy_fm_to_dbcsr(bs_env%fm_work_mo(1), mat_Sigma_pos_tau(i_t, ispin)%matrix, &
+                                     keep_sparsity=.FALSE.)
+               CALL fm_read(bs_env%fm_work_mo(1), bs_env, bs_env%Sigma_n_name, read_write_index)
+               CALL copy_fm_to_dbcsr(bs_env%fm_work_mo(1), mat_Sigma_neg_tau(i_t, ispin)%matrix, &
+                                     keep_sparsity=.FALSE.)
+               IF (bs_env%unit_nr > 0) THEN
+                  WRITE (bs_env%unit_nr, '(T2,2A,I3,A,I3,A,F10.1,A)') 'Read Σ^c(iτ,k=0) ', &
+                     'from file for time point  ', i_t, ' /', bs_env%num_time_freq_points, &
+                     ', Execution time', m_walltime() - t1, ' s'
+               END IF
+
+               CYCLE
+
+            END IF
+
+            tau = bs_env%time_frequency_grid%imaginary_time(i_t)
+
+            CALL compute_Sigma_c_occ_vir(bs_env, qs_env, tau, ispin, fm_W_MIC_time(i_t), &
+                                         t_2c_Gocc, t_2c_Gvir, t_2c_W, t_2c_Sigma_neg_tau, &
+                                         t_2c_Sigma_pos_tau, t_3c_x_W, &
+                                         mat_Sigma_neg_tau(i_t, ispin)%matrix, &
+                                         mat_Sigma_pos_tau(i_t, ispin)%matrix, &
+                                         count_skipped=(i_t == 2))
+
+            CALL fm_write(bs_env%fm_work_mo(1), read_write_index, bs_env%Sigma_p_name, qs_env, &
+                          matrix=mat_Sigma_pos_tau(i_t, ispin)%matrix)
+            CALL fm_write(bs_env%fm_work_mo(1), read_write_index, bs_env%Sigma_n_name, qs_env, &
+                          matrix=mat_Sigma_neg_tau(i_t, ispin)%matrix)
+
+            IF (bs_env%unit_nr > 0) THEN
+               WRITE (bs_env%unit_nr, '(T2,A,I10,A,I3,A,F10.1,A)') &
+                  'Computed Σ^c(iτ,k=0) for time point ', i_t, ' /', bs_env%num_time_freq_points, &
+                  ', Execution time', m_walltime() - t1, ' s'
+            END IF
+
+         END DO ! ispin
+
+      END DO ! i_t
+
+      IF (bs_env%unit_nr > 0) WRITE (bs_env%unit_nr, '(A)') ' '
+
+      CALL fill_fm_Sigma_c_Gamma_time(fm_Sigma_c_Gamma_time, bs_env, &
+                                      mat_Sigma_pos_tau, mat_Sigma_neg_tau)
+
+      CALL print_skipping(bs_env)
+
+      CALL destroy_mat_Sigma_c(t_2c_Gocc, t_2c_Gvir, t_2c_W, t_2c_Sigma_neg_tau, &
+                               t_2c_Sigma_pos_tau, t_3c_x_W, fm_W_MIC_time, &
+                               mat_Sigma_neg_tau, mat_Sigma_pos_tau)
+
+      CALL delete_unnecessary_files(bs_env)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE get_Sigma_c
+
+! **************************************************************************************************
+!> \brief ...
+!> \brief Occupied and virtual parts of the correlation self-energy at one imaginary time τ
+!>          Σ^neg_λσ(iτ) = -sum_νQ [sum_P (νσ|P) W_PQ] [sum_µ (λµ|Q) G^occ_µν(i|τ|)]
+!>          Σ^pos_λσ(iτ) =  sum_νQ [sum_P (νσ|P) W_PQ] [sum_µ (λµ|Q) G^vir_µν(i|τ|)]
+!>        (G0W0: W = W^MIC(iτ); static COHSEX: W = W^MIC(iω=0))
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param tau imaginary time τ
+!> \param ispin ...
+!> \param fm_W W^MIC_PQ
+!> \param t_2c_Gocc ...
+!> \param t_2c_Gvir ...
+!> \param t_2c_W ...
+!> \param t_2c_Sigma_neg work tensor for Σ^neg
+!> \param t_2c_Sigma_pos work tensor for Σ^pos
+!> \param t_3c_x_W ...
+!> \param mat_Sigma_neg Σ^neg_λσ(iτ) on exit
+!> \param mat_Sigma_pos Σ^pos_λσ(iτ) on exit
+!> \param count_skipped count the skipped atom-interval pairs (for print_skipping)
+! **************************************************************************************************
+   SUBROUTINE compute_Sigma_c_occ_vir(bs_env, qs_env, tau, ispin, fm_W, t_2c_Gocc, t_2c_Gvir, &
+                                      t_2c_W, t_2c_Sigma_neg, t_2c_Sigma_pos, t_3c_x_W, &
+                                      mat_Sigma_neg, mat_Sigma_pos, count_skipped)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      REAL(KIND=dp)                                      :: tau
+      INTEGER                                            :: ispin
+      TYPE(cp_fm_type)                                   :: fm_W
+      TYPE(dbt_type)                                     :: t_2c_Gocc, t_2c_Gvir, t_2c_W, &
+                                                            t_2c_Sigma_neg, t_2c_Sigma_pos, &
+                                                            t_3c_x_W
+      TYPE(dbcsr_type)                                   :: mat_Sigma_neg, mat_Sigma_pos
+      LOGICAL                                            :: count_skipped
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_Sigma_c_occ_vir'
+
+      INTEGER                                            :: handle, i_intval_idx, j_intval_idx
+      INTEGER, DIMENSION(2)                              :: i_atoms, j_atoms
+
+      CALL timeset(routineN, handle)
+
+      CALL G_occ_vir(bs_env, tau, bs_env%fm_Gocc, ispin, occ=.TRUE., vir=.FALSE.)
+      CALL G_occ_vir(bs_env, tau, bs_env%fm_Gvir, ispin, occ=.FALSE., vir=.TRUE.)
+
+      ! fm G^occ, G^vir and W to local tensor
+      CALL cp_fm_to_dbt(bs_env%fm_Gocc, bs_env%mat_ao_ao%matrix, bs_env%mat_ao_ao_tensor%matrix, t_2c_Gocc, &
+                        bs_env%para_env, bs_env%para_env_tensor%num_pe, bs_env%eps_filter, &
+                        bs_env%atoms_i_t_group)
+      CALL cp_fm_to_dbt(bs_env%fm_Gvir, bs_env%mat_ao_ao%matrix, bs_env%mat_ao_ao_tensor%matrix, t_2c_Gvir, &
+                        bs_env%para_env, bs_env%para_env_tensor%num_pe, bs_env%eps_filter, &
+                        bs_env%atoms_i_t_group)
+      CALL cp_fm_to_dbt(fm_W, bs_env%mat_RI_RI%matrix, bs_env%mat_RI_RI_tensor%matrix, t_2c_W, &
+                        bs_env%para_env, bs_env%para_env_tensor%num_pe, bs_env%eps_filter, &
+                        bs_env%atoms_j_t_group)
+
+      ! every group has its own range of i_atoms and j_atoms; only deal with a
+      ! limited number of i_atom-j_atom pairs simultaneously in a group to save memory
+      DO i_intval_idx = 1, bs_env%n_intervals_i
+         DO j_intval_idx = 1, bs_env%n_intervals_j
+            i_atoms = bs_env%i_atom_intervals(1:2, i_intval_idx)
+            j_atoms = bs_env%j_atom_intervals(1:2, j_intval_idx)
+
+            IF (bs_env%skip_Sigma_occ(i_intval_idx, j_intval_idx) .AND. &
+                bs_env%skip_Sigma_vir(i_intval_idx, j_intval_idx)) THEN
+               ! Do that only after first timestep to avoid skips due to vanishing G
+               ! caused by gaps
+               IF (count_skipped) THEN
+                  bs_env%n_skip_sigma = bs_env%n_skip_sigma + 1
+               END IF
+               CYCLE
+            END IF
+
+            ! 1. compute 3-center integrals (µν|P) ("|": truncated Coulomb operator)
+            ! 2. tensor operation M_Qνσ(iτ) = sum_P (νσ|P) W^MIC_QP(iτ)
+            CALL compute_3c_and_contract_W(qs_env, bs_env, i_atoms, j_atoms, t_3c_x_W, t_2c_W)
+
+            ! 3. Σ_λσ(iτ,k=0) = sum_νQ M_Qνσ(iτ) sum_µ (Qλ|µ) G^occ_νµ(i|τ|) for τ < 0
+            !    (recall M_Qνσ(iτ) = M_Qνσ(-iτ) because W^MIC_PQ(iτ) = W^MIC_PQ(-iτ) )
+            CALL contract_to_Sigma(t_2c_Gocc, t_3c_x_W, t_2c_Sigma_neg, i_atoms, j_atoms, &
+                                   qs_env, bs_env, occ=.TRUE., vir=.FALSE., &
+                                   can_skip=bs_env%skip_Sigma_occ(i_intval_idx, j_intval_idx))
+
+            !    Σ_λσ(iτ,k=0) = sum_νQ M_Qνσ(iτ) sum_µ (Qλ|µ) G^vir_νµ(i|τ|) for τ > 0
+            CALL contract_to_Sigma(t_2c_Gvir, t_3c_x_W, t_2c_Sigma_pos, i_atoms, j_atoms, &
+                                   qs_env, bs_env, occ=.FALSE., vir=.TRUE., &
+                                   can_skip=bs_env%skip_Sigma_vir(i_intval_idx, j_intval_idx))
+
+         END DO ! j_atoms
+      END DO ! i_atoms
+
+      ! 4. communicate data tensor t_2c_Sigma (which is local in the subgroup)
+      !    to the global dbcsr matrix mat_Sigma_pos/neg_tau (which stores Σ for all iτ)
+      CALL cp_dbt_to_dbcsr(t_2c_Sigma_neg, bs_env%mat_ao_ao_tensor%matrix, &
+                           mat_Sigma_neg, bs_env%para_env)
+      CALL cp_dbt_to_dbcsr(t_2c_Sigma_pos, bs_env%mat_ao_ao_tensor%matrix, &
+                           mat_Sigma_pos, bs_env%para_env)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_Sigma_c_occ_vir
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param t_2c_Gocc ...
+!> \param t_2c_Gvir ...
+!> \param t_2c_W ...
+!> \param t_2c_Sigma_neg_tau ...
+!> \param t_2c_Sigma_pos_tau ...
+!> \param t_3c_x_W ...
+!> \param mat_Sigma_neg_tau ...
+!> \param mat_Sigma_pos_tau ...
+! **************************************************************************************************
+   SUBROUTINE create_mat_for_Sigma_c(bs_env, t_2c_Gocc, t_2c_Gvir, t_2c_W, t_2c_Sigma_neg_tau, &
+                                     t_2c_Sigma_pos_tau, t_3c_x_W, &
+                                     mat_Sigma_neg_tau, mat_Sigma_pos_tau)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbt_type)                                     :: t_2c_Gocc, t_2c_Gvir, t_2c_W, &
+                                                            t_2c_Sigma_neg_tau, &
+                                                            t_2c_Sigma_pos_tau, t_3c_x_W
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: mat_Sigma_neg_tau, mat_Sigma_pos_tau
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'create_mat_for_Sigma_c'
+
+      INTEGER                                            :: handle, i_t, ispin
+
+      CALL timeset(routineN, handle)
+
+      CALL dbt_create(bs_env%t_G, t_2c_Gocc)
+      CALL dbt_create(bs_env%t_G, t_2c_Gvir)
+      CALL dbt_create(bs_env%t_W, t_2c_W)
+      CALL dbt_create(bs_env%t_G, t_2c_Sigma_neg_tau)
+      CALL dbt_create(bs_env%t_G, t_2c_Sigma_pos_tau)
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_x_W)
+
+      NULLIFY (mat_Sigma_neg_tau, mat_Sigma_pos_tau)
+      ALLOCATE (mat_Sigma_neg_tau(bs_env%num_time_freq_points, bs_env%n_spin))
+      ALLOCATE (mat_Sigma_pos_tau(bs_env%num_time_freq_points, bs_env%n_spin))
+
+      DO ispin = 1, bs_env%n_spin
+         DO i_t = 1, bs_env%num_time_freq_points
+            ALLOCATE (mat_Sigma_neg_tau(i_t, ispin)%matrix)
+            ALLOCATE (mat_Sigma_pos_tau(i_t, ispin)%matrix)
+            CALL dbcsr_create(mat_Sigma_neg_tau(i_t, ispin)%matrix, template=bs_env%mat_ao_ao%matrix)
+            CALL dbcsr_create(mat_Sigma_pos_tau(i_t, ispin)%matrix, template=bs_env%mat_ao_ao%matrix)
+         END DO
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE create_mat_for_Sigma_c
+
+! **************************************************************************************************
+!> \brief ...
+!> \param qs_env ...
+!> \param bs_env ...
+!> \param i_atoms ...
+!> \param j_atoms ...
+!> \param t_3c_x_W ...
+!> \param t_2c_W ...
+! **************************************************************************************************
+   SUBROUTINE compute_3c_and_contract_W(qs_env, bs_env, i_atoms, j_atoms, t_3c_x_W, t_2c_W)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      INTEGER, DIMENSION(2)                              :: i_atoms, j_atoms
+      TYPE(dbt_type)                                     :: t_3c_x_W, t_2c_W
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_3c_and_contract_W'
+
+      INTEGER                                            :: handle, RI_intval_idx
+      INTEGER(KIND=int_8)                                :: flop
+      INTEGER, DIMENSION(2)                              :: bounds_P, bounds_Q, RI_atoms
+      INTEGER, DIMENSION(2, 2)                           :: bounds_ao
+      TYPE(dbt_type)                                     :: t_3c_x_W_tmp
+      TYPE(dbt_type), POINTER                            :: t_3c_use
+      TYPE(dbt_type), TARGET                             :: t_3c_for_W
+
+      CALL timeset(routineN, handle)
+
+      CALL dbt_create(bs_env%t_RI__AO_AO, t_3c_x_W_tmp)
+      CALL dbt_create(bs_env%t_RI__AO_AO, t_3c_for_W)
+
+      ! final layout will be: M_Qνσ(iτ) = sum_P (P|νσ) W^MIC_QP(iτ)
+      ! Bounds:
+      ! "AO"
+      !  ->  ν (AO_1 in compute_3c_integrals)  bounds from i_atoms and sparse in σ and P
+      !  ->  σ (AO_2 in compute_3c_integrals)  sparse in ν and P
+      ! Q   bounds from j_atoms
+      ! P   bounds from inner loop indices and sparse in ν and σ
+
+      bounds_Q(1:2) = [bs_env%i_RI_start_from_atom(j_atoms(1)), &
+                       bs_env%i_RI_end_from_atom(j_atoms(2))]
+
+      DO RI_intval_idx = 1, bs_env%n_intervals_inner_loop_atoms
+         RI_atoms = bs_env%inner_loop_atom_intervals(1:2, RI_intval_idx)
+
+         CALL get_bounds_from_atoms(bounds_P, i_atoms, [1, bs_env%n_atom], &
+                                    bs_env%min_RI_idx_from_AO_AO_atom, &
+                                    bs_env%max_RI_idx_from_AO_AO_atom, &
+                                    atoms_3=RI_atoms, &
+                                    indices_3_start=bs_env%i_RI_start_from_atom, &
+                                    indices_3_end=bs_env%i_RI_end_from_atom)
+
+         ! σ
+         CALL get_bounds_from_atoms(bounds_ao(:, 2), RI_atoms, i_atoms, &
+                                    bs_env%min_AO_idx_from_RI_AO_atom, &
+                                    bs_env%max_AO_idx_from_RI_AO_atom)
+         ! ν
+         CALL get_bounds_from_atoms(bounds_ao(:, 1), RI_atoms, [1, bs_env%n_atom], &
+                                    bs_env%min_AO_idx_from_RI_AO_atom, &
+                                    bs_env%max_AO_idx_from_RI_AO_atom, &
+                                    atoms_3=i_atoms, &
+                                    indices_3_start=bs_env%i_ao_start_from_atom, &
+                                    indices_3_end=bs_env%i_ao_end_from_atom)
+
+         IF (bounds_P(1) > bounds_P(2) .OR. bounds_ao(1, 2) > bounds_ao(2, 2)) THEN
+            CYCLE
+         END IF
+
+         ! 1. compute 3-center integrals (P|µν) ("|": truncated Coulomb operator)
+         CALL get_3c_integrals(qs_env, bs_env, bs_env%store_3c_W, t_3c_for_W, t_3c_use, &
+                               atoms_AO_1=i_atoms, atoms_RI=RI_atoms)
+
+         ! 2. tensor operation M_Qνσ(iτ) = sum_P  W^MIC_QP(iτ) (P|νσ)
+         CALL dbt_contract(alpha=1.0_dp, &
+                           tensor_1=t_2c_W, &
+                           tensor_2=t_3c_use, &
+                           beta=1.0_dp, &
+                           tensor_3=t_3c_x_W_tmp, &
+                           contract_1=[2], notcontract_1=[1], map_1=[1], &
+                           contract_2=[1], notcontract_2=[2, 3], map_2=[2, 3], &
+                           bounds_1=bounds_P, &
+                           bounds_2=bounds_Q, &
+                           bounds_3=bounds_ao, &
+                           flop=flop, &
+                           move_data=.FALSE., &
+                           filter_eps=bs_env%eps_filter)
+
+      END DO ! RI_atoms
+
+      ! 3. reorder tensor
+      CALL dbt_copy(t_3c_x_W_tmp, t_3c_x_W, order=[1, 2, 3], move_data=.TRUE.)
+
+      CALL dbt_destroy(t_3c_x_W_tmp)
+      CALL dbt_destroy(t_3c_for_W)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_3c_and_contract_W
+
+! **************************************************************************************************
+!> \brief ...
+!> \param t_2c_G ...
+!> \param t_3c_x_W ...
+!> \param t_2c_Sigma ...
+!> \param i_atoms ...
+!> \param j_atoms ...
+!> \param qs_env ...
+!> \param bs_env ...
+!> \param occ ...
+!> \param vir ...
+!> \param can_skip ...
+! **************************************************************************************************
+   SUBROUTINE contract_to_Sigma(t_2c_G, t_3c_x_W, t_2c_Sigma, i_atoms, j_atoms, qs_env, bs_env, &
+                                occ, vir, can_skip)
+      TYPE(dbt_type)                                     :: t_2c_G, t_3c_x_W, t_2c_Sigma
+      INTEGER, DIMENSION(2)                              :: i_atoms, j_atoms
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      LOGICAL                                            :: occ, vir
+      LOGICAL, OPTIONAL                                  :: can_skip
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'contract_to_Sigma'
+
+      INTEGER :: handle, inner_loop_atoms_interval_index
+      INTEGER(KIND=int_8)                                :: flop
+      INTEGER, DIMENSION(2)                              :: bounds_lambda, bounds_mu, bounds_nu, &
+                                                            bounds_sigma, IL_atoms
+      INTEGER, DIMENSION(2, 2)                           :: bounds_comb
+      REAL(KIND=dp)                                      :: sign_Sigma
+      TYPE(dbt_type)                                     :: t_3c_x_G, t_3c_x_G_2
+      TYPE(dbt_type), POINTER                            :: t_3c_use
+      TYPE(dbt_type), TARGET                             :: t_3c_for_G
+
+      CALL timeset(routineN, handle)
+
+      CPASSERT(occ .EQV. (.NOT. vir))
+      IF (occ) sign_Sigma = -1.0_dp
+      IF (vir) sign_Sigma = 1.0_dp
+
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_for_G)
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_x_G)
+      CALL dbt_create(bs_env%t_RI_AO__AO, t_3c_x_G_2)
+
+      ! Here, in the first step e.g., is computed: N_Qλν = sum_µ (Qλ|µ) G_νµ
+      ! Afterwards e.g., is computed: Σ_λσ = sum_νQ M_Qνσ N_Qνλ (after reordering)
+      ! Bounds:
+      ! "comb" (combined index)
+      !   ->  Q   bounds from j_atoms and sparse in λ
+      !   ->  λ (AO_1 in compute_3c_integrals)  sparse in Q and µ
+      ! µ (AO_2 in compute_3c_integrals)  bounds from inner loop "IL" indices and sparse in Q and λ
+      ! ν bounds from i_atoms
+      ! σ sparse in ν
+
+      ! ν
+      bounds_nu(1:2) = [bs_env%i_ao_start_from_atom(i_atoms(1)), &
+                        bs_env%i_ao_end_from_atom(i_atoms(2))]
+
+      DO inner_loop_atoms_interval_index = 1, bs_env%n_intervals_inner_loop_atoms
+         IL_atoms = bs_env%inner_loop_atom_intervals(1:2, inner_loop_atoms_interval_index)
+
+         ! µ
+         CALL get_bounds_from_atoms(bounds_mu, j_atoms, [1, bs_env%n_atom], &
+                                    bs_env%min_AO_idx_from_RI_AO_atom, &
+                                    bs_env%max_AO_idx_from_RI_AO_atom, &
+                                    atoms_3=IL_atoms, &
+                                    indices_3_start=bs_env%i_ao_start_from_atom, &
+                                    indices_3_end=bs_env%i_ao_end_from_atom)
+
+         ! Q
+         CALL get_bounds_from_atoms(bounds_comb(:, 1), IL_atoms, [1, bs_env%n_atom], &
+                                    bs_env%min_RI_idx_from_AO_AO_atom, &
+                                    bs_env%max_RI_idx_from_AO_AO_atom, &
+                                    atoms_3=j_atoms, &
+                                    indices_3_start=bs_env%i_RI_start_from_atom, &
+                                    indices_3_end=bs_env%i_RI_end_from_atom)
+
+         ! λ
+         CALL get_bounds_from_atoms(bounds_comb(:, 2), j_atoms, IL_atoms, &
+                                    bs_env%min_AO_idx_from_RI_AO_atom, &
+                                    bs_env%max_AO_idx_from_RI_AO_atom)
+
+         IF (bounds_mu(1) > bounds_mu(2) .OR. bounds_comb(1, 1) > bounds_comb(2, 1) .OR. &
+             bounds_comb(1, 2) > bounds_comb(2, 2)) THEN
+            CYCLE
+         END IF
+
+         CALL get_3c_integrals(qs_env, bs_env, bs_env%store_3c_Sigma, t_3c_for_G, t_3c_use, &
+                               atoms_RI=j_atoms, atoms_AO_2=IL_atoms)
+
+         CALL dbt_contract(alpha=1.0_dp, &
+                           tensor_1=t_2c_G, &
+                           tensor_2=t_3c_use, &
+                           beta=1.0_dp, &
+                           tensor_3=t_3c_x_G, &
+                           contract_1=[2], notcontract_1=[1], map_1=[3], &
+                           contract_2=[3], notcontract_2=[1, 2], map_2=[1, 2], &
+                           bounds_1=bounds_mu, &
+                           bounds_2=bounds_nu, &
+                           bounds_3=bounds_comb, &
+                           flop=flop, &
+                           move_data=.FALSE., &
+                           filter_eps=bs_env%eps_filter)
+      END DO ! IL_atoms
+
+      ! Reordering: N_Qλν -> N_Qνλ
+      CALL dbt_copy(t_3c_x_G, t_3c_x_G_2, order=[1, 3, 2], move_data=.TRUE.)
+
+      ! Here, the last contraction is done, e.g., Σ_λσ = sum_νQ M_Qνσ N_Qνλ
+      ! Bounds as above, new "comb" with upper ingredients
+      bounds_comb(1:2, 1) = [bs_env%i_RI_start_from_atom(j_atoms(1)), &
+                             bs_env%i_RI_end_from_atom(j_atoms(2))]
+      bounds_comb(1:2, 2) = bounds_nu(1:2)
+
+      CALL get_bounds_from_atoms(bounds_lambda, j_atoms, [1, bs_env%n_atom], &
+                                 bs_env%min_AO_idx_from_RI_AO_atom, &
+                                 bs_env%max_AO_idx_from_RI_AO_atom)
+      CALL get_bounds_from_atoms(bounds_sigma, [1, bs_env%n_atom], i_atoms, &
+                                 bs_env%min_AO_idx_from_RI_AO_atom, &
+                                 bs_env%max_AO_idx_from_RI_AO_atom)
+
+      IF (bounds_sigma(1) > bounds_sigma(2) .OR. bounds_lambda(1) > bounds_lambda(2)) THEN
+         flop = 0_int_8
+      ELSE
+         CALL dbt_contract(alpha=sign_Sigma, &
+                           tensor_1=t_3c_x_W, &
+                           tensor_2=t_3c_x_G_2, &
+                           beta=1.0_dp, &
+                           tensor_3=t_2c_Sigma, &
+                           contract_1=[1, 2], notcontract_1=[3], map_1=[1], &
+                           contract_2=[1, 2], notcontract_2=[3], map_2=[2], &
+                           bounds_1=bounds_comb, &
+                           bounds_2=bounds_sigma, &
+                           bounds_3=bounds_lambda, &
+                           filter_eps=bs_env%eps_filter, move_data=.FALSE., flop=flop)
+      END IF
+
+      IF (PRESENT(can_skip)) THEN
+         IF (flop == 0_int_8) can_skip = .TRUE.
+      END IF
+
+      CALL dbt_destroy(t_3c_for_G)
+      CALL dbt_destroy(t_3c_x_G)
+      CALL dbt_destroy(t_3c_x_G_2)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE contract_to_Sigma
+
+! **************************************************************************************************
+!> \brief Copy the positive- and negative-time self-energy matrices to the FM time array.
+!> \param fm_Sigma_c_Gamma_time allocated output indexed by time, time sector and spin
+!> \param bs_env time grid, spin count and AO layout
+!> \param mat_Sigma_pos_tau positive-time self-energy matrices
+!> \param mat_Sigma_neg_tau negative-time self-energy matrices
+! **************************************************************************************************
+   SUBROUTINE fill_fm_Sigma_c_Gamma_time(fm_Sigma_c_Gamma_time, bs_env, &
+                                         mat_Sigma_pos_tau, mat_Sigma_neg_tau)
+
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: fm_Sigma_c_Gamma_time
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: mat_Sigma_pos_tau, mat_Sigma_neg_tau
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'fill_fm_Sigma_c_Gamma_time'
+
+      INTEGER                                            :: handle, i_t, ispin, pos_neg
+
+      CALL timeset(routineN, handle)
+
+      ALLOCATE (fm_Sigma_c_Gamma_time(bs_env%num_time_freq_points, 2, bs_env%n_spin))
+      DO ispin = 1, bs_env%n_spin
+         DO i_t = 1, bs_env%num_time_freq_points
+            DO pos_neg = 1, 2
+               CALL cp_fm_create(fm_Sigma_c_Gamma_time(i_t, pos_neg, ispin), &
+                                 bs_env%fm_s_Gamma%matrix_struct)
+            END DO
+            CALL copy_dbcsr_to_fm(mat_Sigma_pos_tau(i_t, ispin)%matrix, &
+                                  fm_Sigma_c_Gamma_time(i_t, 1, ispin))
+            CALL copy_dbcsr_to_fm(mat_Sigma_neg_tau(i_t, ispin)%matrix, &
+                                  fm_Sigma_c_Gamma_time(i_t, 2, ispin))
+         END DO
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE fill_fm_Sigma_c_Gamma_time
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE print_skipping(bs_env)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'print_skipping'
+
+      INTEGER                                            :: handle, n_pairs
+
+      CALL timeset(routineN, handle)
+
+      n_pairs = bs_env%n_intervals_i*bs_env%n_intervals_j*bs_env%n_spin
+
+      CALL bs_env%para_env_tensor%sum(bs_env%n_skip_sigma)
+      CALL bs_env%para_env_tensor%sum(bs_env%n_skip_chi)
+      CALL bs_env%para_env_tensor%sum(n_pairs)
+
+      IF (bs_env%unit_nr > 0) THEN
+         WRITE (bs_env%unit_nr, '(T2,A,T74,F7.1,A)') &
+            'Sparsity of Σ^c(iτ,k=0): Percentage of skipped atom pairs:', &
+            REAL(100*bs_env%n_skip_sigma, KIND=dp)/REAL(n_pairs, KIND=dp), ' %'
+         WRITE (bs_env%unit_nr, '(T2,A,T74,F7.1,A)') &
+            'Sparsity of χ(iτ,k=0): Percentage of skipped atom pairs:', &
+            REAL(100*bs_env%n_skip_chi, KIND=dp)/REAL(n_pairs, KIND=dp), ' %'
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE print_skipping
+
+! **************************************************************************************************
+!> \brief ...
+!> \param t_2c_Gocc ...
+!> \param t_2c_Gvir ...
+!> \param t_2c_W ...
+!> \param t_2c_Sigma_neg_tau ...
+!> \param t_2c_Sigma_pos_tau ...
+!> \param t_3c_x_W ...
+!> \param fm_W_MIC_time ...
+!> \param mat_Sigma_neg_tau ...
+!> \param mat_Sigma_pos_tau ...
+! **************************************************************************************************
+   SUBROUTINE destroy_mat_Sigma_c(t_2c_Gocc, t_2c_Gvir, t_2c_W, t_2c_Sigma_neg_tau, &
+                                  t_2c_Sigma_pos_tau, t_3c_x_W, fm_W_MIC_time, &
+                                  mat_Sigma_neg_tau, mat_Sigma_pos_tau)
+
+      TYPE(dbt_type)                                     :: t_2c_Gocc, t_2c_Gvir, t_2c_W, &
+                                                            t_2c_Sigma_neg_tau, &
+                                                            t_2c_Sigma_pos_tau, t_3c_x_W
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_W_MIC_time
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: mat_Sigma_neg_tau, mat_Sigma_pos_tau
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'destroy_mat_Sigma_c'
+
+      INTEGER                                            :: handle
+
+      CALL timeset(routineN, handle)
+
+      CALL dbt_destroy(t_2c_Gocc)
+      CALL dbt_destroy(t_2c_Gvir)
+      CALL dbt_destroy(t_2c_W)
+      CALL dbt_destroy(t_2c_Sigma_neg_tau)
+      CALL dbt_destroy(t_2c_Sigma_pos_tau)
+      CALL dbt_destroy(t_3c_x_W)
+      CALL cp_fm_release(fm_W_MIC_time)
+      CALL dbcsr_deallocate_matrix_set(mat_Sigma_neg_tau)
+      CALL dbcsr_deallocate_matrix_set(mat_Sigma_pos_tau)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE destroy_mat_Sigma_c
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE delete_unnecessary_files(bs_env)
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'delete_unnecessary_files'
+
+      CHARACTER(LEN=default_path_length)                 :: f_chi, f_W_t, prefix
+      INTEGER                                            :: handle, i_t
+
+      CALL timeset(routineN, handle)
+
+      prefix = bs_env%prefix
+
+      DO i_t = 1, bs_env%num_time_freq_points
+
+         IF (i_t < 10) THEN
+            WRITE (f_chi, '(3A,I1,A)') TRIM(prefix), bs_env%chi_name, "_0", i_t, ".matrix"
+            WRITE (f_W_t, '(3A,I1,A)') TRIM(prefix), bs_env%W_time_name, "_0", i_t, ".matrix"
+         ELSE IF (i_t < 100) THEN
+            WRITE (f_chi, '(3A,I2,A)') TRIM(prefix), bs_env%chi_name, "_", i_t, ".matrix"
+            WRITE (f_W_t, '(3A,I2,A)') TRIM(prefix), bs_env%W_time_name, "_", i_t, ".matrix"
+         ELSE
+            CPABORT('Please implement more than 99 time/frequency points.')
+         END IF
+
+         CALL safe_delete(f_chi, bs_env)
+         CALL safe_delete(f_W_t, bs_env)
+
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE delete_unnecessary_files
+
+! **************************************************************************************************
+!> \brief ...
+!> \param filename ...
+!> \param bs_env ...
+! **************************************************************************************************
+   SUBROUTINE safe_delete(filename, bs_env)
+      CHARACTER(LEN=*)                                   :: filename
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'safe_delete'
+
+      INTEGER                                            :: handle
+      LOGICAL                                            :: file_exists
+
+      CALL timeset(routineN, handle)
+
+      IF (bs_env%para_env%mepos == 0) THEN
+
+         INQUIRE (file=TRIM(filename), exist=file_exists)
+         IF (file_exists) CALL mp_file_delete(TRIM(filename))
+
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE safe_delete
+
+! **************************************************************************************************
+!> \brief ...
+!> \param bs_env ...
+!> \param qs_env ...
+!> \param fm_Sigma_x_Gamma ...
+!> \param fm_Sigma_c_Gamma_time ...
+! **************************************************************************************************
+   SUBROUTINE compute_QP_energies(bs_env, qs_env, fm_Sigma_x_Gamma, fm_Sigma_c_Gamma_time)
+
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: fm_Sigma_x_Gamma
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :, :)  :: fm_Sigma_c_Gamma_time
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_QP_energies'
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)     :: Sigma_c_ikp_n_freq
+      INTEGER                                            :: handle, ikp, ispin, j_t
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: Sigma_x_ikp_n, V_xc_ikp_n
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: Sigma_c_ikp_n_time
+      TYPE(cp_cfm_type)                                  :: cfm_ks_ikp, cfm_mos_ikp, cfm_s_ikp, &
+                                                            cfm_work_ikp
+      TYPE(gw_qp_summary_type)                           :: qp_summary
+
+      CALL timeset(routineN, handle)
+
+      CALL cp_cfm_create(cfm_mos_ikp, bs_env%fm_s_Gamma%matrix_struct)
+      CALL cp_cfm_create(cfm_work_ikp, bs_env%fm_s_Gamma%matrix_struct)
+      ! JW TODO: fully distribute these arrays at given time; also eigenvalues in bs_env
+      ALLOCATE (V_xc_ikp_n(bs_env%n_ao), Sigma_x_ikp_n(bs_env%n_ao))
+      ALLOCATE (Sigma_c_ikp_n_time(bs_env%n_ao, bs_env%num_time_freq_points, 2))
+      ALLOCATE (Sigma_c_ikp_n_freq(bs_env%n_ao, bs_env%num_freq_points_fit))
+
+      qp_summary%n_kpoints = bs_env%nkp_bs_and_DOS
+      DO ispin = 1, bs_env%n_spin
+
+         DO ikp = 1, bs_env%nkp_bs_and_DOS
+
+            ! 1. get H^KS_µν(k_i) from H^KS_µν(k=0)
+            CALL cfm_ikp_from_fm_Gamma(cfm_ks_ikp, bs_env%fm_ks_Gamma(ispin), &
+                                       ikp, qs_env, bs_env%kpoints_DOS, "ORB")
+
+            ! 2. get S_µν(k_i) from S_µν(k=0)
+            CALL cfm_ikp_from_fm_Gamma(cfm_s_ikp, bs_env%fm_s_Gamma, &
+                                       ikp, qs_env, bs_env%kpoints_DOS, "ORB")
+
+            ! 3. Diagonalize (Roothaan-Hall): H_KS(k_i)*C(k_i) = S(k_i)*C(k_i)*ϵ(k_i)
+            CALL cp_cfm_geeig(cfm_ks_ikp, cfm_s_ikp, cfm_mos_ikp, &
+                              bs_env%eigenval_scf(:, ikp, ispin), cfm_work_ikp)
+
+            ! 4. V^xc_µν(k=0) -> V^xc_µν(k_i) -> V^xc_nn(k_i)
+            CALL to_ikp_and_mo(V_xc_ikp_n, bs_env%fm_V_xc_Gamma(ispin), &
+                               ikp, qs_env, bs_env, cfm_mos_ikp, cfm_ks_ikp, cfm_work_ikp)
+
+            ! 5. Σ^x_µν(k=0) -> Σ^x_µν(k_i) -> Σ^x_nn(k_i)
+            CALL to_ikp_and_mo(Sigma_x_ikp_n, fm_Sigma_x_Gamma(ispin), &
+                               ikp, qs_env, bs_env, cfm_mos_ikp, cfm_ks_ikp, cfm_work_ikp)
+
+            ! 6. Σ^c_µν(k=0,+/-i|τ_j|) -> Σ^c_µν(k_i,+/-i|τ_j|) -> Σ^c_nn(k_i,+/-i|τ_j|)
+            DO j_t = 1, bs_env%num_time_freq_points
+               CALL to_ikp_and_mo(Sigma_c_ikp_n_time(:, j_t, positive_time), &
+                                  fm_Sigma_c_Gamma_time(j_t, positive_time, ispin), &
+                                  ikp, qs_env, bs_env, cfm_mos_ikp, cfm_ks_ikp, cfm_work_ikp)
+               CALL to_ikp_and_mo(Sigma_c_ikp_n_time(:, j_t, negative_time), &
+                                  fm_Sigma_c_Gamma_time(j_t, negative_time, ispin), &
+                                  ikp, qs_env, bs_env, cfm_mos_ikp, cfm_ks_ikp, cfm_work_ikp)
+            END DO
+
+            ! 7. Σ^c_nn(k_i,iτ) -> Σ^c_nn(k_i,iω)
+            CALL transform_time_to_frequency(bs_env%time_frequency_grid_sigma, Sigma_c_ikp_n_time, Sigma_c_ikp_n_freq)
+            Sigma_c_ikp_n_freq(1:bs_env%n_occ(ispin), :) = CONJG(Sigma_c_ikp_n_freq(1:bs_env%n_occ(ispin), :))
+
+            ! 8. Analytic continuation Σ^c_nn(k_i,iω) -> Σ^c_nn(k_i,ϵ) and
+            !    ϵ_nk_i^GW = ϵ_nk_i^DFT + Σ^c_nn(k_i,ϵ) + Σ^x_nn(k_i) - v^xc_nn(k_i)
+            CALL analyt_conti_and_print(bs_env, Sigma_c_ikp_n_freq, Sigma_x_ikp_n, V_xc_ikp_n, &
+                                        bs_env%eigenval_scf(:, ikp, ispin), ikp, ispin, qp_summary)
+
+         END DO ! ikp_DOS
+
+      END DO ! ispin
+
+      CALL get_all_VBM_CBM_bandgaps(bs_env)
+
+      ! Σ^x is releases here in case of G0W0
+      IF (bs_env%gw_flavour == G0W0) CALL cp_fm_release(fm_Sigma_x_Gamma)
+      CALL cp_fm_release(fm_Sigma_c_Gamma_time)
+      CALL cp_cfm_release(cfm_ks_ikp)
+      CALL cp_cfm_release(cfm_s_ikp)
+      CALL cp_cfm_release(cfm_mos_ikp)
+      CALL cp_cfm_release(cfm_work_ikp)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE compute_QP_energies
+
+! **************************************************************************************************
+!> \brief Reconstruct a k-point Hermitian operator and return its real MO diagonal.
+!> \param array_ikp_n Real diagonal elements in the MO basis.
+!> \param fm_Gamma Real AO operator at the Gamma point.
+!> \param ikp Index of the target k-point.
+!> \param qs_env Quantum simulation environment.
+!> \param bs_env Band-structure environment containing the target k-points.
+!> \param cfm_mos_ikp Complex MO coefficients at the target k-point.
+!> \param cfm_ikp Reusable AO operator buffer; overwritten by its MO projection.
+!> \param workspace Reusable projection scratch matrix with the MO coefficient layout.
+! **************************************************************************************************
+   SUBROUTINE to_ikp_and_mo(array_ikp_n, fm_Gamma, ikp, qs_env, bs_env, cfm_mos_ikp, cfm_ikp, workspace)
+
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: array_ikp_n
+      TYPE(cp_fm_type), INTENT(IN)                       :: fm_Gamma
+      INTEGER, INTENT(IN)                                :: ikp
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(post_scf_bandstructure_type), POINTER         :: bs_env
+      TYPE(cp_cfm_type), INTENT(IN)                      :: cfm_mos_ikp
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: cfm_ikp, workspace
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'to_ikp_and_mo'
+
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: cdiag
+      INTEGER                                            :: handle
+
+      CALL timeset(routineN, handle)
+
+      ! get cfm_µν(k_i) from fm_µν(k=0)
+      CALL cfm_ikp_from_fm_Gamma(cfm_ikp, fm_Gamma, ikp, qs_env, bs_env%kpoints_DOS, "ORB")
+
+      CALL cfm_contract_ABA(cfm_mos_ikp, cfm_ikp, workspace=workspace)
+
+      ! Taking the real MO diagonal selects the Hermitian part of the operator.
+      ALLOCATE (cdiag(SIZE(array_ikp_n)))
+      CALL cp_cfm_get_diag(cfm_ikp, cdiag)
+      array_ikp_n = REAL(cdiag, KIND=dp)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE to_ikp_and_mo
+
+! **************************************************************************************************
+!> \brief Computes bounds (AO or RI) for given atom intervals atoms_1 and atoms_2 from indices_min
+!>        and indices_max and returns them in bounds_out.
+!>        In case, atoms_3 and indices_3 are given, the bounds are computed as the intersection
+!> \param bounds_out Bounds to be computed
+!> \param atoms_1 First atom interval
+!> \param atoms_2 Second atom interval
+!> \param indices_min Minimum indices for each atom pair (typically from bs_env,
+!>        computed in get_i_j_atom_ranges in gw_utils.F, e.g. bs_env%min_RI_idx_from_AO_AO_atom)
+!> \param indices_max Maximum indices for each atom pair (typically from bs_env,
+!>        computed in get_i_j_atom_ranges in gw_utils.F)
+!> \param atoms_3 (Optional) Third atom interval for intersection
+!> \param indices_3_start (Optional) Indices for third atom interval for intersection
+!> \param indices_3_end (Optional) Indices for third atom interval for intersection
+! **************************************************************************************************
+   SUBROUTINE get_bounds_from_atoms(bounds_out, atoms_1, atoms_2, indices_min, indices_max, &
+                                    atoms_3, indices_3_start, indices_3_end)
+
+      INTEGER, DIMENSION(2), INTENT(OUT)                 :: bounds_out
+      INTEGER, DIMENSION(2), INTENT(IN)                  :: atoms_1, atoms_2
+      INTEGER, DIMENSION(:, :)                           :: indices_min, indices_max
+      INTEGER, DIMENSION(2), INTENT(IN), OPTIONAL        :: atoms_3
+      INTEGER, DIMENSION(:), OPTIONAL                    :: indices_3_start, indices_3_end
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'get_bounds_from_atoms'
+
+      INTEGER                                            :: handle, i_at, j_at
+
+      CALL timeset(routineN, handle)
+      bounds_out(1) = HUGE(0)
+      bounds_out(2) = -1
+      !Loop over all atoms in the two intervals and find min/max indices
+      DO i_at = atoms_1(1), atoms_1(2)
+         DO j_at = atoms_2(1), atoms_2(2)
+            bounds_out(1) = MIN(bounds_out(1), indices_min(i_at, j_at))
+            bounds_out(2) = MAX(bounds_out(2), indices_max(i_at, j_at))
+         END DO
+      END DO
+
+      IF (PRESENT(atoms_3) .AND. PRESENT(indices_3_start) .AND. PRESENT(indices_3_end)) THEN
+         bounds_out(1) = MAX(bounds_out(1), indices_3_start(atoms_3(1)))
+         bounds_out(2) = MIN(bounds_out(2), indices_3_end(atoms_3(2)))
+      END IF
+
+      CALL timestop(handle)
+
+   END SUBROUTINE get_bounds_from_atoms
+
+END MODULE gw_tensor_large_cell_Gamma

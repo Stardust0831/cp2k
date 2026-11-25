@@ -26,7 +26,6 @@ MODULE ec_orth_solver
    USE cp_dbcsr_operations,             ONLY: dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
    USE cp_external_control,             ONLY: external_control
-   USE ec_methods,                      ONLY: create_kernel
    USE input_constants,                 ONLY: do_admm_aux_exch_func_none,&
                                               kg_tnadd_embed,&
                                               kg_tnadd_embed_ri,&
@@ -58,6 +57,8 @@ MODULE ec_orth_solver
                                               pw_r3d_rs_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
+   USE qs_fxc,                          ONLY: qs_fxc_create,&
+                                              qs_fxc_prep
    USE qs_integrate_potential,          ONLY: integrate_v_rspace
    USE qs_kpp1_env_types,               ONLY: qs_kpp1_env_type
    USE qs_linres_kernel,                ONLY: apply_hfx,&
@@ -67,9 +68,9 @@ MODULE ec_orth_solver
                                               p_env_finish_kpp1,&
                                               p_env_update_rho
    USE qs_p_env_types,                  ONLY: qs_p_env_type
+   USE qs_rho_atom_types,               ONLY: rho_atom_type
    USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_type
-   USE xc,                              ONLY: xc_prep_2nd_deriv
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -241,8 +242,9 @@ CONTAINS
 
             ! Tr(r_0 * r_0)
             CALL dbcsr_dot(matrix_res(ispin)%matrix, matrix_res(ispin)%matrix, norm_rr(ispin))
-            IF (abnormal_value(norm_rr(ispin))) &
+            IF (abnormal_value(norm_rr(ispin))) THEN
                CPABORT("Preconditioner: Tr[r_j*r_j] is an abnormal value (NaN/Inf)")
+            END IF
 
             IF (norm_rr(ispin) < 0.0_dp) CPABORT("norm_rr < 0")
             norm_res = MAX(norm_res, ABS(norm_rr(ispin)/REAL(nao, dp)))
@@ -272,8 +274,9 @@ CONTAINS
             ! Tr[r_j+1*z_j+1]
             CALL dbcsr_dot(matrix_res(ispin)%matrix, matrix_res(ispin)%matrix, new_norm(ispin))
             IF (new_norm(ispin) < 0.0_dp) CPABORT("tr(r_j+1*z_j+1) < 0")
-            IF (abnormal_value(new_norm(ispin))) &
+            IF (abnormal_value(new_norm(ispin))) THEN
                CPABORT("Preconditioner: Tr[r_j+1*z_j+1] is an abnormal value (NaN/Inf)")
+            END IF
             norm_res = MAX(norm_res, new_norm(ispin)/REAL(nao, dp))
 
             IF (norm_rr(ispin) < linres_control%eps*0.001_dp &
@@ -710,8 +713,9 @@ CONTAINS
                CALL dbcsr_dot(matrix_cg(ispin)%matrix, matrix_Ax(ispin)%matrix, norm_cA(ispin))
 
                CPABORT("tr(Ap_j*p_j) < 0")
-               IF (abnormal_value(norm_cA(ispin))) &
+               IF (abnormal_value(norm_cA(ispin))) THEN
                   CPABORT("Preconditioner: Tr[Ap_j*p_j] is an abnormal value (NaN/Inf)")
+               END IF
 
             END IF
 
@@ -790,8 +794,9 @@ CONTAINS
             ! Tr[r_j+1*z_j+1]
             CALL dbcsr_dot(matrix_res(ispin)%matrix, matrix_z0(ispin)%matrix, new_norm(ispin))
             IF (new_norm(ispin) < 0.0_dp) CPABORT("tr(r_j+1*z_j+1) < 0")
-            IF (abnormal_value(new_norm(ispin))) &
+            IF (abnormal_value(new_norm(ispin))) THEN
                CPABORT("Preconditioner: Tr[r_j+1*z_j+1] is an abnormal value (NaN/Inf)")
+            END IF
             norm_res = MAX(norm_res, new_norm(ispin)/REAL(nao, dp))
 
             IF (norm_rr(ispin) < linres_control%eps .OR. new_norm(ispin) < linres_control%eps) THEN
@@ -1156,6 +1161,7 @@ CONTAINS
       TYPE(pw_r3d_rs_type), POINTER                      :: weights
       TYPE(qs_kpp1_env_type), POINTER                    :: kpp1_env
       TYPE(qs_rho_type), POINTER                         :: rho, rho_aux
+      TYPE(rho_atom_type), DIMENSION(:), POINTER         :: rho0_atom_set, rho1_atom_set
       TYPE(section_vals_type), POINTER                   :: input, xc_section, xc_section_aux
 
       CALL timeset(routineN, handle)
@@ -1209,14 +1215,9 @@ CONTAINS
       END IF
 
       ! add xc-kernel
-      CALL create_kernel(qs_env, &
-                         vxc=v_xc, &
-                         vxc_tau=v_xc_tau, &
-                         rho=rho, &
-                         rho1_r=rho1_r, &
-                         rho1_g=rho1_g, &
-                         tau1_r=tau1_r, &
-                         xc_section=xc_section)
+      CALL qs_fxc_create(qs_env, rho, p_env%rho1, rho0_atom_set, xc_section, .FALSE., &
+                         v_xc, v_xc_tau, rho1_atom_set, &
+                         dispersion_env=qs_env%dispersion_env)
 
       DO ispin = 1, nspins
          CALL pw_scale(v_xc(ispin), v_xc(ispin)%pw_grid%dvol)
@@ -1230,12 +1231,10 @@ CONTAINS
          IF (admm_env%aux_exch_func /= do_admm_aux_exch_func_none) THEN
             IF (.NOT. ASSOCIATED(kpp1_env%deriv_set_admm)) THEN
                xc_section_aux => admm_env%xc_section_aux
-               CALL get_admm_env(qs_env%admm_env, rho_aux_fit=rho_aux)
-               CALL qs_rho_get(rho_aux, rho_r=rho_r)
+               CALL get_admm_env(admm_env, rho_aux_fit=rho_aux)
                ALLOCATE (kpp1_env%deriv_set_admm, kpp1_env%rho_set_admm)
-               CALL xc_prep_2nd_deriv(kpp1_env%deriv_set_admm, kpp1_env%rho_set_admm, &
-                                      rho_r, auxbas_pw_pool, weights, &
-                                      xc_section=xc_section_aux)
+               CALL qs_fxc_prep(qs_env, rho_aux, kpp1_env%rho_set_admm, kpp1_env%deriv_set_admm, &
+                                xc_section_aux, pw_env, is_triplet=.FALSE.)
             END IF
          END IF
       END IF

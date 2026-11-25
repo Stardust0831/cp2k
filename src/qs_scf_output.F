@@ -29,12 +29,12 @@ MODULE qs_scf_output
    USE input_constants,                 ONLY: &
         becke_cutoff_element, becke_cutoff_global, cdft_alpha_constraint, cdft_beta_constraint, &
         cdft_charge_constraint, cdft_magnetization_constraint, ot_precond_full_all, &
-        outer_scf_becke_constraint, outer_scf_hirshfeld_constraint, outer_scf_optimizer_bisect, &
-        outer_scf_optimizer_broyden, outer_scf_optimizer_diis, outer_scf_optimizer_newton, &
-        outer_scf_optimizer_newton_ls, outer_scf_optimizer_sd, outer_scf_optimizer_secant, &
-        radius_covalent, radius_default, radius_single, radius_user, radius_vdw, &
-        shape_function_density, shape_function_gaussian, smear_fermi_dirac, smear_gaussian, &
-        smear_mp, smear_mv
+        ot_precond_full_all_covariant, outer_scf_becke_constraint, outer_scf_hirshfeld_constraint, &
+        outer_scf_optimizer_bisect, outer_scf_optimizer_broyden, outer_scf_optimizer_diis, &
+        outer_scf_optimizer_newton, outer_scf_optimizer_newton_ls, outer_scf_optimizer_sd, &
+        outer_scf_optimizer_secant, radius_covalent, radius_default, radius_single, radius_user, &
+        radius_vdw, shape_function_density, shape_function_gaussian, smear_fermi_dirac, &
+        smear_gaussian, smear_mp, smear_mv
    USE input_section_types,             ONLY: section_get_ivals,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
@@ -42,7 +42,8 @@ MODULE qs_scf_output
    USE kahan_sum,                       ONLY: accurate_sum
    USE kinds,                           ONLY: default_string_length,&
                                               dp
-   USE kpoint_types,                    ONLY: kpoint_type
+   USE kpoint_types,                    ONLY: get_kpoint_info,&
+                                              kpoint_type
    USE machine,                         ONLY: m_flush
    USE message_passing,                 ONLY: mp_para_env_type
    USE particle_types,                  ONLY: particle_type
@@ -197,9 +198,10 @@ CONTAINS
       CHARACTER(LEN=5)                                   :: spin
       CHARACTER(LEN=default_string_length), &
          DIMENSION(:), POINTER                           :: tmpstringlist
-      INTEGER                                            :: handle, homo, ikp, ispin, iw, kpoint, &
-                                                            nao, nelectron, nkp, nmo, nspin, numo
-      INTEGER, DIMENSION(2)                              :: nmos_occ
+      INTEGER                                            :: handle, homo, ikp, ikp_local, ispin, iw, &
+                                                            nao, nelectron, nkp, nmo, nmo_occ, &
+                                                            nspin, numo
+      INTEGER, DIMENSION(2)                              :: kp_range, nmos_occ
       INTEGER, DIMENSION(:), POINTER                     :: mo_index_range
       LOGICAL                                            :: do_kpoints, do_printout, print_eigvals, &
                                                             print_eigvecs, print_mo_info, &
@@ -218,7 +220,7 @@ CONTAINS
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
       TYPE(mo_set_type), POINTER                         :: mo_set, umo_set
-      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(mp_para_env_type), POINTER                    :: para_env, para_env_inter_kp
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(preconditioner_type), POINTER                 :: local_preconditioner
       TYPE(qs_environment_type), POINTER                 :: cart_overlap_qs_env
@@ -250,13 +252,10 @@ CONTAINS
 
       print_occup_stats = .FALSE.
       occup_stats_occ_threshold = 1e-6_dp
-      IF (SIZE(tmpstringlist) > 0) THEN  ! the lone_keyword_c_vals doesn't work as advertised, handle it manually
-         print_occup_stats = .TRUE.
-         IF (LEN_TRIM(tmpstringlist(1)) > 0) &
-            READ (tmpstringlist(1), *) print_occup_stats
-      END IF
-      IF (SIZE(tmpstringlist) > 1) &
+      IF (SIZE(tmpstringlist) > 0) READ (tmpstringlist(1), *) print_occup_stats
+      IF (SIZE(tmpstringlist) > 1) THEN
          READ (tmpstringlist(2), *) occup_stats_occ_threshold
+      END IF
 
       logger => cp_get_default_logger()
       print_mo_info = (cp_print_key_should_output(logger%iter_info, dft_section, "PRINT%MO") /= 0)
@@ -266,39 +265,67 @@ CONTAINS
          RETURN
       END IF
 
-      NULLIFY (fm_struct_tmp)
-      NULLIFY (mo_coeff)
-      NULLIFY (mo_coeff_deriv)
-      NULLIFY (mo_eigenvalues)
-      NULLIFY (mo_set)
-      NULLIFY (umo_coeff)
-      NULLIFY (umo_eigenvalues)
-      NULLIFY (umo_set)
-
       do_printout = .TRUE.
       nspin = dft_control%nspins
       nmos_occ = 0
 
-      ! Check, if we have k points
       IF (do_kpoints) THEN
          CALL get_qs_env(qs_env, kpoints=kpoints)
-         nkp = SIZE(kpoints%kp_env)
+         CALL get_kpoint_info(kpoints, nkp=nkp, kp_range=kp_range, para_env_inter_kp=para_env_inter_kp)
+         CPASSERT(ASSOCIATED(para_env_inter_kp))
+         IF (scf_env%method == ot_method_nr) THEN
+            solver_method = "OT"
+         ELSE
+            solver_method = "TD"
+         END IF
+         DO ikp = 1, nkp
+            DO ispin = 1, nspin
+               ! Optional MO dummies are absent when their pointers are unassociated.
+               NULLIFY (mo_set, cart_overlap_qs_env)
+               nmo_occ = 0
+               IF ((ikp >= kp_range(1)) .AND. (ikp <= kp_range(2))) THEN
+                  ikp_local = ikp - kp_range(1) + 1
+                  mo_set => kpoints%kp_env(ikp_local)%kpoint_env%mos(ispin)
+                  IF (print_occup_stats) THEN
+                     nmo_occ = COUNT(mo_set%occupation_numbers > occup_stats_occ_threshold)
+                  END IF
+               END IF
+               IF (print_occup_stats) THEN
+                  CALL para_env_inter_kp%max(nmo_occ)
+                  nmos_occ(ispin) = MAX(nmos_occ(ispin), nmo_occ)
+               END IF
+               IF ((ikp == 1) .AND. (ikp >= kp_range(1)) .AND. &
+                   (ikp <= kp_range(2)) .AND. (ispin == 1)) THEN
+                  cart_overlap_qs_env => qs_env
+               END IF
+               IF (nspin > 1) THEN
+                  SELECT CASE (ispin)
+                  CASE (1)
+                     spin = "ALPHA"
+                  CASE (2)
+                     spin = "BETA"
+                  CASE DEFAULT
+                     CPABORT("Invalid spin")
+                  END SELECT
+                  CALL write_mo_set_to_output_unit(mo_set, qs_kind_set, particle_set, dft_section, 4, ikp, &
+                                                   final_mos=final_mos, spin=TRIM(spin), &
+                                                   solver_method=solver_method, qs_env=cart_overlap_qs_env, &
+                                                   para_env_inter_kp=para_env_inter_kp)
+               ELSE
+                  CALL write_mo_set_to_output_unit(mo_set, qs_kind_set, particle_set, dft_section, 4, ikp, &
+                                                   final_mos=final_mos, solver_method=solver_method, &
+                                                   qs_env=cart_overlap_qs_env, para_env_inter_kp=para_env_inter_kp)
+               END IF
+            END DO
+         END DO
       ELSE
-         CALL get_qs_env(qs_env, matrix_ks=ks, matrix_s=s)
+
+         NULLIFY (fm_struct_tmp, mo_coeff, mo_coeff_deriv, mo_eigenvalues, &
+                  mo_set, umo_coeff, umo_eigenvalues, umo_set)
+
+         CALL get_qs_env(qs_env, matrix_ks=ks, matrix_s=s, mos=mos)
          CPASSERT(ASSOCIATED(ks))
          CPASSERT(ASSOCIATED(s))
-         nkp = 1
-      END IF
-
-      kp_loop: DO ikp = 1, nkp
-
-         IF (do_kpoints) THEN
-            mos => kpoints%kp_env(ikp)%kpoint_env%mos(1, :)
-            kpoint = ikp
-         ELSE
-            CALL get_qs_env(qs_env, matrix_ks=ks, mos=mos)
-            kpoint = 0 ! Gamma point only
-         END IF
          CPASSERT(ASSOCIATED(mos))
 
          ! Prepare MO information for printout
@@ -308,10 +335,6 @@ CONTAINS
             IF (scf_env%method == ot_method_nr) THEN
 
                solver_method = "OT"
-
-               IF (do_kpoints) THEN
-                  CPABORT("The OT method is not implemented for k points")
-               END IF
 
                IF (final_mos) THEN
 
@@ -386,11 +409,12 @@ CONTAINS
                      ! Prepare printout of the additional unoccupied MOs when OT is being employed
                      CALL cp_fm_init_random(umo_coeff)
 
-                     ! The FULL_ALL preconditioner makes not much sense for the unoccupied orbitals
+                     ! FULL_ALL has column-dependent occupied-state weights and cannot be reused here.
                      NULLIFY (local_preconditioner)
                      IF (ASSOCIATED(scf_env%ot_preconditioner)) THEN
                         local_preconditioner => scf_env%ot_preconditioner(1)%preconditioner
-                        IF (local_preconditioner%in_use == ot_precond_full_all) THEN
+                        IF (local_preconditioner%in_use == ot_precond_full_all .OR. &
+                            local_preconditioner%in_use == ot_precond_full_all_covariant) THEN
                            NULLIFY (local_preconditioner)
                         END IF
                      END IF
@@ -423,9 +447,9 @@ CONTAINS
                             "is achieved when the orbital transformation (OT) method is used"
                   CPWARN(TRIM(message))
                   do_printout = .FALSE.
-                  EXIT kp_loop
+                  EXIT
 
-               END IF ! final MOs
+               END IF ! final MOs / gamma OT
 
             ELSE
 
@@ -437,7 +461,7 @@ CONTAINS
 
             ! Print MO information
             NULLIFY (cart_overlap_qs_env)
-            IF ((ikp == 1) .AND. (ispin == 1)) cart_overlap_qs_env => qs_env
+            IF (ispin == 1) cart_overlap_qs_env => qs_env
             IF (nspin > 1) THEN
                SELECT CASE (ispin)
                CASE (1)
@@ -447,28 +471,17 @@ CONTAINS
                CASE DEFAULT
                   CPABORT("Invalid spin")
                END SELECT
-               IF (ASSOCIATED(umo_set)) THEN
-                  CALL write_mo_set_to_output_unit(mo_set, qs_kind_set, particle_set, dft_section, 4, kpoint, &
-                                                   final_mos=final_mos, spin=TRIM(spin), solver_method=solver_method, &
-                                                   umo_set=umo_set, qs_env=cart_overlap_qs_env)
-               ELSE
-                  CALL write_mo_set_to_output_unit(mo_set, qs_kind_set, particle_set, dft_section, 4, kpoint, &
-                                                   final_mos=final_mos, spin=TRIM(spin), solver_method=solver_method, &
-                                                   qs_env=cart_overlap_qs_env)
-               END IF
+               CALL write_mo_set_to_output_unit(mo_set, qs_kind_set, particle_set, dft_section, 4, 0, &
+                                                final_mos=final_mos, spin=TRIM(spin), solver_method=solver_method, &
+                                                umo_set=umo_set, qs_env=cart_overlap_qs_env)
             ELSE
-               IF (ASSOCIATED(umo_set)) THEN
-                  CALL write_mo_set_to_output_unit(mo_set, qs_kind_set, particle_set, dft_section, 4, kpoint, &
-                                                   final_mos=final_mos, solver_method=solver_method, &
-                                                   umo_set=umo_set, qs_env=cart_overlap_qs_env)
-               ELSE
-                  CALL write_mo_set_to_output_unit(mo_set, qs_kind_set, particle_set, dft_section, 4, kpoint, &
-                                                   final_mos=final_mos, solver_method=solver_method, &
-                                                   qs_env=cart_overlap_qs_env)
-               END IF
+               CALL write_mo_set_to_output_unit(mo_set, qs_kind_set, particle_set, dft_section, 4, 0, &
+                                                final_mos=final_mos, solver_method=solver_method, &
+                                                umo_set=umo_set, qs_env=cart_overlap_qs_env)
             END IF
 
-            nmos_occ(ispin) = MAX(nmos_occ(ispin), COUNT(mo_set%occupation_numbers > occup_stats_occ_threshold))
+            IF (print_occup_stats) nmos_occ(ispin) = MAX(nmos_occ(ispin), &
+                                                         COUNT(mo_set%occupation_numbers > occup_stats_occ_threshold))
 
             ! Deallocate temporary objects needed for OT
             IF (scf_env%method == ot_method_nr) THEN
@@ -482,15 +495,14 @@ CONTAINS
             NULLIFY (mo_set)
 
          END DO ! ispin
-
-      END DO kp_loop
+      END IF
 
       IF (do_printout .AND. print_mo_info .AND. print_occup_stats) THEN
          iw = cp_print_key_unit_nr(logger, dft_section, "PRINT%MO", &
                                    ignore_should_output=print_mo_info, &
                                    extension=".MOLog")
          IF (iw > 0) THEN
-            IF (SIZE(mos) > 1) THEN
+            IF (nspin > 1) THEN
                WRITE (UNIT=iw, FMT="(A,I4)") " MO| Total occupied (ALPHA):", nmos_occ(1)
                WRITE (UNIT=iw, FMT="(A,I4)") " MO| Total occupied (BETA): ", nmos_occ(2)
             ELSE
@@ -553,14 +565,16 @@ CONTAINS
 !> \param t1 ...
 !> \param t2 ...
 !> \param energy ...
+!> \param adiis_verbose whether to print per-iteration ADIIS diagnostics
 ! **************************************************************************************************
-   SUBROUTINE qs_scf_loop_info(scf_env, output_unit, just_energy, t1, t2, energy)
+   SUBROUTINE qs_scf_loop_info(scf_env, output_unit, just_energy, t1, t2, energy, adiis_verbose)
 
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       INTEGER                                            :: output_unit
-      LOGICAL                                            :: just_energy
+      LOGICAL, INTENT(IN)                                :: just_energy
       REAL(KIND=dp)                                      :: t1, t2
       TYPE(qs_energy_type), POINTER                      :: energy
+      LOGICAL, INTENT(IN)                                :: adiis_verbose
 
       IF ((output_unit > 0) .AND. scf_env%print_iter_line) THEN
          IF (just_energy) THEN
@@ -579,6 +593,20 @@ CONTAINS
                       FMT="(T2,I5,1X,A,T20,E8.2,1X,F6.1,1X,F14.8,1X,F20.10,1X,ES9.2)") &
                   scf_env%iter_count, TRIM(scf_env%iter_method), scf_env%iter_param, &
                   t2 - t1, scf_env%iter_delta, energy%total, energy%total - energy%tot_old
+            END IF
+            IF (adiis_verbose) THEN
+               IF (scf_env%adiis_shift > 0.0_dp) THEN
+                  WRITE (UNIT=output_unit, FMT="(T4,A,ES11.3,A,F5.2,A,I3)") &
+                     "ADIIS shift parameter [Ha]=", scf_env%adiis_shift, &
+                     " CDIIS weight=", scf_env%scf_subspace_buffer%diis_weight, &
+                     " history=", scf_env%scf_subspace_buffer%nstored
+               END IF
+               IF (scf_env%raw_map_delta_valid) THEN
+                  WRITE (UNIT=output_unit, FMT="(T4,A,ES11.3,A,ES11.3)") &
+                     "ADIIS metrics: step_norm=", scf_env%step_norm, &
+                     " raw_map_delta=", scf_env%raw_map_delta
+               END IF
+
             END IF
          END IF
       END IF
@@ -650,6 +678,14 @@ CONTAINS
                   "Total dipole moment perpendicular to ", &
                   "the slab [electrons-Angstroem]: ", &
                   qs_env%surface_dipole_moment
+               WRITE (UNIT=output_unit, FMT="((T3,A,/,T3,A,T41,F20.10))") &
+                  "Position of the dipole ", &
+                  "correction plane [Angstroem]: ", &
+                  qs_env%surface_dipole_ref_pos
+               WRITE (UNIT=output_unit, FMT="((T3,A,/,T3,A,T41,2F20.10))") &
+                  "Vacuum level below/above the ", &
+                  "dipole correction plane [eV]: ", &
+                  qs_env%vacuum_level_below, qs_env%vacuum_level_above
             END IF
 
             IF (gapw) THEN
@@ -701,22 +737,25 @@ CONTAINS
                "Two-electron integral energy [eV]:             ", energy%hartree*evolt, &
                "Electronic energy [eV]:                        ", &
                (energy%core + 0.5_dp*energy%hartree)*evolt
-            IF (energy%dispersion /= 0.0_dp) &
+            IF (energy%dispersion /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "Dispersion energy [eV]:                     ", energy%dispersion*evolt
-         ELSEIF (dft_control%qs_control%dftb) THEN
+                  "Dispersion energy [eV]:                     ", energy%dispersion*evolt
+            END IF
+         ELSE IF (dft_control%qs_control%dftb) THEN
             WRITE (UNIT=output_unit, FMT="(/,(T3,A,T56,F25.14))") &
                "Core Hamiltonian energy:                       ", energy%core, &
                "Repulsive potential energy:                    ", energy%repulsive, &
                "Electronic energy:                             ", energy%hartree, &
                "Dispersion energy:                             ", energy%dispersion
-            IF (energy%dftb3 /= 0.0_dp) &
+            IF (energy%dftb3 /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "DFTB3 3rd order energy:                     ", energy%dftb3
-            IF (energy%efield /= 0.0_dp) &
+                  "DFTB3 3rd order energy:                     ", energy%dftb3
+            END IF
+            IF (energy%efield /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "Electric field interaction energy:          ", energy%efield
-         ELSEIF (dft_control%qs_control%xtb) THEN
+                  "Electric field interaction energy:          ", energy%efield
+            END IF
+         ELSE IF (dft_control%qs_control%xtb) THEN
             IF (dft_control%qs_control%xtb_control%do_tblite) THEN
                WRITE (UNIT=output_unit, FMT="(/,(T3,A,T56,F25.14))") &
                   "Core Hamiltonian energy:                       ", energy%core, &
@@ -733,28 +772,31 @@ CONTAINS
                      "SRB Correction energy:                         ", energy%srb, &
                      "Charge equilibration energy:                   ", energy%eeq, &
                      "Dispersion energy:                             ", energy%dispersion
-               ELSEIF (dft_control%qs_control%xtb_control%gfn_type == 1) THEN
+               ELSE IF (dft_control%qs_control%xtb_control%gfn_type == 1) THEN
                   WRITE (UNIT=output_unit, FMT="(/,(T3,A,T56,F25.14))") &
                      "Core Hamiltonian energy:                       ", energy%core, &
                      "Repulsive potential energy:                    ", energy%repulsive, &
                      "Electronic energy:                             ", energy%hartree, &
                      "DFTB3 3rd order energy:                        ", energy%dftb3, &
                      "Dispersion energy:                             ", energy%dispersion
-                  IF (dft_control%qs_control%xtb_control%xb_interaction) &
+                  IF (dft_control%qs_control%xtb_control%xb_interaction) THEN
                      WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-                     "Correction for halogen bonding:                ", energy%xtb_xb_inter
-               ELSEIF (dft_control%qs_control%xtb_control%gfn_type == 2) THEN
+                        "Correction for halogen bonding:                ", energy%xtb_xb_inter
+                  END IF
+               ELSE IF (dft_control%qs_control%xtb_control%gfn_type == 2) THEN
                   CPABORT("gfn_typ 2 NYA")
                ELSE
                   CPABORT("invalid gfn_typ")
                END IF
             END IF
-            IF (dft_control%qs_control%xtb_control%do_nonbonded) &
+            IF (dft_control%qs_control%xtb_control%do_nonbonded) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "Correction for nonbonded interactions:         ", energy%xtb_nonbonded
-            IF (energy%efield /= 0.0_dp) &
+                  "Correction for nonbonded interactions:         ", energy%xtb_nonbonded
+            END IF
+            IF (energy%efield /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "Electric field interaction energy:          ", energy%efield
+                  "Electric field interaction energy:          ", energy%efield
+            END IF
          ELSE
             IF (dft_control%do_admm) THEN
                exc_energy = energy%exc + energy%exc_aux_fit
@@ -792,22 +834,27 @@ CONTAINS
                   "Hartree energy:                                ", energy%hartree, &
                   "Exchange-correlation energy:                   ", exc_energy
             END IF
-            IF (energy%e_hartree /= 0.0_dp) &
+            IF (energy%e_hartree /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,/,T3,A,T56,F25.14)") &
-               "Coulomb Electron-Electron Interaction Energy ", &
-               "- Already included in the total Hartree term ", energy%e_hartree
-            IF (energy%ex /= 0.0_dp) &
+                  "Coulomb Electron-Electron Interaction Energy ", &
+                  "- Already included in the total Hartree term ", energy%e_hartree
+            END IF
+            IF (energy%ex /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "Hartree-Fock Exchange energy:                  ", energy%ex
-            IF (energy%dispersion /= 0.0_dp) &
+                  "Hartree-Fock Exchange energy:                  ", energy%ex
+            END IF
+            IF (energy%dispersion /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "Dispersion energy:                             ", energy%dispersion
-            IF (energy%gcp /= 0.0_dp) &
+                  "Dispersion energy:                             ", energy%dispersion
+            END IF
+            IF (energy%gcp /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "gCP energy:                                    ", energy%gcp
-            IF (energy%efield /= 0.0_dp) &
+                  "gCP energy:                                    ", energy%gcp
+            END IF
+            IF (energy%efield /= 0.0_dp) THEN
                WRITE (UNIT=output_unit, FMT="(T3,A,T56,F25.14)") &
-               "Electric field interaction energy:          ", energy%efield
+                  "Electric field interaction energy:          ", energy%efield
+            END IF
             IF (gapw) THEN
                WRITE (UNIT=output_unit, FMT="(/,(T3,A,T56,F25.14))") &
                   "GAPW| Exc from hard and soft atomic rho1:      ", exc1_energy, &
@@ -877,18 +924,6 @@ CONTAINS
                   e_extrapolated = energy%total - 0.5_dp*energy%kTS
                   WRITE (UNIT=output_unit, FMT="((T3,A,T56,F25.14))") &
                      "Total energy (extrapolated to T->0):           ", e_extrapolated
-                  IF (scf_control%gce%do_gce) THEN
-                     WRITE (UNIT=output_unit, FMT="(/,(T3,A,T56,F25.14))") &
-                        "GCE work function [eV]: ", scf_control%gce%prev_workfunction*evolt
-                     WRITE (UNIT=output_unit, FMT="((T3,A,T56,ES25.10))") &
-                        "GCE WF-TWF [eV]: ", (scf_control%gce%prev_workfunction - &
-                                              scf_control%gce%target_workfunction)*evolt
-                     WRITE (UNIT=output_unit, FMT="((T3,A,T56,F25.14))") &
-                        "GCE charge [e]: ", dft_control%pcc_control%charge
-                     WRITE (UNIT=output_unit, FMT="((T3,A,T56,F25.14))") &
-                        "GCE free energy: ", (dft_control%pcc_control%charge + dft_control%charge) &
-                        *scf_control%gce%prev_workfunction*evolt
-                  END IF
                CASE (smear_gaussian)
                   e_extrapolated = energy%total - 0.5_dp*energy%kTS
                   WRITE (UNIT=output_unit, FMT="((T3,A,T56,F25.14))") &
@@ -896,6 +931,18 @@ CONTAINS
                CASE (smear_mp, smear_mv)
                   ! Sigma->0 extrapolation does not apply to MP or MV method.
                END SELECT
+               IF (scf_control%gce%do_gce) THEN
+                  WRITE (UNIT=output_unit, FMT="(/,(T3,A,T56,F25.14))") &
+                     "GCE work function [eV]: ", scf_control%gce%prev_workfunction*evolt
+                  WRITE (UNIT=output_unit, FMT="((T3,A,T56,ES25.10))") &
+                     "GCE WF-TWF [eV]: ", (scf_control%gce%prev_workfunction - &
+                                           scf_control%gce%target_workfunction)*evolt
+                  WRITE (UNIT=output_unit, FMT="((T3,A,T56,F25.14))") &
+                     "GCE charge [e]: ", dft_control%pcc_control%charge
+                  WRITE (UNIT=output_unit, FMT="((T3,A,T56,F25.14))") &
+                     "GCE free energy: ", (dft_control%pcc_control%charge + dft_control%charge) &
+                     *scf_control%gce%prev_workfunction*evolt
+               END IF
             END IF
          END IF
          IF (qmmm) THEN
@@ -1200,9 +1247,10 @@ CONTAINS
             WRITE (output_unit, '(A,L7)') &
                "  Precompute gradients    : ", cdft_control%becke_control%in_memory
             WRITE (output_unit, '(A)') "  "
-            IF (cdft_control%becke_control%adjust) &
+            IF (cdft_control%becke_control%adjust) THEN
                WRITE (output_unit, '(A)') &
-               "  Using atomic radii to generate a heteronuclear charge partitioning"
+                  "  Using atomic radii to generate a heteronuclear charge partitioning"
+            END IF
             WRITE (output_unit, '(A)') "  "
             IF (.NOT. cdft_control%becke_control%cavity_confine) THEN
                WRITE (output_unit, '(A)') &

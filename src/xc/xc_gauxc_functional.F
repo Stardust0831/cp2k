@@ -5,6 +5,10 @@
 !   SPDX-License-Identifier: GPL-2.0-or-later                                                      !
 !--------------------------------------------------------------------------------------------------!
 
+#ifdef __GAUXC
+#include "gauxc/gauxc_config.f"
+#endif
+
 MODULE xc_gauxc_functional
    USE atomic_kind_types,               ONLY: atomic_kind_type,&
                                               get_atomic_kind
@@ -19,9 +23,13 @@ MODULE xc_gauxc_functional
    USE cp_dbcsr_operations,             ONLY: dbcsr_allocate_matrix_set,&
                                               dbcsr_deallocate_matrix_set
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
-   USE external_potential_types,        ONLY: gth_potential_type,&
+   USE external_potential_types,        ONLY: all_potential_type,&
+                                              gth_potential_type,&
                                               sgp_potential_type
-   USE input_constants,                 ONLY: xc_vdw_fun_nonloc
+   USE input_constants,                 ONLY: do_gpu_auto,&
+                                              do_gpu_device,&
+                                              do_gpu_host,&
+                                              xc_vdw_fun_nonloc
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_get_subs_vals2,&
                                               section_vals_type,&
@@ -51,6 +59,7 @@ MODULE xc_gauxc_functional
    USE string_utilities,                ONLY: uppercase
    USE xc_gauxc_cache,                  ONLY: cp_gauxc_cache_params,&
                                               cp_gauxc_cache_type,&
+                                              gauxc_cache_ensure_gradient,&
                                               gauxc_cache_init
    USE xc_gauxc_interface,              ONLY: &
         cp_gauxc_basisset_type, cp_gauxc_grid_type, cp_gauxc_integrator_type, &
@@ -69,7 +78,8 @@ MODULE xc_gauxc_functional
    LOGICAL, PARAMETER :: debug_this_module = .TRUE.
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'xc_gauxc_functional'
 
-   PUBLIC :: apply_gauxc, gauxc_gapw_has_paw_pseudopotentials, skala_info, &
+   PUBLIC :: apply_gauxc, gauxc_gapw_all_all_electron, gauxc_gapw_all_pseudopotentials, &
+             gauxc_gapw_has_paw_pseudopotentials, gauxc_gapw_has_pseudopotentials, skala_info, &
              xc_section_uses_gauxc
 
    INTERFACE
@@ -86,6 +96,32 @@ MODULE xc_gauxc_functional
    END INTERFACE
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Return whether every GAPW kind uses an all-electron potential.
+!> \param qs_kind_set ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION gauxc_gapw_all_all_electron(qs_kind_set) RESULT(all_all_electron)
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      LOGICAL                                            :: all_all_electron
+
+      INTEGER                                            :: ikind
+      TYPE(all_potential_type), POINTER                  :: all_potential
+
+      CPASSERT(ASSOCIATED(qs_kind_set))
+
+      all_all_electron = .TRUE.
+      DO ikind = 1, SIZE(qs_kind_set)
+         NULLIFY (all_potential)
+         CALL get_qs_kind(qs_kind_set(ikind), all_potential=all_potential)
+         IF (.NOT. ASSOCIATED(all_potential)) THEN
+            all_all_electron = .FALSE.
+            EXIT
+         END IF
+      END DO
+
+   END FUNCTION gauxc_gapw_all_all_electron
 
 ! **************************************************************************************************
 !> \brief Set the GauXC Skala atom chunk environment knob when the CP2K keyword is explicit.
@@ -124,8 +160,9 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE dbcsr_to_dense(dbcsr_mat, dense_mat, para_env)
       USE cp_dbcsr_api, ONLY: dbcsr_distribution_get, dbcsr_distribution_type, dbcsr_get_info, &
-                              dbcsr_get_matrix_type, dbcsr_get_readonly_block_p, &
-                              dbcsr_get_stored_coordinates, dbcsr_type_antisymmetric, &
+                              dbcsr_get_matrix_type, dbcsr_iterator_blocks_left, &
+                              dbcsr_iterator_next_block, dbcsr_iterator_readonly_start, &
+                              dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_type_antisymmetric, &
                               dbcsr_type_symmetric
       TYPE(dbcsr_p_type), INTENT(IN)                     :: dbcsr_mat
       REAL(c_double), ALLOCATABLE, DIMENSION(:, :), &
@@ -133,24 +170,24 @@ CONTAINS
       TYPE(mp_para_env_type), INTENT(IN), POINTER        :: para_env
 
       CHARACTER                                          :: matrix_type
-      INTEGER :: col, col_end, col_start, icol, irow, mynode, nblkcols_total, nblkrows_total, &
-         ncols, nrows, numnodes, owner, row, row_end, row_start
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: c_offset, r_offset
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, row_blk_size
-      LOGICAL                                            :: found
+      INTEGER                                            :: col_end, col_start, icol, irow, ncol, &
+                                                            ncols, nrow, nrows, numnodes, row_end, &
+                                                            row_start
+      LOGICAL                                            :: has_symmetry, transposed
       REAL(c_double), POINTER                            :: block(:, :)
+      REAL(KIND=dp)                                      :: symmetry_sign
       TYPE(dbcsr_distribution_type)                      :: dist
+      TYPE(dbcsr_iterator_type)                          :: iter
 
       CALL dbcsr_get_info(dbcsr_mat%matrix, &
-                          row_blk_size=row_blk_size, &
-                          col_blk_size=col_blk_size, &
-                          nblkrows_total=nblkrows_total, &
-                          nblkcols_total=nblkcols_total, &
                           nfullrows_total=nrows, &
                           nfullcols_total=ncols, &
                           distribution=dist)
-      CALL dbcsr_distribution_get(dist, mynode=mynode, numnodes=numnodes)
+      CALL dbcsr_distribution_get(dist, numnodes=numnodes)
       matrix_type = dbcsr_get_matrix_type(dbcsr_mat%matrix)
+      has_symmetry = matrix_type == dbcsr_type_symmetric .OR. matrix_type == dbcsr_type_antisymmetric
+      symmetry_sign = 1.0_dp
+      IF (matrix_type == dbcsr_type_antisymmetric) symmetry_sign = -1.0_dp
 
       IF (.NOT. ALLOCATED(dense_mat)) THEN
          ALLOCATE (dense_mat(nrows, ncols))
@@ -162,42 +199,30 @@ CONTAINS
       END IF
       dense_mat = 0._dp
 
-      ALLOCATE (r_offset(nblkrows_total), c_offset(nblkcols_total))
-
-      r_offset(1) = 1
-      DO row = 2, nblkrows_total
-         r_offset(row) = r_offset(row - 1) + row_blk_size(row - 1)
-      END DO
-      c_offset(1) = 1
-      DO col = 2, nblkcols_total
-         c_offset(col) = c_offset(col - 1) + col_blk_size(col - 1)
-      END DO
-
       ! Replicated DBCSR blocks must enter the following MPI sum exactly once.
-      DO irow = 1, nblkrows_total
-         DO icol = 1, nblkcols_total
-            IF (numnodes == 1 .AND. para_env%num_pe > 1 .AND. para_env%mepos /= 0) CYCLE
-            CALL dbcsr_get_stored_coordinates(dbcsr_mat%matrix, irow, icol, owner)
-            IF (owner /= mynode) CYCLE
-            CALL dbcsr_get_readonly_block_p(matrix=dbcsr_mat%matrix, row=irow, col=icol, &
-                                            block=block, found=found)
-            IF (.NOT. found) CYCLE
-            row_start = r_offset(irow)
-            row_end = row_start + row_blk_size(irow) - 1
-            col_start = c_offset(icol)
-            col_end = col_start + col_blk_size(icol) - 1
-            dense_mat(row_start:row_end, col_start:col_end) = block
-            IF (irow /= icol) THEN
-               IF (matrix_type == dbcsr_type_symmetric) THEN
-                  dense_mat(col_start:col_end, row_start:row_end) = TRANSPOSE(block)
-               ELSE IF (matrix_type == dbcsr_type_antisymmetric) THEN
-                  dense_mat(col_start:col_end, row_start:row_end) = -TRANSPOSE(block)
-               END IF
-            END IF
-         END DO
-      END DO
+      IF (numnodes == 1 .AND. para_env%num_pe > 1 .AND. para_env%mepos /= 0) RETURN
 
-      DEALLOCATE (r_offset, c_offset)
+      ! Stored blocks and their symmetry mirrors occupy disjoint dense slices.
+!$OMP PARALLEL DEFAULT(NONE) SHARED(dbcsr_mat, dense_mat, has_symmetry, symmetry_sign) &
+!$OMP PRIVATE(iter, irow, icol, block, transposed, row_start, col_start, nrow, ncol, row_end, col_end)
+      CALL dbcsr_iterator_readonly_start(iter, dbcsr_mat%matrix)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, irow, icol, block, transposed=transposed, &
+                                        row_size=nrow, col_size=ncol, row_offset=row_start, col_offset=col_start)
+         row_end = row_start + nrow - 1
+         col_end = col_start + ncol - 1
+         IF (transposed) THEN
+            dense_mat(row_start:row_end, col_start:col_end) = symmetry_sign*TRANSPOSE(block)
+         ELSE
+            dense_mat(row_start:row_end, col_start:col_end) = block
+         END IF
+         IF (has_symmetry .AND. irow /= icol) THEN
+            dense_mat(col_start:col_end, row_start:row_end) = &
+               symmetry_sign*TRANSPOSE(dense_mat(row_start:row_end, col_start:col_end))
+         END IF
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
    END SUBROUTINE dbcsr_to_dense
 
@@ -342,7 +367,7 @@ CONTAINS
          ifun = ifun + 1
          xc_fun => section_vals_get_subs_vals2(functionals, i_section=ifun)
          IF (.NOT. ASSOCIATED(xc_fun)) EXIT
-         IF (xc_fun%section%name == "GAUXC") THEN
+         IF (xc_fun%section%name == "GAUXC" .OR. xc_fun%section%name == "SKALA_NATIVE") THEN
             uses_gauxc = .TRUE.
             EXIT
          END IF
@@ -380,6 +405,35 @@ CONTAINS
    END FUNCTION gauxc_gapw_has_pseudopotentials
 
 ! **************************************************************************************************
+!> \brief Return whether every GAPW kind uses a pseudopotential.
+!> \param qs_kind_set ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION gauxc_gapw_all_pseudopotentials(qs_kind_set) RESULT(all_pseudopotentials)
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      LOGICAL                                            :: all_pseudopotentials
+
+      INTEGER                                            :: ikind
+      TYPE(gth_potential_type), POINTER                  :: gth_potential
+      TYPE(sgp_potential_type), POINTER                  :: sgp_potential
+
+      CPASSERT(ASSOCIATED(qs_kind_set))
+
+      all_pseudopotentials = .TRUE.
+      DO ikind = 1, SIZE(qs_kind_set)
+         NULLIFY (gth_potential, sgp_potential)
+         CALL get_qs_kind(qs_kind_set(ikind), &
+                          gth_potential=gth_potential, &
+                          sgp_potential=sgp_potential)
+         IF (.NOT. (ASSOCIATED(gth_potential) .OR. ASSOCIATED(sgp_potential))) THEN
+            all_pseudopotentials = .FALSE.
+            EXIT
+         END IF
+      END DO
+
+   END FUNCTION gauxc_gapw_all_pseudopotentials
+
+! **************************************************************************************************
 !> \brief Return whether GauXC GAPW mode sees pseudopotential one-center GAPW kinds.
 !> \param qs_kind_set ...
 !> \return ...
@@ -389,7 +443,7 @@ CONTAINS
       LOGICAL                                            :: has_paw_pseudopotentials
 
       INTEGER                                            :: ikind
-      LOGICAL                                            :: gpw_type_forced, paw_atom
+      LOGICAL                                            :: paw_atom
       TYPE(gth_potential_type), POINTER                  :: gth_potential
       TYPE(sgp_potential_type), POINTER                  :: sgp_potential
 
@@ -400,11 +454,10 @@ CONTAINS
          NULLIFY (gth_potential, sgp_potential)
          CALL get_qs_kind(qs_kind_set(ikind), &
                           gth_potential=gth_potential, &
-                          gpw_type_forced=gpw_type_forced, &
                           paw_atom=paw_atom, &
                           sgp_potential=sgp_potential)
          IF ((ASSOCIATED(gth_potential) .OR. ASSOCIATED(sgp_potential)) .AND. &
-             paw_atom .AND. .NOT. gpw_type_forced) THEN
+             paw_atom) THEN
             has_paw_pseudopotentials = .TRUE.
             EXIT
          END IF
@@ -575,7 +628,8 @@ CONTAINS
                       device_runtime_fill_fraction, &
                       gauxc_status, &
                       mpi_comm=mp_comm_self%get_handle(), &
-                      force_new_runtime=.TRUE.)
+                      force_new_runtime=.TRUE., &
+                      int_exec_space=int_exec_space)
       CALL gauxc_check_status(gauxc_status)
       gauxc_integrator_fd = gauxc_create_integrator( &
                             TRIM(xc_fun_name), &
@@ -899,11 +953,28 @@ CONTAINS
 
       CHARACTER(len=default_path_length)                 :: model_key, model_name
       CHARACTER(len=default_string_length)               :: xc_fun_key, xc_fun_name
-      LOGICAL                                            :: native_grid
+
+      IF (functional%section%name == "SKALA_NATIVE") THEN
+         CALL section_vals_val_get(functional, "MODEL", c_val=model_name)
+         IF (PRESENT(reference)) reference = "CP2K-native SKALA TorchScript model "//TRIM(model_name)
+         IF (PRESENT(shortform)) shortform = "SKALA (native)"
+         IF (PRESENT(needs)) THEN
+            IF (lsd) THEN
+               needs%rho_spin = .TRUE.
+               needs%drho_spin = .TRUE.
+               needs%tau_spin = .TRUE.
+            ELSE
+               needs%rho = .TRUE.
+               needs%drho = .TRUE.
+               needs%tau = .TRUE.
+            END IF
+         END IF
+         IF (PRESENT(max_deriv)) max_deriv = 1
+         RETURN
+      END IF
 
       CALL section_vals_val_get(functional, "FUNCTIONAL", c_val=xc_fun_name)
       CALL section_vals_val_get(functional, "MODEL", c_val=model_name)
-      CALL section_vals_val_get(functional, "NATIVE_GRID", l_val=native_grid)
       model_key = ADJUSTL(model_name)
       xc_fun_key = ADJUSTL(xc_fun_name)
       CALL uppercase(model_key)
@@ -926,22 +997,9 @@ CONTAINS
          END IF
       END IF
       IF (PRESENT(needs)) THEN
-         IF (native_grid .AND. TRIM(model_key) /= "NONE" .AND. TRIM(model_key) /= "" .AND. &
-             TRIM(model_key) /= TRIM(xc_fun_key)) THEN
-            IF (lsd) THEN
-               needs%rho_spin = .TRUE.
-               needs%drho_spin = .TRUE.
-               needs%tau_spin = .TRUE.
-            ELSE
-               needs%rho = .TRUE.
-               needs%drho = .TRUE.
-               needs%tau = .TRUE.
-            END IF
-         ELSE
-            needs%rho = .TRUE.
-            IF (lsd) THEN
-               needs%rho_spin = .TRUE.
-            END IF
+         needs%rho = .TRUE.
+         IF (lsd) THEN
+            needs%rho_spin = .TRUE.
          END IF
       END IF
       IF (PRESENT(max_deriv)) max_deriv = 1
@@ -953,15 +1011,26 @@ CONTAINS
 ! passing it to GauXC.
 
 ! **************************************************************************************************
-!> \brief ...
+!> \brief Evaluate molecular GauXC, optionally for an explicit configuration density.
 !> \param qs_env ...
 !> \param xc_section ...
 !> \param calculate_forces ...
+!> \param rho_ao_external Optional spin/image AO density; supply all three external arguments together
+!> \param exc_external Configuration XC energy, leaving the baseline energy unchanged
+!> \param matrix_vxc_external Initially null; caller owns the returned spin AO potential matrices
+!> \note External-density mode preserves baseline energy and KS storage and shares
+!>       the geometry/model cache.
 ! **************************************************************************************************
-   SUBROUTINE apply_gauxc(qs_env, xc_section, calculate_forces)
+   SUBROUTINE apply_gauxc(qs_env, xc_section, calculate_forces, &
+                          rho_ao_external, exc_external, matrix_vxc_external)
       TYPE(qs_environment_type), INTENT(in), POINTER     :: qs_env
       TYPE(section_vals_type), INTENT(in), POINTER       :: xc_section
       LOGICAL, INTENT(IN)                                :: calculate_forces
+      TYPE(dbcsr_p_type), DIMENSION(:, :), INTENT(IN), &
+         OPTIONAL, POINTER                               :: rho_ao_external
+      REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: exc_external
+      TYPE(dbcsr_p_type), DIMENSION(:), INTENT(INOUT), &
+         OPTIONAL, POINTER                               :: matrix_vxc_external
 
       CHARACTER(len=*), PARAMETER :: nonlocal_vdw_abort_message = &
          "GauXC does not support non-local VDW_POTENTIAL corrections. "// &
@@ -969,16 +1038,17 @@ CONTAINS
       REAL(KIND=dp), PARAMETER :: gapw_fd_gradient_dx = 1.0E-4_dp
 
       CHARACTER(len=default_path_length)                 :: model_key, model_name, output_path
-      CHARACTER(len=default_string_length)               :: gradient_runtime, gradient_runtime_key, &
-                                                            grid_key, pruning_key, skala_runtime, &
-                                                            skala_runtime_key, xc_fun_key
-      INTEGER                                            :: atom_chunk_size, env_status, img, ispin, &
-                                                            nimages
-      LOGICAL :: atom_chunk_size_explicit, do_kpoints, gapw_method, gapw_paw_pseudopotentials, &
-         gapw_pseudopotentials, grid_explicit, hdf5_output, is_periodic, molecular_virial, &
-         molecular_virial_debug, need_xc_gradient, periodic_reference, pruning_explicit, &
+      CHARACTER(len=default_string_length) :: gradient_runtime, gradient_runtime_key, grid_key, &
+         int_exec_space_key, lb_exec_space_key, lwd_kernel_key, pruning_key, skala_runtime, &
+         skala_runtime_key, xc_fun_key
+      INTEGER                                            :: atom_chunk_size, env_status, gpu_mode, &
+                                                            img, ispin, nimages
+      LOGICAL :: atom_chunk_size_explicit, do_kpoints, external_density, gapw_method, &
+         gapw_paw_pseudopotentials, gapw_pseudopotentials, grid_explicit, hdf5_output, &
+         int_space_explicit, is_periodic, lb_space_explicit, low_spin_scope, molecular_virial, &
+         molecular_virial_debug, need_xc_gradient, periodic_reference, pruning_explicit, use_cuda, &
          use_skala_model, write_hdf5_output
-      REAL(KIND=dp)                                      :: molecular_virial_debug_dx
+      REAL(KIND=dp)                                      :: exc_value, molecular_virial_debug_dx
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: density_scalar, density_zeta
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
@@ -1000,6 +1070,14 @@ CONTAINS
       TYPE(qs_rho_type), POINTER                         :: rho, rho_use, rho_xc
       TYPE(qs_scf_env_type), POINTER                     :: scf_env
       TYPE(section_vals_type), POINTER                   :: gauxc_functional_section
+
+      external_density = PRESENT(rho_ao_external)
+      CPASSERT(PRESENT(exc_external) .EQV. external_density)
+      CPASSERT(PRESENT(matrix_vxc_external) .EQV. external_density)
+      IF (external_density) THEN
+         CPASSERT(ASSOCIATED(rho_ao_external))
+         CPASSERT(.NOT. ASSOCIATED(matrix_vxc_external))
+      END IF
 
       NULLIFY ( &
          atomic_kind_set, &
@@ -1052,8 +1130,18 @@ CONTAINS
          rho_use, &
          rho_ao_kp=rho_ao)
 
+      IF (external_density) THEN
+         rho_ao => rho_ao_external
+         ! get_qs_env returned the baseline pointer. Never release or replace it.
+         NULLIFY (matrix_vxc)
+      END IF
       nimages = dft_control%nimages
       params%nspins = dft_control%nspins
+      IF (external_density) THEN
+         CPASSERT(SIZE(rho_ao, 1) == params%nspins)
+         CPASSERT(SIZE(rho_ao, 2) == nimages)
+      END IF
+      low_spin_scope = external_density .OR. (dft_control%low_spin_roks .AND. gapw_method)
       is_periodic = .FALSE.
       IF (ASSOCIATED(cell)) is_periodic = ANY(cell%perd /= 0)
 
@@ -1118,12 +1206,50 @@ CONTAINS
          r_val=molecular_virial_debug_dx)
       CALL section_vals_val_get( &
          gauxc_functional_section, &
+         "USE_GPU", &
+         i_val=gpu_mode)
+      SELECT CASE (gpu_mode)
+      CASE (do_gpu_auto)
+#if defined(GAUXC_HAS_DEVICE) && defined(__LIBTORCH_CUDA)
+         use_cuda = .TRUE.
+#else
+         use_cuda = .FALSE.
+#endif
+      CASE (do_gpu_host)
+         use_cuda = .FALSE.
+      CASE (do_gpu_device)
+         use_cuda = .TRUE.
+      CASE DEFAULT
+         CALL cp_abort(__LOCATION__, "Unknown GAUXC%USE_GPU value.")
+      END SELECT
+      CALL section_vals_val_get( &
+         gauxc_functional_section, &
          "LB_EXECUTION_SPACE", &
-         c_val=params%lb_exec_space)
+         c_val=params%lb_exec_space, &
+         explicit=lb_space_explicit)
       CALL section_vals_val_get( &
          gauxc_functional_section, &
          "INT_EXECUTION_SPACE", &
-         c_val=params%int_exec_space)
+         c_val=params%int_exec_space, &
+         explicit=int_space_explicit)
+      lb_exec_space_key = ADJUSTL(params%lb_exec_space)
+      int_exec_space_key = ADJUSTL(params%int_exec_space)
+      CALL uppercase(lb_exec_space_key)
+      CALL uppercase(int_exec_space_key)
+      IF (.NOT. use_cuda) THEN
+         IF ((lb_space_explicit .AND. TRIM(lb_exec_space_key) == "DEVICE") .OR. &
+             (int_space_explicit .AND. TRIM(int_exec_space_key) == "DEVICE")) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "GAUXC%USE_GPU disables GPU execution, but an explicit "// &
+                          "DEVICE execution space was requested. Use USE_GPU GPU "// &
+                          "or remove the explicit DEVICE setting.")
+         END IF
+         params%lb_exec_space = "HOST"
+         params%int_exec_space = "HOST"
+      ELSE
+         IF (.NOT. lb_space_explicit) params%lb_exec_space = "DEVICE"
+         IF (.NOT. int_space_explicit) params%int_exec_space = "DEVICE"
+      END IF
       CALL section_vals_val_get( &
          gauxc_functional_section, &
          "LWD_KERNEL", &
@@ -1138,6 +1264,10 @@ CONTAINS
          c_val=gradient_runtime)
       CALL section_vals_val_get( &
          gauxc_functional_section, &
+         "FORCE_NUMERICAL_GRADIENT", &
+         l_val=params%force_fd_gradient)
+      CALL section_vals_val_get( &
+         gauxc_functional_section, &
          "OUTPUT_PATH", &
          c_val=output_path)
 
@@ -1149,9 +1279,21 @@ CONTAINS
       CALL uppercase(skala_runtime_key)
       gradient_runtime_key = ADJUSTL(gradient_runtime)
       CALL uppercase(gradient_runtime_key)
+      int_exec_space_key = ADJUSTL(params%int_exec_space)
+      CALL uppercase(int_exec_space_key)
       params%use_gauxc_model = (TRIM(model_key) /= "" .AND. TRIM(model_key) /= "NONE" .AND. &
                                 TRIM(model_key) /= TRIM(xc_fun_key))
       use_skala_model = (INDEX(TRIM(model_key), "SKALA") > 0)
+      lwd_kernel_key = ADJUSTL(params%lwd_kernel)
+      CALL uppercase(lwd_kernel_key)
+      IF (TRIM(lwd_kernel_key) == "AUTO") THEN
+         params%lwd_kernel = "DEFAULT"
+#if defined(GAUXC_HAS_CUTLASS)
+         IF (use_skala_model .AND. TRIM(params%int_exec_space) == "DEVICE") THEN
+            params%lwd_kernel = "SCHEME1-CUTLASS"
+         END IF
+#endif
+      END IF
       params%model_eval_name = model_name
       IF (.NOT. params%use_gauxc_model) THEN
          ! MODEL NONE and MODEL equal to FUNCTIONAL select conventional GauXC.
@@ -1183,6 +1325,30 @@ CONTAINS
          molecular_virial = .TRUE.
       END IF
       need_xc_gradient = calculate_forces .OR. molecular_virial
+      IF (low_spin_scope) THEN
+         IF (.NOT. dft_control%qs_control%gapw .OR. dft_control%qs_control%gapw_xc) THEN
+            CPABORT("GauXC low spin ROKS requires METHOD GAPW.")
+         END IF
+         IF (.NOT. gauxc_gapw_all_all_electron(qs_kind_set)) THEN
+            CPABORT("GAPW low spin ROKS GauXC requires all-electron kinds.")
+         END IF
+         IF (is_periodic .OR. do_kpoints .OR. nimages /= 1) THEN
+            CPABORT("GAPW low spin ROKS GauXC requires an isolated Gamma-point calculation.")
+         END IF
+         IF (need_xc_gradient) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "GAPW low spin ROKS GauXC nuclear gradients and molecular virial are not implemented.")
+         END IF
+         IF (TRIM(int_exec_space_key) /= "HOST" .OR. TRIM(params%lb_exec_space) /= "HOST") THEN
+            CPABORT("GAPW low spin ROKS GauXC currently requires HOST execution.")
+         END IF
+         IF (params%use_gauxc_model .AND. .NOT. use_skala_model) THEN
+            CPABORT("GAPW low spin ROKS GauXC supports only the SKALA model or conventional XC.")
+         END IF
+         IF (use_skala_model .AND. TRIM(skala_runtime_key) == "MPI") THEN
+            CPABORT("GAPW low spin ROKS Skala requires SKALA_RUNTIME AUTO or SELF.")
+         END IF
+      END IF
       CALL ensure_gauxc_periodic_reference_scope( &
          dft_control, cell, qs_kind_set, do_kpoints, periodic_reference)
       IF (is_periodic .AND. periodic_reference .AND. para_env%mepos == 0) THEN
@@ -1220,9 +1386,23 @@ CONTAINS
                "Use GRID SUPERFINE and PRUNING_SCHEME UNPRUNED for quantitative force checks.")
          END IF
          IF (TRIM(model_key) == "SKALA") THEN
-            CALL GET_ENVIRONMENT_VARIABLE("GAUXC_SKALA_MODEL", model_name, STATUS=env_status)
+            model_name = ""
+            env_status = 1
+            IF (TRIM(int_exec_space_key) == "DEVICE") THEN
+               CALL GET_ENVIRONMENT_VARIABLE("SKALA_CUDA_MODEL", model_name, STATUS=env_status)
+            END IF
             IF (env_status /= 0 .OR. LEN_TRIM(model_name) == 0) THEN
-               CPABORT("MODEL SKALA requires the GAUXC_SKALA_MODEL environment variable")
+               CALL GET_ENVIRONMENT_VARIABLE("SKALA_MODEL", model_name, STATUS=env_status)
+            END IF
+            IF (env_status /= 0 .OR. LEN_TRIM(model_name) == 0) THEN
+               IF (TRIM(int_exec_space_key) == "DEVICE") THEN
+                  CALL cp_abort( &
+                     __LOCATION__, &
+                     "MODEL SKALA with DEVICE execution requires SKALA_CUDA_MODEL or "// &
+                     "GAUXC_SKALA_MODEL")
+               ELSE
+                  CPABORT("MODEL SKALA requires the GAUXC_SKALA_MODEL environment variable")
+               END IF
             END IF
             params%model_eval_name = model_name
          END IF
@@ -1238,21 +1418,7 @@ CONTAINS
          CALL cp_abort(__LOCATION__, "Unknown GAUXC%SKALA_RUNTIME value.")
       END SELECT
       IF (.NOT. use_skala_model) params%use_self_runtime = .FALSE.
-      SELECT CASE (TRIM(gradient_runtime_key))
-      CASE ("AUTO", "SELF")
-         params%use_gradient_mpi_runtime = .FALSE.
-         params%use_gradient_self_runtime = need_xc_gradient .AND. params%use_gauxc_model .AND. &
-                                            para_env%num_pe > 1 .AND. .NOT. params%use_self_runtime
-      CASE ("MPI")
-         params%use_gradient_mpi_runtime = need_xc_gradient .AND. params%use_gauxc_model .AND. para_env%num_pe > 1
-         params%use_gradient_self_runtime = .FALSE.
-      CASE DEFAULT
-         CALL cp_abort(__LOCATION__, "Unknown GAUXC%MODEL_GRADIENT_RUNTIME value.")
-      END SELECT
-      IF (.NOT. params%use_gauxc_model) THEN
-         params%use_gradient_mpi_runtime = .FALSE.
-         params%use_gradient_self_runtime = .FALSE.
-      END IF
+      params%gradient_runtime = gradient_runtime_key
       IF (use_skala_model .AND. para_env%num_pe > 1 .AND. .NOT. params%use_self_runtime .AND. &
           para_env%mepos == 0 .AND. ASSOCIATED(scf_env)) THEN
          IF (scf_env%iter_count == 1) THEN
@@ -1264,9 +1430,10 @@ CONTAINS
          END IF
       END IF
 
-      ! After creating the basisset, we will have to check max_l>3 as a further condition
-      params%use_fd_gradient = gapw_method .AND. need_xc_gradient
+      params%gapw_method = gapw_method
+      params%need_xc_gradient = need_xc_gradient
 
+      IF (.NOT. ASSOCIATED(qs_env%gauxc_cache)) ALLOCATE (qs_env%gauxc_cache)
       cache => qs_env%gauxc_cache
       CALL gauxc_cache_init( &
          cache, &
@@ -1276,8 +1443,11 @@ CONTAINS
          qs_kind_set, &
          gauxc_status)
 
+      CALL gauxc_cache_ensure_gradient(cache, params, gauxc_status)
+      CALL gauxc_check_status(gauxc_status)
+
       hdf5_output = (TRIM(output_path) /= "")
-      write_hdf5_output = hdf5_output .AND. para_env%mepos == 0
+      write_hdf5_output = hdf5_output .AND. para_env%mepos == 0 .AND. .NOT. external_density
       IF (write_hdf5_output .AND. ASSOCIATED(scf_env)) THEN
          write_hdf5_output = scf_env%iter_count == 1
       END IF
@@ -1302,7 +1472,7 @@ CONTAINS
          CPABORT("GAUXC XC energy currently does not support real-time propagation")
       END IF
 
-      energy%exc = 0
+      exc_value = 0.0_dp
 
       IF (ASSOCIATED(matrix_vxc)) CALL dbcsr_deallocate_matrix_set(matrix_vxc)
       CALL dbcsr_allocate_matrix_set(matrix_vxc, params%nspins)
@@ -1438,7 +1608,7 @@ CONTAINS
             END IF
          END IF
 
-         energy%exc = energy%exc + gauxc_xc_result%exc
+         exc_value = exc_value + gauxc_xc_result%exc
 
          IF (params%nspins == 1) THEN
             IF (img == 1) THEN
@@ -1473,7 +1643,13 @@ CONTAINS
       DEALLOCATE (gauxc_xc_result%vxc_scalar)
       IF (ALLOCATED(gauxc_xc_result%vxc_zeta)) DEALLOCATE (gauxc_xc_result%vxc_zeta)
 
-      CALL set_ks_env(ks_env, matrix_vxc=matrix_vxc)
+      IF (external_density) THEN
+         exc_external = exc_value
+         matrix_vxc_external => matrix_vxc
+      ELSE
+         energy%exc = exc_value
+         CALL set_ks_env(ks_env, matrix_vxc=matrix_vxc)
+      END IF
       DO ispin = 1, params%nspins
          CALL dbcsr_finalize(matrix_vxc(ispin)%matrix)
       END DO

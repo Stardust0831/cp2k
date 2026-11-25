@@ -79,7 +79,8 @@ MODULE colvar_types
                                  mindist_colvar_id = 23, &
                                  acid_hyd_dist_colvar_id = 24, &
                                  acid_hyd_shell_colvar_id = 25, &
-                                 hydronium_dist_colvar_id = 26
+                                 hydronium_dist_colvar_id = 26, &
+                                 voronoiipz_colvar_id = 27
 
 ! **************************************************************************************************
 !> \brief parameters for the distance collective variable
@@ -222,6 +223,14 @@ MODULE colvar_types
                                          i_hydrogens => NULL()
       REAL(KIND=dp)                   :: rwoh = 0.0_dp, raoh = 0.0_dp, lambda = 0.0_dp, nc = 0.0_dp
    END TYPE acid_hyd_dist_colvar_type
+
+! **************************************************************************************************
+   TYPE voronoiipz_colvar_type
+      INTEGER, DIMENSION(:), POINTER :: group_a => NULL(), group_b => NULL()
+      INTEGER                        :: nrx = 0, zidx = 3
+      REAL(KIND=dp)                  :: d0 = 2.0_dp, d1 = 2.0_dp, d2 = 2.0_dp, d3 = 2.0_dp, &
+                                        lambda = -8.0_dp, nl_cutoff = 4.536862_dp, zmid = 0.0_dp
+   END TYPE voronoiipz_colvar_type
 
 ! **************************************************************************************************
    TYPE acid_hyd_shell_colvar_type
@@ -377,6 +386,7 @@ MODULE colvar_types
       TYPE(HBP_colvar_type), POINTER               :: HBP => NULL()
       TYPE(ring_puckering_colvar_type), POINTER    :: ring_puckering_param => NULL()
       TYPE(mindist_colvar_type), POINTER           :: mindist_param => NULL()
+      TYPE(voronoiipz_colvar_type), POINTER        :: voronoiipz_params => NULL()
    END TYPE colvar_type
 
 ! **************************************************************************************************
@@ -406,6 +416,7 @@ MODULE colvar_types
       INTEGER :: ngyration = 0
       INTEGER :: nxyz_diag = 0
       INTEGER :: nxyz_outerdiag = 0
+      INTEGER :: nvoronoiipz = 0
       INTEGER :: ntot = 0
    END TYPE colvar_counters
 
@@ -485,6 +496,8 @@ CONTAINS
          ALLOCATE (colvar%ring_puckering_param)
       CASE (mindist_colvar_id)
          ALLOCATE (colvar%mindist_param)
+      CASE (voronoiipz_colvar_id)
+         ALLOCATE (colvar%voronoiipz_params)
       CASE (no_colvar_id)
          ! Do nothing
       CASE DEFAULT
@@ -501,7 +514,7 @@ CONTAINS
    SUBROUTINE colvar_setup(colvar)
       TYPE(colvar_type), INTENT(INOUT)                   :: colvar
 
-      INTEGER                                            :: i, idum, iend, ii, istart, j, np, stat
+      INTEGER                                            :: i, idum, iend, ii, istart, j, np
       INTEGER, DIMENSION(:), POINTER                     :: list
 
       SELECT CASE (colvar%type_id)
@@ -660,11 +673,12 @@ CONTAINS
          IF (colvar%plane_plane_angle_param%plane1%type_of_def == plane_def_atoms) np = np + 3
          IF (colvar%plane_plane_angle_param%plane2%type_of_def == plane_def_atoms) np = np + 3
          ! if np is equal to zero this means that this is not a COLLECTIVE variable..
-         IF (np == 0) &
+         IF (np == 0) THEN
             CALL cp_abort(__LOCATION__, &
                           "PLANE_PLANE_ANGLE Colvar defined using two normal vectors! This is "// &
                           "not a COLLECTIVE VARIABLE! One of the two planes must be defined "// &
                           "using atomic positions.")
+         END IF
 
          ! Number of real atoms involved in the colvar
          colvar%n_atom_s = 0
@@ -850,8 +864,8 @@ CONTAINS
          i = colvar%xyz_outerdiag_param%i_atoms(2)
          list(2) = i
       CASE (u_colvar_id)
-         np = 1; ALLOCATE (list(np), stat=stat)
-         CPASSERT(stat == 0)
+         np = 1
+         ALLOCATE (list(np))
          colvar%n_atom_s = np; list(1) = 1
       CASE (Wc_colvar_id)
          np = 3
@@ -957,6 +971,12 @@ CONTAINS
                list(idum) = colvar%combine_cvs_param%colvar_p(ii)%colvar%i_atom(j)
             END DO
          END DO
+      CASE (voronoiipz_colvar_id)
+         colvar%use_points = .FALSE.
+         ALLOCATE (list(SIZE(colvar%voronoiipz_params%group_a) + SIZE(colvar%voronoiipz_params%group_b)))
+         list(1:SIZE(colvar%voronoiipz_params%group_a)) = colvar%voronoiipz_params%group_a(:)
+         list(SIZE(colvar%voronoiipz_params%group_a) + 1:SIZE(list)) = colvar%voronoiipz_params%group_b(:)
+         colvar%n_atom_s = SIZE(list)
       END SELECT
 
       IF (ASSOCIATED(colvar%dsdr)) THEN
@@ -1034,8 +1054,9 @@ CONTAINS
          idum = idum + 1
          i = i_oxygens(ii)
          list(idum) = i
-         IF (ANY(i_hydrogens == i)) &
+         IF (ANY(i_hydrogens == i)) THEN
             CPABORT("COLVAR: atoms doubled in OXYGENS and HYDROGENS list")
+         END IF
       END DO
       DO ii = 1, n_hydrogens
          idum = idum + 1
@@ -1046,10 +1067,12 @@ CONTAINS
       DO i = 1, np
          DO ii = i + 1, np
             IF (list(i) == list(ii)) THEN
-               IF (i <= n_oxygens) &
+               IF (i <= n_oxygens) THEN
                   CPABORT("atoms doubled in OXYGENS list")
-               IF (i > n_oxygens) &
+               END IF
+               IF (i > n_oxygens) THEN
                   CPABORT("atoms doubled in HYDROGENS list")
+               END IF
             END IF
          END DO
       END DO
@@ -1113,17 +1136,20 @@ CONTAINS
          idum = idum + 1
          i = i_oxygens_water(ii)
          list(idum) = i
-         IF (ANY(i_hydrogens == i)) &
+         IF (ANY(i_hydrogens == i)) THEN
             CPABORT("COLVAR: atoms doubled in OXYGENS_WATER and HYDROGENS list")
-         IF (ANY(i_oxygens_acid == i)) &
+         END IF
+         IF (ANY(i_oxygens_acid == i)) THEN
             CPABORT("COLVAR: atoms doubled in OXYGENS_WATER and OXYGENS_ACID list")
+         END IF
       END DO
       DO ii = 1, n_oxygens_acid
          idum = idum + 1
          i = i_oxygens_acid(ii)
          list(idum) = i
-         IF (ANY(i_hydrogens == i)) &
+         IF (ANY(i_hydrogens == i)) THEN
             CPABORT("COLVAR: atoms doubled in OXYGENS_ACID and HYDROGENS list")
+         END IF
       END DO
       DO ii = 1, n_hydrogens
          idum = idum + 1
@@ -1134,12 +1160,15 @@ CONTAINS
       DO i = 1, np
          DO ii = i + 1, np
             IF (list(i) == list(ii)) THEN
-               IF (i <= n_oxygens_water) &
+               IF (i <= n_oxygens_water) THEN
                   CPABORT("atoms doubled in OXYGENS_WATER list")
-               IF (i > n_oxygens_water .AND. i <= n_oxygens_water + n_oxygens_acid) &
+               END IF
+               IF (i > n_oxygens_water .AND. i <= n_oxygens_water + n_oxygens_acid) THEN
                   CPABORT("atoms doubled in OXYGENS_ACID list")
-               IF (i > n_oxygens_water + n_oxygens_acid) &
+               END IF
+               IF (i > n_oxygens_water + n_oxygens_acid) THEN
                   CPABORT("atoms doubled in HYDROGENS list")
+               END IF
             END IF
          END DO
       END DO
@@ -1333,6 +1362,11 @@ CONTAINS
             DEALLOCATE (colvar%mindist_param%k_coord_to)
          END IF
          DEALLOCATE (colvar%mindist_param)
+
+      CASE (voronoiipz_colvar_id)
+         DEALLOCATE (colvar%voronoiipz_params%group_a)
+         DEALLOCATE (colvar%voronoiipz_params%group_b)
+         DEALLOCATE (colvar%voronoiipz_params)
       CASE (no_colvar_id)
          ! Do nothing
       CASE default
@@ -1354,7 +1388,7 @@ CONTAINS
       TYPE(colvar_type), INTENT(IN)                      :: colvar_in
       INTEGER, INTENT(IN), OPTIONAL                      :: i_atom_offset
 
-      INTEGER                                            :: i, my_offset, ndim, ndim2, stat
+      INTEGER                                            :: i, my_offset, ndim, ndim2
 
       my_offset = 0
       IF (PRESENT(i_atom_offset)) my_offset = i_atom_offset
@@ -1362,6 +1396,20 @@ CONTAINS
       CALL colvar_clone_points(colvar_out, colvar_in, my_offset)
       IF (colvar_in%use_points) my_offset = 0
       SELECT CASE (colvar_out%type_id)
+      CASE (voronoiipz_colvar_id)
+         colvar_out%voronoiipz_params%lambda = colvar_in%voronoiipz_params%lambda
+         colvar_out%voronoiipz_params%zidx = colvar_in%voronoiipz_params%zidx
+         colvar_out%voronoiipz_params%nrx = colvar_in%voronoiipz_params%nrx
+         colvar_out%voronoiipz_params%zmid = colvar_in%voronoiipz_params%zmid
+         colvar_out%voronoiipz_params%d0 = colvar_in%voronoiipz_params%d0
+         colvar_out%voronoiipz_params%d1 = colvar_in%voronoiipz_params%d1
+         colvar_out%voronoiipz_params%d2 = colvar_in%voronoiipz_params%d2
+         colvar_out%voronoiipz_params%d3 = colvar_in%voronoiipz_params%d3
+         colvar_out%voronoiipz_params%nl_cutoff = colvar_in%voronoiipz_params%nl_cutoff
+         ALLOCATE (colvar_out%voronoiipz_params%group_a(SIZE(colvar_in%voronoiipz_params%group_a)))
+         ALLOCATE (colvar_out%voronoiipz_params%group_b(SIZE(colvar_in%voronoiipz_params%group_b)))
+         colvar_out%voronoiipz_params%group_a = colvar_in%voronoiipz_params%group_a + my_offset
+         colvar_out%voronoiipz_params%group_b = colvar_in%voronoiipz_params%group_b + my_offset
       CASE (dist_colvar_id)
          colvar_out%dist_param%i_at = colvar_in%dist_param%i_at + my_offset
          colvar_out%dist_param%j_at = colvar_in%dist_param%j_at + my_offset
@@ -1407,7 +1455,7 @@ CONTAINS
             ndim = SIZE(colvar_in%coord_param%c_kinds_to_b)
             ALLOCATE (colvar_out%coord_param%c_kinds_to_b(ndim))
             colvar_out%coord_param%c_kinds_to_b = colvar_in%coord_param%c_kinds_to_b
-         ELSEIF (ASSOCIATED(colvar_in%coord_param%i_at_to_b)) THEN
+         ELSE IF (ASSOCIATED(colvar_in%coord_param%i_at_to_b)) THEN
             ! INDEX
             ndim = SIZE(colvar_in%coord_param%i_at_to_b)
             ALLOCATE (colvar_out%coord_param%i_at_to_b(ndim))
@@ -1615,11 +1663,11 @@ CONTAINS
             colvar_out%reaction_path_param%align_frames = colvar_in%reaction_path_param%align_frames
             colvar_out%reaction_path_param%subset = colvar_in%reaction_path_param%subset
             ndim = SIZE(colvar_in%reaction_path_param%i_rmsd)
-            ALLOCATE (colvar_out%reaction_path_param%i_rmsd(ndim), stat=stat)
+            ALLOCATE (colvar_out%reaction_path_param%i_rmsd(ndim))
             colvar_out%reaction_path_param%i_rmsd = colvar_in%reaction_path_param%i_rmsd
             ndim = SIZE(colvar_in%reaction_path_param%r_ref, 1)
             ndim2 = SIZE(colvar_in%reaction_path_param%r_ref, 2)
-            ALLOCATE (colvar_out%reaction_path_param%r_ref(ndim, ndim2), stat=stat)
+            ALLOCATE (colvar_out%reaction_path_param%r_ref(ndim, ndim2))
             colvar_out%reaction_path_param%r_ref = colvar_in%reaction_path_param%r_ref
          ELSE
             ndim = SIZE(colvar_in%reaction_path_param%colvar_p)
@@ -1842,8 +1890,9 @@ CONTAINS
 
       IF (ASSOCIATED(colvar_p)) THEN
          DO i = 1, SIZE(colvar_p)
-            IF (ASSOCIATED(colvar_p(i)%colvar)) &
+            IF (ASSOCIATED(colvar_p(i)%colvar)) THEN
                CALL colvar_release(colvar_p(i)%colvar)
+            END IF
          END DO
          DEALLOCATE (colvar_p)
       END IF

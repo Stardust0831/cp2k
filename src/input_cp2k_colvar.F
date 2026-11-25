@@ -11,7 +11,8 @@
 !> \author teo & fawzi
 ! **************************************************************************************************
 MODULE input_cp2k_colvar
-   USE bibliography,                    ONLY: Branduardi2007
+   USE bibliography,                    ONLY: Branduardi2007,&
+                                              Zhang2025
    USE colvar_types,                    ONLY: &
         do_clv_fix_point, do_clv_geo_center, do_clv_x, do_clv_xy, do_clv_xyz, do_clv_xz, do_clv_y, &
         do_clv_yz, do_clv_z, plane_def_atoms, plane_def_vec
@@ -21,6 +22,7 @@ MODULE input_cp2k_colvar
                                               low_print_level
    USE cp_units,                        ONLY: cp_unit_to_cp2k
    USE fparser,                         ONLY: docf
+   USE generic_function_input,          ONLY: create_function_section
    USE input_constants,                 ONLY: gaussian,&
                                               numerical,&
                                               rmsd_all,&
@@ -39,7 +41,8 @@ MODULE input_cp2k_colvar
                                               lchar_t,&
                                               real_t
    USE kinds,                           ONLY: dp
-   USE string_utilities,                ONLY: s2a
+   USE string_utilities,                ONLY: newline,&
+                                              s2a
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -228,6 +231,10 @@ CONTAINS
       CALL section_release(subsection)
 
       CALL create_colvar_cond_dist_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+      CALL create_voronoiipz_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
@@ -956,7 +963,6 @@ CONTAINS
    SUBROUTINE create_colvar_u_section(section)
       TYPE(section_type), POINTER                        :: section
 
-      TYPE(keyword_type), POINTER                        :: keyword
       TYPE(section_type), POINTER                        :: subsection
 
       CPASSERT(.NOT. ASSOCIATED(section))
@@ -964,63 +970,13 @@ CONTAINS
                           description="Section to define the energy as a generalized collective variable.", &
                           n_keywords=0, n_subsections=0, repeats=.FALSE.)
 
-      NULLIFY (subsection, keyword)
-      CALL section_create(subsection, __LOCATION__, name="MIXED", &
-                          description="This section allows to use any function of the energy subsystems"// &
-                          " in a mixed_env calculation as a collective variable.", &
-                          n_keywords=1, n_subsections=0, repeats=.FALSE.)
-
-      CALL keyword_create(keyword, __LOCATION__, name="ENERGY_FUNCTION", &
-                          description="Specifies the functional form of the collective variable in mathematical notation.", &
-                          usage="ENERGY_FUNCTION (E1+E2-LOG(E1/E2))", type_of_var=lchar_t, &
-                          n_var=1)
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="VARIABLES", &
-                          description="Defines the variables of the functional form. To allow an efficient"// &
-                          " mapping the order of the energy variables will be considered identical to the"// &
-                          " order of the force_eval in the force_eval_order list.", &
-                          usage="VARIABLES x", type_of_var=char_t, &
-                          n_var=-1)
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="PARAMETERS", &
-                          description="Defines the parameters of the functional form", &
-                          usage="PARAMETERS a b D", type_of_var=char_t, &
-                          n_var=-1, repeats=.TRUE.)
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="VALUES", &
-                          description="Defines the values of parameter of the functional form", &
-                          usage="VALUES ", type_of_var=real_t, &
-                          n_var=-1, repeats=.TRUE., unit_str="internal_cp2k")
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="UNITS", &
-                          description="Optionally, allows to define valid CP2K unit strings for each parameter value. "// &
-                          "It is assumed that the corresponding parameter value is specified in this unit.", &
-                          usage="UNITS angstrom eV*angstrom^-1 angstrom^1 K", type_of_var=char_t, &
-                          n_var=-1, repeats=.TRUE.)
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="DX", &
-                          description="Parameter used for computing the derivative with the Ridders' method.", &
-                          usage="DX <REAL>", default_r_val=0.1_dp, unit_str="bohr")
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="ERROR_LIMIT", &
-                          description="Checks that the error in computing the derivative is not larger than "// &
-                          "the value set; in case error is larger a warning message is printed.", &
-                          usage="ERROR_LIMIT <REAL>", default_r_val=1.0E-12_dp)
-      CALL section_add_keyword(subsection, keyword)
-      CALL keyword_release(keyword)
-
+      NULLIFY (subsection)
+      CALL create_function_section(subsection, "MIXED", "ENERGY_FUNCTION", &
+                                   description="This section allows to use any function of the energy subsystems "// &
+                                   "in a mixed_env calculation as a collective variable. Same as the section "// &
+                                   "FORCE_EVAL/MIXED/GENERIC, to allow an efficient mapping the order of the "// &
+                                   "energy variables will be considered identical to the order of the force_eval "// &
+                                   "in the MULTIPLE_FORCE_EVALS/FORCE_EVAL_ORDER list.", do_deriv=.TRUE.)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
@@ -1889,7 +1845,13 @@ CONTAINS
                           description="Section defining a one dimensional reaction path in an Q-dimensional space of colvars. "// &
                           "Constraining this colvar, allows to sample the space orthogonal to the reaction path, "// &
                           "both in the Q-dimensional colvar and 3N-Q remaining coordinates. "// &
-                          "For the details of the function see cited literature.", &
+                          "For the details of the function see cited literature."//newline//newline// &
+                          "The default is to use the colvars defined in the COLVAR subsections, which "// &
+                          "requires FUNCTION, VARIABLE, RANGE, STEP_SIZE keywords and optionally "// &
+                          "the MAP print key. Switching on either RMSD or DISTANCES_RMSD (which are "// &
+                          "mutually exclusive) instead requires the SUBSET_TYPE, ALIGN_FRAMES (and "// &
+                          "optionally ATOMS) keywords and the FRAME subsections. The LAMBDA keyword "// &
+                          "is always required for each of the three possibilities.", &
                           n_keywords=1, n_subsections=0, repeats=.FALSE., &
                           citations=[Branduardi2007])
 
@@ -1910,7 +1872,13 @@ CONTAINS
                           "path in an Q-dimensional space of colvars. "// &
                           "Constraining this colvar, allows to sample the space equidistant to the reaction path, "// &
                           "both in the Q-dimensional colvar and 3N-Q remaining coordinates. "// &
-                          "For the details of the function see cited literature.", &
+                          "For the details of the function see cited literature."//newline//newline// &
+                          "The default is to use the colvars defined in the COLVAR subsections, which "// &
+                          "requires FUNCTION, VARIABLE, RANGE, STEP_SIZE keywords and optionally "// &
+                          "the MAP print key. Switching on either RMSD or DISTANCES_RMSD (which are "// &
+                          "mutually exclusive) instead requires the SUBSET_TYPE, ALIGN_FRAMES (and "// &
+                          "optionally ATOMS) keywords and the FRAME subsections. The LAMBDA keyword "// &
+                          "is always required for each of the three possibilities.", &
                           n_keywords=1, n_subsections=0, repeats=.FALSE., &
                           citations=[Branduardi2007])
 
@@ -1918,7 +1886,7 @@ CONTAINS
    END SUBROUTINE create_colvar_dpath_section
 
 ! **************************************************************************************************
-!> \brief Section describinf keywords for both reaction path and distance from reaction path
+!> \brief Section describing keywords for both reaction path and distance from reaction path
 !> \param section the section to be created
 !> \author 01.2010
 ! **************************************************************************************************
@@ -1935,14 +1903,14 @@ CONTAINS
       CALL section_release(subsection)
 
       CALL keyword_create(keyword, __LOCATION__, name="DISTANCES_RMSD", &
-                          description=" ", &
+                          description="Whether to use distances RMSD instead of COLVARs.", &
                           usage="DISTANCES_RMSD T", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="RMSD", &
-                          description=" ", &
+                          description="Whether to use RMSD instead of COLVARs.", &
                           usage="RMSD T", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
@@ -1990,9 +1958,11 @@ CONTAINS
       CALL section_release(subsection)
 
       CALL keyword_create(keyword, __LOCATION__, name="FUNCTION", &
-                          description="Specifies the ith element of the vector valued function that defines the reaction path. "// &
-                          "This keyword needs to repeat exactly Q times, and the order must match the order of the colvars. "// &
-                          "The VARIABLE (e.g. T) which parametrises the curve can be used as the target of a constraint.", &
+                          description="Specifies the ith element of the vector valued function that "// &
+                          "defines the reaction path. This keyword needs to repeat exactly Q times, "// &
+                          "and the order must match the order of the colvars defined in the COLVAR "// &
+                          "subsections. The VARIABLE (e.g. T) which parametrises the curve can be "// &
+                          "used as the target of a constraint. "//docf(), &
                           usage="FUNCTION (sin(T+2)+2*T)", type_of_var=lchar_t, &
                           n_var=1, default_lc_val="0", repeats=.TRUE.)
       CALL section_add_keyword(section, keyword)
@@ -2000,7 +1970,7 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="VARIABLE", &
                           description="Specifies the name of the variable that parametrises the FUNCTION "// &
-                          "defining the reaction path.", &
+                          "defining the reaction path. All Q functions must use this variable.", &
                           usage="VARIABLE T", type_of_var=char_t, &
                           n_var=1, repeats=.FALSE.)
       CALL section_add_keyword(section, keyword)
@@ -2066,71 +2036,22 @@ CONTAINS
    SUBROUTINE create_colvar_comb_section(section)
       TYPE(section_type), POINTER                        :: section
 
-      TYPE(keyword_type), POINTER                        :: keyword
       TYPE(section_type), POINTER                        :: subsection
 
       CPASSERT(.NOT. ASSOCIATED(section))
-      CALL section_create(section, __LOCATION__, name="COMBINE_COLVAR", &
-                          description="Allows the possibility to combine several COLVARs into one COLVAR "// &
-                          "with a generic function. "//docf(), &
-                          n_keywords=1, n_subsections=0, repeats=.FALSE.)
 
-      NULLIFY (keyword, subsection)
+      CALL create_function_section(section, "COMBINE_COLVAR", "FUNCTION", &
+                                   description="Defines a COLVAR as a combination of several other "// &
+                                   "COLVARs with a generic function. To allow an efficient mapping "// &
+                                   "the order of the COLVARs will be considered identical to the "// &
+                                   "order of definition in the input file, and no extraneous COLVAR "// &
+                                   "that is not involved in the generic function should be present.", &
+                                   do_deriv=.TRUE.)
+
+      NULLIFY (subsection)
       CALL create_colvar_section(subsection, skip_recursive_colvar=.TRUE.)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
-
-      CALL keyword_create(keyword, __LOCATION__, name="FUNCTION", &
-                          description="Specifies the function used to combine different COLVARs into one.", &
-                          ! **************************************************************************************************
-                          !> \brief ...
-                          !> \param CV1^2 ...
-                          !> \param CV2^2 ...
-                          !> \param " ...
-                          !> \param type_of_var=lchar_t ...
-                          !> \param n_var=1 ...
-                          !> \param error=error ...
-                          ! **************************************************************************************************
-                          usage="FUNCTION SQRT(CV1^2+CV2^2)", type_of_var=lchar_t, &
-                          n_var=1)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="VARIABLES", &
-                          description="Specifies the name of the variable that parametrises the FUNCTION "// &
-                          "defining how COLVARS should be combined. The matching follows the same order of the "// &
-                          "COLVARS definition in the input file.", &
-                          usage="VARIABLES CV1 CV2 CV3", type_of_var=char_t, n_var=-1, repeats=.FALSE.)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="PARAMETERS", &
-                          description="Defines the parameters of the functional form", &
-                          usage="PARAMETERS a b D", type_of_var=char_t, &
-                          n_var=-1, repeats=.TRUE.)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="VALUES", &
-                          description="Defines the values of  parameter of the functional form", &
-                          usage="VALUES ", type_of_var=real_t, &
-                          n_var=-1, repeats=.TRUE., unit_str="internal_cp2k")
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="DX", &
-                          description="Parameter used for computing the derivative of the combination "// &
-                          "of COLVARs with the Ridders' method.", &
-                          usage="DX <REAL>", default_r_val=0.1_dp, unit_str="bohr")
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
-      CALL keyword_create(keyword, __LOCATION__, name="ERROR_LIMIT", &
-                          description="Checks that the error in computing the derivative is not larger than "// &
-                          "the value set; in case error is larger a warning message is printed.", &
-                          usage="ERROR_LIMIT <REAL>", default_r_val=1.0E-12_dp)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
 
    END SUBROUTINE create_colvar_comb_section
 
@@ -2300,5 +2221,95 @@ CONTAINS
    END SUBROUTINE create_colvar_ring_puckering_section
 
 ! **************************************************************************************************
+!> \brief Creates the VORONOIIPZ collective variable input section
+!> \param section the section to create
+! **************************************************************************************************
+   SUBROUTINE create_voronoiipz_section(section)
+      TYPE(section_type), POINTER                        :: section
+
+      TYPE(keyword_type), POINTER                        :: keyword
+
+      CPASSERT(.NOT. ASSOCIATED(section))
+      NULLIFY (keyword)
+      CALL section_create(section, __LOCATION__, name="VORONOIIPZ", &
+                          description="Absolute location of a hydronium ion along a Cartesian axis, "// &
+                          "based on continuous Voronoi weights.", &
+                          citations=[Zhang2025], n_subsections=0, repeats=.FALSE.)
+
+      CALL keyword_create(keyword, __LOCATION__, name="LAMBDA", &
+                          description="Exponent in the Voronoi weight exp(LAMBDA*r). "// &
+                          "Negative values assign each hydrogen predominantly to nearby oxygen atoms.", &
+                          usage="LAMBDA [angstrom^-1] -8.0", type_of_var=real_t, &
+                          default_r_val=cp_unit_to_cp2k(value=-8.0_dp, unit_str="angstrom^-1"), &
+                          unit_str="angstrom^-1", n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ZMID", &
+                          description="Coordinate of the reference plane along the selected axis.", &
+                          usage="ZMID [angstrom] 0.0", type_of_var=real_t, default_r_val=0.0_dp, &
+                          unit_str="angstrom", n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ZIDX", &
+                          description="Cartesian direction used for the ion location: 1=X, 2=Y, 3=Z.", &
+                          usage="ZIDX 3", type_of_var=integer_t, default_i_val=3, n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="D_0", &
+                          description="Reference coordination of the non-reactive GROUPA atoms.", &
+                          usage="D_0 2.0", type_of_var=real_t, default_r_val=2.0_dp, n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="D_1", &
+                          description="Reference coordination of the first reactive GROUPA atom.", &
+                          usage="D_1 2.0", type_of_var=real_t, default_r_val=2.0_dp, n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="D_2", &
+                          description="Reference coordination of the second reactive GROUPA atom.", &
+                          usage="D_2 2.0", type_of_var=real_t, default_r_val=2.0_dp, n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="D_3", &
+                          description="Reference coordination of the third reactive GROUPA atom.", &
+                          usage="D_3 2.0", type_of_var=real_t, default_r_val=2.0_dp, n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="NL_CUTOFF", &
+                          description="Maximum GROUPA-GROUPB distance included in the Voronoi weights.", &
+                          usage="NL_CUTOFF [angstrom] 2.4", &
+                          default_r_val=cp_unit_to_cp2k(value=2.4_dp, unit_str="angstrom"), &
+                          unit_str="angstrom", n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="GROUPA", &
+                          description="Oxygen atoms used as Voronoi sites. Any reactive sites must "// &
+                          "be the final NRX entries.", &
+                          usage="GROUPA 1 4 7", n_var=-1, type_of_var=integer_t)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="GROUPB", &
+                          description="Hydrogen atoms assigned to the GROUPA sites.", &
+                          usage="GROUPB 2 3 5 6 8 9", n_var=-1, type_of_var=integer_t)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="NRX", &
+                          description="Number of reactive sites at the end of GROUPA (zero to three). "// &
+                          "Their reference coordinations are D_1 through D_3.", &
+                          usage="NRX 0", type_of_var=integer_t, default_i_val=0, n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+   END SUBROUTINE create_voronoiipz_section
 
 END MODULE input_cp2k_colvar

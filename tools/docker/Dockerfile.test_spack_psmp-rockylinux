@@ -18,6 +18,8 @@ RUN dnf -y install dnf-plugins-core && \
     libtool \
     openssl-devel \
     patch \
+    perl \
+    procps-ng \
     python3 \
     python3-devel \
     python3-pip \
@@ -28,30 +30,41 @@ RUN dnf -y install dnf-plugins-core && \
     zlib-static \
     && dnf clean -q all
 
-ARG IMAGE_TAG
-ENV IMAGE_TAG=${IMAGE_TAG:-spack_psmp-rockylinux}
+ARG IMAGE_TAG="spack_psmp-rockylinux"
+ENV IMAGE_TAG="${IMAGE_TAG}"
 
-ARG SPACK_CACHE
-ENV SPACK_CACHE="${SPACK_CACHE:-s3://spack-cache --s3-endpoint-url=http://host.containers.internal:9000}"
+# Set number CPU cores if requested
+ARG NUM_PROCS=""
+ENV NUM_PROCS="${NUM_PROCS}"
+
+# Set number of packages built by spack in parallel
+ARG NUM_PACKAGES="2"
+ENV NUM_PACKAGES="${NUM_PACKAGES}"
+
+ARG SPACK_CACHE="s3://spack-cache --s3-endpoint-url=http://host.containers.internal:9000"
+ENV SPACK_CACHE="${SPACK_CACHE}"
 
 # Build CP2K dependencies
 WORKDIR /opt/cp2k
 COPY ./tools/spack ./tools/spack
 COPY ./tools/docker ./tools/docker
 COPY ./make_cp2k.sh .
-RUN ./make_cp2k.sh -bd_only -cv psmp -gpu none -gv 14 -mpi mpich -ue 
+COPY ./tools/make_cp2k ./tools/make_cp2k
+RUN ./make_cp2k.sh -bd_only -cv psmp -gpu none -gv 14 -j${NUM_PROCS} -mpi mpich -np ${NUM_PACKAGES} -ue 
 
 ###### Stage 2: Build CP2K ######
 
 FROM build_deps AS build_cp2k
 
-COPY ./src ./src
-COPY ./data ./data
-COPY ./tools/build_utils ./tools/build_utils
+COPY ./CMakeLists.txt ./CMakePresets.json ./
 COPY ./cmake ./cmake
-COPY ./CMakeLists.txt .
+COPY ./data ./data
+COPY ./src ./src
+COPY ./tests ./tests
+COPY ./tools/build_utils ./tools/build_utils
+COPY ./tools/conventions ./tools/conventions
 
-RUN ./make_cp2k.sh -cv psmp -gv 14 -gpu none -mpi mpich 
+RUN ./make_cp2k.sh -cv psmp -gv 14 -gpu none -j${NUM_PROCS} -mpi mpich 
 
 ###### Stage 3: Install CP2K ######
 
@@ -73,7 +86,7 @@ COPY --from=build_cp2k /opt/cp2k/spack/spack/opt/spack ./spack/spack/opt/spack
 COPY --from=build_cp2k /opt/cp2k/install ./install
 
 # Install CP2K regression tests
-COPY ./tests ./tests
+COPY --from=build_cp2k /opt/cp2k/tests ./tests
 COPY --from=build_cp2k /opt/cp2k/src/grid/sample_tasks ./src/grid/sample_tasks
 
 # Install CP2K/Quickstep CI benchmarks
@@ -84,7 +97,8 @@ COPY --from=build_cp2k /etc/ld.so.conf.d/cp2k.conf /etc/ld.so.conf.d/cp2k.conf
 RUN ldconfig
 
 # Run CP2K regression test
-RUN /opt/cp2k/install/bin/launch /opt/cp2k/install/bin/run_tests --keepalive || echo "ERROR: Tests failed"
+RUN /opt/cp2k/install/bin/launch /opt/cp2k/install/bin/run_tests --keepalive 2>&1 | tee report.log; \
+    grep -q '^Status:' report.log || printf "\nSummary: Regression test run failed\nStatus: FAILED\n" | tee -a report.log
 
 # Create entrypoint and finalise container build
 WORKDIR /mnt

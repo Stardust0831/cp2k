@@ -8,13 +8,15 @@
 ! **************************************************************************************************
 !> \brief module handles definition of the tree nodes for the global and
 !>      the subtrees binary tree
-!>                   parent element
-!>                      /      \
-!>      accepted (acc) /        \  not accepted (nacc)
-!>                    /          \
-!>                  child       child
-!>                   / \         / \
-!>
+!>      --------------------------------------------------
+!>      |              parent element                    |
+!>      |                 /      \                       |
+!>      | accepted (acc) /        \  not accepted (nacc) |
+!>      |               /          \                     |
+!>      |             child       child                  |
+!>      |              / \         / \                   |
+!>      |                    ...                         |
+!>      --------------------------------------------------
 !>      tree creation assuming acceptance (acc) AND rejectance (nacc)
 !>        of configuration
 !>      if configuration is accepted: new configuration (child on acc) on basis
@@ -216,22 +218,28 @@ CONTAINS
       CPASSERT(ASSOCIATED(tmc_env%params))
 
       DEALLOCATE (tmc_env%params%sub_box_size)
-      IF (ASSOCIATED(tmc_env%params%Temp)) &
+      IF (ASSOCIATED(tmc_env%params%Temp)) THEN
          DEALLOCATE (tmc_env%params%Temp)
-      IF (ASSOCIATED(tmc_env%params%cell)) &
+      END IF
+      IF (ASSOCIATED(tmc_env%params%cell)) THEN
          DEALLOCATE (tmc_env%params%cell)
-      IF (ASSOCIATED(tmc_env%params%atoms)) &
+      END IF
+      IF (ASSOCIATED(tmc_env%params%atoms)) THEN
          CALL deallocate_tmc_atom_type(tmc_env%params%atoms)
+      END IF
       DEALLOCATE (tmc_env%params)
 
       CALL mp_para_env_release(tmc_env%tmc_comp_set%para_env_sub_group)
       CALL mp_para_env_release(tmc_env%tmc_comp_set%para_env_m_w)
-      IF (ASSOCIATED(tmc_env%tmc_comp_set%para_env_m_first_w)) &
+      IF (ASSOCIATED(tmc_env%tmc_comp_set%para_env_m_first_w)) THEN
          CALL mp_para_env_release(tmc_env%tmc_comp_set%para_env_m_first_w)
-      IF (ASSOCIATED(tmc_env%tmc_comp_set%para_env_m_ana)) &
+      END IF
+      IF (ASSOCIATED(tmc_env%tmc_comp_set%para_env_m_ana)) THEN
          CALL mp_para_env_release(tmc_env%tmc_comp_set%para_env_m_ana)
-      IF (ASSOCIATED(tmc_env%tmc_comp_set%para_env_m_only)) &
+      END IF
+      IF (ASSOCIATED(tmc_env%tmc_comp_set%para_env_m_only)) THEN
          CALL mp_para_env_release(tmc_env%tmc_comp_set%para_env_m_only)
+      END IF
 
       DEALLOCATE (tmc_env%tmc_comp_set)
 
@@ -281,8 +289,9 @@ CONTAINS
       DO i = 1, tmc_env%params%nr_temp
          tmc_env%m_env%st_heads(i)%elem => NULL()
          tmc_env%m_env%st_clean_ends(i)%elem => NULL()
-         IF (tmc_env%params%USE_REDUCED_TREE) &
+         IF (tmc_env%params%USE_REDUCED_TREE) THEN
             tmc_env%m_env%result_list(i)%elem => NULL()
+         END IF
       END DO
       tmc_env%m_env%gt_head => NULL()
       tmc_env%m_env%gt_clean_end => NULL()

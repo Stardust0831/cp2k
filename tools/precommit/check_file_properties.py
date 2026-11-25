@@ -31,16 +31,17 @@ FLAG_EXCEPTIONS = (
     r"FD_DEBUG",
     r"GRID_DO_COLLOCATE",
     r"GRID_GPU.*_H",
+    r"GRID_SEP_.+",
     r"INTEL_MKL_VERSION",
     r"LIBINT2_MAX_AM_eri",
+    r"LIBINT2?_(?:ACCUM_INTS|CONTRACTED_INTS|FLOP_COUNT|MAX_VECLEN|PROFILE)$",
+    r"CP2K_LIBINT_IMAGE_CONTRACTION$",
     r"LIBGRPP",
     r"M_",
-    r"LIBINT_CONTRACTED_INTS",
     r"XC_MAJOR_VERSION",
     r"XC_MINOR_VERSION",
     r"NDEBUG",
     r"M_PI",
-    r"OMP_DEFAULT_NONE_WITH_OOP",
     r"FTN_NO_DEFAULT_INIT",
     r"_OPENMP",
     r"__COMPILE_ARCH",
@@ -58,7 +59,6 @@ FLAG_EXCEPTIONS = (
     r"__OFFLOAD_CUDA",
     r"__OFFLOAD_HIP",
     r"__PILAENV_BLOCKSIZE",
-    r"__PW_CUDA_NO_HOSTALLOC",
     r"__T_C_G0",
     r"__YUKAWA",
     r"__cplusplus",
@@ -81,8 +81,6 @@ FLAG_EXCEPTIONS = (
     r"openPMD_HAVE_MPI",
     # TODO: Add CMake support for the following flags or remove the corresponding code.
     # See also https://github.com/cp2k/cp2k/issues/4611
-    r"__PW_FPGA",
-    r"__PW_FPGA_SP",
     r"__NO_SOCKETS",
     r"__SCALAPACK_NO_WA",
     r"__STATM_RESIDENT",
@@ -102,6 +100,14 @@ STR_END_NOSPACE_RE = re.compile(r'[^ ]"\s*//\s*&')
 STR_BEGIN_NOSPACE_RE = re.compile(r'^\s*"[^ ]')
 STR_END_SPACE_RE = re.compile(r' "\s*//\s*&')
 STR_BEGIN_SPACE_RE = re.compile(r'^\s*" ')
+C_COMMENTS_AND_LITERALS_RE = re.compile(
+    r'R"(?P<delimiter>[^\s()\\]{0,16})\(.*?\)(?P=delimiter)"'
+    r'|"(?:\\.|[^"\\])*"'
+    r"|(?<!\w)(?:u8|[LuU])?'(?:\\.|[^'\\\n])+'"
+    r"|//(?:\\\n|[^\n])*|/\*.*?\*/",
+    re.DOTALL,
+)
+C_ASSERT_RE = re.compile(r"\bassert(?:\s|\\\n)*\(")
 
 
 BANNER_F = """\
@@ -136,20 +142,38 @@ C_EXTENSIONS = (".c", ".cu", ".cpp", ".cc", ".h", ".hpp")
 
 # Non-GPL licenses (directory, file, basename, or generally "startswith")
 BSD_PATHS = (
+    "src/base/cp_assert.h",
     "src/base/openmp_trace.c",
     "src/mpiwrap/cp_mpi.",
     "src/offload/",
     "src/grid/",
     "src/dbm/",
+    "src/fft/fft_api",
+    "src/fft/fft_key.h",
+    "src/fft/fft_lib",
+    "src/fft/fft_timer",
+    "src/fft/fft_unittest",
+    "src/fft/fft_utils.h",
+    "src/fft/gpu/",
+    "src/fft/LICENSE",
 )
 MIT_PATHS = ("src/grpp/",)
+
+# Redistributed data that is not covered by the CP2K source licenses. Every file
+# below these paths (except the LICENSE file itself) must declare its license
+# through an SPDX identifier near the top.
+CC_BY_SA_PATHS = ("data/NNP/NaClaq-cnnp/",)
 
 
 @lru_cache(maxsize=None)
 def get_src_cmakelists_txt() -> str:
     return "\n".join(
         (CP2K_DIR / fn).read_text(encoding="utf8")
-        for fn in ["src/CMakeLists.txt", "cmake/CompilerConfiguration.cmake"]
+        for fn in [
+            "src/CMakeLists.txt",
+            "cmake/CompilerConfiguration.cmake",
+            "CMakePresets.json",
+        ]
     )
 
 
@@ -206,11 +230,25 @@ def check_file(path: pathlib.Path) -> List[str]:
     if "\r\n" in content:
         warnings += [f"{path}: contains DOS linebreaks"]
 
-    if fn_ext not in (".pot", ".patch") and basefn != "Makefile" and "\t" in content:
+    if (
+        fn_ext not in (".pot", ".patch", ".mdp")
+        and basefn != "Makefile"
+        and "\t" in content
+    ):
         warnings += [f"{path}: contains tab character"]
 
     if fn_ext == ".cu" and "#if defined(_OMP_H)\n#error" not in content:
         warnings += [f"{path}: misses check against OpenMP usage"]
+
+    if fn_ext in C_EXTENSIONS and "assert" in content:
+        code = C_COMMENTS_AND_LITERALS_RE.sub(
+            lambda match: " " + "\n" * match[0].count("\n"), content
+        )
+        for match in C_ASSERT_RE.finditer(code):
+            line_number = code.count("\n", 0, match.start()) + 1
+            warnings.append(
+                f"{path}:{line_number}: Please use cp_assert() for runtime assertions"
+            )
 
     # Check spaces in Fortran multi-line strings.
     if fn_ext == ".F":
@@ -254,6 +292,10 @@ def check_file(path: pathlib.Path) -> List[str]:
         warnings += [f"{path}: Copyright banner malformed"]
     if path.name == "LICENSE" and bsd_licensed and f"2000-{year}" not in content:
         warnings += [f"{path}: Copyright banner malformed"]
+    if any(str(path).startswith(p) for p in CC_BY_SA_PATHS) and path.name != "LICENSE":
+        head = "\n".join(content.split("\n")[:8])
+        if "SPDX-License-Identifier: CC-BY-SA-4.0" not in head:
+            warnings += [f"{path}: Missing SPDX-License-Identifier: CC-BY-SA-4.0"]
     if path.name == "cp2k_info.F" and f'cp2k_year = "{year}"' not in content:
         warnings += [f"{path}: Wrong year."]
 
@@ -295,9 +337,11 @@ def check_file(path: pathlib.Path) -> List[str]:
             continue
         if flag == "_OMP_H" and fn_ext == ".cu":
             continue
+        if flag == "FLEXIBLE" and fn_ext == ".top":  # GROMACS top file
+            continue
         if flag not in get_src_cmakelists_txt():
             warnings += [
-                f"{path}: Flag '{flag}' not mentioned in src/CMakeLists.txt nor cmake/CompilerConfiguration.cmake"
+                f"{path}: Flag '{flag}' not mentioned in src/CMakeLists.txt, cmake/CompilerConfiguration.cmake, or CMakePresets.json"
             ]
         if flag not in get_flags_src():
             warnings += [f"{path}: Flag '{flag}' not mentioned in cp2k_flags()"]

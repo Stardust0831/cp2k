@@ -8,6 +8,7 @@
 ! **************************************************************************************************
 !> \brief  Creates the NNP section of the input
 !> \author Christoph Schran (christoph.schran@rub.de)
+!> \author Dhruv Sharma (ds2173@cam.ac.uk)
 !> \date   2020-10-10
 ! **************************************************************************************************
 MODULE input_cp2k_nnp
@@ -19,6 +20,11 @@ MODULE input_cp2k_nnp
    USE cp_output_handling,              ONLY: cp_print_key_section_create,&
                                               medium_print_level
    USE cp_units,                        ONLY: cp_unit_to_cp2k
+   USE input_constants,                 ONLY: nnp_gpu_prec_double,&
+                                              nnp_gpu_prec_mixed,&
+                                              nnp_use_gpu_auto,&
+                                              nnp_use_gpu_off,&
+                                              nnp_use_gpu_on
    USE input_keyword_types,             ONLY: keyword_create,&
                                               keyword_release,&
                                               keyword_type
@@ -28,14 +34,16 @@ MODULE input_cp2k_nnp
                                               section_release,&
                                               section_type
    USE input_val_types,                 ONLY: char_t,&
+                                              integer_t,&
                                               real_t
    USE kinds,                           ONLY: dp
+   USE string_utilities,                ONLY: s2a
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
    PRIVATE
 
-   LOGICAL, PRIVATE, PARAMETER :: debug_this_module = .TRUE.
+   LOGICAL, PRIVATE, PARAMETER :: debug_this_module = .FALSE.
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'input_cp2k_nnp'
 
    PUBLIC :: create_nnp_section
@@ -58,7 +66,7 @@ CONTAINS
       CALL section_create(section, __LOCATION__, name="NNP", &
                           description="This section contains all information to run a "// &
                           "Neural Network Potential (NNP) calculation.", &
-                          n_keywords=3, n_subsections=3, repeats=.FALSE., &
+                          n_keywords=5, n_subsections=3, repeats=.FALSE., &
                           citations=[Behler2007, Behler2011, Schran2020a, Schran2020b])
 
       NULLIFY (subsection, subsubsection, keyword)
@@ -73,6 +81,115 @@ CONTAINS
                           description="File containing the scaling information for "// &
                           "the symmetry functions of the NNP.", &
                           repeats=.FALSE., default_lc_val="scaling.data")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="RAD_SPLINE_N", &
+                          description="Number of knots per radial group in "// &
+                          "the cubic-Hermite spline tables that tabulate "// &
+                          "the radial symmetry-function product "// &
+                          "y(r) = exp(-eta*(r-rs)^2) * fcut(r). "// &
+                          "The value error scales as O(1/n^4) and the "// &
+                          "force (derivative) error as O(1/n^3); the "// &
+                          "default keeps both inside the NNP regression "// &
+                          "tolerance for a radial cutoff of ~12 bohr "// &
+                          "(value ~1e-14, force ~1e-10). Larger cutoffs or "// &
+                          "stricter tolerances may need a larger n, with "// &
+                          "the force term the binding constraint. Memory "// &
+                          "cost scales linearly in n per group.", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          type_of_var=integer_t, &
+                          default_i_val=8192, &
+                          usage="RAD_SPLINE_N 8192")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="VERLET_SKIN", &
+                          description="Verlet skin distance for the NNP descriptor "// &
+                          "neighbour cell-list. The neighbour-list cutoff is "// &
+                          "(symmetry-function cutoff + skin); the cell-list "// &
+                          "chain is rebuilt only when an atom drifts more "// &
+                          "than skin/2 from its rebuild-time position, "// &
+                          "analogous to the LAMMPS 'neighbor <skin> bin' "// &
+                          "command. Larger skin reduces the rebuild rate "// &
+                          "but enlarges the per-atom neighbour list. "// &
+                          "A negative value (default) selects the "// &
+                          "automatic heuristic MIN(0.5 bohr, 0.1*cutoff). "// &
+                          "Useful upper bound is half the smallest "// &
+                          "perpendicular cell width.", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          type_of_var=real_t, &
+                          default_r_val=-1.0_dp, &
+                          unit_str="bohr", &
+                          usage="VERLET_SKIN [bohr] 0.5")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="USE_GPU", &
+                          description="Choose between the CPU and GPU code paths for "// &
+                          "the NNP energy and force evaluation. The GPU path "// &
+                          "requires a build with CUDA or HIP support; it "// &
+                          "reproduces the CPU results within the "// &
+                          "regression-test tolerances. Analytic stress (e.g. "// &
+                          "NPT) is accumulated on the device by the "// &
+                          "force-scatter kernels; only energy-only "// &
+                          "evaluations always use the CPU path.", &
+                          usage="USE_GPU AUTO", &
+                          repeats=.FALSE., &
+                          enum_c_vals=s2a("AUTO", "ON", "OFF"), &
+                          enum_i_vals=[nnp_use_gpu_auto, nnp_use_gpu_on, nnp_use_gpu_off], &
+                          enum_desc=s2a("Probe for a GPU at initialization and use it when "// &
+                                        "the build supports one, every rank sees a device, "// &
+                                        "the model fits the compiled-in device-table "// &
+                                        "capacities, and the system is large enough for the "// &
+                                        "transfer and launch overhead to pay off (currently "// &
+                                        "a thousand atoms per rank); otherwise fall back to "// &
+                                        "the CPU.", &
+                                        "Force the GPU code path; abort if the build has "// &
+                                        "no GPU support or no device is available.", &
+                                        "Force the CPU code path."), &
+                          default_i_val=nnp_use_gpu_auto)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="GPU_PRECISION", &
+                          description="Floating-point precision of the GPU code path. "// &
+                          "Only meaningful when the GPU path is active.", &
+                          usage="GPU_PRECISION DOUBLE", &
+                          repeats=.FALSE., &
+                          enum_c_vals=s2a("DOUBLE", "MIXED"), &
+                          enum_i_vals=[nnp_gpu_prec_double, nnp_gpu_prec_mixed], &
+                          enum_desc=s2a("All-FP64 path; reproduces the CPU trajectory "// &
+                                        "within the regression-test tolerances.", &
+                                        "FP32 angular symmetry-function math with FP64 "// &
+                                        "radial functions, network evaluation and every "// &
+                                        "accumulator that sums over neighbours. Faster on "// &
+                                        "GPUs whose single-precision throughput exceeds "// &
+                                        "their double-precision throughput, at the cost of "// &
+                                        "a perturbation of energies and forces that is "// &
+                                        "model dependent (a relative 4.5e-11 on the "// &
+                                        "step-zero energy of the shipped regression-test "// &
+                                        "model, whose tests bound it at 1e-6; measure it "// &
+                                        "for your own)."), &
+                          default_i_val=nnp_gpu_prec_double)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="VALIDATE", &
+                          description="When enabled and the GPU code path is active, the CPU "// &
+                          "reference implementation is run in shadow mode on every force "// &
+                          "evaluation and its energies, forces and stress are compared with "// &
+                          "those from the GPU path. If the two results differ by too much "// &
+                          "then the calculation is aborted. Under USE_GPU AUTO the "// &
+                          "system-size heuristic is skipped, so the GPU path engages "// &
+                          "whenever the build and the machine support it. Has no effect "// &
+                          "when the evaluation runs on the CPU, so the same input can be "// &
+                          "used on every architecture.", &
+                          usage="VALIDATE", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

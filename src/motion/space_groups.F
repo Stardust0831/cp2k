@@ -16,7 +16,8 @@ MODULE space_groups
    USE bibliography,                    ONLY: Togo2018,&
                                               cite_reference
    USE cell_methods,                    ONLY: cell_create,&
-                                              init_cell
+                                              init_cell,&
+                                              set_cell_param
    USE cell_types,                      ONLY: cell_copy,&
                                               cell_type,&
                                               real_to_scaled,&
@@ -53,7 +54,7 @@ MODULE space_groups
 
    PUBLIC :: spgr_create, identify_space_group, spgr_find_equivalent_atoms
    PUBLIC :: spgr_apply_rotations_coord, spgr_apply_rotations_force, print_spgr
-   PUBLIC :: spgr_apply_rotations_stress, spgr_write_stress_tensor
+   PUBLIC :: spgr_apply_rotations_stress, spgr_project_cell_metric, spgr_write_stress_tensor
 
 CONTAINS
 
@@ -627,11 +628,11 @@ CONTAINS
       nparticle = spgr%nparticle
       nops = spgr%n_reduced_operations
 
-      !$OMP PARALLEL DO PRIVATE (ia,ib,ja,jb,ir,ri,ro,rf,rn,rot,tr) SHARED (spgr,coord,nparticle,nop,nops) DEFAULT(NONE)
+      !$OMP PARALLEL DO PRIVATE (ia,ib,ja,jb,ir,ri,ro,rf,rn,rot,tr) SHARED (spgr,coord,cold,nparticle,nop,nops) DEFAULT(NONE)
       DO ia = 1, nparticle
          IF (.NOT. spgr%lat(ia)) CYCLE
          ja = 3*(ia - 1)
-         CALL real_to_scaled(rf(1:3), coord(ja + 1:ja + 3), spgr%cell_ref)
+         CALL real_to_scaled(rf(1:3), cold(ja + 1:ja + 3), spgr%cell_ref)
          rn(1:3) = 0.d0
          DO ir = 1, nop
             IF (.NOT. spgr%lop(ir)) CYCLE
@@ -639,7 +640,7 @@ CONTAINS
             rot(1:3, 1:3) = spgr%rotations(1:3, 1:3, ir)
             tr(1:3) = spgr%translations(1:3, ir)
             jb = 3*(ib - 1)
-            CALL real_to_scaled(ri(1:3), coord(jb + 1:jb + 3), spgr%cell_ref)
+            CALL real_to_scaled(ri(1:3), cold(jb + 1:jb + 3), spgr%cell_ref)
             ro(1) = REAL(rot(1, 1), dp)*ri(1) + REAL(rot(2, 1), dp)*ri(2) + REAL(rot(3, 1), dp)*ri(3) + tr(1)
             ro(2) = REAL(rot(1, 2), dp)*ri(1) + REAL(rot(2, 2), dp)*ri(2) + REAL(rot(3, 2), dp)*ri(3) + tr(2)
             ro(3) = REAL(rot(1, 3), dp)*ri(1) + REAL(rot(2, 3), dp)*ri(2) + REAL(rot(3, 3), dp)*ri(3) + tr(3)
@@ -688,7 +689,7 @@ CONTAINS
       nparticle = spgr%nparticle
       nops = spgr%n_reduced_operations
 
-      !$OMP PARALLEL DO PRIVATE (ia,ib,ja,jb,ir,ri,ro,rn,rot) SHARED (spgr,force,nparticle,nop,nops) DEFAULT(NONE)
+      !$OMP PARALLEL DO PRIVATE (ia,ib,ja,jb,ir,ri,ro,rn,rot) SHARED (spgr,force,fold,nparticle,nop,nops) DEFAULT(NONE)
       DO ia = 1, nparticle
          IF (.NOT. spgr%lat(ia)) CYCLE
          ja = 3*(ia - 1)
@@ -698,7 +699,7 @@ CONTAINS
             ib = spgr%eqatom(ir, ia)
             rot(1:3, 1:3) = spgr%rotations(1:3, 1:3, ir)
             jb = 3*(ib - 1)
-            CALL real_to_scaled(ri(1:3), force(jb + 1:jb + 3), spgr%cell_ref)
+            CALL real_to_scaled(ri(1:3), fold(jb + 1:jb + 3), spgr%cell_ref)
             ro(1) = REAL(rot(1, 1), dp)*ri(1) + REAL(rot(2, 1), dp)*ri(2) + REAL(rot(3, 1), dp)*ri(3)
             ro(2) = REAL(rot(1, 2), dp)*ri(1) + REAL(rot(2, 2), dp)*ri(2) + REAL(rot(3, 2), dp)*ri(3)
             ro(3) = REAL(rot(1, 3), dp)*ri(1) + REAL(rot(2, 3), dp)*ri(2) + REAL(rot(3, 3), dp)*ri(3)
@@ -809,6 +810,49 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE spgr_apply_rotations_stress
+
+! **************************************************************************************************
+!> \brief Project a cell onto the metric preserved by the selected space-group rotations.
+!> \param spgr ...
+!> \param cell ...
+! **************************************************************************************************
+   SUBROUTINE spgr_project_cell_metric(spgr, cell)
+
+      TYPE(spgr_type), INTENT(IN), POINTER               :: spgr
+      TYPE(cell_type), INTENT(INOUT), POINTER            :: cell
+
+      INTEGER                                            :: i, ir, nop
+      REAL(KIND=dp)                                      :: scale
+      REAL(KIND=dp), DIMENSION(3)                        :: abc, cell_angle
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: metric, metric_sym, rot
+
+      CPASSERT(ALLOCATED(spgr%rotations_subset))
+      nop = spgr%n_operations_subset
+      CPASSERT(nop > 0)
+
+      metric = MATMUL(TRANSPOSE(cell%hmat), cell%hmat)
+      metric_sym = 0.0_dp
+      DO ir = 1, nop
+         rot = REAL(spgr%rotations_subset(:, :, ir), dp)
+         metric_sym = metric_sym + MATMUL(rot, MATMUL(metric, TRANSPOSE(rot)))
+      END DO
+      metric_sym = metric_sym/REAL(nop, dp)
+
+      ! The group average can change the determinant. Retain the volume of the
+      ! optimizer proposal so KEEP_VOLUME and hydrostatic changes remain intact.
+      scale = (cell%deth**2/det_3x3(metric_sym))**(1.0_dp/3.0_dp)
+      metric_sym = scale*metric_sym
+
+      DO i = 1, 3
+         abc(i) = SQRT(metric_sym(i, i))
+      END DO
+      cell_angle(1) = ACOS(MAX(-1.0_dp, MIN(1.0_dp, metric_sym(2, 3)/(abc(2)*abc(3)))))
+      cell_angle(2) = ACOS(MAX(-1.0_dp, MIN(1.0_dp, metric_sym(1, 3)/(abc(1)*abc(3)))))
+      cell_angle(3) = ACOS(MAX(-1.0_dp, MIN(1.0_dp, metric_sym(1, 2)/(abc(1)*abc(2)))))
+      CALL set_cell_param(cell, cell_length=abc, cell_angle=cell_angle, &
+                          periodic=cell%perd, do_init_cell=.TRUE.)
+
+   END SUBROUTINE spgr_project_cell_metric
 
 ! **************************************************************************************************
 !> \brief routine prints Space Group Information.

@@ -104,7 +104,7 @@ CONTAINS
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: err_minimax
 
       INTEGER                                            :: potential_prv
-      REAL(KIND=dp)                                      :: dG, G_max, minimax_Rc
+      REAL(KIND=dp)                                      :: G_max, minimax_Rc
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: a, w
 
       IF (PRESENT(potential)) THEN
@@ -121,8 +121,6 @@ CONTAINS
          CPABORT("potential parameter pot_par required for yukawa or long-range Coulomb")
       END IF
 
-      dG = 1.0E-3 ! Resolution in G to determine error of minimax approximation
-
       ! Note: G_c = SQRT(2*cutoff) cutoff in 1 cartesian direction
       ! G_max = SQRT(3*G_c**2) maximum absolute value of G vector
       ! Minimax approx. needs to be valid in range [G_min, G_max]
@@ -133,7 +131,7 @@ CONTAINS
       CPASSERT(G_max > G_min)
       IF (potential_prv == eri_mme_coulomb .OR. potential_prv == eri_mme_longrange) THEN
          minimax_Rc = (G_max/G_min)**2
-      ELSEIF (potential_prv == eri_mme_yukawa) THEN
+      ELSE IF (potential_prv == eri_mme_yukawa) THEN
          minimax_Rc = (G_max**2 + pot_par**2)/(G_min**2 + pot_par**2)
       END IF
 
@@ -165,9 +163,9 @@ CONTAINS
       IF (PRESENT(err_minimax)) THEN
          IF (potential_prv == eri_mme_coulomb) THEN
             err_minimax = err_minimax/G_min**2
-         ELSEIF (potential_prv == eri_mme_yukawa) THEN
+         ELSE IF (potential_prv == eri_mme_yukawa) THEN
             err_minimax = err_minimax/(G_min**2 + pot_par**2)
-         ELSEIF (potential_prv == eri_mme_longrange) THEN
+         ELSE IF (potential_prv == eri_mme_longrange) THEN
             err_minimax = err_minimax/G_min**2 ! approx. of Coulomb
             err_minimax = err_minimax*EXP(-G_min**2/pot_par**2) ! exponential factor
          END IF

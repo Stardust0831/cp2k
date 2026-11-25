@@ -182,7 +182,7 @@ CONTAINS
       CHARACTER(len=2*default_string_length)             :: msg
       CHARACTER(len=default_path_length)                 :: output_file_name, project_name
       INTEGER                                            :: handle, iat, ibead, icont, idim, idir, &
-                                                            ierr, ig, itmp, nrep, prep, stat
+                                                            ierr, ig, itmp, nrep, prep
       LOGICAL                                            :: explicit, ltmp
       REAL(kind=dp)                                      :: dt, mass, omega
       TYPE(cp_subsys_type), POINTER                      :: subsys
@@ -236,7 +236,7 @@ CONTAINS
 
       NULLIFY (pint_env%logger)
       pint_env%logger => cp_get_default_logger()
-      CALL cp_add_iter_level(pint_env%logger%iter_info, "PINT")
+      CALL cp_add_iter_level(pint_env%logger, "PINT")
 
       NULLIFY (pint_env%replicas, pint_env%input, pint_env%staging_env, &
                pint_env%normalmode_env, pint_env%propagator)
@@ -377,9 +377,7 @@ CONTAINS
          pint_env%uf_h(pint_env%p, pint_env%ndim), &
          pint_env%centroid(pint_env%ndim), &
          pint_env%rtmp_ndim(pint_env%ndim), &
-         pint_env%rtmp_natom(pint_env%ndim/3), &
-         STAT=stat)
-      CPASSERT(stat == 0)
+         pint_env%rtmp_natom(pint_env%ndim/3))
       pint_env%x = 0._dp
       pint_env%v = 0._dp
       pint_env%f = 0._dp
@@ -476,7 +474,6 @@ CONTAINS
             pint_env%gle%loc_num_gle = pint_env%p*pint_env%ndim
             pint_env%gle%glob_num_gle = pint_env%gle%loc_num_gle
             ALLOCATE (pint_env%gle%map_info%index(pint_env%gle%loc_num_gle))
-            CPASSERT(stat == 0)
             DO itmp = 1, pint_env%gle%loc_num_gle
                pint_env%gle%map_info%index(itmp) = itmp
             END DO
@@ -1168,8 +1165,9 @@ CONTAINS
             CPASSERT(n_rep_val == 1)
             CALL section_vals_val_get(input_section, "_DEFAULT_KEYWORD_", &
                                       r_vals=r_vals)
-            IF (SIZE(r_vals) /= pint_env%p*pint_env%ndim) &
+            IF (SIZE(r_vals) /= pint_env%p*pint_env%ndim) THEN
                CPABORT("Invalid size of MOTION%PINT%BEADS%COORD")
+            END IF
             ic = 0
             DO idim = 1, pint_env%ndim
                DO ib = 1, pint_env%p
@@ -1337,8 +1335,9 @@ CONTAINS
          WRITE (stmp, *) n_rep_val
          msg = "Invalid number of atoms in FORCE_EVAL%SUBSYS%VELOCITY ("// &
                TRIM(ADJUSTL(stmp))//")."
-         IF (3*n_rep_val /= pint_env%ndim) &
+         IF (3*n_rep_val /= pint_env%ndim) THEN
             CPABORT(msg)
+         END IF
          DO ia = 1, pint_env%ndim/3
             CALL section_vals_val_get(input_section, "_DEFAULT_KEYWORD_", &
                                       i_rep_val=ia, r_vals=r_vals)
@@ -1347,8 +1346,9 @@ CONTAINS
             WRITE (stmp, *) itmp
             msg = "Number of coordinates != 3 in FORCE_EVAL%SUBSYS%VELOCITY ("// &
                   TRIM(ADJUSTL(stmp))//")."
-            IF (itmp /= 3) &
+            IF (itmp /= 3) THEN
                CPABORT(msg)
+            END IF
             DO ib = 1, pint_env%p
                DO ic = 1, 3
                   idim = 3*(ia - 1) + ic
@@ -1464,8 +1464,9 @@ CONTAINS
             CPASSERT(n_rep_val == 1)
             CALL section_vals_val_get(input_section, "_DEFAULT_KEYWORD_", &
                                       r_vals=r_vals)
-            IF (SIZE(r_vals) /= pint_env%p*pint_env%ndim) &
+            IF (SIZE(r_vals) /= pint_env%p*pint_env%ndim) THEN
                CPABORT("Invalid size of MOTION%PINT%BEAD%VELOCITY")
+            END IF
             itmp = 0
             DO idim = 1, pint_env%ndim
                DO ib = 1, pint_env%p
@@ -1642,8 +1643,9 @@ CONTAINS
                CPASSERT(n_rep_val == 1)
                CALL section_vals_val_get(input_section, "_DEFAULT_KEYWORD_", &
                                          r_vals=r_vals)
-               IF (SIZE(r_vals) /= pint_env%p*pint_env%ndim*pint_env%nnos) &
+               IF (SIZE(r_vals) /= pint_env%p*pint_env%ndim*pint_env%nnos) THEN
                   CPABORT("Invalid size of MOTION%PINT%NOSE%COORD")
+               END IF
                ii = 0
                DO idim = 1, pint_env%ndim
                   DO ib = 1, pint_env%p
@@ -1670,8 +1672,9 @@ CONTAINS
                CPASSERT(n_rep_val == 1)
                CALL section_vals_val_get(input_section, "_DEFAULT_KEYWORD_", &
                                          r_vals=r_vals)
-               IF (SIZE(r_vals) /= pint_env%p*pint_env%ndim*pint_env%nnos) &
+               IF (SIZE(r_vals) /= pint_env%p*pint_env%ndim*pint_env%nnos) THEN
                   CPABORT("Invalid size of MOTION%PINT%NOSE%VELOCITY")
+               END IF
                ii = 0
                DO idim = 1, pint_env%ndim
                   DO ib = 1, pint_env%p
@@ -1687,7 +1690,7 @@ CONTAINS
             END IF
          END IF
 
-      ELSEIF (pint_env%pimd_thermostat == thermostat_gle) THEN
+      ELSE IF (pint_env%pimd_thermostat == thermostat_gle) THEN
          NULLIFY (input_section)
          input_section => section_vals_get_subs_vals(pint_env%input, &
                                                      "MOTION%PINT%GLE")
@@ -1889,7 +1892,7 @@ CONTAINS
       END DO
 
       ! remove iteration level
-      CALL cp_rm_iter_level(pint_env%logger%iter_info, "PINT")
+      CALL cp_rm_iter_level(pint_env%logger, "PINT")
 
    END SUBROUTINE pint_do_run
 
@@ -2004,7 +2007,7 @@ CONTAINS
       rn = REAL(pint_env%nrespa, dp)
       dti = pint_env%dt/rn
       dti2 = dti/2._dp
-      tdti = 2.*dti
+      tdti = 2._dp*dti
       dti22 = dti**2/2._dp
 
       ! Get constraint info, if needed
@@ -2235,7 +2238,7 @@ CONTAINS
                END IF
                DO i = 1, 6
                   tol = 0._dp
-                  pint_env%uv_new = pint_env%uv_t/(1.+dti2*pint_env%tv(1, :, :))
+                  pint_env%uv_new = pint_env%uv_t/(1._dp + dti2*pint_env%tv(1, :, :))
                   DO idim = 1, pint_env%ndim
                      DO ib = 1, pint_env%p
                         pint_env%tf(1, ib, idim) = (pint_env%mass_fict(ib, idim)* &
@@ -2822,7 +2825,7 @@ CONTAINS
             res = res + pint_env%mass_fict(ib, idim)*my_uv(ib, idim)**2
          END DO
       END DO
-      res = res*0.5
+      res = res*0.5_dp
       IF (.NOT. PRESENT(uv)) pint_env%e_kin_beads = res
       IF (PRESENT(e_k)) e_k = res
    END SUBROUTINE pint_calc_e_kin_beads_u

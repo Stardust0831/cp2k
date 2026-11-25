@@ -5,37 +5,32 @@
 #
 # Stage 2: Build CP2K
 
-ARG BASE_IMAGE=${BASE_IMAGE:-ubuntu:26.04}
-ARG DEPS_IMAGE=${DEPS_IMAGE:-}
+ARG BASE_IMAGE="docker.io/ubuntu:26.04"
+ARG DEPS_IMAGE
 
 FROM "${DEPS_IMAGE}" AS build_cp2k
 
-# Setup CUDA environment
-ENV CUDA_HOME=/usr/local/cuda
-ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
-
-# Retrieve the number of available CPU cores
-ARG NUM_PROCS
-ENV NUM_PROCS=${NUM_PROCS:-32}
-
-ARG FEATURE_FLAGS
-ENV FEATURE_FLAGS=${FEATURE_FLAGS:-}
+# Number of parallel build jobs (override with --build-arg NUM_PROCS=...)
+ARG NUM_PROCS="32"
 
 # Build CP2K
 WORKDIR /opt/cp2k
-COPY ./src ./src
-COPY ./data ./data
-COPY ./tools/build_utils ./tools/build_utils
+COPY ./CMakeLists.txt ./CMakePresets.json ./
 COPY ./cmake ./cmake
-COPY ./CMakeLists.txt .
+COPY ./data ./data
+COPY ./src ./src
+COPY ./tools/build_utils ./tools/build_utils
 
-RUN ./make_cp2k.sh -cray -cv ${CP2K_VERSION} -uc no -j${NUM_PROCS} ${FEATURE_FLAGS}
+RUN ./make_cp2k.sh -cray -cv ${CP2K_VERSION} -j${NUM_PROCS} -uc no ${FEATURE_FLAGS}
 
 # Stage 3: Install CP2K
 
 FROM "${BASE_IMAGE}" AS install_cp2k
 
-RUN apt-get update -qq && apt-get install -qq --no-install-recommends \
+ARG APT_GET="apt-get -o APT::Sandbox::User=root -qq"
+
+RUN ${APT_GET} update && \
+    ${APT_GET} install --no-install-recommends \
     g++ gcc gfortran \
     python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -54,6 +49,7 @@ COPY --from=build_cp2k /opt/cp2k/src/grid/sample_tasks ./src/grid/sample_tasks
 
 # Install CP2K/Quickstep CI benchmarks
 COPY ./benchmarks/CI ./benchmarks/CI
+COPY ./ci ./ci
 
 # Do not rely only on LD_LIBRARY_PATH because it is fragile
 COPY --from=build_cp2k /etc/ld.so.conf.d/cp2k.conf /etc/ld.so.conf.d/cp2k.conf

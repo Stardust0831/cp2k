@@ -88,6 +88,7 @@ MODULE cell_types
              cell_release, &
              cell_retain, &
              get_cell, &
+             minimum_image_weights, &
              parse_cell_line
 
 #if defined (__PLUMED2)
@@ -97,6 +98,7 @@ MODULE cell_types
    ! Public functions
    PUBLIC :: plane_distance, &
              pbc, &
+             pbc_stable, &
              real_to_scaled, &
              scaled_to_real
 
@@ -105,6 +107,28 @@ MODULE cell_types
    END INTERFACE
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Select a stable periodic image index close to half-cell boundaries.
+!> \param s Scaled coordinate
+!> \return image_shift ...
+! **************************************************************************************************
+   PURE ELEMENTAL FUNCTION pbc_image_shift(s) RESULT(image_shift)
+
+      REAL(KIND=dp), INTENT(IN)                          :: s
+      REAL(KIND=dp)                                      :: image_shift
+
+      REAL(KIND=dp)                                      :: half_boundary, tolerance
+
+      image_shift = ANINT(s)
+      half_boundary = ANINT(s - 0.5_dp) + 0.5_dp
+      tolerance = MIN(1.0e-8_dp, 64.0_dp*EPSILON(1.0_dp)*MAX(1.0_dp, ABS(s)))
+      IF (ABS(s - half_boundary) <= tolerance) THEN
+         ! Select the lower side for every lattice-equivalent half-cell boundary.
+         image_shift = half_boundary + 0.5_dp
+      END IF
+
+   END FUNCTION pbc_image_shift
 
 ! **************************************************************************************************
 !> \brief Clone cell variable
@@ -388,6 +412,78 @@ CONTAINS
       END IF
 
    END FUNCTION pbc1
+
+! **************************************************************************************************
+!> \brief Distribute an atom-pair contribution equally among its nearest candidate images.
+!>        Images within 1.0E-6 of the minimum distance receive normalized equal weights.
+!> \param ra Position of the first atom.
+!> \param rb Position of the second atom.
+!> \param cell Simulation cell used to wrap the positions and translate the images.
+!> \param index_to_cell Candidate lattice translations, indexed (direction, image).
+!> \param weights Normalized image weights; non-nearest images receive zero.
+! **************************************************************************************************
+   SUBROUTINE minimum_image_weights(ra, rb, cell, index_to_cell, weights)
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: ra, rb
+      TYPE(cell_type), INTENT(IN), POINTER               :: cell
+      INTEGER, DIMENSION(:, :), INTENT(IN)               :: index_to_cell
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: weights
+
+      INTEGER                                            :: i_image
+      REAL(KIND=dp), DIMENSION(3)                        :: ra_pbc, rab, rb_pbc
+      REAL(KIND=dp), DIMENSION(SIZE(index_to_cell, 2))   :: distances
+
+      CPASSERT(SIZE(index_to_cell, 1) == 3)
+      CPASSERT(SIZE(index_to_cell, 2) > 0)
+      CPASSERT(SIZE(weights) == SIZE(index_to_cell, 2))
+
+      ra_pbc = pbc(ra, cell)
+      rb_pbc = pbc(rb, cell)
+      DO i_image = 1, SIZE(index_to_cell, 2)
+         rab = ra_pbc - (rb_pbc + MATMUL(cell%hmat, REAL(index_to_cell(:, i_image), KIND=dp)))
+         distances(i_image) = NORM2(rab)
+      END DO
+
+      weights = MERGE(1.0_dp, 0.0_dp, distances <= MINVAL(distances) + 1.0E-6_dp)
+      weights = weights/SUM(weights)
+
+   END SUBROUTINE minimum_image_weights
+
+! **************************************************************************************************
+!> \brief Apply a stable periodic-image convention for k-point Bloch gauges.
+!> \param r ...
+!> \param cell ...
+!> \return r_pbc ...
+! **************************************************************************************************
+   FUNCTION pbc_stable(r, cell) RESULT(r_pbc)
+
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: r
+      TYPE(cell_type), POINTER                           :: cell
+      REAL(KIND=dp), DIMENSION(3)                        :: r_pbc
+
+      REAL(KIND=dp), DIMENSION(3)                        :: s
+
+      CPASSERT(ASSOCIATED(cell))
+
+      IF (cell%orthorhombic) THEN
+         r_pbc(1) = r(1) - cell%hmat(1, 1)*cell%perd(1)* &
+                    pbc_image_shift(cell%h_inv(1, 1)*r(1))
+         r_pbc(2) = r(2) - cell%hmat(2, 2)*cell%perd(2)* &
+                    pbc_image_shift(cell%h_inv(2, 2)*r(2))
+         r_pbc(3) = r(3) - cell%hmat(3, 3)*cell%perd(3)* &
+                    pbc_image_shift(cell%h_inv(3, 3)*r(3))
+      ELSE
+         s(1) = cell%h_inv(1, 1)*r(1) + cell%h_inv(1, 2)*r(2) + cell%h_inv(1, 3)*r(3)
+         s(2) = cell%h_inv(2, 1)*r(1) + cell%h_inv(2, 2)*r(2) + cell%h_inv(2, 3)*r(3)
+         s(3) = cell%h_inv(3, 1)*r(1) + cell%h_inv(3, 2)*r(2) + cell%h_inv(3, 3)*r(3)
+         s(1) = s(1) - cell%perd(1)*pbc_image_shift(s(1))
+         s(2) = s(2) - cell%perd(2)*pbc_image_shift(s(2))
+         s(3) = s(3) - cell%perd(3)*pbc_image_shift(s(3))
+         r_pbc(1) = cell%hmat(1, 1)*s(1) + cell%hmat(1, 2)*s(2) + cell%hmat(1, 3)*s(3)
+         r_pbc(2) = cell%hmat(2, 1)*s(1) + cell%hmat(2, 2)*s(2) + cell%hmat(2, 3)*s(3)
+         r_pbc(3) = cell%hmat(3, 1)*s(1) + cell%hmat(3, 2)*s(2) + cell%hmat(3, 3)*s(3)
+      END IF
+
+   END FUNCTION pbc_stable
 
 ! **************************************************************************************************
 !> \brief   Apply the periodic boundary conditions defined by a simulation

@@ -21,7 +21,7 @@ build deps eiger:
   stage: deps
   timeout: 6h
   before_script:
-    - DEPS_IMAGE_TAG=$(cat make_cp2k.sh ci/cscs_eiger_${TAG}.yaml ci/docker/build_deps_spack.Dockerfile $(find tools/spack -type f | sort) | sha256sum | head -c 16)
+    - DEPS_IMAGE_TAG=$(cat make_cp2k.sh ci/cscs_eiger_${TAG}.yaml ci/docker/build_deps_spack.Dockerfile $(find tools/make_cp2k tools/spack -type f | sort) | sha256sum | head -c 16)
     - export PERSIST_IMAGE_NAME=${CSCS_REGISTRY_PATH}/base/${REPOSITORY}:${TAG}_${DEPS_IMAGE_TAG}
     - echo "DEPS_IMAGE_NAME=${PERSIST_IMAGE_NAME}" | tee build.env
   artifacts:
@@ -32,17 +32,19 @@ build deps eiger:
       "BASE_IMAGE",
       "CP2K_VERSION",
       "FEATURE_FLAGS",
+      "NUM_PACKAGES",
       "NUM_PROCS"
     ]'
     DOCKERFILE: ci/docker/build_${CI_JOB_STAGE}_${BUILDER}.Dockerfile
     BASE_IMAGE: ${UBUNTU_IMAGE_NAME}
     CP2K_VERSION: ${VERSION}
-    FEATURE_FLAGS: "-ef openpmd -np 4"
+    FEATURE_FLAGS: ""
+    NUM_PACKAGES: 4
     NUM_PROCS: 64
     KUBERNETES_CPU_REQUEST: 64
     KUBERNETES_CPU_LIMIT: 64
-    KUBERNETES_MEMORY_REQUEST: 128Gi
-    KUBERNETES_MEMORY_LIMIT: 128Gi
+    KUBERNETES_MEMORY_REQUEST: 256Gi
+    KUBERNETES_MEMORY_LIMIT: 256Gi
 
 build cp2k eiger:
   extends: .container-builder-cscs-zen2
@@ -64,7 +66,7 @@ build cp2k eiger:
     DOCKERFILE: ci/docker/build_${CI_JOB_STAGE}_${BUILDER}.Dockerfile
     BASE_IMAGE: ${UBUNTU_IMAGE_NAME}
     DEPS_IMAGE: ${DEPS_IMAGE_NAME}
-    FEATURE_FLAGS: "-ef openpmd"
+    FEATURE_FLAGS: ""
     NUM_PROCS: 32
     KUBERNETES_CPU_REQUEST: 32
     KUBERNETES_CPU_LIMIT: 32
@@ -76,13 +78,13 @@ test cp2k eiger:
   needs: ["build cp2k eiger"]
   timeout: 6h
   script:
-    - podman run --shm-size=1g -v ${PWD}:/mnt ${DOCKERHUB_IMAGE_NAME} mpiexec -genv OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK} -n ${SLURM_NTASKS} cp2k /opt/cp2k/benchmarks/CI/H2O-32_md.inp
-    - podman run --shm-size=1g -v ${PWD}:/mnt ${DOCKERHUB_IMAGE_NAME} mpiexec -genv OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK} -n ${SLURM_NTASKS} cp2k /opt/cp2k/benchmarks/CI/H2O-32_md_elpa.inp
+    - podman run --env HDF5_DO_MPI_FILE_SYNC --shm-size=1g -v ${PWD}:/mnt ${DOCKERHUB_IMAGE_NAME} mpiexec -genv OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK} -n ${SLURM_NTASKS} cp2k /opt/cp2k/benchmarks/CI/H2O-32_md.inp
+    - podman run --env HDF5_DO_MPI_FILE_SYNC --shm-size=1g -v ${PWD}:/mnt ${DOCKERHUB_IMAGE_NAME} mpiexec -genv OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK} -n ${SLURM_NTASKS} cp2k /opt/cp2k/benchmarks/CI/H2O-32_md_elpa.inp
   variables:
+    HDF5_DO_MPI_FILE_SYNC: 0
     SLURM_CONSTRAINT: mc
     SLURM_CPUS_PER_TASK: 4
     SLURM_DEBUG: 1
-    SLURM_HINT: nomultithread
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 8
     SLURM_NTASKS_PER_NODE: 8
@@ -96,11 +98,12 @@ regression test cp2k eiger:
   timeout: 6h
   script:
     - git --no-pager log -1 --pretty="%nCommitSHA:%x20%H%nCommitTime:%x20%ci%nCommitAuthor:%x20%an%nCommitSubject:%x20%s%n"
-    - podman run --shm-size=1g -v ${PWD}:/mnt ${DOCKERHUB_IMAGE_NAME} /opt/cp2k/tests/do_regtest.py --cp2kdatadir /opt/cp2k/install/share/cp2k/data --maxtasks ${SLURM_NTASKS} --mpiexec "mpiexec -bind-to none" --keepalive /opt/cp2k/install/bin ${VERSION} 2>&1 || true
+    - podman run --env HDF5_DO_MPI_FILE_SYNC --shm-size=1g -v ${PWD}:/mnt ${DOCKERHUB_IMAGE_NAME} /opt/cp2k/tests/do_regtest.py --cp2kdatadir /opt/cp2k/install/share/cp2k/data --maxtasks ${SLURM_NTASKS} --mpiexec "mpiexec -bind-to none" --keepalive /opt/cp2k/install/bin ${VERSION} 2>&1 | tee report.log || true
+    - 'grep -q "^Status:" report.log || printf "\nSummary: Regression test run failed\nStatus: FAILED\n"'
   variables:
+    HDF5_DO_MPI_FILE_SYNC: 0
     SLURM_CONSTRAINT: mc
     SLURM_DEBUG: 1
-    SLURM_HINT: nomultithread
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 128
     SLURM_TIMELIMIT: 60
@@ -109,11 +112,12 @@ regression test cp2k eiger:
 benchmark cp2k 1 eiger node:
   extends: .container-runner-eiger-zen2
   stage: benchmark
-  needs: ["build cp2k eiger","test cp2k eiger","regression test cp2k eiger"]
+  needs: ["regression test cp2k eiger"]
   timeout: 6h
   image: ${CSCS_IMAGE_NAME}
   before_script:
     - export CP2K_DATA_DIR=/opt/cp2k/install/share/cp2k/data
+    - export HDF5_DO_MPI_FILE_SYNC=0
   script:
     - cp2k.popt /opt/cp2k/benchmarks/CI/H2O-128_md.inp
   variables:
@@ -123,7 +127,6 @@ benchmark cp2k 1 eiger node:
     SLURM_HINT: nomultithread
     SLURM_JOB_NUM_NODES: 1
     SLURM_MPI_TYPE: pmi2
-    SLURM_NTASKS: 128
     SLURM_NTASKS_PER_NODE: 128
     SLURM_TIMELIMIT: 30
     USE_MPI: YES
@@ -131,11 +134,12 @@ benchmark cp2k 1 eiger node:
 benchmark cp2k 1 eiger node elpa:
   extends: .container-runner-eiger-zen2
   stage: benchmark
-  needs: ["build cp2k eiger","test cp2k eiger","regression test cp2k eiger","benchmark cp2k 1 eiger node"]
+  needs: ["regression test cp2k eiger"]
   timeout: 6h
   image: ${CSCS_IMAGE_NAME}
   before_script:
     - export CP2K_DATA_DIR=/opt/cp2k/install/share/cp2k/data
+    - export HDF5_DO_MPI_FILE_SYNC=0
   script:
     - cp2k.popt /opt/cp2k/benchmarks/CI/H2O-128_md_elpa.inp
   variables:
@@ -145,7 +149,6 @@ benchmark cp2k 1 eiger node elpa:
     SLURM_HINT: nomultithread
     SLURM_JOB_NUM_NODES: 1
     SLURM_MPI_TYPE: pmi2
-    SLURM_NTASKS: 128
     SLURM_NTASKS_PER_NODE: 128
     SLURM_TIMELIMIT: 30
     USE_MPI: YES
@@ -153,11 +156,12 @@ benchmark cp2k 1 eiger node elpa:
 benchmark cp2k 2 eiger nodes:
   extends: .container-runner-eiger-zen2
   stage: benchmark
-  needs: ["build cp2k eiger","test cp2k eiger","regression test cp2k eiger"]
+  needs: ["benchmark cp2k 1 eiger node"]
   timeout: 6h
   image: ${CSCS_IMAGE_NAME}
   before_script:
     - export CP2K_DATA_DIR=/opt/cp2k/install/share/cp2k/data
+    - export HDF5_DO_MPI_FILE_SYNC=0
     - export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
   script:
     - cp2k /opt/cp2k/benchmarks/CI/H2O-512_md.inp
@@ -168,7 +172,6 @@ benchmark cp2k 2 eiger nodes:
     SLURM_HINT: nomultithread
     SLURM_JOB_NUM_NODES: 2
     SLURM_MPI_TYPE: pmi2
-    SLURM_NTASKS: 256
     SLURM_NTASKS_PER_NODE: 128
     SLURM_TIMELIMIT: 30
     USE_MPI: YES
@@ -176,11 +179,12 @@ benchmark cp2k 2 eiger nodes:
 benchmark cp2k 2 eiger nodes elpa:
   extends: .container-runner-eiger-zen2
   stage: benchmark
-  needs: ["build cp2k eiger","test cp2k eiger","regression test cp2k eiger","benchmark cp2k 2 eiger nodes"]
+  needs: ["benchmark cp2k 1 eiger node elpa"]
   timeout: 6h
   image: ${CSCS_IMAGE_NAME}
   before_script:
     - export CP2K_DATA_DIR=/opt/cp2k/install/share/cp2k/data
+    - export HDF5_DO_MPI_FILE_SYNC=0
     - export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
   script:
     - cp2k /opt/cp2k/benchmarks/CI/H2O-512_md_elpa.inp
@@ -191,7 +195,6 @@ benchmark cp2k 2 eiger nodes elpa:
     SLURM_HINT: nomultithread
     SLURM_JOB_NUM_NODES: 2
     SLURM_MPI_TYPE: pmi2
-    SLURM_NTASKS: 256
     SLURM_NTASKS_PER_NODE: 128
     SLURM_TIMELIMIT: 30
     USE_MPI: YES

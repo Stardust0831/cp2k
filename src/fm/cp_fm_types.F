@@ -13,6 +13,7 @@
 !> \author Matthias Krack (22.05.2001)
 ! **************************************************************************************************
 MODULE cp_fm_types
+   USE OMP_LIB,                         ONLY: omp_get_max_threads
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_blacs_types,                  ONLY: cp_blacs_type
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
@@ -64,6 +65,7 @@ MODULE cp_fm_types
              cp_fm_to_fm, & ! copy (parts of) a fm to a fm
              cp_fm_vectorsnorm, & ! compute the norm of the column-vectors
              cp_fm_vectorssum, & ! compute the sum of all elements of the column-vectors
+             cp_fm_sumall, & ! sum all elements or a function of them of the matrix
              cp_fm_to_fm_submat, & ! copy (parts of) a fm to a fm
              cp_fm_to_fm_triangular, &
              cp_fm_copy_general, &
@@ -482,8 +484,9 @@ CONTAINS
       my_ncol = matrix%matrix_struct%ncol_global
       IF (PRESENT(ncol)) my_ncol = ncol
 
-      IF (ncol_global < (my_start_col + my_ncol - 1)) &
+      IF (ncol_global < (my_start_col + my_ncol - 1)) THEN
          CPABORT("ncol_global>=(my_start_col+my_ncol-1)")
+      END IF
 
       ALLOCATE (buff(nrow_global))
 
@@ -558,47 +561,53 @@ CONTAINS
 !> \brief returns the diagonal elements of a fm
 !> \param matrix ...
 !> \param diag ...
+!> \param n_active optional number of leading diagonal elements to return
 ! **************************************************************************************************
-   SUBROUTINE cp_fm_get_diag(matrix, diag)
+   SUBROUTINE cp_fm_get_diag(matrix, diag, n_active)
 
-      ! arguments
-      TYPE(cp_fm_type), INTENT(IN)             :: matrix
-      REAL(KIND=dp), DIMENSION(:), INTENT(OUT) :: diag
+      TYPE(cp_fm_type), INTENT(IN)                       :: matrix
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: diag
+      INTEGER, INTENT(IN), OPTIONAL                      :: n_active
 
-      ! locals
-      INTEGER :: i, nrow_global
-
+      INTEGER                                            :: i_global, n_diag, ncol_global, nrow_global
 #if defined(__parallel)
-      INTEGER, DIMENSION(9) :: desca
-      TYPE(cp_blacs_env_type), POINTER :: context
-      INTEGER :: icol_local, ipcol, iprow, irow_local, mypcol, myprow, npcol, &
-                 nprow
-      REAL(KIND=dp), DIMENSION(:, :), POINTER :: a
+      INTEGER                                            :: icol_local, ipcol, iprow, irow, irow_local, &
+                                                            mypcol, myprow, npcol, nprow, nrow_local
+      INTEGER, DIMENSION(9)                              :: desca
+      INTEGER, DIMENSION(:), POINTER                     :: row_indices
+      TYPE(cp_blacs_env_type), POINTER                   :: context
 #endif
 
-      CALL cp_fm_get_info(matrix, nrow_global=nrow_global)
+      CALL cp_fm_get_info(matrix, nrow_global=nrow_global, ncol_global=ncol_global)
 
-#if defined(__parallel)
+      n_diag = MIN(nrow_global, ncol_global)
+      IF (PRESENT(n_active)) n_diag = n_active
+      CPASSERT(n_diag >= 0 .AND. n_diag <= MIN(nrow_global, ncol_global))
+      CPASSERT(SIZE(diag) >= n_diag)
+
       diag = 0.0_dp
+#if defined(__parallel)
+      CALL cp_fm_get_info(matrix, nrow_local=nrow_local, row_indices=row_indices)
       context => matrix%matrix_struct%context
       myprow = context%mepos(1)
       mypcol = context%mepos(2)
       nprow = context%num_pe(1)
       npcol = context%num_pe(2)
 
-      a => matrix%local_data
       desca(:) = matrix%matrix_struct%descriptor(:)
 
-      DO i = 1, nrow_global
-         CALL infog2l(i, i, desca, nprow, npcol, myprow, mypcol, &
+      DO irow = 1, nrow_local
+         i_global = row_indices(irow)
+         IF (i_global > n_diag) EXIT
+         CALL infog2l(i_global, i_global, desca, nprow, npcol, myprow, mypcol, &
                       irow_local, icol_local, iprow, ipcol)
          IF ((iprow == myprow) .AND. (ipcol == mypcol)) THEN
-            diag(i) = a(irow_local, icol_local)
+            diag(i_global) = matrix%local_data(irow_local, icol_local)
          END IF
       END DO
 #else
-      DO i = 1, nrow_global
-         diag(i) = matrix%local_data(i, i)
+      DO i_global = 1, n_diag
+         diag(i_global) = matrix%local_data(i_global, i_global)
       END DO
 #endif
       CALL matrix%matrix_struct%para_env%sum(diag)
@@ -655,10 +664,10 @@ CONTAINS
 
       IF ((iprow == myprow) .AND. (ipcol == mypcol)) THEN
          alpha = a(irow_local, icol_local)
-         CALL context%dgebs2d('All', ' ', 1, 1, alpha, 1)
+         CALL context%dgebs2d('A', ' ', 1, 1, alpha, 1)
          IF (PRESENT(local)) local = .TRUE.
       ELSE
-         CALL context%dgebr2d('All', ' ', 1, 1, alpha, 1, iprow, ipcol)
+         CALL context%dgebr2d('A', ' ', 1, 1, alpha, 1, iprow, ipcol)
          IF (PRESENT(local)) local = .FALSE.
       END IF
 
@@ -786,7 +795,7 @@ CONTAINS
                           nrow_local=nrow_local, ncol_local=ncol_local, &
                           row_indices=row_indices, col_indices=col_indices)
 
-      IF (al == 1.0 .AND. be == 0.0) THEN
+      IF (al == 1.0_dp .AND. be == 0.0_dp) THEN
          DO j = 1, ncol_local
             this_col = col_indices(j) - j0 + 1
             IF (this_col >= 1 .AND. this_col <= ncol) THEN
@@ -1204,37 +1213,54 @@ CONTAINS
    END SUBROUTINE cp_fm_maxabsrownorm
 
 ! **************************************************************************************************
-!> \brief find the inorm of each column norm_{j}= sqrt( \sum_{i} A_{ij}*A_{ij} )
+!> \brief find the norm of each column norm_{j}= sqrt( \sum_{i} A_{ij}*A_{ij} )
 !> \param matrix ...
 !> \param norm_array ...
+!> \param squared return squared norms instead (default: false)
 ! **************************************************************************************************
-   SUBROUTINE cp_fm_vectorsnorm(matrix, norm_array)
+   SUBROUTINE cp_fm_vectorsnorm(matrix, norm_array, squared)
       TYPE(cp_fm_type), INTENT(IN)                       :: matrix
       REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: norm_array
+      LOGICAL, INTENT(IN), OPTIONAL                      :: squared
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'cp_fm_vectorsnorm'
 
-      INTEGER                                            :: handle, i, j, ncol_global, ncol_local, &
-                                                            nrow_local
+      INTEGER                                            :: handle, i, j, ncol_local, nrow_local
+
+!$    INTEGER                                            :: nworkers
       INTEGER, DIMENSION(:), POINTER                     :: col_indices
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: my_block
+      LOGICAL                                            :: take_sqrt
+      REAL(KIND=dp)                                      :: norm_sq
+      REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), &
+         POINTER                                         :: local_data
 
       CALL timeset(routineN, handle)
 
-      my_block => matrix%local_data
+      local_data => matrix%local_data
+      CALL cp_fm_get_info(matrix, col_indices=col_indices, nrow_local=nrow_local, &
+                          ncol_local=ncol_local)
 
-      CALL cp_fm_get_info(matrix, col_indices=col_indices, ncol_global=ncol_global, &
-                          nrow_local=nrow_local, ncol_local=ncol_local)
-
-      ! the efficiency could be improved by making use of the row-col distribution of scalapack
       norm_array = 0.0_dp
+      ! Own whole columns and keep at least 8192 elements per worker to amortize team startup.
+!$    nworkers = MAX(1, MIN(omp_get_max_threads(), ncol_local))
+!$    nworkers = MAX(1, MIN(nworkers, (nrow_local*ncol_local + 1)/8192))
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) &
+!$OMP SHARED(local_data, col_indices, nrow_local, ncol_local, norm_array) PRIVATE(i, j, norm_sq) &
+!$OMP NUM_THREADS(nworkers) IF(nworkers > 1)
       DO j = 1, ncol_local
+         norm_sq = 0.0_dp
+!$OMP SIMD REDUCTION(+:norm_sq)
          DO i = 1, nrow_local
-            norm_array(col_indices(j)) = norm_array(col_indices(j)) + my_block(i, j)*my_block(i, j)
+            norm_sq = norm_sq + local_data(i, j)**2
          END DO
+!$OMP END SIMD
+         norm_array(col_indices(j)) = norm_sq
       END DO
+!$OMP END PARALLEL DO
       CALL matrix%matrix_struct%para_env%sum(norm_array)
-      norm_array = SQRT(norm_array)
+      take_sqrt = .TRUE.
+      IF (PRESENT(squared)) take_sqrt = .NOT. squared
+      IF (take_sqrt) norm_array = SQRT(norm_array)
 
       CALL timestop(handle)
    END SUBROUTINE cp_fm_vectorsnorm
@@ -1268,7 +1294,7 @@ CONTAINS
       IF (PRESENT(dir)) THEN
          IF (dir == 'c' .OR. dir == 'C') THEN
             docol = .TRUE.
-         ELSEIF (dir == 'r' .OR. dir == 'R') THEN
+         ELSE IF (dir == 'r' .OR. dir == 'R') THEN
             docol = .FALSE.
          ELSE
             CPABORT('Wrong argument DIR')
@@ -1303,6 +1329,44 @@ CONTAINS
    END SUBROUTINE cp_fm_vectorssum
 
 ! **************************************************************************************************
+!> \brief summing up all the elements of the matrix
+!>        \f$ result = \sum_{ij} fun(A_{ij}) \f$
+!> \param matrix     an input matrix A
+!> \param fun ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION cp_fm_sumall(matrix, fun) RESULT(res)
+      TYPE(cp_fm_type), INTENT(IN)                       :: matrix
+      CHARACTER(LEN=3), INTENT(IN), OPTIONAL             :: fun
+      REAL(KIND=dp)                                      :: res
+
+      CHARACTER(LEN=3)                                   :: funval
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: data
+
+      IF (PRESENT(fun)) THEN
+         funval = fun
+      ELSE
+         funval = "ONE"
+      END IF
+
+      DATA => matrix%local_data
+
+      SELECT CASE (funval)
+      CASE ("ONE", "one")
+         res = SUM(DATA)
+      CASE ("TWO", "two")
+         res = SUM(DATA**2)
+      CASE ("ABS", "abs")
+         res = SUM(ABS(DATA))
+      CASE DEFAULT
+         CPABORT("Unknown function requested")
+      END SELECT
+
+      CALL matrix%matrix_struct%para_env%sum(res)
+
+   END FUNCTION cp_fm_sumall
+
+! **************************************************************************************************
 !> \brief copy one identically sized matrix in the other
 !> \param source ...
 !> \param destination ...
@@ -1326,11 +1390,12 @@ CONTAINS
           cp_fm_struct_equivalent(source%matrix_struct, &
                                   destination%matrix_struct)) THEN
          IF (SIZE(source%local_data, 1) /= SIZE(destination%local_data, 1) .OR. &
-             SIZE(source%local_data, 2) /= SIZE(destination%local_data, 2)) &
+             SIZE(source%local_data, 2) /= SIZE(destination%local_data, 2)) THEN
             CALL cp_abort(__LOCATION__, &
                           "Cannot copy full matrix <"//TRIM(source%name)// &
                           "> to full matrix <"//TRIM(destination%name)// &
                           ">. The local_data blocks have different sizes.")
+         END IF
          CALL dcopy(SIZE(source%local_data, 1)*SIZE(source%local_data, 2), &
                     source%local_data, 1, destination%local_data, 1)
       ELSE
@@ -1472,17 +1537,21 @@ CONTAINS
       na = msource%matrix_struct%nrow_global
       nb = mtarget%matrix_struct%nrow_global
 !    nrow must be <= na and nb
-      IF (nrow > na) &
+      IF (nrow > na) THEN
          CPABORT("cannot copy because nrow > number of rows of source matrix")
-      IF (nrow > nb) &
+      END IF
+      IF (nrow > nb) THEN
          CPABORT("cannot copy because nrow > number of rows of target matrix")
+      END IF
       na = msource%matrix_struct%ncol_global
       nb = mtarget%matrix_struct%ncol_global
 !    ncol must be <= na_col and nb_col
-      IF (ncol > na) &
+      IF (ncol > na) THEN
          CPABORT("cannot copy because nrow > number of rows of source matrix")
-      IF (ncol > nb) &
+      END IF
+      IF (ncol > nb) THEN
          CPABORT("cannot copy because nrow > number of rows of target matrix")
+      END IF
 
 #if defined(__parallel)
       desca(:) = msource%matrix_struct%descriptor(:)
@@ -1716,7 +1785,8 @@ CONTAINS
          !      pack send buffers
          !      call isend
          !  DEST_2
-         !      wait for the recvs and unpack buffers (this part eventually will go into another routine to allow comms to run concurrently)
+         !      wait for the recvs and unpack buffers (this part eventually will go into another
+         !         routine to allow comms to run concurrently)
          !  SRC_2
          !      wait for the sends
 
@@ -2012,10 +2082,12 @@ CONTAINS
          ! check whether source is available on this process
          IF (ASSOCIATED(source%matrix_struct)) THEN
             desca = source%matrix_struct%descriptor
-            IF (nrows > source%matrix_struct%nrow_global) &
+            IF (nrows > source%matrix_struct%nrow_global) THEN
                CPABORT("nrows is greater than nrow_global of source")
-            IF (ncols > source%matrix_struct%ncol_global) &
+            END IF
+            IF (ncols > source%matrix_struct%ncol_global) THEN
                CPABORT("ncols is greater than ncol_global of source")
+            END IF
             smat => source%local_data
          ELSE
             desca = -1
@@ -2024,10 +2096,12 @@ CONTAINS
          ! check destination is available on this process
          IF (ASSOCIATED(destination%matrix_struct)) THEN
             descb = destination%matrix_struct%descriptor
-            IF (nrows > destination%matrix_struct%nrow_global) &
+            IF (nrows > destination%matrix_struct%nrow_global) THEN
                CPABORT("nrows is greater than nrow_global of destination")
-            IF (ncols > destination%matrix_struct%ncol_global) &
+            END IF
+            IF (ncols > destination%matrix_struct%ncol_global) THEN
                CPABORT("ncols is greater than ncol_global of destination")
+            END IF
             dmat => destination%local_data
          ELSE
             descb = -1
@@ -2116,10 +2190,12 @@ CONTAINS
 !> \brief ...
 !> \param fm ...
 !> \param unit ...
+!> \param ncol Number of leading columns to write; If omitted, write all columns.
 ! **************************************************************************************************
-   SUBROUTINE cp_fm_write_unformatted(fm, unit)
+   SUBROUTINE cp_fm_write_unformatted(fm, unit, ncol)
       TYPE(cp_fm_type), INTENT(IN)             :: fm
       INTEGER, INTENT(IN)                      :: unit
+      INTEGER, INTENT(IN), OPTIONAL            :: ncol
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'cp_fm_write_unformatted'
 
@@ -2142,6 +2218,11 @@ CONTAINS
       CALL timeset(routineN, handle)
       CALL cp_fm_get_info(fm, nrow_global=nrow_global, ncol_global=ncol_global, ncol_block=max_block, &
                           para_env=para_env)
+
+      IF (PRESENT(ncol)) THEN
+         CPASSERT(ncol >= 0 .AND. ncol <= ncol_global)
+         ncol_global = ncol
+      END IF
 
 #if defined(__parallel)
       num_pe = para_env%num_pe

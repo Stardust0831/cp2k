@@ -184,8 +184,9 @@ CONTAINS
       END DO
       ! Trigger error
       IF ((my_end) .AND. (j /= natom - MOD(natom, 2) + 1)) THEN
-         IF (j /= natom) &
+         IF (j /= natom) THEN
             CPABORT("Error while reading CRD file. Unexpected end of file.")
+         END IF
       ELSE IF (MOD(natom, 2) /= 0) THEN
          ! In case let's handle the last atom
          j = natom
@@ -230,10 +231,11 @@ CONTAINS
          END DO
          setup_velocities = .TRUE.
          IF ((my_end) .AND. (j /= natom - MOD(natom, 2) + 1)) THEN
-            IF (j /= natom) &
+            IF (j /= natom) THEN
                CALL cp_warn(__LOCATION__, &
                             "No VELOCITY information found in CRD file. Ignoring BOX information. "// &
                             "Please provide the BOX information directly from the main CP2K input! ")
+            END IF
             setup_velocities = .FALSE.
          ELSE IF (MOD(natom, 2) /= 0) THEN
             ! In case let's handle the last atom
@@ -257,10 +259,11 @@ CONTAINS
       IF (my_end) THEN
          CPWARN_IF(j /= natom, "BOX information missing in CRD file.")
       ELSE
-         IF (j /= natom) &
+         IF (j /= natom) THEN
             CALL cp_warn(__LOCATION__, &
                          "BOX information found in CRD file. They will be ignored. "// &
                          "Please provide the BOX information directly from the main CP2K input!")
+         END IF
       END IF
       CALL parser_release(parser)
       CALL cp_print_key_finished_output(iw, logger, subsys_section, &
@@ -378,7 +381,7 @@ CONTAINS
 
       CHARACTER(LEN=default_string_length)               :: input_format, section
       CHARACTER(LEN=default_string_length), &
-         ALLOCATABLE, DIMENSION(:)                       :: isymbl, labres, strtmp_a
+         ALLOCATABLE, DIMENSION(:)                       :: isymbl, labres, raw_isymbl, strtmp_a
       INTEGER :: handle, handle2, i, ifbox, ifcap, ifpert, index_now, info(31), istart, mbona, &
          mbper, mdper, mgper, mphia, mtheta, natom, natom_prev, natyp, nbona, nbond_prev, nbonh, &
          nbper, ndper, ngper, nhparm, nmxrs, nnb, nparm, nphb, nphi_prev, nphia, nphih, nptra, &
@@ -665,6 +668,8 @@ CONTAINS
 
          ! Sort atom names + charges and identify unique types
          CALL sort(isymbl, natom, iwork)
+         ALLOCATE (raw_isymbl(natom))
+         raw_isymbl(:) = isymbl
 
          istart = 1
          DO i = 2, natom
@@ -674,6 +679,8 @@ CONTAINS
             END IF
          END DO
          CALL conform_atom_type_low(isymbl, iwork, i, istart, atom_info%atm_charge(natom_prev + 1:))
+
+         CALL resolve_atom_type_collisions(isymbl, raw_isymbl)
 
          ! Copy back the modified and conformed atom types
          DO i = 1, natom
@@ -693,6 +700,7 @@ CONTAINS
          ! Deallocate when extracting connectivity infos
          DEALLOCATE (iwork)
          DEALLOCATE (isymbl)
+         DEALLOCATE (raw_isymbl)
          DEALLOCATE (labres)
          DEALLOCATE (ipres)
 
@@ -1020,6 +1028,8 @@ CONTAINS
                kend = k - 1
                DO j = kstart, kend
                   gind = lindx(cindx(j))
+                  IF (LEN_TRIM(isymbl(gind)) + LEN_TRIM(ADJUSTL(cp_to_string(counter))) > &
+                      LEN(isymbl(gind))) CPABORT("AMBER charge kind name exceeds string length")
                   isymbl(gind) = TRIM(isymbl(gind))//ADJUSTL(cp_to_string(counter))
                END DO
                counter = counter + 1
@@ -1030,6 +1040,8 @@ CONTAINS
          kend = k - 1
          DO j = kstart, kend
             gind = lindx(cindx(j))
+            IF (LEN_TRIM(isymbl(gind)) + LEN_TRIM(ADJUSTL(cp_to_string(counter))) > &
+                LEN(isymbl(gind))) CPABORT("AMBER charge kind name exceeds string length")
             isymbl(gind) = TRIM(isymbl(gind))//ADJUSTL(cp_to_string(counter))
          END DO
       END IF
@@ -1038,6 +1050,143 @@ CONTAINS
       DEALLOCATE (cindx)
       CALL timestop(handle)
    END SUBROUTINE conform_atom_type_low
+
+! **************************************************************************************************
+!> \brief Resolve ambiguities introduced by the legacy AMBER charge-split
+!>        atom-kind naming scheme while preserving non-colliding names.
+!> \param isymbl Conformed atom-kind names
+!> \param raw_isymbl Original AMBER atom types
+! **************************************************************************************************
+   SUBROUTINE resolve_atom_type_collisions(isymbl, raw_isymbl)
+      CHARACTER(LEN=default_string_length), &
+         DIMENSION(:), INTENT(INOUT)                     :: isymbl
+      CHARACTER(LEN=default_string_length), &
+         DIMENSION(:), INTENT(IN)                        :: raw_isymbl
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'resolve_atom_type_collisions'
+
+      CHARACTER(LEN=default_string_length)               :: base_name, candidate, suffix
+      CHARACTER(LEN=default_string_length), &
+         ALLOCATABLE, DIMENSION(:)                       :: sorted_labels
+      INTEGER                                            :: finish, handle, idx, jdx, keeper, n, &
+                                                            nsep, p, q, raw_len, start
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: order
+      LOGICAL                                            :: collision, seen_type
+
+      CALL timeset(routineN, handle)
+
+      n = SIZE(isymbl)
+      CPASSERT(SIZE(raw_isymbl) == n)
+
+      ALLOCATE (sorted_labels(n))
+      ALLOCATE (order(n))
+
+      ! Sort a copy of the legacy-generated labels.  Equal labels then
+      ! form contiguous groups, while order maps back to isymbl/raw_isymbl.
+      sorted_labels(:) = isymbl
+      CALL sort(sorted_labels, n, order)
+
+      start = 1
+      DO WHILE (start <= n)
+         finish = start
+
+         DO WHILE (finish < n)
+            IF (sorted_labels(finish + 1) /= sorted_labels(start)) EXIT
+            finish = finish + 1
+         END DO
+
+         IF (finish > start) THEN
+            keeper = order(start)
+            collision = .FALSE.
+
+            ! Repeated atoms of the same original AMBER type are normal.
+            ! A collision exists only when one generated label represents
+            ! more than one original AMBER atom type.
+            DO p = start + 1, finish
+               idx = order(p)
+               IF (raw_isymbl(idx) /= raw_isymbl(keeper)) THEN
+                  collision = .TRUE.
+                  EXIT
+               END IF
+            END DO
+
+            IF (collision) THEN
+
+               ! Preserve an unsplit original AMBER atom type when its name
+               ! exactly matches the colliding legacy label.  If no such type
+               ! exists, disambiguate all identities in the collision group.
+               keeper = 0
+               DO p = start, finish
+                  idx = order(p)
+                  IF (raw_isymbl(idx) == sorted_labels(start)) THEN
+                     keeper = idx
+                     EXIT
+                  END IF
+               END DO
+
+               DO p = start, finish
+                  idx = order(p)
+
+                  IF (keeper /= 0) THEN
+                     IF (raw_isymbl(idx) == raw_isymbl(keeper)) CYCLE
+                  END IF
+
+                  ! Handle each conflicting original AMBER type only once.
+                  seen_type = .FALSE.
+                  DO q = start, p - 1
+                     jdx = order(q)
+                     IF (raw_isymbl(jdx) == raw_isymbl(idx)) THEN
+                        seen_type = .TRUE.
+                        EXIT
+                     END IF
+                  END DO
+                  IF (seen_type) CYCLE
+
+                  base_name = TRIM(raw_isymbl(idx))
+                  raw_len = LEN_TRIM(base_name)
+
+                  ! A non-keeper colliding identity must have acquired a
+                  ! numeric charge-class suffix through conform_atom_type_low.
+                  IF (LEN_TRIM(sorted_labels(start)) <= raw_len) THEN
+                     CPABORT("Unable to disambiguate AMBER atom kind name")
+                  END IF
+
+                  suffix = ADJUSTL(sorted_labels(start) (raw_len + 1:))
+                  nsep = 1
+
+                  ! Prefer TYPE_1.  If that name already exists, use
+                  ! TYPE__1, TYPE___1, ... until an unused name is found.
+                  DO
+                     IF (raw_len + nsep + LEN_TRIM(suffix) > LEN(candidate)) THEN
+                        CPABORT("AMBER charge kind name exceeds string length")
+                     END IF
+
+                     candidate = TRIM(base_name)//REPEAT("_", nsep)//TRIM(suffix)
+
+                     IF (.NOT. ANY(isymbl == candidate)) EXIT
+                     nsep = nsep + 1
+                  END DO
+
+                  ! Rename all atoms belonging to this conflicting identity.
+                  DO q = start, finish
+                     jdx = order(q)
+                     IF (raw_isymbl(jdx) == raw_isymbl(idx)) THEN
+                        isymbl(jdx) = candidate
+                     END IF
+                  END DO
+
+               END DO
+            END IF
+         END IF
+
+         start = finish + 1
+      END DO
+
+      DEALLOCATE (sorted_labels)
+      DEALLOCATE (order)
+
+      CALL timestop(handle)
+   END SUBROUTINE resolve_atom_type_collisions
 
 ! **************************************************************************************************
 !> \brief Set of Low level subroutines reading section for parmtop
@@ -1060,16 +1209,18 @@ CONTAINS
       CALL parser_get_next_line(parser, 1, at_end=my_end)
       i = 1
       DO WHILE ((i <= dim) .AND. (.NOT. my_end))
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array1(i))
          i = i + 1
       END DO
       ! Trigger end of file aborting
-      IF (my_end .AND. (i <= dim)) &
+      IF (my_end .AND. (i <= dim)) THEN
          CALL cp_abort(__LOCATION__, &
                        "End of file while reading section "//TRIM(section)//" in amber topology file!")
+      END IF
    END SUBROUTINE rd_amber_section_i1
 
 ! **************************************************************************************************
@@ -1096,26 +1247,30 @@ CONTAINS
       i = 1
       DO WHILE ((i <= dim) .AND. (.NOT. my_end))
          !array1
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array1(i))
          !array2
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array2(i))
          !array3
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array3(i))
          i = i + 1
       END DO
       ! Trigger end of file aborting
-      IF (my_end .AND. (i <= dim)) &
+      IF (my_end .AND. (i <= dim)) THEN
          CALL cp_abort(__LOCATION__, &
                        "End of file while reading section "//TRIM(section)//" in amber topology file!")
+      END IF
    END SUBROUTINE rd_amber_section_i3
 
 ! **************************************************************************************************
@@ -1143,31 +1298,36 @@ CONTAINS
       i = 1
       DO WHILE ((i <= dim) .AND. (.NOT. my_end))
          !array1
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array1(i))
          !array2
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array2(i))
          !array3
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array3(i))
          !array4
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array4(i))
          i = i + 1
       END DO
       ! Trigger end of file aborting
-      IF (my_end .AND. (i <= dim)) &
+      IF (my_end .AND. (i <= dim)) THEN
          CALL cp_abort(__LOCATION__, &
                        "End of file while reading section "//TRIM(section)//" in amber topology file!")
+      END IF
    END SUBROUTINE rd_amber_section_i4
 
 ! **************************************************************************************************
@@ -1197,36 +1357,42 @@ CONTAINS
       i = 1
       DO WHILE ((i <= dim) .AND. (.NOT. my_end))
          !array1
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array1(i))
          !array2
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array2(i))
          !array3
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array3(i))
          !array4
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array4(i))
          !array5
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array5(i))
          i = i + 1
       END DO
       ! Trigger end of file aborting
-      IF (my_end .AND. (i <= dim)) &
+      IF (my_end .AND. (i <= dim)) THEN
          CALL cp_abort(__LOCATION__, &
                        "End of file while reading section "//TRIM(section)//" in amber topology file!")
+      END IF
    END SUBROUTINE rd_amber_section_i5
 
 ! **************************************************************************************************
@@ -1250,16 +1416,18 @@ CONTAINS
       CALL parser_get_next_line(parser, 1, at_end=my_end)
       i = 1
       DO WHILE ((i <= dim) .AND. (.NOT. my_end))
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array1(i), lower_to_upper=.TRUE.)
          i = i + 1
       END DO
       ! Trigger end of file aborting
-      IF (my_end .AND. (i <= dim)) &
+      IF (my_end .AND. (i <= dim)) THEN
          CALL cp_abort(__LOCATION__, &
                        "End of file while reading section "//TRIM(section)//" in amber topology file!")
+      END IF
    END SUBROUTINE rd_amber_section_c1
 
 ! **************************************************************************************************
@@ -1283,16 +1451,18 @@ CONTAINS
       CALL parser_get_next_line(parser, 1, at_end=my_end)
       i = 1
       DO WHILE ((i <= dim) .AND. (.NOT. my_end))
-         IF (parser_test_next_token(parser) == "EOL") &
+         IF (parser_test_next_token(parser) == "EOL") THEN
             CALL parser_get_next_line(parser, 1, at_end=my_end)
+         END IF
          IF (my_end) EXIT
          CALL parser_get_object(parser, array1(i))
          i = i + 1
       END DO
       ! Trigger end of file aborting
-      IF (my_end .AND. (i <= dim)) &
+      IF (my_end .AND. (i <= dim)) THEN
          CALL cp_abort(__LOCATION__, &
                        "End of file while reading section "//TRIM(section)//" in amber topology file!")
+      END IF
    END SUBROUTINE rd_amber_section_r1
 
 ! **************************************************************************************************
@@ -1321,8 +1491,9 @@ CONTAINS
          section = TRIM(parser%input_line(indflag:))
          ! Input format
          CALL parser_get_next_line(parser, 1, at_end=my_end)
-         IF (INDEX(parser%input_line, "%FORMAT") == 0 .OR. my_end) &
+         IF (INDEX(parser%input_line, "%FORMAT") == 0 .OR. my_end) THEN
             CPABORT("Expecting %FORMAT. Not found! Abort reading of AMBER topology file!")
+         END IF
 
          start_f = INDEX(parser%input_line, "(")
          end_f = INDEX(parser%input_line, ")")
@@ -1346,10 +1517,11 @@ CONTAINS
       LOGICAL                                            :: found_AMBER_V8
 
       CALL parser_search_string(parser, "%VERSION ", .TRUE., found_AMBER_V8, begin_line=.TRUE.)
-      IF (.NOT. found_AMBER_V8) &
+      IF (.NOT. found_AMBER_V8) THEN
          CALL cp_abort(__LOCATION__, &
                        "This is not an AMBER V.8 PRMTOP format file. Cannot interpret older "// &
                        "AMBER file formats. ")
+      END IF
       IF (output_unit > 0) WRITE (output_unit, '(" AMBER_INFO| ",A)') "Amber PrmTop V.8 or greater.", &
          TRIM(parser%input_line)
 
@@ -1738,7 +1910,11 @@ CONTAINS
       eps(nsize) = my_eps
 
       DO i = 2, natom
-         IF (work_label(i) /= atom_label(nsize)) THEN
+         IF (work_label(i) == atom_label(nsize)) THEN
+            IF (iac(iwork(i)) /= iac(iwork(i - 1))) THEN
+               CPABORT("AMBER kind collision: "//TRIM(work_label(i)))
+            END IF
+         ELSE
             nsize = nsize + 1
             ! In case we need more space ... give it up...
             IF (nsize > SIZE(atom_label)) THEN

@@ -12,6 +12,7 @@
 !> \author Manuel Guidon
 ! **************************************************************************************************
 MODULE hfx_derivatives
+   USE r12_fundamentals, ONLY: r12_fundamentals_init
    USE admm_types, ONLY: admm_type
    USE atomic_kind_types, ONLY: atomic_kind_type, &
                                 get_atomic_kind_set
@@ -30,7 +31,7 @@ MODULE hfx_derivatives
    USE cp_dbcsr_api, ONLY: dbcsr_get_matrix_type, &
                            dbcsr_p_type, &
                            dbcsr_type_antisymmetric
-   USE gamma, ONLY: init_md_ftable
+   USE four_center_integral_methods, ONLY: forces4
    USE hfx_communication, ONLY: get_full_density
    USE hfx_compression_methods, ONLY: hfx_add_mult_cache_elements, &
                                       hfx_add_single_cache_element, &
@@ -39,29 +40,24 @@ MODULE hfx_derivatives
                                       hfx_get_mult_cache_elements, &
                                       hfx_get_single_cache_element, &
                                       hfx_reset_cache_and_container
-   USE hfx_libint_interface, ONLY: evaluate_deriv_eri
    USE hfx_load_balance_methods, ONLY: collect_load_balance_info, &
                                        hfx_load_balance, &
                                        hfx_update_load_balance
    USE hfx_pair_list_methods, ONLY: build_atomic_pair_list, &
-                                    build_pair_list, &
-                                    build_pair_list_pgf, &
-                                    build_pgf_product_list, &
-                                    pgf_product_list_size
+                                    build_pair_list
    USE hfx_screening_methods, ONLY: update_pmax_mat
    USE hfx_types, ONLY: &
       alloc_containers, dealloc_containers, hfx_basis_info_type, hfx_basis_type, hfx_cache_type, &
       hfx_cell_type, hfx_container_type, hfx_distribution, hfx_general_type, hfx_init_container, &
-      hfx_load_balance_type, hfx_memory_type, hfx_p_kind, hfx_pgf_list, hfx_pgf_product_list, &
+      hfx_load_balance_type, hfx_memory_type, hfx_p_kind, hfx_pgf_list, &
       hfx_potential_type, hfx_screen_coeff_type, hfx_screening_type, hfx_task_list_type, &
-      hfx_type, init_t_c_g0_lmax, log_zero, pair_list_type, pair_set_list_type
+      hfx_type, log_zero, pair_list_type, pair_set_list_type
    USE input_constants, ONLY: do_potential_mix_cl_trunc, &
                               do_potential_truncated, &
                               hfx_do_eval_forces
    USE input_section_types, ONLY: section_vals_type
    USE kinds, ONLY: dp, &
                     int_8
-   USE libint_wrapper, ONLY: cp_libint_t
    USE machine, ONLY: m_walltime
    USE mathconstants, ONLY: fac
    USE orbital_pointers, ONLY: nco, &
@@ -71,7 +67,6 @@ MODULE hfx_derivatives
    USE qs_environment_types, ONLY: get_qs_env, &
                                    qs_environment_type
    USE qs_force_types, ONLY: qs_force_type
-   USE t_c_g0, ONLY: init
    USE util, ONLY: sort
    USE virial_types, ONLY: virial_type
 
@@ -138,10 +133,9 @@ CONTAINS
                  jatom_start, jkind, jset, k, k_atom, katom, katom_block, katom_end, katom_start
       INTEGER :: kind_kind_idx, kkind, kset, l_atom, l_max, latom, latom_block, latom_end, &
                  latom_start, lkind, lset, max_am, max_pgf, max_set, my_bin_id, my_bin_size, my_thread_id, &
-                 n_threads, natom, nbits, ncob, ncos_max, nints, nkimages, nkind, nneighbors, nseta, &
-                 nsetb, nsgf_max, my_nspins, sgfb, shm_task_counter, shm_total_bins, sphi_a_u1, sphi_a_u2, &
-                 sphi_a_u3, sphi_b_u1, sphi_b_u2, sphi_b_u3, sphi_c_u1, sphi_c_u2, sphi_c_u3, sphi_d_u1, &
-                 sphi_d_u2, sphi_d_u3, swap_id, tmp_i4, unit_id
+                 n_threads, natom, nbits, ncob, ncos_max, nints, nkimages, nkind, nneighbors, nseta, nsetb, &
+                 nsgf_max, my_nspins, sgfb, shm_task_counter, shm_total_bins, &
+                 swap_id, tmp_i4
       INTEGER(int_8) :: atom_block, counter, estimate_to_store_int, max_val_memory, &
                         mem_compression_counter, mem_eris, mem_max_val, my_current_counter, my_istart, &
                         n_processes, nblocks, ncpu, neris_incore, neris_onthefly, neris_tmp, neris_total, &
@@ -153,7 +147,7 @@ CONTAINS
                                                             nimages, tmp_index
       INTEGER, DIMENSION(:), POINTER :: la_max, la_min, lb_max, lb_min, lc_max, lc_min, ld_max, &
                                         ld_min, npgfa, npgfb, npgfc, npgfd, nsgfa, nsgfb, nsgfc, nsgfd, shm_block_offset
-      INTEGER, DIMENSION(:, :), POINTER :: first_sgfb, nsgfl_a, nsgfl_b, nsgfl_c, nsgfl_d, &
+      INTEGER, DIMENSION(:, :), POINTER :: first_sgfb, &
                                            offset_ac_set, offset_ad_set, offset_bc_set, offset_bd_set, shm_atomic_block_offset
       INTEGER, DIMENSION(:, :), POINTER, SAVE            :: shm_is_assoc_atomic_block
       INTEGER, DIMENSION(:, :, :, :), POINTER            :: shm_set_offset
@@ -168,8 +162,8 @@ CONTAINS
                   my_adiabatic_rescale_factor, pmax_atom, pmax_blocks, pmax_entry, pmax_tmp, ra(3), rab2, &
                   rb(3), rc(3), rcd2, rd(3), spherical_estimate, spherical_estimate_virial, symm_fac, &
                   tmp_virial(3, 3)
-      REAL(dp), ALLOCATABLE, DIMENSION(:) :: ede_buffer1, ede_buffer2, ede_primitives_tmp, &
-                                             ede_primitives_tmp_virial, ede_work, ede_work2, ede_work2_virial, ede_work_forces, &
+      REAL(dp), ALLOCATABLE, DIMENSION(:) :: ede_buffer1, ede_buffer2, &
+                                             ede_work, ede_work2, ede_work2_virial, ede_work_forces, &
                                              ede_work_virial, pac_buf, pac_buf_beta, pac_buf_resp, pac_buf_resp_beta, pad_buf, &
                                              pad_buf_beta, pad_buf_resp, pad_buf_resp_beta, pbc_buf, pbc_buf_beta, pbc_buf_resp, &
                                              pbc_buf_resp_beta, pbd_buf, pbd_buf_beta, pbd_buf_resp, pbd_buf_resp_beta
@@ -179,15 +173,10 @@ CONTAINS
       REAL(dp), DIMENSION(:, :), POINTER :: full_density_alpha, full_density_beta, &
                                             max_contraction, ptr_p_1, ptr_p_2, ptr_p_3, ptr_p_4, shm_pmax_atom, shm_pmax_block, &
                                             sphi_b, zeta, zetb, zetc, zetd
-      REAL(dp), DIMENSION(:, :, :), POINTER              :: sphi_a_ext_set, sphi_b_ext_set, &
-                                                            sphi_c_ext_set, sphi_d_ext_set
-      REAL(dp), DIMENSION(:, :, :, :), POINTER           :: sphi_a_ext, sphi_b_ext, sphi_c_ext, &
-                                                            sphi_d_ext
       REAL(KIND=dp)                                      :: coeffs_kind_max0
       TYPE(admm_type), POINTER                           :: admm_env
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(cp_libint_t)                                  :: private_deriv
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(hfx_basis_info_type), POINTER                 :: basis_info
@@ -202,8 +191,6 @@ CONTAINS
       TYPE(hfx_memory_type), POINTER                     :: memory_parameter
       TYPE(hfx_p_kind), DIMENSION(:), POINTER            :: shm_initial_p
       TYPE(hfx_pgf_list), ALLOCATABLE, DIMENSION(:)      :: pgf_list_ij, pgf_list_kl
-      TYPE(hfx_pgf_product_list), ALLOCATABLE, &
-         DIMENSION(:)                                    :: pgf_product_list
       TYPE(hfx_potential_type)                           :: potential_parameter
       TYPE(hfx_screen_coeff_type), DIMENSION(:, :), &
          POINTER                                         :: screen_coeffs_kind, tmp_R_1, tmp_R_2, &
@@ -264,17 +251,7 @@ CONTAINS
          l_max = MAX(l_max, MAXVAL(my_x_data(1, 1)%basis_parameter(ikind)%lmax))
       END DO
       l_max = 4*l_max + 1
-      CALL init_md_ftable(l_max)
-
-      IF (my_x_data(1, 1)%potential_parameter%potential_type == do_potential_truncated .OR. &
-          my_x_data(1, 1)%potential_parameter%potential_type == do_potential_mix_cl_trunc) THEN
-         IF (l_max > init_t_c_g0_lmax) THEN
-            CALL open_file(unit_number=unit_id, file_name=my_x_data(1, 1)%potential_parameter%filename)
-            CALL init(l_max, unit_id, para_env%mepos, para_env)
-            CALL close_file(unit_id)
-            init_t_c_g0_lmax = l_max
-         END IF
-      END IF
+      CALL r12_fundamentals_init(l_max, my_x_data(1, 1)%potential_parameter, para_env)
 
       n_threads = 1
 !$    n_threads = omp_get_max_threads()
@@ -294,7 +271,7 @@ CONTAINS
          my_adiabatic_rescale_factor = adiabatic_rescale_factor
       END IF
 
-      !$OMP PARALLEL DEFAULT(OMP_DEFAULT_NONE_WITH_OOP) &
+      !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(qs_env,&
 !$OMP                                  rho_ao,&
 !$OMP                                  rho_ao_resp,&
@@ -327,7 +304,6 @@ CONTAINS
 !$OMP                                  screen_coeffs_set,&
 !$OMP                                  screen_coeffs_kind,&
 !$OMP                                  screen_coeffs_pgf,&
-!$OMP                                  pgf_product_list_size,&
 !$OMP                                  nkind,&
 !$OMP                                  is_anti_symmetric,&
 !$OMP                                  radii_pgf,&
@@ -349,7 +325,6 @@ CONTAINS
 !$OMP  buffer_start,cache_size,cartesian_estimate,cartesian_estimate_virial,&
 !$OMP  coeffs_kind_max0,compression_factor,counter,current_counter,&
 !$OMP  distribution_forces,do_dynamic_load_balancing,do_it,do_periodic,ede_buffer1,ede_buffer2,&
-!$OMP  ede_primitives_tmp,ede_primitives_tmp_virial,&
 !$OMP  ede_work,ede_work2,ede_work2_virial,ede_work_forces,ede_work_virial,eps_schwarz,eps_storage,estimate_to_store_int,&
 !$OMP  fac,first_sgfb,forces_map,general_parameter,handle_bin,handle_getp,handle_load,&
 !$OMP  handle_main,hf_fraction,i_atom,iatom_end,iatom_start,ikind,integral_caches,integral_containers,&
@@ -364,16 +339,15 @@ CONTAINS
 !$OMP  nbits,nblocks,ncob,ncos_max,ncpu,neris_incore,neris_onthefly,neris_tmp,&
 !$OMP  neris_total,nimages,nints,nneighbors,npgfa,npgfb,npgfc,npgfd,&
 !$OMP  nprim_ints,n_processes,nseta,nsetb,nsgfa,nsgfb,nsgfc,nsgfd,&
-!$OMP  nsgfl_a,nsgfl_b,nsgfl_c,nsgfl_d,nsgf_max,offset_ac_set,offset_ad_set,&
+!$OMP  nsgf_max,offset_ac_set,offset_ad_set,&
 !$OMP  offset_bc_set,offset_bd_set,pac_buf,pac_buf_beta,pac_buf_resp,pac_buf_resp_beta,pad_buf,pad_buf_beta,pad_buf_resp,&
 !$OMP  pad_buf_resp_beta,particle_set,pbc_buf,pbc_buf_beta,pbc_buf_resp,pbc_buf_resp_beta,pbd_buf,pbd_buf_beta, &
 !$OMP  pbd_buf_resp, pbd_buf_resp_beta, pgf_list_ij,&
-!$OMP  pgf_list_kl,pgf_product_list,pmax_atom,pmax_blocks,pmax_entry,pmax_tmp,potential_parameter,primitive_forces,&
-!$OMP  primitive_forces_virial,private_deriv,ptr_p_1,ptr_p_2,ptr_p_3,ptr_p_4,ra,rab2,&
+!$OMP  pgf_list_kl,pmax_atom,pmax_blocks,pmax_entry,pmax_tmp,potential_parameter,primitive_forces,&
+!$OMP  primitive_forces_virial,ptr_p_1,ptr_p_2,ptr_p_3,ptr_p_4,ra,rab2,&
 !$OMP  rb,rc,rcd2,rd,screening_parameter,screen_pmat_forces,set_list_ij,set_list_kl,&
-!$OMP  sgfb,spherical_estimate,spherical_estimate_virial,sphi_a_ext,sphi_a_ext_set,sphi_a_u1,sphi_a_u2,sphi_a_u3,&
-!$OMP  sphi_b,sphi_b_ext,sphi_b_ext_set,sphi_b_u1,sphi_b_u2,sphi_b_u3,sphi_c_ext,sphi_c_ext_set,&
-!$OMP  sphi_c_u1,sphi_c_u2,sphi_c_u3,sphi_d_ext,sphi_d_ext_set,sphi_d_u1,sphi_d_u2,sphi_d_u3,&
+!$OMP  sgfb,spherical_estimate,spherical_estimate_virial,&
+!$OMP  sphi_b,&
 !$OMP  storage_counter_integrals,stor_count_max_val,swap_id,symm_fac,t2,tmp_block,tmp_i8, tmp_i4,&
 !$OMP  tmp_index,tmp_r_1,tmp_r_2,tmp_screen_pgf1,tmp_screen_pgf2,tmp_task_list,tmp_task_list_cost,tmp_virial,&
 !$OMP  treat_forces_in_core,use_disk_storage,zeta,zetb,zetc,zetd)
@@ -436,9 +410,6 @@ CONTAINS
       eps_storage = eps_schwarz*memory_parameter%eps_storage_scaling
 
       counter = 0_int_8
-
-      !! Copy the libint_guy
-      private_deriv = actual_x_data%lib_deriv
 
       !! Get screening parameter
 
@@ -552,7 +523,7 @@ CONTAINS
                                  shm_pmax_atom, &
                                  full_density_alpha, full_density_beta, &
                                  natom, kind_of, basis_parameter, &
-                                 nkind, actual_x_data%is_assoc_atomic_block)
+                                 nkind, actual_x_data%is_assoc_atomic_block, my_nspins)
          END IF
       END IF
 
@@ -623,9 +594,6 @@ CONTAINS
       nneighbors = SIZE(actual_x_data%neighbor_cells)
       ALLOCATE (pgf_list_ij(max_pgf**2))
       ALLOCATE (pgf_list_kl(max_pgf**2))
-!$OMP     ATOMIC READ
-      tmp_i4 = pgf_product_list_size
-      ALLOCATE (pgf_product_list(tmp_i4))
       ALLOCATE (nimages(max_pgf**2))
 
       DO i = 1, max_pgf**2
@@ -661,14 +629,12 @@ CONTAINS
       ALLOCATE (ede_work_forces(ncos_max**4*12))
       ALLOCATE (ede_buffer1(ncos_max**4))
       ALLOCATE (ede_buffer2(ncos_max**4))
-      ALLOCATE (ede_primitives_tmp(nsgf_max**4))
 
       IF (use_virial) THEN
          ALLOCATE (primitive_forces_virial(12*nsgf_max**4*3))
          primitive_forces_virial = 0.0_dp
          ALLOCATE (ede_work_virial(ncos_max**4*12*3))
          ALLOCATE (ede_work2_virial(ncos_max**4*12*3))
-         ALLOCATE (ede_primitives_tmp_virial(nsgf_max**4))
          tmp_virial = 0.0_dp
       ELSE
          ! dummy allocation
@@ -676,7 +642,6 @@ CONTAINS
          primitive_forces_virial = 0.0_dp
          ALLOCATE (ede_work_virial(1))
          ALLOCATE (ede_work2_virial(1))
-         ALLOCATE (ede_primitives_tmp_virial(1))
       END IF
 
       !! Start caluclating integrals of the form (ab|cd) or (ij|kl)
@@ -972,11 +937,6 @@ CONTAINS
                nseta = basis_parameter(ikind)%nset
                zeta => basis_parameter(ikind)%zet
                nsgfa => basis_parameter(ikind)%nsgf
-               sphi_a_ext => basis_parameter(ikind)%sphi_ext(:, :, :, :)
-               nsgfl_a => basis_parameter(ikind)%nsgfl
-               sphi_a_u1 = UBOUND(sphi_a_ext, 1)
-               sphi_a_u2 = UBOUND(sphi_a_ext, 2)
-               sphi_a_u3 = UBOUND(sphi_a_ext, 3)
 
                lb_max => basis_parameter(jkind)%lmax
                lb_min => basis_parameter(jkind)%lmin
@@ -984,11 +944,6 @@ CONTAINS
                nsetb = basis_parameter(jkind)%nset
                zetb => basis_parameter(jkind)%zet
                nsgfb => basis_parameter(jkind)%nsgf
-               sphi_b_ext => basis_parameter(jkind)%sphi_ext(:, :, :, :)
-               nsgfl_b => basis_parameter(jkind)%nsgfl
-               sphi_b_u1 = UBOUND(sphi_b_ext, 1)
-               sphi_b_u2 = UBOUND(sphi_b_ext, 2)
-               sphi_b_u3 = UBOUND(sphi_b_ext, 3)
 
                i_atom = atom_of_kind(iatom)
                forces_map(1, 1) = ikind
@@ -1062,22 +1017,12 @@ CONTAINS
                   npgfc => basis_parameter(kkind)%npgf
                   zetc => basis_parameter(kkind)%zet
                   nsgfc => basis_parameter(kkind)%nsgf
-                  sphi_c_ext => basis_parameter(kkind)%sphi_ext(:, :, :, :)
-                  nsgfl_c => basis_parameter(kkind)%nsgfl
-                  sphi_c_u1 = UBOUND(sphi_c_ext, 1)
-                  sphi_c_u2 = UBOUND(sphi_c_ext, 2)
-                  sphi_c_u3 = UBOUND(sphi_c_ext, 3)
 
                   ld_max => basis_parameter(lkind)%lmax
                   ld_min => basis_parameter(lkind)%lmin
                   npgfd => basis_parameter(lkind)%npgf
                   zetd => basis_parameter(lkind)%zet
                   nsgfd => basis_parameter(lkind)%nsgf
-                  sphi_d_ext => basis_parameter(lkind)%sphi_ext(:, :, :, :)
-                  nsgfl_d => basis_parameter(lkind)%nsgfl
-                  sphi_d_u1 = UBOUND(sphi_d_ext, 1)
-                  sphi_d_u2 = UBOUND(sphi_d_ext, 2)
-                  sphi_d_u3 = UBOUND(sphi_d_ext, 3)
 
                   atomic_offset_bd = shm_atomic_block_offset(jatom, latom)
                   atomic_offset_bc = shm_atomic_block_offset(jatom, katom)
@@ -1213,8 +1158,6 @@ CONTAINS
                      !! Near field screening
                      IF (max_val1 + (screen_coeffs_kind(lkind, kkind)%x(1)*rcd2 + &
                                      screen_coeffs_kind(lkind, kkind)%x(2)) + pmax_atom < log10_eps_schwarz) CYCLE
-                     sphi_a_ext_set => sphi_a_ext(:, :, :, iset)
-                     sphi_b_ext_set => sphi_b_ext(:, :, :, jset)
 
                      DO i_set_list_kl = i_set_list_kl_start, i_set_list_kl_stop
                         kset = set_list_kl(i_set_list_kl)%pair(1)
@@ -1226,8 +1169,6 @@ CONTAINS
 
                         !! Near field screening
                         IF (max_val2 + pmax_atom < log10_eps_schwarz) CYCLE
-                        sphi_c_ext_set => sphi_c_ext(:, :, :, kset)
-                        sphi_d_ext_set => sphi_d_ext(:, :, :, lset)
 
                         IF (screen_pmat_forces) THEN
                            CALL get_pmax_val(ptr_p_1, ptr_p_2, ptr_p_3, ptr_p_4, &
@@ -1289,15 +1230,11 @@ CONTAINS
                            tmp_screen_pgf1 => screen_coeffs_pgf(:, :, jset, iset, jkind, ikind)
                            tmp_screen_pgf2 => screen_coeffs_pgf(:, :, lset, kset, lkind, kkind)
 
-                           CALL forces4(private_deriv, ra, rb, rc, rd, npgfa(iset), npgfb(jset), &
+                           CALL forces4(actual_x_data%eri4_context, ra, rb, rc, rd, npgfa(iset), npgfb(jset), &
                                         npgfc(kset), npgfd(lset), &
                                         la_min(iset), la_max(iset), lb_min(jset), lb_max(jset), &
                                         lc_min(kset), lc_max(kset), ld_min(lset), ld_max(lset), &
                                         nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                        sphi_a_u1, sphi_a_u2, sphi_a_u3, &
-                                        sphi_b_u1, sphi_b_u2, sphi_b_u3, &
-                                        sphi_c_u1, sphi_c_u2, sphi_c_u3, &
-                                        sphi_d_u1, sphi_d_u2, sphi_d_u3, &
                                         zeta(1:npgfa(iset), iset), zetb(1:npgfb(jset), jset), &
                                         zetc(1:npgfc(kset), kset), zetd(1:npgfd(lset), lset), &
                                         primitive_forces, &
@@ -1308,14 +1245,13 @@ CONTAINS
                                         max_contraction_val, cartesian_estimate, cell, neris_tmp, &
                                         log10_pmax, log10_eps_schwarz, &
                                         tmp_R_1, tmp_R_2, tmp_screen_pgf1, tmp_screen_pgf2, &
-                                        pgf_list_ij, pgf_list_kl, pgf_product_list, &
-                                        nsgfl_a(:, iset), nsgfl_b(:, jset), &
-                                        nsgfl_c(:, kset), nsgfl_d(:, lset), &
-                                        sphi_a_ext_set, sphi_b_ext_set, sphi_c_ext_set, sphi_d_ext_set, &
+                                        pgf_list_ij, pgf_list_kl, &
+                                        basis_parameter(ikind)%contraction(:, iset), basis_parameter(jkind)%contraction(:, jset), &
+                                        basis_parameter(kkind)%contraction(:, kset), basis_parameter(lkind)%contraction(:, lset), &
                                         ede_work, ede_work2, ede_work_forces, &
-                                        ede_buffer1, ede_buffer2, ede_primitives_tmp, &
+                                        ede_buffer1, ede_buffer2, &
                                         nimages, do_periodic, use_virial, ede_work_virial, ede_work2_virial, &
-                                        ede_primitives_tmp_virial, primitive_forces_virial, &
+                                        primitive_forces_virial, &
                                         cartesian_estimate_virial)
 
                            nints = nsgfa(iset)*nsgfb(jset)*nsgfc(kset)*nsgfd(lset)*12
@@ -1340,12 +1276,14 @@ CONTAINS
 
                            !! Compress the array for storage
                            spherical_estimate = 0.0_dp
-                           DO i = 1, nints
-                              spherical_estimate = MAX(spherical_estimate, ABS(primitive_forces(i)))
-                           END DO
+                           IF (cartesian_estimate /= 0.0_dp) THEN
+                              DO i = 1, nints
+                                 spherical_estimate = MAX(spherical_estimate, ABS(primitive_forces(i)))
+                              END DO
+                           END IF
 
                            spherical_estimate_virial = 0.0_dp
-                           IF (use_virial) THEN
+                           IF (use_virial .AND. cartesian_estimate_virial /= 0.0_dp) THEN
                               DO i = 1, 3*nints
                                  spherical_estimate_virial = MAX(spherical_estimate_virial, ABS(primitive_forces_virial(i)))
                               END DO
@@ -1386,7 +1324,7 @@ CONTAINS
                            ELSE
                               !! In order to be consistent with in-core part, round all the eris wrt. eps_schwarz
                               !! but only if we treat forces in-core
-                              IF (treat_forces_in_core) THEN
+                              IF (treat_forces_in_core .AND. cartesian_estimate /= 0.0_dp) THEN
                                  DO i = 1, nints
                                     primitive_forces(i) = primitive_forces(i)*pmax_entry
                                     IF (ABS(primitive_forces(i)) > eps_storage) THEN
@@ -1397,6 +1335,8 @@ CONTAINS
                                  END DO
                               END IF
                            END IF
+                           IF (cartesian_estimate == 0.0_dp .AND. &
+                               (.NOT. use_virial .OR. cartesian_estimate_virial == 0.0_dp)) CYCLE
                         END IF
                         IF (with_resp_density) THEN
                            CALL prefetch_density_matrix(nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
@@ -1721,15 +1661,14 @@ CONTAINS
 
       DEALLOCATE (pgf_list_ij)
       DEALLOCATE (pgf_list_kl)
-      DEALLOCATE (pgf_product_list)
 
       DEALLOCATE (set_list_ij, set_list_kl)
 
       DEALLOCATE (primitive_forces_virial)
 
-      DEALLOCATE (ede_work, ede_work2, ede_work_forces, ede_buffer1, ede_buffer2, ede_primitives_tmp)
+      DEALLOCATE (ede_work, ede_work2, ede_work_forces, ede_buffer1, ede_buffer2)
 
-      DEALLOCATE (ede_work_virial, ede_work2_virial, ede_primitives_tmp_virial)
+      DEALLOCATE (ede_work_virial, ede_work2_virial)
 
       DEALLOCATE (nimages)
 
@@ -1743,259 +1682,11 @@ CONTAINS
          END IF
       END IF
 
-      !
-      ! this wraps to free_libint, but currently causes a segfault
-      ! as a result, we don't call it, but some memory remains allocated
-      !
-      ! CALL terminate_libderiv(private_deriv)
-
 !$OMP END PARALLEL
 
       CALL timestop(handle)
 
    END SUBROUTINE derivatives_four_center
-
-! **************************************************************************************************
-!> \brief ...
-!> \param deriv ...
-!> \param ra ...
-!> \param rb ...
-!> \param rc ...
-!> \param rd ...
-!> \param npgfa ...
-!> \param npgfb ...
-!> \param npgfc ...
-!> \param npgfd ...
-!> \param la_min ...
-!> \param la_max ...
-!> \param lb_min ...
-!> \param lb_max ...
-!> \param lc_min ...
-!> \param lc_max ...
-!> \param ld_min ...
-!> \param ld_max ...
-!> \param nsgfa ...
-!> \param nsgfb ...
-!> \param nsgfc ...
-!> \param nsgfd ...
-!> \param sphi_a_u1 ...
-!> \param sphi_a_u2 ...
-!> \param sphi_a_u3 ...
-!> \param sphi_b_u1 ...
-!> \param sphi_b_u2 ...
-!> \param sphi_b_u3 ...
-!> \param sphi_c_u1 ...
-!> \param sphi_c_u2 ...
-!> \param sphi_c_u3 ...
-!> \param sphi_d_u1 ...
-!> \param sphi_d_u2 ...
-!> \param sphi_d_u3 ...
-!> \param zeta ...
-!> \param zetb ...
-!> \param zetc ...
-!> \param zetd ...
-!> \param primitive_integrals ...
-!> \param potential_parameter ...
-!> \param neighbor_cells ...
-!> \param screen1 ...
-!> \param screen2 ...
-!> \param eps_schwarz ...
-!> \param max_contraction_val ...
-!> \param cart_estimate ...
-!> \param cell ...
-!> \param neris_tmp ...
-!> \param log10_pmax ...
-!> \param log10_eps_schwarz ...
-!> \param R1_pgf ...
-!> \param R2_pgf ...
-!> \param pgf1 ...
-!> \param pgf2 ...
-!> \param pgf_list_ij ...
-!> \param pgf_list_kl ...
-!> \param pgf_product_list ...
-!> \param nsgfl_a ...
-!> \param nsgfl_b ...
-!> \param nsgfl_c ...
-!> \param nsgfl_d ...
-!> \param sphi_a_ext ...
-!> \param sphi_b_ext ...
-!> \param sphi_c_ext ...
-!> \param sphi_d_ext ...
-!> \param ede_work ...
-!> \param ede_work2 ...
-!> \param ede_work_forces ...
-!> \param ede_buffer1 ...
-!> \param ede_buffer2 ...
-!> \param ede_primitives_tmp ...
-!> \param nimages ...
-!> \param do_periodic ...
-!> \param use_virial ...
-!> \param ede_work_virial ...
-!> \param ede_work2_virial ...
-!> \param ede_primitives_tmp_virial ...
-!> \param primitive_integrals_virial ...
-!> \param cart_estimate_virial ...
-! **************************************************************************************************
-   SUBROUTINE forces4(deriv, ra, rb, rc, rd, npgfa, npgfb, npgfc, npgfd, &
-                      la_min, la_max, lb_min, lb_max, &
-                      lc_min, lc_max, ld_min, ld_max, nsgfa, nsgfb, nsgfc, nsgfd, &
-                      sphi_a_u1, sphi_a_u2, sphi_a_u3, &
-                      sphi_b_u1, sphi_b_u2, sphi_b_u3, &
-                      sphi_c_u1, sphi_c_u2, sphi_c_u3, &
-                      sphi_d_u1, sphi_d_u2, sphi_d_u3, &
-                      zeta, zetb, zetc, zetd, &
-                      primitive_integrals, &
-                      potential_parameter, neighbor_cells, &
-                      screen1, screen2, eps_schwarz, max_contraction_val, &
-                      cart_estimate, cell, neris_tmp, log10_pmax, &
-                      log10_eps_schwarz, R1_pgf, R2_pgf, pgf1, pgf2, &
-                      pgf_list_ij, pgf_list_kl, &
-                      pgf_product_list, &
-                      nsgfl_a, nsgfl_b, nsgfl_c, &
-                      nsgfl_d, &
-                      sphi_a_ext, sphi_b_ext, sphi_c_ext, sphi_d_ext, &
-                      ede_work, ede_work2, ede_work_forces, &
-                      ede_buffer1, ede_buffer2, ede_primitives_tmp, &
-                      nimages, do_periodic, use_virial, ede_work_virial, &
-                      ede_work2_virial, ede_primitives_tmp_virial, primitive_integrals_virial, &
-                      cart_estimate_virial)
-
-      TYPE(cp_libint_t)                                  :: deriv
-      REAL(dp), INTENT(IN)                               :: ra(3), rb(3), rc(3), rd(3)
-      INTEGER, INTENT(IN) :: npgfa, npgfb, npgfc, npgfd, la_min, la_max, lb_min, lb_max, lc_min, &
-                             lc_max, ld_min, ld_max, nsgfa, nsgfb, nsgfc, nsgfd, sphi_a_u1, sphi_a_u2, sphi_a_u3, &
-                             sphi_b_u1, sphi_b_u2, sphi_b_u3, sphi_c_u1, sphi_c_u2, sphi_c_u3, sphi_d_u1, sphi_d_u2, &
-                             sphi_d_u3
-      REAL(dp), DIMENSION(1:npgfa), INTENT(IN)           :: zeta
-      REAL(dp), DIMENSION(1:npgfb), INTENT(IN)           :: zetb
-      REAL(dp), DIMENSION(1:npgfc), INTENT(IN)           :: zetc
-      REAL(dp), DIMENSION(1:npgfd), INTENT(IN)           :: zetd
-      REAL(dp), &
-         DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 12)       :: primitive_integrals
-      TYPE(hfx_potential_type)                           :: potential_parameter
-      TYPE(hfx_cell_type), DIMENSION(:), POINTER         :: neighbor_cells
-      REAL(dp), INTENT(IN)                               :: screen1(2), screen2(2), eps_schwarz, &
-                                                            max_contraction_val
-      REAL(dp)                                           :: cart_estimate
-      TYPE(cell_type), POINTER                           :: cell
-      INTEGER(int_8)                                     :: neris_tmp
-      REAL(dp), INTENT(IN)                               :: log10_pmax, log10_eps_schwarz
-      TYPE(hfx_screen_coeff_type), DIMENSION(:, :), &
-         POINTER                                         :: R1_pgf, R2_pgf, pgf1, pgf2
-      TYPE(hfx_pgf_list), DIMENSION(*)                   :: pgf_list_ij, pgf_list_kl
-      TYPE(hfx_pgf_product_list), ALLOCATABLE, &
-         DIMENSION(:), INTENT(INOUT)                     :: pgf_product_list
-      INTEGER, DIMENSION(0:), INTENT(IN)                 :: nsgfl_a, nsgfl_b, nsgfl_c, nsgfl_d
-      REAL(dp), INTENT(IN) :: sphi_a_ext(sphi_a_u1, sphi_a_u2, sphi_a_u3), &
-                              sphi_b_ext(sphi_b_u1, sphi_b_u2, sphi_b_u3), sphi_c_ext(sphi_c_u1, sphi_c_u2, sphi_c_u3), &
-                              sphi_d_ext(sphi_d_u1, sphi_d_u2, sphi_d_u3)
-      REAL(dp), DIMENSION(*)                             :: ede_work, ede_work2, ede_work_forces, &
-                                                            ede_buffer1, ede_buffer2, &
-                                                            ede_primitives_tmp
-      INTEGER, DIMENSION(*)                              :: nimages
-      LOGICAL, INTENT(IN)                                :: do_periodic, use_virial
-      REAL(dp), DIMENSION(*)                             :: ede_work_virial, ede_work2_virial, &
-                                                            ede_primitives_tmp_virial
-      REAL(dp), &
-         DIMENSION(nsgfa, nsgfb, nsgfc, nsgfd, 12, 3)    :: primitive_integrals_virial
-      REAL(dp)                                           :: cart_estimate_virial
-
-      INTEGER :: ipgf, jpgf, kpgf, la, lb, lc, ld, list_ij, list_kl, lpgf, max_l, ncoa, ncob, &
-                 ncoc, ncod, nelements_ij, nelements_kl, nproducts, nsgfla, nsgflb, nsgflc, nsgfld, nsoa, &
-                 nsob, nsoc, nsod, s_offset_a, s_offset_b, s_offset_c, s_offset_d
-      REAL(dp)                                           :: EtaInv, tmp_max, tmp_max_virial, Zeta_A, &
-                                                            Zeta_B, Zeta_C, Zeta_D, ZetaInv
-
-      CALL build_pair_list_pgf(npgfa, npgfb, pgf_list_ij, zeta, zetb, screen1, screen2, &
-                               pgf1, R1_pgf, log10_pmax, log10_eps_schwarz, ra, rb, &
-                               nelements_ij, &
-                               neighbor_cells, nimages, do_periodic)
-      CALL build_pair_list_pgf(npgfc, npgfd, pgf_list_kl, zetc, zetd, screen2, screen1, &
-                               pgf2, R2_pgf, log10_pmax, log10_eps_schwarz, rc, rd, &
-                               nelements_kl, &
-                               neighbor_cells, nimages, do_periodic)
-
-      cart_estimate = 0.0_dp
-      primitive_integrals = 0.0_dp
-      IF (use_virial) THEN
-         primitive_integrals_virial = 0.0_dp
-         cart_estimate_virial = 0.0_dp
-      END IF
-      neris_tmp = 0_int_8
-      max_l = la_max + lb_max + lc_max + ld_max + 1
-      DO list_ij = 1, nelements_ij
-         Zeta_A = pgf_list_ij(list_ij)%zeta
-         Zeta_B = pgf_list_ij(list_ij)%zetb
-         ZetaInv = pgf_list_ij(list_ij)%ZetaInv
-         ipgf = pgf_list_ij(list_ij)%ipgf
-         jpgf = pgf_list_ij(list_ij)%jpgf
-
-         DO list_kl = 1, nelements_kl
-            Zeta_C = pgf_list_kl(list_kl)%zeta
-            Zeta_D = pgf_list_kl(list_kl)%zetb
-            EtaInv = pgf_list_kl(list_kl)%ZetaInv
-            kpgf = pgf_list_kl(list_kl)%ipgf
-            lpgf = pgf_list_kl(list_kl)%jpgf
-
-            CALL build_pgf_product_list(pgf_list_ij(list_ij), pgf_list_kl(list_kl), pgf_product_list, &
-                                        nproducts, log10_pmax, log10_eps_schwarz, neighbor_cells, cell, &
-                                        potential_parameter, max_l, do_periodic)
-            s_offset_a = 0
-            DO la = la_min, la_max
-               s_offset_b = 0
-               ncoa = nco(la)
-               nsgfla = nsgfl_a(la)
-               nsoa = nso(la)
-
-               DO lb = lb_min, lb_max
-                  s_offset_c = 0
-                  ncob = nco(lb)
-                  nsgflb = nsgfl_b(lb)
-                  nsob = nso(lb)
-
-                  DO lc = lc_min, lc_max
-                     s_offset_d = 0
-                     ncoc = nco(lc)
-                     nsgflc = nsgfl_c(lc)
-                     nsoc = nso(lc)
-
-                     DO ld = ld_min, ld_max
-                        ncod = nco(ld)
-                        nsgfld = nsgfl_d(ld)
-                        nsod = nso(ld)
-                        tmp_max = 0.0_dp
-                        tmp_max_virial = 0.0_dp
-                        CALL evaluate_deriv_eri(deriv, nproducts, pgf_product_list, &
-                                                la, lb, lc, ld, &
-                                                ncoa, ncob, ncoc, ncod, &
-                                                nsgfa, nsgfb, nsgfc, nsgfd, &
-                                                primitive_integrals, &
-                                                max_contraction_val, tmp_max, eps_schwarz, neris_tmp, &
-                                                Zeta_A, Zeta_B, Zeta_C, Zeta_D, ZetaInv, EtaInv, &
-                                                s_offset_a, s_offset_b, s_offset_c, s_offset_d, &
-                                                nsgfla, nsgflb, nsgflc, nsgfld, nsoa, nsob, nsoc, nsod, &
-                                                sphi_a_ext(1, la + 1, ipgf), &
-                                                sphi_b_ext(1, lb + 1, jpgf), &
-                                                sphi_c_ext(1, lc + 1, kpgf), &
-                                                sphi_d_ext(1, ld + 1, lpgf), &
-                                                ede_work, ede_work2, ede_work_forces, &
-                                                ede_buffer1, ede_buffer2, ede_primitives_tmp, use_virial, &
-                                                ede_work_virial, ede_work2_virial, ede_primitives_tmp_virial, &
-                                                primitive_integrals_virial, cell, tmp_max_virial)
-                        cart_estimate = MAX(tmp_max, cart_estimate)
-                        IF (use_virial) cart_estimate_virial = MAX(tmp_max_virial, cart_estimate_virial)
-                        s_offset_d = s_offset_d + nsod*nsgfld
-                     END DO !ld
-                     s_offset_c = s_offset_c + nsoc*nsgflc
-                  END DO !lc
-                  s_offset_b = s_offset_b + nsob*nsgflb
-               END DO !lb
-               s_offset_a = s_offset_a + nsoa*nsgfla
-            END DO !la
-         END DO
-      END DO
-
-   END SUBROUTINE forces4
 
 ! **************************************************************************************************
 !> \brief Given a 2d index pair, this function returns a 1d index pair for

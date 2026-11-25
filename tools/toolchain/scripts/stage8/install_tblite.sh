@@ -6,10 +6,8 @@
 [ "${BASH_SOURCE[0]}" ] && SCRIPT_NAME="${BASH_SOURCE[0]}" || SCRIPT_NAME=$0
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_NAME")/.." && pwd -P)"
 
-tblite_ver="0.6.0"
-tblite_sha256="372281aedb89234168d00eb691addb303197a9462a9c55d145c835f2cf5e8b42"
-tblite_sdftd3_ver="1.4.0"
-tblite_dftd4_ver="4.2.0"
+tblite_ver="0.8.0"
+tblite_sha256="2d00fd612b3fcbb69365de53577080457ceae221cd151be52e7a9977b4832ad3"
 
 source "${SCRIPT_DIR}"/common_vars.sh
 source "${SCRIPT_DIR}"/tool_kit.sh
@@ -36,25 +34,15 @@ case "$with_tblite" in
       [ -d tblite-${tblite_ver} ] && rm -rf tblite-${tblite_ver}
       tar -xJf tblite-${tblite_ver}.tar.xz
       cd tblite-${tblite_ver}
-
-      patch -l -d subprojects/s-dftd3 -p1 < "${SCRIPT_DIR}/stage8/simple-dftd3-${tblite_sdftd3_ver}-gradient-fixes.patch" \
-        > simple_dftd3_gradient_fixes.patch.log 2>&1 || tail_excerpt simple_dftd3_gradient_fixes.patch.log
-      patch -l -d subprojects/dftd4 -p1 < "${SCRIPT_DIR}/stage8/dftd4-${tblite_dftd4_ver}-gradient-fixes.patch" \
-        > dftd4_gradient_fixes.patch.log 2>&1 || tail_excerpt dftd4_gradient_fixes.patch.log
-
-      mkdir -p build && cd build
-      cmake \
+      cmake -B build \
         -DCMAKE_INSTALL_PREFIX="${pkg_install_dir}" \
         -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_VERBOSE_MAKEFILE=ON \
         -DBUILD_TESTING=OFF \
         -DWITH_TESTS=OFF \
-        .. \
         > cmake.log 2>&1 || tail_excerpt cmake.log
-      make install -j $(get_nprocs) > make.log 2>&1 || tail_excerpt make.log
-      write_checksums "${install_lock_file}" "${SCRIPT_DIR}/stage8/$(basename ${SCRIPT_NAME})" \
-        "${SCRIPT_DIR}/stage8/simple-dftd3-${tblite_sdftd3_ver}-gradient-fixes.patch" \
-        "${SCRIPT_DIR}/stage8/dftd4-${tblite_dftd4_ver}-gradient-fixes.patch"
+      cmake --build build -t install -j $(get_nprocs) > build.log 2>&1 || tail_excerpt build.log
+      write_checksums "${install_lock_file}" "${SCRIPT_DIR}/stage8/$(basename ${SCRIPT_NAME})"
       cd ..
     fi
     ;;

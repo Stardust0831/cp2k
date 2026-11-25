@@ -30,6 +30,7 @@ MODULE input_cp2k_negf
                                               section_release,&
                                               section_type
    USE input_val_types,                 ONLY: char_t,&
+                                              enum_t,&
                                               integer_t,&
                                               real_t
    USE kinds,                           ONLY: dp
@@ -222,23 +223,28 @@ CONTAINS
       CALL section_add_subsection(subsection, print_key)
       CALL section_release(print_key)
 
-      CALL create_print_dos_section(print_key, "TRANSMISSION", "the transmission coefficient")
+      CALL create_print_dos_section(print_key, "TRANSMISSION", "the transmission function")
       CALL section_add_subsection(subsection, print_key)
       CALL section_release(print_key)
 
+      CALL keyword_create(keyword, __LOCATION__, name="ENERGY_UNIT", &
+                          description="Energy unit used for the printed Transmission/DOS energy axis. "// &
+                          "Density of states (DOS) values are converted consistently to the selected energy unit.", &
+                          usage="ENERGY_UNIT HARTREE", type_of_var=enum_t, &
+                          enum_c_vals=s2a("HARTREE", "EV"), &
+                          enum_i_vals=[1, 2], &
+                          enum_desc=s2a("Print energies in Hartree (a.u.).", &
+                                        "Print energies in electronvolt (eV)."), &
+                          default_i_val=2)
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+
       ! RESTART subsection
       CALL cp_print_key_section_create(print_key, __LOCATION__, "RESTART", &
-                                       description="Controls the dumping of the restart files during NEGF SCF."// &
-                                       " By default keeps a short history of three restarts.", &
+                                       description="Controls the dumping of the restart files during NEGF SCF.", &
                                        print_level=low_print_level, common_iter_levels=3, &
                                        each_iter_names=s2a("NEGF_SCF"), each_iter_values=[1], &
-                                       add_last=add_last_numeric, filename="RESTART")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=3)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       add_last=add_last_numeric, filename="RESTART", do_backup=.TRUE.)
       CALL section_add_subsection(subsection, print_key)
       CALL section_release(print_key)
 

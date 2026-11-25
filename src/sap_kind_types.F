@@ -11,27 +11,30 @@
 ! **************************************************************************************************
 MODULE sap_kind_types
 
-   USE ai_moments,                      ONLY: moment
-   USE ai_overlap,                      ONLY: overlap
-   USE basis_set_types,                 ONLY: gto_basis_set_p_type,&
-                                              gto_basis_set_type
-   USE cell_types,                      ONLY: cell_type,&
-                                              pbc
-   USE external_potential_types,        ONLY: gth_potential_p_type,&
-                                              gth_potential_type,&
-                                              sgp_potential_p_type,&
-                                              sgp_potential_type
-   USE kinds,                           ONLY: dp
-   USE orbital_pointers,                ONLY: init_orbital_pointers,&
-                                              nco,&
-                                              ncoset
-   USE particle_types,                  ONLY: particle_type
-   USE qs_kind_types,                   ONLY: get_qs_kind,&
-                                              get_qs_kind_set,&
-                                              qs_kind_type
-   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
-   USE util,                            ONLY: locate,&
-                                              sort
+   USE ai_moments, ONLY: moment
+   USE ai_overlap, ONLY: overlap
+   USE basis_set_types, ONLY: gto_basis_set_p_type, &
+                              gto_basis_set_type
+   USE cell_types, ONLY: cell_type, &
+                         pbc
+   USE external_potential_types, ONLY: gth_potential_p_type, &
+                                       gth_potential_type, &
+                                       sgp_potential_p_type, &
+                                       sgp_potential_type
+   USE kinds, ONLY: dp
+   USE orbital_pointers, ONLY: init_orbital_pointers, &
+                               nco, &
+                               ncoset
+   USE particle_types, ONLY: particle_type
+   USE qs_kind_types, ONLY: get_qs_kind, &
+                            get_qs_kind_set, &
+                            qs_kind_type
+   USE qs_neighbor_list_types, ONLY: neighbor_list_set_p_type
+   USE upf_projector_integrals, ONLY: upf_projector_init, &
+                                      upf_projector_overlap, &
+                                      upf_projector_type
+   USE util, ONLY: locate, &
+                   sort
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -40,122 +43,139 @@ MODULE sap_kind_types
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'sap_kind_types'
 
-   TYPE clist_type
-      INTEGER                                    :: catom = -1
-      INTEGER                                    :: nsgf_cnt = -1
-      INTEGER, DIMENSION(:), POINTER             :: sgf_list => NULL()
-      INTEGER, DIMENSION(3)                      :: cell = -1
-      LOGICAL                                    :: sgf_soft_only = .FALSE.
-      REAL(KIND=dp)                              :: maxac = 0.0_dp
-      REAL(KIND=dp)                              :: maxach = 0.0_dp
-      REAL(KIND=dp), DIMENSION(3)                :: rac = 0.0_dp
-      REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: acint => NULL()
-      REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: achint => NULL()
-      REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: alint => NULL()
-      REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: alkint => NULL()
-   END TYPE clist_type
+   #:for type_suffix, integral_type in [('', 'REAL'), ('_complex', 'COMPLEX')]
+      TYPE clist${type_suffix}$_type
+         INTEGER                                    :: catom = -1
+         INTEGER                                    :: nsgf_cnt = -1
+         INTEGER, DIMENSION(:), POINTER             :: sgf_list => NULL()
+         INTEGER, DIMENSION(3)                      :: cell = -1
+         LOGICAL                                    :: sgf_soft_only = .FALSE.
+         REAL(KIND=dp)                              :: maxac = 0.0_dp
+         REAL(KIND=dp)                              :: maxach = 0.0_dp
+         REAL(KIND=dp), DIMENSION(3)                :: rac = 0.0_dp
+         ${integral_type}$ (KIND=dp), DIMENSION(:, :, :), POINTER :: acint => NULL()
+         ${integral_type}$ (KIND=dp), DIMENSION(:, :, :), POINTER :: achint => NULL()
+         ${integral_type}$ (KIND=dp), DIMENSION(:, :, :), POINTER :: alint => NULL()
+         ${integral_type}$ (KIND=dp), DIMENSION(:, :, :), POINTER :: alkint => NULL()
+      END TYPE clist${type_suffix}$_type
 
-   TYPE alist_type
-      INTEGER                                    :: aatom = -1
-      INTEGER                                    :: nclist = -1
-      TYPE(clist_type), DIMENSION(:), POINTER    :: clist => NULL()
-   END TYPE alist_type
+      TYPE alist${type_suffix}$_type
+         INTEGER                                    :: aatom = -1
+         INTEGER                                    :: nclist = -1
+         TYPE(clist${type_suffix}$_type), DIMENSION(:), POINTER    :: clist => NULL()
+      END TYPE alist${type_suffix}$_type
 
-   TYPE sap_int_type
-      INTEGER                                    :: a_kind = -1
-      INTEGER                                    :: p_kind = -1
-      INTEGER                                    :: nalist = -1
-      TYPE(alist_type), DIMENSION(:), POINTER    :: alist => NULL()
-      INTEGER, DIMENSION(:), POINTER             :: asort => NULL()
-      INTEGER, DIMENSION(:), POINTER             :: aindex => NULL()
-   END TYPE sap_int_type
+      TYPE sap_int${type_suffix}$_type
+         INTEGER                                    :: a_kind = -1
+         INTEGER                                    :: p_kind = -1
+         INTEGER                                    :: nalist = -1
+         TYPE(alist${type_suffix}$_type), DIMENSION(:), POINTER    :: alist => NULL()
+         INTEGER, DIMENSION(:), POINTER             :: asort => NULL()
+         INTEGER, DIMENSION(:), POINTER             :: aindex => NULL()
+      END TYPE sap_int${type_suffix}$_type
+   #:endfor
 
    PUBLIC :: sap_int_type, clist_type, alist_type, &
+             sap_int_complex_type, clist_complex_type, alist_complex_type, &
              release_sap_int, get_alist, alist_pre_align_blk, &
              alist_post_align_blk, sap_sort, build_sap_ints
+
+   INTERFACE release_sap_int
+      MODULE PROCEDURE release_sap_int_real, release_sap_int_complex
+   END INTERFACE release_sap_int
+   INTERFACE get_alist
+      MODULE PROCEDURE get_alist_real, get_alist_complex
+   END INTERFACE get_alist
+   INTERFACE sap_sort
+      MODULE PROCEDURE sap_sort_real, sap_sort_complex
+   END INTERFACE sap_sort
 
 CONTAINS
 
 !==========================================================================================================
 
+   #:for type_suffix, suffix in [('', 'real'), ('_complex', 'complex')]
 ! **************************************************************************************************
 !> \brief ...
 !> \param sap_int ...
 ! **************************************************************************************************
-   SUBROUTINE release_sap_int(sap_int)
+      SUBROUTINE release_sap_int_${suffix}$ (sap_int)
 
-      TYPE(sap_int_type), DIMENSION(:), POINTER          :: sap_int
+         TYPE(sap_int${type_suffix}$_type), DIMENSION(:), POINTER          :: sap_int
 
-      INTEGER                                            :: i, j, k
-      TYPE(clist_type), POINTER                          :: clist
+         INTEGER                                            :: i, j, k
+         TYPE(clist${type_suffix}$_type), POINTER                          :: clist
 
-      CPASSERT(ASSOCIATED(sap_int))
+         CPASSERT(ASSOCIATED(sap_int))
 
-      DO i = 1, SIZE(sap_int)
-         IF (ASSOCIATED(sap_int(i)%alist)) THEN
-            DO j = 1, SIZE(sap_int(i)%alist)
-               IF (ASSOCIATED(sap_int(i)%alist(j)%clist)) THEN
-                  DO k = 1, SIZE(sap_int(i)%alist(j)%clist)
-                     clist => sap_int(i)%alist(j)%clist(k)
-                     IF (ASSOCIATED(clist%acint)) THEN
-                        DEALLOCATE (clist%acint)
-                     END IF
-                     IF (ASSOCIATED(clist%sgf_list)) THEN
-                        DEALLOCATE (clist%sgf_list)
-                     END IF
-                     IF (ASSOCIATED(clist%achint)) THEN
-                        DEALLOCATE (clist%achint)
-                     END IF
-                     IF (ASSOCIATED(clist%alint)) THEN
-                        DEALLOCATE (clist%alint)
-                     END IF
-                     IF (ASSOCIATED(clist%alkint)) THEN
-                        DEALLOCATE (clist%alkint)
-                     END IF
-                  END DO
-                  DEALLOCATE (sap_int(i)%alist(j)%clist)
-               END IF
-            END DO
-            DEALLOCATE (sap_int(i)%alist)
-         END IF
-         IF (ASSOCIATED(sap_int(i)%asort)) THEN
-            DEALLOCATE (sap_int(i)%asort)
-         END IF
-         IF (ASSOCIATED(sap_int(i)%aindex)) THEN
-            DEALLOCATE (sap_int(i)%aindex)
-         END IF
-      END DO
+         DO i = 1, SIZE(sap_int)
+            IF (ASSOCIATED(sap_int(i)%alist)) THEN
+               DO j = 1, SIZE(sap_int(i)%alist)
+                  IF (ASSOCIATED(sap_int(i)%alist(j)%clist)) THEN
+                     DO k = 1, SIZE(sap_int(i)%alist(j)%clist)
+                        clist => sap_int(i)%alist(j)%clist(k)
+                        IF (ASSOCIATED(clist%acint)) THEN
+                           DEALLOCATE (clist%acint)
+                        END IF
+                        IF (ASSOCIATED(clist%sgf_list)) THEN
+                           DEALLOCATE (clist%sgf_list)
+                        END IF
+                        IF (ASSOCIATED(clist%achint)) THEN
+                           DEALLOCATE (clist%achint)
+                        END IF
+                        IF (ASSOCIATED(clist%alint)) THEN
+                           DEALLOCATE (clist%alint)
+                        END IF
+                        IF (ASSOCIATED(clist%alkint)) THEN
+                           DEALLOCATE (clist%alkint)
+                        END IF
+                     END DO
+                     DEALLOCATE (sap_int(i)%alist(j)%clist)
+                  END IF
+               END DO
+               DEALLOCATE (sap_int(i)%alist)
+            END IF
+            IF (ASSOCIATED(sap_int(i)%asort)) THEN
+               DEALLOCATE (sap_int(i)%asort)
+            END IF
+            IF (ASSOCIATED(sap_int(i)%aindex)) THEN
+               DEALLOCATE (sap_int(i)%aindex)
+            END IF
+         END DO
 
-      DEALLOCATE (sap_int)
+         DEALLOCATE (sap_int)
 
-   END SUBROUTINE release_sap_int
+      END SUBROUTINE release_sap_int_${suffix}$
+   #:endfor
 
+   #:for type_suffix, suffix in [('', 'real'), ('_complex', 'complex')]
 ! **************************************************************************************************
 !> \brief ...
 !> \param sap_int ...
 !> \param alist ...
 !> \param atom ...
 ! **************************************************************************************************
-   SUBROUTINE get_alist(sap_int, alist, atom)
+      SUBROUTINE get_alist_${suffix}$ (sap_int, alist, atom)
 
-      TYPE(sap_int_type), INTENT(IN)                     :: sap_int
-      TYPE(alist_type), INTENT(OUT), POINTER             :: alist
-      INTEGER, INTENT(IN)                                :: atom
+         TYPE(sap_int${type_suffix}$_type), INTENT(IN)                     :: sap_int
+         TYPE(alist${type_suffix}$_type), INTENT(OUT), POINTER             :: alist
+         INTEGER, INTENT(IN)                                :: atom
 
-      INTEGER                                            :: i
+         INTEGER                                            :: i
 
-      NULLIFY (alist)
-      i = locate(sap_int%asort, atom)
-      IF (i > 0 .AND. i <= SIZE(sap_int%alist)) THEN
-         i = sap_int%aindex(i)
-         alist => sap_int%alist(i)
-      ELSE IF (i == 0) THEN
          NULLIFY (alist)
-      ELSE
-         CPABORT("Invalid result of locate(sap_int%asort, atom)")
-      END IF
+         i = locate(sap_int%asort, atom)
+         IF (i > 0 .AND. i <= SIZE(sap_int%alist)) THEN
+            i = sap_int%aindex(i)
+            alist => sap_int%alist(i)
+         ELSE IF (i == 0) THEN
+            NULLIFY (alist)
+         ELSE
+            CPABORT("Invalid result of locate(sap_int%asort, atom)")
+         END IF
 
-   END SUBROUTINE get_alist
+      END SUBROUTINE get_alist_${suffix}$
+   #:endfor
 
 ! **************************************************************************************************
 !> \brief ...
@@ -239,29 +259,31 @@ CONTAINS
       END DO
    END SUBROUTINE alist_post_align_blk
 
+   #:for type_suffix, suffix in [('', 'real'), ('_complex', 'complex')]
 ! **************************************************************************************************
 !> \brief ...
 !> \param sap_int ...
 ! **************************************************************************************************
-   SUBROUTINE sap_sort(sap_int)
-      TYPE(sap_int_type), DIMENSION(:), POINTER          :: sap_int
+      SUBROUTINE sap_sort_${suffix}$ (sap_int)
+         TYPE(sap_int${type_suffix}$_type), DIMENSION(:), POINTER          :: sap_int
 
-      INTEGER                                            :: iac, na
+         INTEGER                                            :: iac, na
 
 ! *** Set up a sorting index
 
 !$OMP PARALLEL DEFAULT(NONE) SHARED(sap_int) PRIVATE(iac,na)
 !$OMP DO
-      DO iac = 1, SIZE(sap_int)
-         IF (.NOT. ASSOCIATED(sap_int(iac)%alist)) CYCLE
-         na = SIZE(sap_int(iac)%alist)
-         ALLOCATE (sap_int(iac)%asort(na), sap_int(iac)%aindex(na))
-         sap_int(iac)%asort(1:na) = sap_int(iac)%alist(1:na)%aatom
-         CALL sort(sap_int(iac)%asort, na, sap_int(iac)%aindex)
-      END DO
+         DO iac = 1, SIZE(sap_int)
+            IF (.NOT. ASSOCIATED(sap_int(iac)%alist)) CYCLE
+            na = SIZE(sap_int(iac)%alist)
+            ALLOCATE (sap_int(iac)%asort(na), sap_int(iac)%aindex(na))
+            sap_int(iac)%asort(1:na) = sap_int(iac)%alist(1:na)%aatom
+            CALL sort(sap_int(iac)%asort, na, sap_int(iac)%aindex)
+         END DO
 !$OMP END PARALLEL
 
-   END SUBROUTINE sap_sort
+      END SUBROUTINE sap_sort_${suffix}$
+   #:endfor
 
 !==========================================================================================================
 
@@ -296,21 +318,22 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'build_sap_ints'
 
       INTEGER :: first_col, handle, i, iac, iatom, ikind, ilist, iset, j, jneighbor, katom, kkind, &
-         l, lc_max, lc_min, ldai, ldai_nl, ldsab, lppnl, maxco, maxder, maxl, maxlgto, maxlppnl, &
-         maxppnl, maxsgf, na, nb, ncoa, ncoc, nkind, nlist, nneighbor, nnl, np, nppnl, nprjc, &
-         nseta, nsgfa, prjc, sgfa, slot
+                 l, lc_max, lc_min, ldai, ldai_nl, ldsab, lppnl, maxco, maxder, maxl, maxlgto, maxlppnl, &
+                 maxppnl, maxsgf, na, nb, ncoa, ncoc, nkind, nlist, nneighbor, nnl, np, nppnl, nprjc, &
+                 nseta, nsgfa, prjc, sgfa, slot
       INTEGER, DIMENSION(3)                              :: cell_c
       INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, npgfa, nprj_ppnl, &
                                                             nsgf_seta
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa
-      LOGICAL                                            :: dogth, my_momentmode, my_ref
+      LOGICAL                                            :: do_upf, dogth, my_momentmode, my_ref
       LOGICAL, DIMENSION(0:9)                            :: is_nonlocal
       REAL(KIND=dp)                                      :: dac, ppnl_radius
+      REAL(KIND=dp), ALLOCATABLE                         :: upf_int(:, :, :)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: radp
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: sab, work
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: ai_work
       REAL(KIND=dp), DIMENSION(1)                        :: rprjc, zetc
-      REAL(KIND=dp), DIMENSION(3)                        :: ra, rac, raf, rc, rcf, rf
+      REAL(KIND=dp), DIMENSION(3)                        :: rac, raf, rcf, rf
       REAL(KIND=dp), DIMENSION(:), POINTER               :: a_nl, alpha_ppnl, hprj, set_radius_a
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: cprj, h_nl, rpgfa, sphi_a, vprj_ppnl, &
                                                             zeta
@@ -323,6 +346,7 @@ CONTAINS
       TYPE(gto_basis_set_type), POINTER                  :: orb_basis_set
       TYPE(sgp_potential_p_type), DIMENSION(:), POINTER  :: spotential
       TYPE(sgp_potential_type), POINTER                  :: sgp_potential
+      TYPE(upf_projector_type), POINTER                  :: upf
 
       CALL timeset(routineN, handle)
 
@@ -337,7 +361,8 @@ CONTAINS
 
       my_ref = .FALSE.
       IF (PRESENT(refpoint)) THEN
-         CPASSERT((PRESENT(cell) .AND. PRESENT(particle_set))) ! need these as well if refpoint is provided
+         ! A reference point also requires the cell and particle coordinates.
+         CPASSERT((PRESENT(cell) .AND. PRESENT(particle_set)))
          rf = refpoint
          my_ref = .TRUE.
       END IF
@@ -378,6 +403,13 @@ CONTAINS
             ldai_nl = MAX(ldai_nl, ncoset(gth_potential%lprj_ppnl_max))
          ELSE IF (ASSOCIATED(sgp_potential)) THEN
             spotential(ikind)%sgp_potential => sgp_potential
+            IF (ALLOCATED(sgp_potential%upf_data)) THEN
+               IF (sgp_potential%upf_data%number_of_proj > 0) THEN
+                  IF (sgp_potential%upf_projectors%degree < maxlgto + nder) THEN
+                     CALL upf_projector_init(sgp_potential%upf_data, maxlgto + nder, sgp_potential%upf_projectors)
+                  END IF
+               END IF
+            END IF
             ldai_nl = MAX(ldai_nl, sgp_potential%n_nonlocal*ncoset(sgp_potential%lmax))
          END IF
       END DO
@@ -426,10 +458,11 @@ CONTAINS
 !$OMP PRIVATE (ikind, kkind, iatom, katom, nlist, ilist, nneighbor, jneighbor, &
 !$OMP          cell_c, rac, iac, first_sgfa, la_max, la_min, npgfa, nseta, nsgfa, nsgf_seta, &
 !$OMP          slot, sphi_a, zeta, cprj, hprj, lppnl, nppnl, nprj_ppnl, &
+!$OMP          do_upf, upf, upf_int, &
 !$OMP          clist, iset, ncoa, sgfa, prjc, work, sab, ai_work, nprjc,  ppnl_radius, &
 !$OMP          ncoc, rpgfa, first_col, vprj_ppnl, i, j, l, dogth, &
 !$OMP          set_radius_a, rprjc, dac, lc_max, lc_min, zetc, alpha_ppnl, &
-!$OMP          na, nb, np, nnl, is_nonlocal, a_nl, h_nl, c_nl, radp, raf, rcf, ra, rc)
+!$OMP          na, nb, np, nnl, is_nonlocal, a_nl, h_nl, c_nl, radp, raf, rcf)
 
       ! allocate work storage
       ALLOCATE (sab(ldsab, ldsab*maxder), work(ldsab, ldsab*maxder))
@@ -470,6 +503,7 @@ CONTAINS
          sphi_a => basis_set(ikind)%gto_basis_set%sphi
          zeta => basis_set(ikind)%gto_basis_set%zet
          ! get definition of PP projectors
+         do_upf = .FALSE.
          IF (ASSOCIATED(gpotential(kkind)%gth_potential)) THEN
             ! GTH potential
             dogth = .TRUE.
@@ -485,32 +519,36 @@ CONTAINS
             dogth = .FALSE.
             nprjc = spotential(kkind)%sgp_potential%nppnl
             IF (nprjc == 0) CYCLE
-            nnl = spotential(kkind)%sgp_potential%n_nonlocal
-            lppnl = spotential(kkind)%sgp_potential%lmax
-            is_nonlocal = .FALSE.
-            is_nonlocal(0:lppnl) = spotential(kkind)%sgp_potential%is_nonlocal(0:lppnl)
-            a_nl => spotential(kkind)%sgp_potential%a_nonlocal
-            h_nl => spotential(kkind)%sgp_potential%h_nonlocal
-            c_nl => spotential(kkind)%sgp_potential%c_nonlocal
-            ppnl_radius = spotential(kkind)%sgp_potential%ppnl_radius
-            ALLOCATE (radp(nnl))
-            radp(:) = ppnl_radius
-            cprj => spotential(kkind)%sgp_potential%cprj_ppnl
-            hprj => spotential(kkind)%sgp_potential%vprj_ppnl
-            nppnl = SIZE(cprj, 2)
+            do_upf = ALLOCATED(spotential(kkind)%sgp_potential%upf_data)
+            IF (do_upf) THEN
+               upf => spotential(kkind)%sgp_potential%upf_projectors
+               nppnl = upf%nproj
+            ELSE
+               nnl = spotential(kkind)%sgp_potential%n_nonlocal
+               lppnl = spotential(kkind)%sgp_potential%lmax
+               is_nonlocal = .FALSE.
+               is_nonlocal(0:lppnl) = spotential(kkind)%sgp_potential%is_nonlocal(0:lppnl)
+               a_nl => spotential(kkind)%sgp_potential%a_nonlocal
+               h_nl => spotential(kkind)%sgp_potential%h_nonlocal
+               c_nl => spotential(kkind)%sgp_potential%c_nonlocal
+               ppnl_radius = spotential(kkind)%sgp_potential%ppnl_radius
+               ALLOCATE (radp(nnl))
+               radp(:) = ppnl_radius
+               cprj => spotential(kkind)%sgp_potential%cprj_ppnl
+               hprj => spotential(kkind)%sgp_potential%vprj_ppnl
+               nppnl = SIZE(cprj, 2)
+            END IF
          ELSE
             CYCLE
          END IF
 
          IF (my_ref) THEN
-            ra(:) = pbc(particle_set(iatom)%r(:) - rf, cell) + rf
-            rc(:) = pbc(particle_set(katom)%r(:) - rf, cell) + rf
-            raf(:) = ra(:) - rf(:)
-            rcf(:) = rc(:) - rf(:)
+            raf(:) = pbc(particle_set(iatom)%r(:) - rf, cell)
          ELSE
             raf(:) = -rac
-            rcf(:) = [0._dp, 0._dp, 0._dp]
          END IF
+         ! Keep both moment centers on the image used by the projector neighbor list.
+         rcf(:) = raf + rac
 
          dac = NORM2(rac)
          clist => sap_int(iac)%alist(ilist)%clist(jneighbor)
@@ -528,7 +566,7 @@ CONTAINS
             IF (pseudoatom /= katom) THEN
                clist%maxac = MAXVAL(ABS(clist%acint(:, :, 1)))
                clist%maxach = MAXVAL(ABS(clist%achint(:, :, 1)))
-               IF (.NOT. dogth) DEALLOCATE (radp)
+               IF (.NOT. dogth .AND. .NOT. do_upf) DEALLOCATE (radp)
                CYCLE
             END IF
          END IF
@@ -552,15 +590,8 @@ CONTAINS
 
                   ! *** Calculate the primitive overlap integrals ***
                   IF (my_momentmode) THEN
-                     CALL overlap(la_max(iset), la_min(iset), npgfa(iset), rpgfa(:, iset), zeta(:, iset), &
-                                  lc_max, lc_min, 1, rprjc, zetc, rac, dac, sab, 0, .FALSE., ai_work, ldai)
-                  ELSE
-                     CALL overlap(la_max(iset), la_min(iset), npgfa(iset), rpgfa(:, iset), zeta(:, iset), &
-                                  lc_max, lc_min, 1, rprjc, zetc, rac, dac, sab, nder, .TRUE., ai_work, ldai)
-                  END IF
-                  IF (my_momentmode .AND. nder >= 1) THEN
                      CALL moment(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
-                                 lc_max, 1, zetc, rprjc, nder, raf, rcf, ai_work)
+                                 lc_max, 1, zetc, rprjc, nder, raf, rcf, ai_work, overlap=sab)
                      ! reduce ai_work to sab
                      na = ncoa
                      np = ncoc
@@ -568,6 +599,9 @@ CONTAINS
                         first_col = i*ldsab
                         sab(1:na, first_col + 1:first_col + np) = ai_work(1:na, 1:np, i)
                      END DO
+                  ELSE
+                     CALL overlap(la_max(iset), la_min(iset), npgfa(iset), rpgfa(:, iset), zeta(:, iset), &
+                                  lc_max, lc_min, 1, rprjc, zetc, rac, dac, sab, nder, .TRUE., ai_work, ldai)
                   END IF
 
                   ! *** Transformation step projector functions (cartesian->spherical) ***
@@ -596,25 +630,40 @@ CONTAINS
                   clist%achint(sgfa:sgfa + na - 1, 1:nb, i) = &
                      MATMUL(clist%acint(sgfa:sgfa + na - 1, 1:nb, i), vprj_ppnl(1:nb, 1:nb))
                END DO
+            ELSE IF (do_upf) THEN
+               na = nsgf_seta(iset)
+               nb = nppnl
+               np = ncoa
+               ALLOCATE (upf_int(np, nb, maxder))
+               IF (my_momentmode) THEN
+                  CALL upf_projector_overlap(upf, la_max(iset), zeta(:npgfa(iset), iset), &
+                                             rac, nder, upf_int, moment_origin=raf)
+               ELSE
+                  CALL upf_projector_overlap(upf, la_max(iset), zeta(:npgfa(iset), iset), &
+                                             rac, nder, upf_int)
+               END IF
+               DO i = 1, maxder
+                  clist%acint(sgfa:sgfa + na - 1, 1:nb, i) = &
+                     MATMUL(TRANSPOSE(sphi_a(1:np, sgfa:sgfa + na - 1)), upf_int(:, :, i))
+                  clist%achint(sgfa:sgfa + na - 1, 1:nb, i) = &
+                     MATMUL(clist%acint(sgfa:sgfa + na - 1, 1:nb, i), upf%d)
+               END DO
+               DEALLOCATE (upf_int)
             ELSE
                ! SGP potential
                ! *** Calculate the primitive overlap integrals ***
                IF (my_momentmode) THEN
-                  CALL overlap(la_max(iset), la_min(iset), npgfa(iset), rpgfa(:, iset), zeta(:, iset), &
-                               lppnl, 0, nnl, radp, a_nl, rac, dac, sab, 0, .FALSE., ai_work, ldai)
-               ELSE
-                  CALL overlap(la_max(iset), la_min(iset), npgfa(iset), rpgfa(:, iset), zeta(:, iset), &
-                               lppnl, 0, nnl, radp, a_nl, rac, dac, sab, nder, .TRUE., ai_work, ldai)
-               END IF
-               IF (my_momentmode .AND. nder >= 1) THEN
                   CALL moment(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
-                              lppnl, nnl, a_nl, radp, nder, raf, rcf, ai_work)
+                              lppnl, nnl, a_nl, radp, nder, raf, rcf, ai_work, overlap=sab)
                   ! reduce ai_work to sab
                   na = ncoa
                   DO i = 1, maxder - 1
-                     first_col = i*ldsab
+                     first_col = i*ldsab + 1
                      sab(1:na, first_col:first_col + nprjc - 1) = ai_work(1:na, 1:nprjc, i)
                   END DO
+               ELSE
+                  CALL overlap(la_max(iset), la_min(iset), npgfa(iset), rpgfa(:, iset), zeta(:, iset), &
+                               lppnl, 0, nnl, radp, a_nl, rac, dac, sab, nder, .TRUE., ai_work, ldai)
                END IF
 
                na = nsgf_seta(iset)
@@ -639,7 +688,7 @@ CONTAINS
          END DO
          clist%maxac = MAXVAL(ABS(clist%acint(:, :, 1)))
          clist%maxach = MAXVAL(ABS(clist%achint(:, :, 1)))
-         IF (.NOT. dogth) DEALLOCATE (radp)
+         IF (.NOT. dogth .AND. .NOT. do_upf) DEALLOCATE (radp)
 
       END DO
 

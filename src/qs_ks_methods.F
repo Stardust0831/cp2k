@@ -51,6 +51,7 @@ MODULE qs_ks_methods
    USE cp_output_handling,              ONLY: cp_p_file,&
                                               cp_print_key_should_output
    USE dft_plus_u,                      ONLY: plus_u
+   USE gapw_gspace_reconstruction,      ONLY: integrate_gapw_composite_vxc_gspace
    USE gce_methods,                     ONLY: planar_averaged_v_hartree_3d,&
                                               planar_counter_charge
    USE hartree_local_methods,           ONLY: Vh_1c_gg_integrals
@@ -98,6 +99,7 @@ MODULE qs_ks_methods
                                               calculate_image_pot,&
                                               integrate_potential_devga_rspace
    USE qs_cdft_types,                   ONLY: cdft_control_type
+   USE qs_cdft_utils,                   ONLY: cdft_constraint_print
    USE qs_charges_types,                ONLY: qs_charges_type
    USE qs_core_energies,                ONLY: calculate_ptrace
    USE qs_dftb_matrices,                ONLY: build_dftb_ks_matrix
@@ -112,7 +114,8 @@ MODULE qs_ks_methods
    USE qs_harris_utils,                 ONLY: harris_set_potentials
    USE qs_integrate_potential,          ONLY: integrate_ppl_rspace,&
                                               integrate_rho_nlcc,&
-                                              integrate_v_core_rspace
+                                              integrate_v_core_rspace,&
+                                              integrate_v_rspace
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE qs_ks_apply_restraints,          ONLY: qs_ks_cdft_constraint,&
                                               qs_ks_mulliken_restraint,&
@@ -123,7 +126,7 @@ MODULE qs_ks_methods
    USE qs_ks_types,                     ONLY: qs_ks_env_type,&
                                               set_ks_env
    USE qs_ks_utils,                     ONLY: &
-        calc_v_sic_rspace, calculate_zmp_potential, compute_matrix_vxc, compute_matrix_vxc_kp, &
+        calc_v_sic_rspace, calculate_zmp_potential, check_sum_energies, compute_matrix_vxc, &
         get_embed_potential_energy, low_spin_roks, print_densities, print_detailed_energy, &
         sic_explicit_orbitals, sum_up_and_integrate
    USE qs_local_rho_types,              ONLY: local_rho_type
@@ -133,22 +136,31 @@ MODULE qs_ks_methods
    USE qs_rho0_ggrid,                   ONLY: integrate_vhg0_rspace
    USE qs_rho_types,                    ONLY: qs_rho_get,&
                                               qs_rho_type
-   USE qs_sccs,                         ONLY: sccs
+   USE qs_sccs,                         ONLY: sccs,&
+                                              sccs_core_fill_coefficients
+   USE qs_scf_types,                    ONLY: qs_scf_env_type
    USE qs_vxc,                          ONLY: qs_vxc_create
-   USE qs_vxc_atom,                     ONLY: calculate_vxc_atom
+   USE qs_vxc_atom,                     ONLY: calculate_vxc_atom,&
+                                              gapw_cdft_one_center
    USE rtp_admm_methods,                ONLY: rtp_admm_calc_rho_aux,&
                                               rtp_admm_merge_ks_matrix
    USE se_fock_matrix,                  ONLY: build_se_fock_matrix
-   USE skala_gpw_functional,            ONLY: ensure_native_skala_grid_scope,&
-                                              get_gauxc_section,&
-                                              xc_section_uses_native_skala_grid
+   USE skala_gpw_functional,            ONLY: &
+        ensure_native_skala_grid_scope, get_gauxc_section, get_skala_native_section, &
+        native_skala_gapw_atom_composite_requested, native_skala_gapw_composite_direct_ao, &
+        native_skala_gapw_composite_reference, native_skala_uses_atom_composite_grid, &
+        skala_execution_use_cuda, skala_gapw_representation, xc_section_uses_native_skala_grid
    USE smeagol_interface,               ONLY: smeagol_shift_v_hartree
    USE string_utilities,                ONLY: uppercase
    USE surface_dipole,                  ONLY: calc_dipsurf_potential
    USE tblite_ks_matrix,                ONLY: build_tblite_ks_matrix
    USE virial_types,                    ONLY: virial_type
    USE xc_gauxc_functional,             ONLY: apply_gauxc,&
+                                              gauxc_gapw_all_all_electron,&
+                                              gauxc_gapw_all_pseudopotentials,&
                                               gauxc_gapw_has_paw_pseudopotentials
+   USE xc_input_constants,              ONLY: skala_gapw_direct_valence,&
+                                              skala_gapw_paw_one_center
    USE xtb_ks_matrix,                   ONLY: build_xtb_ks_matrix
 #include "./base/base_uses.f90"
 
@@ -201,29 +213,37 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_ks_build_kohn_sham_matrix'
 
       CHARACTER(len=default_string_length)               :: gauxc_model_name, name
-      INTEGER                                            :: ace_rebuild_frequency, atom_a, handle, &
-                                                            iatom, ikind, img, ispin, natom, &
-                                                            nimages, nspins, output_unit
+      INTEGER :: ace_rebuild_frequency, atom_a, gapw_representation, handle, iatom, ikind, img, &
+         ispin, natom, nimages, nspins, output_unit
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_of_kind, kind_of
       LOGICAL :: ace_active, do_adiabatic_rescaling, do_ddapc, do_hfx, do_kpoints, do_ppl, dokp, &
-         gapw, gapw_xc, gauxc_model_none, just_energy_xc, lrigpw, my_print, &
-         native_grid_diagnostics, native_grid_use_cuda, native_skala_restore_exc, rigpw, &
-         use_gauxc_matrix, use_virial
+         gapw, gapw_all_all_electron, gapw_all_pseudopotentials, gapw_mixed_core_representations, &
+         gapw_xc, gauxc_model_none, just_energy_xc, lrigpw, my_print, &
+         native_direct_valence_atom_composite, native_gapw_all_electron_atom_composite, &
+         native_gapw_atom_composite_reference, native_gapw_atom_composite_requested, &
+         native_gapw_composite_direct_ao, native_gapw_composite_reference, &
+         native_gapw_periodic_atom_composite, native_grid_diagnostics, native_grid_use_cuda, &
+         native_skala_evaluator, native_skala_restore_exc
+      LOGICAL :: paw_composite_representation, rigpw, use_gauxc_matrix, use_virial
       LOGICAL, SAVE :: native_grid_cpu_kpoints_warned = .FALSE.
-      REAL(KIND=dp)                                      :: ecore_ppl, edisp, ee_ener, ekin_mol, &
-                                                            mulliken_order_p, &
-                                                            native_skala_exc_scf, &
-                                                            native_skala_total_scf, vscale
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: native_skala_atom_force
-      REAL(KIND=dp), DIMENSION(3, 3)                     :: h_stress, pv_loc
+      REAL(KIND=dp) :: ecore_ppl, edisp, ee_ener, ekin_mol, mulliken_order_p, &
+         native_skala_composite_contraction, native_skala_composite_rho_contraction, &
+         native_skala_composite_tau_contraction, native_skala_exc_scf, native_skala_total_scf, &
+         vscale
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cdft_gapw_values
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: cdft_charge_correction, &
+                                                            cdft_electronic_charge, &
+                                                            native_skala_atom_force
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: h_stress, native_skala_composite_virial, &
+                                                            pv_loc
       TYPE(admm_type), POINTER                           :: admm_env
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cdft_control_type), POINTER                   :: cdft_control
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: ksmat, matrix_vxc, mo_derivs
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: ksmat, matrix_vhxc, mo_derivs
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: ks_matrix, ks_matrix_im, matrix_h, &
-                                                            matrix_h_im, matrix_s, matrix_vxc_kp, &
+                                                            matrix_h_im, matrix_s, matrix_vxc, &
                                                             my_rho, rho_ao
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(ecoul_1center_type), DIMENSION(:), POINTER    :: ecoul_1c
@@ -234,12 +254,15 @@ CONTAINS
       TYPE(lri_environment_type), POINTER                :: lri_env
       TYPE(lri_kind_type), DIMENSION(:), POINTER         :: lri_v_int
       TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_orb
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(pw_c1d_gs_type)                               :: rho_tot_gspace, v_hartree_gspace
       TYPE(pw_c1d_gs_type), POINTER                      :: rho_core
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_poisson_type), POINTER                     :: poisson_env
       TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool
+      TYPE(pw_r3d_rs_type), DIMENSION(2)                 :: v_hxc_rspace
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho_r, v_rspace_embed, v_rspace_new, &
                                                             v_rspace_new_aux_fit, v_tau_rspace, &
                                                             v_tau_rspace_aux_fit
@@ -250,10 +273,8 @@ CONTAINS
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
       TYPE(qs_rho_type), POINTER                         :: rho, rho1, rho_struct, rho_xc
-      TYPE(section_vals_type), POINTER                   :: ace_section, &
-                                                            adiabatic_rescaling_section, &
-                                                            gauxc_section, hfx_sections, input, &
-                                                            scf_section, xc_section
+      TYPE(section_vals_type), POINTER :: ace_section, adiabatic_rescaling_section, gauxc_section, &
+         hfx_sections, input, native_section, scf_section, xc_section
       TYPE(virial_type), POINTER                         :: virial
 
       CALL timeset(routineN, handle)
@@ -261,11 +282,12 @@ CONTAINS
                rho_struct, para_env, pw_env, virial, vppl_rspace, &
                ace_section, &
                adiabatic_rescaling_section, hfx_sections, input, scf_section, &
-               xc_section, gauxc_section, matrix_h, matrix_h_im, matrix_s, auxbas_pw_pool, poisson_env, &
+               xc_section, gauxc_section, native_section, matrix_h, matrix_h_im, matrix_s, &
+               auxbas_pw_pool, poisson_env, &
                v_rspace_new, v_rspace_new_aux_fit, v_tau_rspace, v_tau_rspace_aux_fit, matrix_vxc, &
-               matrix_vxc_kp, &
+               matrix_vhxc, &
                vee, rho_nlcc, ks_env, ks_matrix, ks_matrix_im, rho, energy, rho_xc, rho_r, rho_ao, &
-               rho_core, particle_set, qs_kind_set, kpoints)
+               rho_core, sab_orb, particle_set, qs_kind_set, kpoints)
 
       CPASSERT(ASSOCIATED(qs_env))
 
@@ -273,6 +295,20 @@ CONTAINS
       my_print = .TRUE.
       IF (PRESENT(print_active)) my_print = print_active
       use_gauxc_matrix = .FALSE.
+      native_gapw_atom_composite_reference = .FALSE.
+      native_gapw_atom_composite_requested = .FALSE.
+      native_gapw_all_electron_atom_composite = .FALSE.
+      native_direct_valence_atom_composite = .FALSE.
+      gapw_all_all_electron = .FALSE.
+      gapw_all_pseudopotentials = .FALSE.
+      gapw_mixed_core_representations = .FALSE.
+      native_gapw_composite_direct_ao = .FALSE.
+      native_gapw_composite_reference = .FALSE.
+      native_gapw_periodic_atom_composite = .FALSE.
+      native_grid_diagnostics = .FALSE.
+      native_skala_composite_contraction = 0.0_dp
+      native_skala_composite_rho_contraction = 0.0_dp
+      native_skala_composite_tau_contraction = 0.0_dp
       native_skala_restore_exc = .FALSE.
 
       CALL get_qs_env(qs_env, &
@@ -283,8 +319,8 @@ CONTAINS
                       matrix_s_kp=matrix_s, &
                       matrix_ks_kp=ks_matrix, &
                       matrix_ks_im_kp=ks_matrix_im, &
-                      matrix_vxc=matrix_vxc, &
-                      matrix_vxc_kp=matrix_vxc_kp, &
+                      matrix_vhxc=matrix_vhxc, &
+                      matrix_vxc_kp=matrix_vxc, &
                       pw_env=pw_env, &
                       cell=cell, &
                       atomic_kind_set=atomic_kind_set, &
@@ -297,6 +333,7 @@ CONTAINS
                       rho=rho, &
                       rho_core=rho_core, &
                       rho_xc=rho_xc, &
+                      sab_orb=sab_orb, &
                       energy=energy, &
                       force=force, &
                       kpoints=kpoints, &
@@ -304,6 +341,17 @@ CONTAINS
                       particle_set=particle_set, &
                       qs_kind_set=qs_kind_set, &
                       natom=natom)
+
+      ! Reject force/stress requests before assembling even the baseline KS matrix.
+      IF (dft_control%low_spin_roks .AND. dft_control%qs_control%gapw) THEN
+         IF (.NOT. virial%pv_numer .AND. &
+             (virial%pv_calculate .OR. (virial%pv_availability .AND. calculate_forces))) THEN
+            CALL cp_abort(__LOCATION__, "GAPW low spin ROKS stress is not implemented.")
+         END IF
+         IF (calculate_forces) THEN
+            CALL cp_abort(__LOCATION__, "GAPW low spin ROKS forces are not implemented.")
+         END IF
+      END IF
 
       CALL qs_rho_get(rho, rho_r=rho_r, rho_ao_kp=rho_ao)
 
@@ -577,7 +625,7 @@ CONTAINS
                   CALL admm_mo_calc_rho_aux(qs_env)
                END IF
             END IF
-         ELSEIF (dft_control%do_admm_dm) THEN
+         ELSE IF (dft_control%do_admm_dm) THEN
             CALL admm_dm_calc_rho_aux(qs_env)
          END IF
       END IF
@@ -646,9 +694,83 @@ CONTAINS
          END IF
 
          ! Everything else, either via GauXC or manual XC computation
+         native_skala_evaluator = xc_section_uses_native_skala_grid(xc_section)
+         paw_composite_representation = .FALSE.
+         IF (gapw .OR. gapw_xc) THEN
+            paw_composite_representation = xc_section_uses_native_skala_grid(xc_section) .AND. &
+                                           skala_gapw_representation(xc_section) == skala_gapw_paw_one_center .AND. &
+                                           gauxc_gapw_has_paw_pseudopotentials(qs_kind_set)
+         END IF
          IF (dft_control%use_gauxc) THEN
-            IF (xc_section_uses_native_skala_grid(xc_section)) THEN
+            IF (native_skala_evaluator) THEN
+               IF (gapw .AND. dft_control%low_spin_roks) THEN
+                  CALL cp_abort(__LOCATION__, &
+                                "GAPW low spin ROKS requires the molecular GauXC grid, not native Skala grids.")
+               END IF
                CALL ensure_native_skala_grid_scope(xc_section)
+               gapw_representation = skala_gapw_representation(xc_section)
+               IF (gapw .OR. gapw_xc) THEN
+                  gapw_all_all_electron = gauxc_gapw_all_all_electron(qs_kind_set)
+                  gapw_all_pseudopotentials = gauxc_gapw_all_pseudopotentials(qs_kind_set)
+                  gapw_mixed_core_representations = &
+                     .NOT. gapw_all_all_electron .AND. .NOT. gapw_all_pseudopotentials
+               END IF
+               native_direct_valence_atom_composite = &
+                  xc_section_uses_native_skala_grid(xc_section) .AND. &
+                  native_skala_uses_atom_composite_grid(xc_section) .AND. &
+                  ((.NOT. gapw .AND. .NOT. gapw_xc) .OR. &
+                   (gapw_representation == skala_gapw_direct_valence .AND. &
+                    gapw_all_pseudopotentials))
+               native_gapw_composite_reference = &
+                  native_skala_gapw_composite_reference(xc_section) .AND. (gapw .OR. gapw_xc)
+               native_gapw_atom_composite_requested = &
+                  native_skala_gapw_atom_composite_requested(xc_section) .AND. &
+                  (gapw .OR. gapw_xc)
+               native_gapw_atom_composite_reference = &
+                  native_gapw_atom_composite_requested .OR. paw_composite_representation
+               native_gapw_periodic_atom_composite = &
+                  native_skala_uses_atom_composite_grid(xc_section)
+               IF (gapw_mixed_core_representations .AND. &
+                   .NOT. native_gapw_periodic_atom_composite) THEN
+                  CALL cp_abort(__LOCATION__, &
+                                "Mixed all-electron and pseudopotential GAPW kinds require "// &
+                                "LAYOUT ATOM_COMPOSITE so that their primitive "// &
+                                "fields are combined before Skala feature construction.")
+               END IF
+               native_gapw_atom_composite_reference = &
+                  native_gapw_atom_composite_reference .OR. &
+                  (gapw_mixed_core_representations .AND. &
+                   native_gapw_periodic_atom_composite)
+               native_gapw_all_electron_atom_composite = &
+                  (gapw .OR. gapw_xc) .AND. &
+                  gapw_all_all_electron .AND. &
+                  (.NOT. native_gapw_composite_reference) .AND. &
+                  native_gapw_periodic_atom_composite
+               native_gapw_atom_composite_reference = &
+                  native_gapw_atom_composite_reference .OR. &
+                  native_gapw_all_electron_atom_composite
+               IF (paw_composite_representation) THEN
+                  IF (ANY(cell%perd /= 0)) THEN
+                     native_gapw_composite_reference = &
+                        .NOT. native_gapw_periodic_atom_composite
+                     native_gapw_atom_composite_reference = &
+                        native_gapw_periodic_atom_composite
+                  ELSE
+                     native_gapw_composite_reference = .FALSE.
+                     native_gapw_atom_composite_reference = .TRUE.
+                  END IF
+               END IF
+               IF (native_gapw_composite_reference .AND. native_gapw_atom_composite_reference) THEN
+                  CALL cp_abort(__LOCATION__, &
+                                "Select only one native-grid GAPW composite reference route.")
+               END IF
+               native_gapw_composite_direct_ao = native_gapw_composite_reference .AND. &
+                                                 native_skala_gapw_composite_direct_ao(xc_section)
+               native_section => get_skala_native_section(xc_section)
+               IF (ASSOCIATED(native_section)) THEN
+                  CALL section_vals_val_get(native_section, "DIAGNOSTICS", &
+                                            l_val=native_grid_diagnostics)
+               END IF
                IF ((.NOT. do_kpoints) .AND. nimages /= 1) THEN
                   CALL cp_abort(__LOCATION__, &
                                 "Native SKALA grid evaluation supports multiple images only "// &
@@ -656,15 +778,13 @@ CONTAINS
                END IF
                IF (do_kpoints) THEN
                   CPASSERT(ASSOCIATED(kpoints))
-                  gauxc_section => get_gauxc_section(xc_section)
-                  CPASSERT(ASSOCIATED(gauxc_section))
-                  CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_USE_CUDA", l_val=native_grid_use_cuda)
+                  native_grid_use_cuda = skala_execution_use_cuda(xc_section)
                   IF (.NOT. native_grid_use_cuda) THEN
                      IF (para_env%mepos == 0 .AND. .NOT. native_grid_cpu_kpoints_warned) THEN
                         CALL cp_warn(__LOCATION__, &
                                      "Native SKALA grid evaluation with k-points is using the CPU TorchScript "// &
-                                     "path. For CPU runs, preload libtorch_cpu.so before OpenBLAS if the "// &
-                                     "runtime library order is unstable; otherwise use NATIVE_GRID_USE_CUDA T.")
+                                     "path. Use a mutually compatible BLAS, ScaLAPACK, OpenMP, and LibTorch "// &
+                                     "runtime stack, or select USE_GPU GPU.")
                         native_grid_cpu_kpoints_warned = .TRUE.
                      END IF
                   END IF
@@ -675,30 +795,88 @@ CONTAINS
                IF (dft_control%do_admm) THEN
                   CPABORT("Native SKALA grid evaluation does not support ADMM.")
                END IF
-               ! Force-only rebuilds re-enter this path for derivatives and VXC only.
-               ! For analytical stress the XC volume term must stay consistent with
-               ! the rebuilt SKALA energy used by the autograd virial.
-               native_skala_restore_exc = calculate_forces .AND. .NOT. use_virial
+               ! Force and stress rebuilds re-enter this path for derivatives and VXC only. The
+               ! autograd virial already contains the rebuilt XC volume term when qs_vxc_create
+               ! returns, so the externally reported energy must be restored to its SCF value.
+               native_skala_restore_exc = calculate_forces
                IF (native_skala_restore_exc) THEN
                   native_skala_exc_scf = energy%exc
                   native_skala_total_scf = energy%total
                END IF
                IF (calculate_forces) THEN
                   ALLOCATE (native_skala_atom_force(3, natom))
-                  CALL qs_vxc_create(ks_env=ks_env, rho_struct=rho_struct, xc_section=xc_section, &
-                                     vxc_rho=v_rspace_new, vxc_tau=v_tau_rspace, exc=energy%exc, &
-                                     edisp=edisp, dispersion_env=qs_env%dispersion_env, &
-                                     just_energy=just_energy_xc, &
-                                     native_skala_atom_force=native_skala_atom_force)
-                  native_grid_diagnostics = .FALSE.
-                  gauxc_section => get_gauxc_section(xc_section)
-                  IF (ASSOCIATED(gauxc_section)) THEN
-                     CALL section_vals_val_get(gauxc_section, "NATIVE_GRID_DIAGNOSTICS", &
-                                               l_val=native_grid_diagnostics)
+                  native_skala_atom_force = 0.0_dp
+                  IF (native_gapw_atom_composite_reference .OR. &
+                      native_direct_valence_atom_composite) THEN
+                     CALL qs_vxc_create(ks_env=ks_env, rho_struct=rho_struct, xc_section=xc_section, &
+                                        vxc_rho=v_rspace_new, vxc_tau=v_tau_rspace, exc=energy%exc, &
+                                        edisp=edisp, dispersion_env=qs_env%dispersion_env, &
+                                        just_energy=just_energy_xc, qs_env_external=qs_env, &
+                                        native_gapw_composite_override=native_gapw_composite_reference, &
+                                        native_skala_defer_to_atom_composite=.TRUE.)
+                  ELSE
+                     CALL qs_vxc_create(ks_env=ks_env, rho_struct=rho_struct, xc_section=xc_section, &
+                                        vxc_rho=v_rspace_new, vxc_tau=v_tau_rspace, exc=energy%exc, &
+                                        edisp=edisp, dispersion_env=qs_env%dispersion_env, &
+                                        just_energy=just_energy_xc, &
+                                        native_skala_atom_force=native_skala_atom_force, &
+                                        qs_env_external=qs_env, &
+                                        native_gapw_composite_override=native_gapw_composite_reference)
+                  END IF
+                  IF (native_gapw_composite_reference .AND. .NOT. native_gapw_composite_direct_ao .AND. &
+                      ASSOCIATED(v_rspace_new) .AND. ASSOCIATED(v_tau_rspace)) THEN
+                     IF (native_grid_diagnostics .AND. para_env%mepos == 0) THEN
+                        output_unit = cp_logger_get_default_io_unit()
+                        IF (output_unit > 0) THEN
+                           DO iatom = 1, natom
+                              WRITE (UNIT=output_unit, FMT="(T2,A,1X,I0,3(1X,ES20.12))") &
+                                 "SKALA_GPW| Native regular-grid atom force", iatom, &
+                                 native_skala_atom_force(:, iatom)
+                           END DO
+                        END IF
+                     END IF
+                     IF (use_virial) THEN
+                        native_skala_composite_virial = 0.0_dp
+                        CALL integrate_gapw_composite_vxc_gspace( &
+                           qs_env, auxbas_pw_pool, v_rspace_new, v_tau_rspace, &
+                           atom_force=native_skala_atom_force, &
+                           strain_virial=native_skala_composite_virial, &
+                           one_center_contraction=native_skala_composite_contraction, &
+                           one_center_rho_contraction=native_skala_composite_rho_contraction, &
+                           one_center_tau_contraction=native_skala_composite_tau_contraction)
+                        IF (native_grid_diagnostics .AND. para_env%mepos == 0) THEN
+                           output_unit = cp_logger_get_default_io_unit()
+                           IF (output_unit > 0) THEN
+                              WRITE (UNIT=output_unit, FMT="(T2,A)") &
+                                 "SKALA_GPW| Composite-direction one-center virial"
+                              DO iatom = 1, 3
+                                 WRITE (UNIT=output_unit, FMT="(T2,A,1X,3ES20.10)") &
+                                    "SKALA_GPW|", native_skala_composite_virial(iatom, :)
+                              END DO
+                           END IF
+                        END IF
+                        virial%pv_xc = virial%pv_xc + native_skala_composite_virial
+                     ELSE
+                        CALL integrate_gapw_composite_vxc_gspace( &
+                           qs_env, auxbas_pw_pool, v_rspace_new, v_tau_rspace, &
+                           atom_force=native_skala_atom_force, &
+                           one_center_contraction=native_skala_composite_contraction, &
+                           one_center_rho_contraction=native_skala_composite_rho_contraction, &
+                           one_center_tau_contraction=native_skala_composite_tau_contraction)
+                     END IF
                   END IF
                   IF (native_grid_diagnostics .AND. para_env%mepos == 0) THEN
                      output_unit = cp_logger_get_default_io_unit()
                      IF (output_unit > 0) THEN
+                        WRITE (UNIT=output_unit, FMT="(T2,A,1X,ES20.10)") &
+                           "SKALA_GPW| Composite-direction one-center VXC contraction", &
+                           native_skala_composite_contraction
+                        WRITE (UNIT=output_unit, FMT="(T2,A,1X,ES20.10)") &
+                           "SKALA_GPW| Composite-direction one-center rho contraction", &
+                           native_skala_composite_rho_contraction
+                        WRITE (UNIT=output_unit, FMT="(T2,A,1X,ES20.10)") &
+                           "SKALA_GPW| Composite-direction one-center tau contraction", &
+                           native_skala_composite_tau_contraction
                         DO iatom = 1, natom
                            WRITE (UNIT=output_unit, FMT="(T2,A,1X,I0,3(1X,ES20.12))") &
                               "SKALA_GPW| Native atom force", iatom, native_skala_atom_force(:, iatom)
@@ -719,23 +897,64 @@ CONTAINS
                   CALL qs_vxc_create(ks_env=ks_env, rho_struct=rho_struct, xc_section=xc_section, &
                                      vxc_rho=v_rspace_new, vxc_tau=v_tau_rspace, exc=energy%exc, &
                                      edisp=edisp, dispersion_env=qs_env%dispersion_env, &
-                                     just_energy=just_energy_xc)
+                                     just_energy=just_energy_xc, qs_env_external=qs_env, &
+                                     native_gapw_composite_override=native_gapw_composite_reference, &
+                                     native_skala_defer_to_atom_composite= &
+                                     (native_gapw_atom_composite_reference .OR. &
+                                      native_direct_valence_atom_composite))
+                  IF (native_gapw_composite_reference .AND. .NOT. native_gapw_composite_direct_ao .AND. &
+                      ASSOCIATED(v_rspace_new) .AND. ASSOCIATED(v_tau_rspace)) THEN
+                     CALL integrate_gapw_composite_vxc_gspace( &
+                        qs_env, auxbas_pw_pool, v_rspace_new, v_tau_rspace, &
+                        one_center_contraction=native_skala_composite_contraction, &
+                        one_center_rho_contraction=native_skala_composite_rho_contraction, &
+                        one_center_tau_contraction=native_skala_composite_tau_contraction)
+                     IF (native_grid_diagnostics .AND. para_env%mepos == 0) THEN
+                        output_unit = cp_logger_get_default_io_unit()
+                        IF (output_unit > 0) THEN
+                           WRITE (UNIT=output_unit, FMT="(T2,A,1X,ES20.10)") &
+                              "SKALA_GPW| Composite-direction one-center VXC contraction", &
+                              native_skala_composite_contraction
+                           WRITE (UNIT=output_unit, FMT="(T2,A,1X,ES20.10)") &
+                              "SKALA_GPW| Composite-direction one-center rho contraction", &
+                              native_skala_composite_rho_contraction
+                           WRITE (UNIT=output_unit, FMT="(T2,A,1X,ES20.10)") &
+                              "SKALA_GPW| Composite-direction one-center tau contraction", &
+                              native_skala_composite_tau_contraction
+                        END IF
+                     END IF
+                  END IF
                END IF
                IF (native_skala_restore_exc) energy%exc = native_skala_exc_scf
-               IF (gapw .OR. gapw_xc) THEN
-                  CALL calculate_vxc_atom(qs_env, just_energy_xc, energy%exc1, &
-                                          xc_section_external=xc_section, &
-                                          calculate_forces=calculate_forces)
+               IF (native_direct_valence_atom_composite) THEN
+                  CPASSERT(ASSOCIATED(v_rspace_new))
+                  CPASSERT(ASSOCIATED(v_tau_rspace))
+                  CALL calculate_vxc_atom( &
+                     qs_env, just_energy_xc, energy%exc1, xc_section_external=xc_section, &
+                     calculate_forces=calculate_forces, composite_vxc_rho=v_rspace_new, &
+                     composite_vxc_tau=v_tau_rspace, direct_valence_atom_grid=.TRUE.)
+                  energy%exc = 0.0_dp
+               ELSE IF ((gapw .OR. gapw_xc) .AND. .NOT. native_gapw_composite_reference) THEN
+                  IF (native_gapw_atom_composite_reference) THEN
+                     CPASSERT(ASSOCIATED(v_rspace_new))
+                     CPASSERT(ASSOCIATED(v_tau_rspace))
+                     CALL calculate_vxc_atom( &
+                        qs_env, just_energy_xc, energy%exc1, xc_section_external=xc_section, &
+                        calculate_forces=calculate_forces, composite_vxc_rho=v_rspace_new, &
+                        composite_vxc_tau=v_tau_rspace, atom_composite_grid=.TRUE.)
+                     energy%exc = 0.0_dp
+                  ELSE
+                     CALL calculate_vxc_atom(qs_env, just_energy_xc, energy%exc1, &
+                                             xc_section_external=xc_section, &
+                                             calculate_forces=calculate_forces)
+                  END IF
                END IF
                IF (edisp /= 0.0_dp) energy%dispersion = edisp
                IF (qs_env%requires_matrix_vxc .AND. ASSOCIATED(v_rspace_new)) THEN
-                  IF (do_kpoints) THEN
-                     CALL compute_matrix_vxc_kp(qs_env=qs_env, v_rspace=v_rspace_new, matrix_vxc_kp=matrix_vxc_kp)
-                     CALL set_ks_env(ks_env, matrix_vxc_kp=matrix_vxc_kp)
-                  ELSE
-                     CALL compute_matrix_vxc(qs_env=qs_env, v_rspace=v_rspace_new, matrix_vxc=matrix_vxc)
-                     CALL set_ks_env(ks_env, matrix_vxc=matrix_vxc)
-                  END IF
+                  CALL compute_matrix_vxc(qs_env=qs_env, v_rspace=v_rspace_new, &
+                                          matrix_vxc=matrix_vxc, &
+                                          gapw_full_basis=native_gapw_composite_direct_ao)
+                  CALL set_ks_env(ks_env, matrix_vxc_kp=matrix_vxc)
                END IF
             ELSE
                use_gauxc_matrix = .TRUE.
@@ -754,7 +973,7 @@ CONTAINS
             IF (edisp /= 0.0_dp) energy%dispersion = edisp
             IF (qs_env%requires_matrix_vxc .AND. ASSOCIATED(v_rspace_new)) THEN
                CALL compute_matrix_vxc(qs_env=qs_env, v_rspace=v_rspace_new, matrix_vxc=matrix_vxc)
-               CALL set_ks_env(ks_env, matrix_vxc=matrix_vxc)
+               CALL set_ks_env(ks_env, matrix_vxc_kp=matrix_vxc)
             END IF
 
             IF (gapw .OR. gapw_xc) THEN
@@ -763,6 +982,80 @@ CONTAINS
                                        calculate_forces=calculate_forces)
             END IF
          END IF
+      END IF
+
+      IF (gapw .AND. dft_control%qs_control%cdft) THEN
+         ALLOCATE (cdft_gapw_values(SIZE(cdft_control%group)))
+         IF (cdft_control%atomic_charges) THEN
+            ALLOCATE (cdft_charge_correction(natom, nspins), &
+                      cdft_electronic_charge(cdft_control%natoms, nspins))
+            CALL gapw_cdft_one_center(qs_env, just_energy, calculate_forces, &
+                                      cdft_gapw_values, cdft_charge_correction)
+            DO ispin = 1, nspins
+               DO iatom = 1, cdft_control%natoms
+                  cdft_electronic_charge(iatom, ispin) = &
+                     pw_integral_ab(cdft_control%charge(iatom), rho_r(ispin), local_only=.TRUE.)
+               END DO
+            END DO
+            CALL para_env%sum(cdft_electronic_charge)
+            DO ispin = 1, nspins
+               DO iatom = 1, cdft_control%natoms
+                  cdft_electronic_charge(iatom, ispin) = &
+                     cdft_electronic_charge(iatom, ispin) + &
+                     cdft_charge_correction(cdft_control%atoms(iatom), ispin)
+               END DO
+            END DO
+         ELSE
+            CALL gapw_cdft_one_center(qs_env, just_energy, calculate_forces, cdft_gapw_values)
+         END IF
+         cdft_control%value = cdft_control%value + cdft_gapw_values
+         energy%cdft = energy%cdft + DOT_PRODUCT(cdft_control%strength, cdft_gapw_values)
+         IF (cdft_control%atomic_charges) THEN
+            CALL cdft_constraint_print(qs_env, cdft_electronic_charge)
+            DEALLOCATE (cdft_charge_correction, cdft_electronic_charge)
+         ELSE
+            CALL cdft_constraint_print(qs_env, cdft_electronic_charge)
+         END IF
+         DEALLOCATE (cdft_gapw_values)
+      END IF
+
+      IF (dft_control%mtlr_dft_with_perturbation .AND. .NOT. just_energy) THEN
+         IF (do_adiabatic_rescaling .OR. use_gauxc_matrix) THEN
+            CPABORT("MTLR requires an XC potential on the real-space grid.")
+         END IF
+         IF (.NOT. ASSOCIATED(matrix_vhxc)) THEN
+            ALLOCATE (matrix_vhxc(nspins))
+            DO ispin = 1, nspins
+               NULLIFY (matrix_vhxc(ispin)%matrix)
+               ALLOCATE (matrix_vhxc(ispin)%matrix)
+               CALL dbcsr_create(matrix_vhxc(ispin)%matrix, &
+                                 template=ks_matrix(1, 1)%matrix)
+               CALL cp_dbcsr_alloc_block_from_nbl(matrix_vhxc(ispin)%matrix, sab_orb)
+               CALL dbcsr_set(matrix_vhxc(ispin)%matrix, 0.0_dp)
+            END DO
+            CALL set_ks_env(ks_env, matrix_vhxc=matrix_vhxc)
+         ELSE
+            CPASSERT(SIZE(matrix_vhxc) == nspins)
+            DO ispin = 1, nspins
+               CPASSERT(ASSOCIATED(matrix_vhxc(ispin)%matrix))
+            END DO
+         END IF
+         DO ispin = 1, nspins
+            CALL auxbas_pw_pool%create_pw(v_hxc_rspace(ispin))
+            CALL pw_zero(v_hxc_rspace(ispin))
+            CALL pw_axpy(v_hartree_rspace, v_hxc_rspace(ispin))
+            IF (ASSOCIATED(v_rspace_new)) THEN
+               CALL pw_axpy(v_rspace_new(ispin), &
+                            v_hxc_rspace(ispin), &
+                            v_rspace_new(ispin)%pw_grid%dvol)
+            END IF
+            CALL dbcsr_set(matrix_vhxc(ispin)%matrix, 0.0_dp)
+            CALL integrate_v_rspace(v_hxc_rspace(ispin), &
+                                    hmat=matrix_vhxc(ispin), &
+                                    qs_env=qs_env, &
+                                    calculate_forces=.FALSE.)
+            CALL auxbas_pw_pool%give_back_pw(v_hxc_rspace(ispin))
+         END DO
       END IF
 
       ! set hartree and xc potentials for use in Harris method
@@ -820,7 +1113,10 @@ CONTAINS
          END DO
       END IF
 
-      IF (ASSOCIATED(rho_nlcc) .AND. calculate_forces) THEN
+      ! The atom-composite evaluator differentiates its atom-centered NLCC field directly.
+      IF (ASSOCIATED(rho_nlcc) .AND. calculate_forces .AND. &
+          .NOT. native_gapw_atom_composite_reference .AND. &
+          .NOT. native_direct_valence_atom_composite) THEN
          DO ispin = 1, nspins
             CALL integrate_rho_nlcc(v_rspace_new(ispin), qs_env)
             IF (dft_control%do_admm) CALL integrate_rho_nlcc(v_rspace_new_aux_fit(ispin), qs_env)
@@ -855,6 +1151,25 @@ CONTAINS
                END BLOCK
             ELSE
                CALL integrate_v_core_rspace(v_hartree_rspace, qs_env)
+            END IF
+            ! SCCS with core fill: the dielectric function depends on rho_elec + rho_fill(R),
+            ! which yields an additional nuclear force contribution from v_sccs. The fill
+            ! Gaussians enter integrate_v_core_rspace with the sign convention of rho_core
+            ! (-ccore*exp(-calpha*r**2)), hence the negated potential
+            IF (dft_control%do_sccs) THEN
+               IF (dft_control%sccs_control%core_fill) THEN
+                  BLOCK
+                     REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: calpha, ccore
+                     TYPE(pw_r3d_rs_type)                               :: v_minus_vsccs
+                     CALL sccs_core_fill_coefficients(qs_env, calpha, ccore)
+                     CALL auxbas_pw_pool%create_pw(v_minus_vsccs)
+                     CALL pw_copy(v_sccs_rspace, v_minus_vsccs)
+                     CALL pw_scale(v_minus_vsccs, -1.0_dp)
+                     CALL integrate_v_core_rspace(v_minus_vsccs, qs_env, calpha=calpha, ccore=ccore)
+                     CALL auxbas_pw_pool%give_back_pw(v_minus_vsccs)
+                     DEALLOCATE (calpha, ccore)
+                  END BLOCK
+               END IF
             END IF
          END IF
 
@@ -895,23 +1210,14 @@ CONTAINS
                                    cdft_control, calculate_forces)
 
          IF (use_gauxc_matrix) THEN
-            IF (dokp) THEN
-               CALL get_qs_env(qs_env=qs_env, matrix_vxc_kp=matrix_vxc_kp)
-               CPASSERT(ASSOCIATED(matrix_vxc_kp))
-               DO ispin = 1, nspins
-                  DO img = 1, nimages
-                     CALL dbcsr_add(ks_matrix(ispin, img)%matrix, matrix_vxc_kp(ispin, img)%matrix, &
-                                    1.0_dp, 1.0_dp)
-                  END DO
+            CALL get_qs_env(qs_env=qs_env, matrix_vxc_kp=matrix_vxc)
+            CPASSERT(ASSOCIATED(matrix_vxc))
+            DO ispin = 1, nspins
+               DO img = 1, nimages
+                  CALL dbcsr_add(ks_matrix(ispin, img)%matrix, matrix_vxc(ispin, img)%matrix, &
+                                 1.0_dp, 1.0_dp)
                END DO
-            ELSE
-               CALL get_qs_env(qs_env=qs_env, matrix_vxc=matrix_vxc)
-               CPASSERT(ASSOCIATED(matrix_vxc))
-               CPASSERT(nimages == 1)
-               DO ispin = 1, nspins
-                  CALL dbcsr_add(ks_matrix(ispin, 1)%matrix, matrix_vxc(ispin)%matrix, 1.0_dp, 1.0_dp)
-               END DO
-            END IF
+            END DO
          END IF
 
          IF (gapw .OR. gapw_xc) THEN
@@ -923,7 +1229,7 @@ CONTAINS
                END IF
                NULLIFY (rho1)
                IF (dft_control%use_gauxc .AND. (gapw .OR. gapw_xc) .AND. &
-                   .NOT. xc_section_uses_native_skala_grid(xc_section)) THEN
+                   .NOT. native_skala_evaluator) THEN
                   gauxc_model_none = .FALSE.
                   gauxc_section => get_gauxc_section(xc_section)
                   IF (ASSOCIATED(gauxc_section)) THEN
@@ -985,6 +1291,20 @@ CONTAINS
          END IF
 
       ELSE
+         ! Atom-composite XC also creates potential buffers for energy-only calls.
+         ! These calls skip sum_up_and_integrate, which normally returns the buffers.
+         IF (ASSOCIATED(v_rspace_new)) THEN
+            DO ispin = 1, SIZE(v_rspace_new)
+               CALL auxbas_pw_pool%give_back_pw(v_rspace_new(ispin))
+            END DO
+            DEALLOCATE (v_rspace_new)
+         END IF
+         IF (ASSOCIATED(v_tau_rspace)) THEN
+            DO ispin = 1, SIZE(v_tau_rspace)
+               CALL auxbas_pw_pool%give_back_pw(v_tau_rspace(ispin))
+            END DO
+            DEALLOCATE (v_tau_rspace)
+         END IF
          IF (do_hfx) THEN
             IF (.FALSE.) THEN
                CPWARN("KS matrix no longer correct. Check possible problems with property calculations!")
@@ -1093,7 +1413,7 @@ CONTAINS
          ELSE
             CALL admm_mo_merge_ks_matrix(qs_env)
          END IF
-      ELSEIF (dft_control%do_admm_dm) THEN
+      ELSE IF (dft_control%do_admm_dm) THEN
          CALL admm_dm_merge_ks_matrix(qs_env)
       END IF
 
@@ -1158,21 +1478,15 @@ CONTAINS
       END IF
 
       ! Sum all energy terms to obtain the total energy
-      energy%total = energy%core_overlap + energy%core_self + energy%core_cneo + energy%core + &
-                     energy%hartree + energy%hartree_1c + energy%exc + energy%exc1 + energy%ex + &
-                     energy%dispersion + energy%gcp + energy%qmmm_el + energy%mulliken + &
-                     SUM(energy%ddapc_restraint) + energy%s2_restraint + &
-                     energy%dft_plus_u + energy%kTS + &
-                     energy%efield + energy%efield_core + energy%ee + &
-                     energy%ee_core + energy%exc_aux_fit + energy%image_charge + &
-                     energy%sccs_pol + energy%cdft + energy%exc1_aux_fit
-
-      IF (dft_control%apply_embed_pot) energy%total = energy%total + energy%embed_corr
-
-      IF (native_skala_restore_exc) energy%total = native_skala_total_scf
-
-      IF (abnormal_value(energy%total)) &
-         CPABORT("KS energy is an abnormal value (NaN/Inf).")
+      IF (native_skala_restore_exc) THEN
+         energy%total = native_skala_total_scf
+         IF (abnormal_value(energy%total)) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "SCF energy restored by native Skala is an abnormal value (NaN/Inf).")
+         END IF
+      ELSE
+         CALL check_sum_energies(energy)
+      END IF
 
       ! Print detailed energy
       IF (my_print) THEN
@@ -1437,19 +1751,20 @@ CONTAINS
 
       CALL calculate_ptrace(matrixkp_h, rho_ao_kp, energy%core, dft_control%nspins)
 
-      ! Add the imaginary part in the RTP case
+      ! kinetic energy
+      IF (ASSOCIATED(matrixkp_t)) THEN
+         CALL calculate_ptrace(matrixkp_t, rho_ao_kp, energy%kinetic, dft_control%nspins)
+      END IF
+
+      ! Add the imaginary part in the RTP case: Re Tr(P*H) = P_re.H_re + P_im.H_im
       IF (qs_env%run_rtp) THEN
          IF (dft_control%rtp_control%velocity_gauge) THEN
             CALL get_qs_env(qs_env, matrix_h_im_kp=matrixkp_h)
             CALL qs_rho_get(rho, rho_ao_im_kp=rho_ao_kp)
             CALL calculate_ptrace(matrixkp_h, rho_ao_kp, energy_core_im, dft_control%nspins)
-            energy%core = energy%core - energy_core_im
+            energy%core = energy%core + energy_core_im
          END IF
       END IF
-
-      ! kinetic energy
-      IF (ASSOCIATED(matrixkp_t)) &
-         CALL calculate_ptrace(matrixkp_t, rho_ao_kp, energy%kinetic, dft_control%nspins)
 
       CALL timestop(handle)
    END SUBROUTINE evaluate_core_matrix_traces
@@ -1471,23 +1786,25 @@ CONTAINS
 
       INTEGER                                            :: handle
       TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
 
       CALL timeset(routineN, handle)
-      NULLIFY (dft_control)
+      NULLIFY (dft_control, scf_env)
 
-      CALL get_qs_env(qs_env, dft_control=dft_control)
+      CALL get_qs_env(qs_env, dft_control=dft_control, scf_env=scf_env)
+      IF (.NOT. just_energy .AND. ASSOCIATED(scf_env)) scf_env%ot_ks_valid = .FALSE.
 
       IF (dft_control%qs_control%semi_empirical) THEN
          CALL build_se_fock_matrix(qs_env, &
                                    calculate_forces=calculate_forces, &
                                    just_energy=just_energy)
 
-      ELSEIF (dft_control%qs_control%dftb) THEN
+      ELSE IF (dft_control%qs_control%dftb) THEN
          CALL build_dftb_ks_matrix(qs_env, &
                                    calculate_forces=calculate_forces, &
                                    just_energy=just_energy)
 
-      ELSEIF (dft_control%qs_control%xtb) THEN
+      ELSE IF (dft_control%qs_control%xtb) THEN
          IF (dft_control%qs_control%xtb_control%do_tblite) THEN
             CALL build_tblite_ks_matrix(qs_env, &
                                         calculate_forces=calculate_forces, &

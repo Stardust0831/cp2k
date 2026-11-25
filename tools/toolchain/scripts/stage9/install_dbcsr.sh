@@ -6,8 +6,11 @@
 [ "${BASH_SOURCE[0]}" ] && SCRIPT_NAME="${BASH_SOURCE[0]}" || SCRIPT_NAME=$0
 SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_NAME}")/.." && pwd -P)"
 
-dbcsr_ver="2.10.0"
-dbcsr_sha256="3d897220fbb4498215331efad6905eb7744881b4cf04eb5c5fb4db7c48a56ef9"
+dbcsr_ver="8e8c7d4"
+dbcsr_sha256="30b5ae6a41d6547196110b74271b7baf923bb1e6b2986cefcf6c497d86c07861"
+# DBCSR's fypp submodule (tools/build_utils/fypp), fetched if the archive lacks it
+fypp_ver="b8dd58b"
+fypp_sha256="e4c007903d1457b7000d1b3d0546355b570f0f9d747416701ca015f5bbb215a9"
 source "${SCRIPT_DIR}"/common_vars.sh
 source "${SCRIPT_DIR}"/tool_kit.sh
 source "${SCRIPT_DIR}"/signal_trap.sh
@@ -27,19 +30,37 @@ case "${with_dbcsr}" in
     if verify_checksums "${install_lock_file}"; then
       echo "dbcsr-${dbcsr_ver} is already installed, skipping it."
     else
-      retrieve_package "${dbcsr_sha256}" "dbcsr-${dbcsr_ver}.tar.gz"
+      if [ -f "dbcsr-${dbcsr_ver}.tar.gz" ] && checksum "${dbcsr_sha256}" "dbcsr-${dbcsr_ver}.tar.gz"; then
+        echo "dbcsr-${dbcsr_ver}.tar.gz is found and checksum is right"
+      else
+        download_pkg_from_urlpath "${dbcsr_sha256}" "${dbcsr_ver}" \
+          https://codeload.github.com/cp2k/dbcsr/tar.gz "dbcsr-${dbcsr_ver}.tar.gz"
+      fi
       echo "Installing from scratch into ${pkg_install_dir}"
       [ -d dbcsr-${dbcsr_ver} ] && rm -rf dbcsr-${dbcsr_ver}
       tar -xzf dbcsr-${dbcsr_ver}.tar.gz
+      # Release tarballs contain fypp, GitHub archives lack the submodule.
+      if ! [ -f dbcsr-${dbcsr_ver}/tools/build_utils/fypp/bin/fypp ]; then
+        if [ -f "fypp-${fypp_ver}.tar.gz" ] && checksum "${fypp_sha256}" "fypp-${fypp_ver}.tar.gz"; then
+          echo "fypp-${fypp_ver}.tar.gz is found and checksum is right"
+        else
+          download_pkg_from_urlpath "${fypp_sha256}" "${fypp_ver}" \
+            https://codeload.github.com/aradi/fypp/tar.gz "fypp-${fypp_ver}.tar.gz"
+        fi
+        mkdir -p dbcsr-${dbcsr_ver}/tools/build_utils/fypp
+        tar -xzf fypp-${fypp_ver}.tar.gz --strip-components=1 \
+          -C dbcsr-${dbcsr_ver}/tools/build_utils/fypp
+      fi
       cd dbcsr-${dbcsr_ver}
-      # DBCSR may predate GB10. Build native sm_121 code while
+      # DBCSR predates GB10 and B200. Build native device code while
       # reusing the closest available libsmm_acc parameters.
-      if [ "${ENABLE_CUDA}" == "__TRUE__" ] && [ "${GPUVER}" == "GB10" ]; then
-        if ! grep -q "GB10" CMakeLists.txt; then
-          sed -i "s/    H100)/    H100\\n    GB10)/" CMakeLists.txt
-          sed -i "/  set(GPU_ARCH_NUMBER_H100 90)/a\\  set(GPU_ARCH_NUMBER_GB10 121)" CMakeLists.txt
+      if [ "${ENABLE_CUDA}" == "__TRUE__" ] &&
+        { [ "${GPUVER}" == "GB10" ] || [ "${GPUVER}" == "B200" ]; }; then
+        if ! grep -q "${GPUVER}" CMakeLists.txt; then
+          sed -i "s/    H100)/    H100\\n    ${GPUVER})/" CMakeLists.txt
+          sed -i "/  set(GPU_ARCH_NUMBER_H100 90)/a\\  set(GPU_ARCH_NUMBER_${GPUVER} ${ARCH_NUM})" CMakeLists.txt
           cp src/acc/libsmm_acc/parameters/parameters_H100.json \
-            src/acc/libsmm_acc/parameters/parameters_GB10.json
+            "src/acc/libsmm_acc/parameters/parameters_${GPUVER}.json"
         fi
       fi
       mkdir build-cpu
@@ -97,7 +118,7 @@ case "${with_dbcsr}" in
     pkg_install_dir="$(dirname $(dirname $(find_in_paths "libdbcsr.*" $LIB_PATHS)))"
     ;;
   __DONTUSE__)
-    # Nothing to do
+    report_error "DBCSR is a required dependency of CP2K and cannot be disabled"
     ;;
   *)
     echo "==================== Linking DBCSR to user paths ===================="

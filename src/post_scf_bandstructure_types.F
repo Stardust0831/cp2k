@@ -15,25 +15,38 @@ MODULE post_scf_bandstructure_types
    USE cp_cfm_types,                    ONLY: cp_cfm_release,&
                                               cp_cfm_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type,&
-                                              dbcsr_release,&
-                                              dbcsr_type
+                                              dbcsr_release
    USE cp_dbcsr_operations,             ONLY: dbcsr_deallocate_matrix_set
    USE cp_fm_types,                     ONLY: cp_fm_release,&
                                               cp_fm_type
    USE dbt_api,                         ONLY: dbt_destroy,&
                                               dbt_type
-   USE input_constants,                 ONLY: rtp_method_bse,&
-                                              small_cell_full_kp
+   USE gw_auto_ri_types,                ONLY: auto_ri_release,&
+                                              auto_ri_type
+   USE gw_nevanlinna,                   ONLY: gw_nevanlinna_env_type
+   USE gw_ri_rs_small_cell_full_kp_types,ONLY: gwkp_type
+   USE hfx_types,                       ONLY: dealloc_containers,&
+                                              hfx_compression_type
+   USE input_constants,                 ONLY: G0W0,&
+                                              cohsex_off,&
+                                              gw_ac_nevanlinna,&
+                                              tensor_small_cell_full_kp
+   USE integral_library_types,          ONLY: coulomb_operator_type
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
-                                              dp
+                                              dp,&
+                                              int_4,&
+                                              int_8
    USE kpoint_types,                    ONLY: kpoint_release,&
                                               kpoint_type
-   USE libint_2c_3c,                    ONLY: libint_potential_type
    USE message_passing,                 ONLY: mp_para_env_release,&
                                               mp_para_env_type
    USE physcon,                         ONLY: evolt
    USE qs_tensors_types,                ONLY: neighbor_list_3c_type
+   USE ri_rs_types,                     ONLY: ri_rs_env,&
+                                              ri_rs_release
+   USE time_frequency_grids,            ONLY: time_frequency_grid_release,&
+                                              time_frequency_grid_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -42,7 +55,8 @@ MODULE post_scf_bandstructure_types
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'post_scf_bandstructure_types'
 
-   PUBLIC :: post_scf_bandstructure_type, band_edges_type, data_3_type, bs_env_release
+   PUBLIC :: post_scf_bandstructure_type, band_edges_type, bs_env_release, store_3c_release, &
+             store_3c_type
 
    ! valence band maximum (VBM), conduction band minimum (CBM), direct band gap (DBG),
    ! indirect band gap (IDBG)
@@ -50,49 +64,27 @@ MODULE post_scf_bandstructure_types
       REAL(KIND=dp)                                   :: VBM = -1.0_dp, &
                                                          CBM = -1.0_dp, &
                                                          DBG = -1.0_dp, &
-                                                         IDBG = -1.0_dp
+                                                         IDBG = -1.0_dp, &
+                                                         E_fermi = -1.0_dp
    END TYPE band_edges_type
 
-   ! data type for storing 3-index quantities for small-cell, full-k-points GW code
-   TYPE data_3_type
-      REAL(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE :: data_3
-   END TYPE data_3_type
+   ! 3-center integrals of one set of atom ranges (RI, AO_1, AO_2; zero: all atoms), compressed
+   ! (blk_indices, compressed) or as a tensor (t_3c)
+   TYPE store_3c_set_type
+      INTEGER, DIMENSION(2, 3)                        :: atoms = 0
+      INTEGER, DIMENSION(:, :), ALLOCATABLE           :: blk_indices
+      TYPE(hfx_compression_type)                      :: compressed
+      TYPE(dbt_type)                                  :: t_3c
+   END TYPE store_3c_set_type
 
-   ! data types for GW RI-RS code
-   TYPE rirs_grid_type
-      INTEGER                    :: npts = 0
-      REAL(KIND=dp), ALLOCATABLE :: raw_points(:, :)
-   END TYPE rirs_grid_type
-
-   TYPE ri_rs_env
-
-      ! Input parameters for RI-RS
-      INTEGER                                          :: grid_select = 1
-      REAL(KIND=dp)                                    :: tikhonov = 1.0E-08_dp
-      REAL(KIND=dp)                                    :: cutoff_radius_ri_rs = 30.0_dp
-
-      ! Number of MPI ranks that cooperate on one atom's Cholesky solve via
-      ! distributed pdpotrf. Default 1 = single-rank dpotrf path (BLAS, fastest
-      ! when D_local fits per rank). > 1 enables ScaLAPACK: ranks are split into
-      ! atom-groups of this size, D_local is block-cyclic distributed across
-      ! each group (memory ~1/G per rank), and compute_d_lp is also split across
-      ! the subgroup so wall time matches the BLAS path.
-      INTEGER                                          :: n_procs_per_atom_z_lp = 1
-
-      ! Data types for building grid points
-      TYPE(rirs_grid_type), ALLOCATABLE                :: grid_cache(:)
-
-      ! Data types for storing RI-RS matrices
-      TYPE(dbcsr_type)                                 :: mat_phi_mu_l
-      TYPE(dbcsr_type)                                 :: mat_Z_lP
-      REAL(KIND=dp), ALLOCATABLE                       :: grid_points(:, :)
-      LOGICAL                                          :: Z_lP_exists = .FALSE.
-
-      ! Per-atom spatial extent of the most diffuse Gaussian primitive in each basis
-      REAL(KIND=dp), ALLOCATABLE                       :: radius_ao_per_atom(:)
-      REAL(KIND=dp), ALLOCATABLE                       :: radius_ri_per_atom(:)
-
-   END TYPE ri_rs_env
+   ! 3-center integrals kept for the time points of a phase (in use if sets is allocated), all
+   ! sets uncompressed or all compressed; memory is the size on this process [MiB]
+   TYPE store_3c_type
+      INTEGER                                         :: nsets = 0
+      LOGICAL                                         :: uncompressed = .FALSE.
+      REAL(KIND=dp)                                   :: memory = 0.0_dp
+      TYPE(store_3c_set_type), DIMENSION(:), ALLOCATABLE :: sets
+   END TYPE store_3c_type
 
    TYPE post_scf_bandstructure_type
 
@@ -102,29 +94,61 @@ MODULE post_scf_bandstructure_types
                                                          do_ldos = .FALSE., &
                                                          do_gw_ri_rs = .FALSE., &
                                                          do_dos_pdos = .FALSE., &
-                                                         do_floquet = .FALSE.
+                                                         do_floquet = .FALSE., &
+                                                         do_static_cohsex = .FALSE., &
+                                                         do_spin_texture = .FALSE.
 
       ! various eigenvalues computed in GW code, some depend on k-points
       ! and have therefore three dimensions (band index, k-point, spin)
+      !
+      ! eigenval_GW carries the quasiparticle energies of the highest-level GW flavour requested
+      !   eigenval_G0W0  - the G0W0 result
+      !   eigenval_evGW0 - the evGW0 result
       REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE     :: eigenval_scf_Gamma
       REAL(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE  :: eigenval_scf, &
+                                                         eigenval_GW, &
                                                          eigenval_G0W0, &
-                                                         eigenval_HF, &
-                                                         eigenval_scGW0
-      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE     :: eigenval_scf_soc, &
-                                                         eigenval_G0W0_soc
-      TYPE(band_edges_type), DIMENSION(2)             :: band_edges_scf_Gamma = band_edges_type()
+                                                         eigenval_evGW0, &
+                                                         eigenval_HF
       TYPE(band_edges_type)                           :: band_edges_scf = band_edges_type(), &
-                                                         band_edges_G0W0 = band_edges_type(), &
+                                                         band_edges_GW = band_edges_type(), &
                                                          band_edges_HF = band_edges_type()
 
       ! parameters that influence the GW flavor
       LOGICAL                                         :: do_hedin_shift = .FALSE.
+      ! which GW flavour was requested; constants from input_constants (G0W0, evGW0, ...)
+      INTEGER                                         :: gw_flavour = G0W0
+
+      ! parameters for static COHSEX approximation to GW
+      ! static COHSEX: OFF, DIAGONAL (ϵ^DG only) or QP_UPDATE (also diagonalization, ϵ^CN, MOs)
+      INTEGER                                         :: cohsex_flavor = cohsex_off
+      REAL(KIND=dp)                                   :: cohsex_scale_occ = 1.0_dp, &
+                                                         cohsex_scale_virt = 1.0_dp
 
       ! parameters for RI-RS implementation of GW
       TYPE(ri_rs_env)                                 :: ri_rs
 
+      ! Work data of periodic RI-RS GW with full k-point sampling
+      TYPE(gwkp_type), ALLOCATABLE                    :: gwkp_env
+
+      ! Eigenvalue self-consistency settings
+      INTEGER                                         :: evgw0_n_iter = 1
+      REAL(KIND=dp)                                   :: evgw0_eps_iter = 5.0E-5_dp
+
+      ! Parameters for automatic RI basis set optimization.
+      TYPE(auto_ri_type)                              :: auto_ri = auto_ri_type()
+
+      ! DBCSR stores each rank's matrix panel in one MPI message whose length is stored in a
+      ! 32-bit default INTEGER (dbcsr_mpiwrap.F: msglen = SIZE(buffer)). Exceeding this ceiling
+      ! overflows the count to a negative/garbage value and multiply_cannon segfaults. This is
+      ! that hard limit in elements (= HUGE(int_4) = 2^31-1), the same bound DBCSR uses
+      ! internally as mp_max_memory_size. Panel sizing keeps every per-rank message below it.
+      INTEGER(KIND=int_8)                             :: dbcsr_msg_elem_limit = &
+                                                         INT(HUGE(0_int_4), int_8)
+
       ! general parameters on molecular orbitals and basis sets
+      ! Number of real states; entries above it are linear-dependency placeholders, not states.
+      INTEGER                                      :: n_mo_retained = -1
       INTEGER                                      :: n_ao = -1, &
                                                       n_RI = -1, &
                                                       n_spin = -1, &
@@ -140,6 +164,15 @@ MODULE post_scf_bandstructure_types
                                                        max_AO_idx_from_RI_AO_atom
       INTEGER, DIMENSION(2)                        :: n_occ = -1, &
                                                       n_vir = -1
+      INTEGER, DIMENSION(2)                        :: n_electron = -1
+      ! n_occ above is the HOMO index: under smearing,
+      ! not the true T=0 electron count. n_occ_nosmear is the smearing-independent
+      ! NINT(nelectron/maxocc) count, used only to center the SOC truncation window.
+      INTEGER, DIMENSION(2)                        :: n_occ_nosmear = -1
+      LOGICAL                                      :: do_smear = .FALSE.
+      INTEGER                                      :: smear_method = -1
+      REAL(KIND=dp)                                :: smear_width = 0.0_dp
+      REAL(KIND=dp)                                :: fixed_mag_mom = -1.0_dp
       REAL(KIND=dp)                                :: spin_degeneracy = -1.0_dp
       REAL(KIND=dp), DIMENSION(2)                  :: e_fermi = -1.0_dp
 
@@ -149,7 +182,6 @@ MODULE post_scf_bandstructure_types
       INTEGER, DIMENSION(3)                        :: nkp_grid_chi_eps_W_orig = -1, &
                                                       nkp_grid_chi_eps_W_extra = -1
       INTEGER                                      :: nkp_chi_eps_W_orig = -1, &
-                                                      nkp_chi_eps_W_extra = -1, &
                                                       nkp_chi_eps_W_orig_plus_extra = -1, &
                                                       nkp_chi_eps_W_batch = -1, &
                                                       num_chi_eps_W_batches = -1, &
@@ -169,28 +201,32 @@ MODULE post_scf_bandstructure_types
                                                       nkp_only_DOS = -1
       REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE  :: xkp_special
 
-      ! parameters for GW band structure calculation of small unit cell (with multiple unit cell)
-      INTEGER                                      :: small_cell_full_kp_or_large_cell_Gamma = -1, &
+      ! parameters for GW band structure calculation with k-points
+      INTEGER                                      :: gw_implementation = -1, &
                                                       nimages_scf = -1
       INTEGER, DIMENSION(3)                        :: periodic = -1
+      LOGICAL                                      :: do_periodic = .FALSE.
       REAL(KIND=dp), DIMENSION(3, 3)               :: hmat = -1.0_dp
 
       ! imaginary time and frequency grids
-      INTEGER                                         :: num_time_freq_points = -1, &
-                                                         num_freq_points_fit = -1
-      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE        :: imag_time_points, &
-                                                         imag_time_weights_freq_zero, &
-                                                         imag_freq_points, &
-                                                         imag_freq_points_fit
-      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE     :: weights_cos_t_to_w, &
-                                                         weights_cos_w_to_t, &
-                                                         weights_sin_t_to_w
-      INTEGER                                         :: nparam_pade = -1, &
-                                                         num_points_per_magnitude = -1
-      REAL(KIND=dp)                                   :: freq_max_fit = -1.0_dp, &
-                                                         input_regularization_minimax = -1.0_dp, &
-                                                         regularization_minimax = -1.0_dp, &
-                                                         stabilize_exp = -1.0_dp
+      INTEGER                                      :: num_time_freq_points = -1, &
+                                                      num_freq_points_fit = -1, &
+                                                      num_freq_points_pade = -1
+      TYPE(time_frequency_grid_type)               :: time_frequency_grid
+      ! same grid points; weights of the transform Σ^c(iτ) -> Σ^c(iω), which for NEVANLINNA are
+      ! fitted by a truncated SVD; χ and W always use time_frequency_grid
+      TYPE(time_frequency_grid_type)               :: time_frequency_grid_sigma
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE     :: imag_freq_points_fit
+      INTEGER                                      :: nparam_pade = -1, &
+                                                      num_points_per_magnitude = -1
+      REAL(KIND=dp)                                :: freq_max_fit = -1.0_dp, &
+                                                      input_regularization_minimax = -1.0_dp, &
+                                                      regularization_minimax = -1.0_dp, &
+                                                      stabilize_exp = -1.0_dp
+
+      ! analytic continuation of Σ^c(iω): Padé or Nevanlinna, with the parameters of the latter
+      INTEGER                                      :: ac_method = gw_ac_nevanlinna
+      TYPE(gw_nevanlinna_env_type)                 :: nevanlinna
 
       ! filter threshold for matrix-tensor operations
       REAL(KIND=dp)                                :: eps_filter = -1.0_dp, &
@@ -211,12 +247,12 @@ MODULE post_scf_bandstructure_types
                                                       fm_mo_coeff_Gamma = cp_fm_type()
       TYPE(cp_fm_type), DIMENSION(4)               :: fm_work_mo = cp_fm_type()
       TYPE(cp_fm_type)                             :: fm_RI_RI = cp_fm_type(), &
+                                                      fm_Minv_Gamma = cp_fm_type(), &
                                                       fm_chi_Gamma_freq = cp_fm_type(), &
                                                       fm_W_MIC_freq = cp_fm_type(), &
                                                       fm_W_MIC_freq_1_extra = cp_fm_type(), &
                                                       fm_W_MIC_freq_1_no_extra = cp_fm_type(), &
-                                                      fm_W_MIC_freq_zero = cp_fm_type(), &
-                                                      fm_h_G0W0_Gamma = cp_fm_type()
+                                                      fm_W_MIC_freq_zero = cp_fm_type()
       TYPE(cp_cfm_type)                            :: cfm_work_mo = cp_cfm_type(), &
                                                       cfm_work_mo_2 = cp_cfm_type()
 
@@ -249,6 +285,7 @@ MODULE post_scf_bandstructure_types
                                                       tensor_group_color = -1, &
                                                       num_tensor_groups = -1
       REAL(KIND=dp)                                :: input_memory_per_proc_GB = -1.0_dp
+      LOGICAL                                      :: auto_memory_per_proc = .FALSE.
       TYPE(mp_para_env_type), POINTER              :: para_env => NULL(), &
                                                       para_env_tensor => NULL()
       REAL(KIND=dp)                                :: occupation_3c_int = -1.0_dp, &
@@ -262,9 +299,7 @@ MODULE post_scf_bandstructure_types
                                                       n_intervals_i = -1, &
                                                       n_atom_j = -1, &
                                                       n_intervals_j = -1, &
-                                                      n_atom_per_interval_ij = -1, &
                                                       n_intervals_inner_loop_atoms = -1, &
-                                                      n_atom_per_IL_interval = -1, &
                                                       n_skip_sigma = -1, &
                                                       n_skip_chi = -1
       INTEGER, DIMENSION(:, :), ALLOCATABLE        :: i_atom_intervals, &
@@ -275,23 +310,32 @@ MODULE post_scf_bandstructure_types
       LOGICAL, DIMENSION(:, :), ALLOCATABLE        :: skip_Sigma_occ, &
                                                       skip_Sigma_vir, &
                                                       skip_chi
-      ! Marek : rtbse_method
-      INTEGER                                      :: rtp_method = rtp_method_bse
+      ! 3-center integrals kept for χ, and for Σ^x and Σ^c (W and G side)
+      TYPE(store_3c_type)                          :: store_3c_chi, &
+                                                      store_3c_W, &
+                                                      store_3c_Sigma
+      ! rtbse_method (Stepan Marek)
+      INTEGER                                      :: rtp_method = -1
+      ! what PROPERTIES%BSE needs the GW to keep for it; set at init, read at the W(0) and de-init
+      ! sites; the consumer frees both itself once read
+      LOGICAL                                      :: keep_W_freq_zero = .FALSE., &
+                                                      keep_3c_nl = .FALSE.
 
       ! check-arrays and names for restarting
       LOGICAL, DIMENSION(:), ALLOCATABLE           :: read_chi, &
                                                       calc_chi
       LOGICAL, DIMENSION(:, :), ALLOCATABLE        :: Sigma_c_exists
       LOGICAL                                      :: all_W_exist = .FALSE., &
-                                                      Sigma_x_exists = .FALSE.
+                                                      Sigma_x_exists = .FALSE., &
+                                                      Sigma_c_freq_zero_exists = .FALSE.
       CHARACTER(LEN=3)                             :: chi_name = "chi"
       CHARACTER(LEN=6)                             :: W_time_name = "W_time"
       CHARACTER(LEN=7)                             :: Sigma_x_name = "Sigma_x"
+      CHARACTER(LEN=17)                            :: Sigma_c_freq_zero_name = "Sigma_c_freq_zero"
       CHARACTER(LEN=13)                            :: Sigma_p_name = "Sigma_pos_tau", &
                                                       Sigma_n_name = "Sigma_neg_tau"
       CHARACTER(LEN=default_path_length)           :: prefix = ""
-      INTEGER                                      :: unit_nr = -1, &
-                                                      unit_nr_contract = -1
+      INTEGER                                      :: unit_nr = -1
 
       ! parameters and data for basis sets
       TYPE(gto_basis_set_p_type), &
@@ -300,20 +344,26 @@ MODULE post_scf_bandstructure_types
       INTEGER, DIMENSION(:), ALLOCATABLE           :: sizes_AO, &
                                                       sizes_RI
       TYPE(neighbor_list_3c_type)                  :: nl_3c = neighbor_list_3c_type()
-      TYPE(libint_potential_type)                  :: ri_metric = libint_potential_type(), &
-                                                      trunc_coulomb = libint_potential_type()
+      TYPE(coulomb_operator_type)                  :: ri_metric = coulomb_operator_type(), &
+                                                      trunc_coulomb = coulomb_operator_type()
 
       ! parameters for SOC calculation
       REAL(KIND=dp)                                :: soc_window_occ = -1.0_dp
       REAL(KIND=dp)                                :: soc_window_virt = -1.0_dp
       REAL(KIND=dp)                                :: soc_window_smearing = 1.0_dp/evolt
+      REAL(KIND=dp)                                :: soc_diag_occ = -1.0_dp
+      REAL(KIND=dp)                                :: soc_diag_virt = -1.0_dp
+      ! spin texture: atoms for the layer-projected spin (SPIN_TEXTURE_ATOMS) and, after each
+      ! call of SOC_ev, the spinor-state index (in eigenval_spinor) of every column of the
+      ! spinor wavefunction matrix that holds a valid eigenvector (all 2*n_ao columns for the
+      ! untruncated SOC, the window columns for SOC_DIAG_OCC/VIRT)
+      INTEGER, DIMENSION(:), ALLOCATABLE           :: spin_texture_atoms, &
+                                                      soc_wf_state_index
+
       ! sizes: mat_V_SOC_xyz: xyz, img
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER :: mat_V_SOC_xyz => NULL()
-      TYPE(cp_fm_type), DIMENSION(3)               :: fm_V_SOC_xyz_mo = cp_fm_type()
       ! small-cell GW: dimension = number of kpoints; large-cell GW: Gamma-point, dimension = 1
       TYPE(cp_cfm_type), DIMENSION(:), ALLOCATABLE :: cfm_SOC_spinor_ao
-      TYPE(band_edges_type)                        :: band_edges_scf_SOC = band_edges_type(), &
-                                                      band_edges_G0W0_SOC = band_edges_type()
 
       ! parameters for DOS and PDOS calculation
       REAL(KIND=dp)                                :: energy_window_DOS = -1.0_dp, &
@@ -328,6 +378,7 @@ MODULE post_scf_bandstructure_types
 
       ! parameters for Floquet band structure calculations
       INTEGER                                      :: max_floquet_index = -1
+      INTEGER                                      :: max_nmo_floquet = -1
       REAL(KIND=dp), DIMENSION(:), POINTER         :: floquet_polarisation => NULL(), &
                                                       floquet_phi => NULL()
       REAL(KIND=dp)                                :: floquet_omega = -1.0_dp, &
@@ -335,17 +386,19 @@ MODULE post_scf_bandstructure_types
                                                       eps_floquet = -1.0_dp, &
                                                       broadening_floquet = -1.0_dp, &
                                                       energy_step_floquet = -1.0_dp, &
-                                                      energy_window_floquet = -1.0_dp
+                                                      energy_window_floquet = -1.0_dp, &
+                                                      floquet_mem_fill_fraction = -1.0_dp, &
+                                                      floquet_temperature = -1.0_dp
       CHARACTER(LEN=default_string_length)         :: floquet_dos_file = "", &
-                                                      floquet_qe_file = ""
+                                                      floquet_qe_file = "", &
+                                                      floquet_bs_file = ""
 
-      ! quantities only needed for small cells and k-point sampling in DFT (small_cell_full_kp)
+      ! quantities only needed for small cells and k-point sampling in DFT (tensor_small_cell_full_kp)
       INTEGER                                      :: nkp_scf_desymm = -1, &
                                                       nimages_3c = -1, &
                                                       nimages_scf_desymm = -1, &
                                                       nimages_Delta_R = -1
-      TYPE(kpoint_type), POINTER                   :: kpoints_scf_desymm => NULL(), &
-                                                      kpoints_scf_desymm_2 => NULL()
+      TYPE(kpoint_type), POINTER                   :: kpoints_scf_desymm => NULL()
       INTEGER, DIMENSION(3)                        :: cell_grid_scf_desymm = -1
       INTEGER, DIMENSION(:, :), ALLOCATABLE        :: index_to_cell_3c, &
                                                       index_to_cell_Delta_R
@@ -353,7 +406,7 @@ MODULE post_scf_bandstructure_types
                                                       cell_to_index_Delta_R => NULL()
       REAL(KIND=dp)                                :: heuristic_filter_factor = -1.0_dp
 
-      ! small_cell_full_kp parallelization
+      ! tensor_small_cell_full_kp parallelization
       INTEGER                                      :: n_tasks_Delta_R_local = -1
       INTEGER, DIMENSION(:), ALLOCATABLE           :: task_Delta_R
       INTEGER, DIMENSION(:, :), ALLOCATABLE        :: nblocks_3c
@@ -379,11 +432,11 @@ MODULE post_scf_bandstructure_types
       REAL(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE    :: v_xc_n
       TYPE(dbt_type), ALLOCATABLE, DIMENSION(:, :)      :: t_3c_int
 
-      !MG: Print options
-      LOGICAL                                           :: print_contract = .FALSE., &
-                                                           print_contract_verbose = .FALSE.
-
    END TYPE post_scf_bandstructure_type
+
+   ! Sanity bounds on a quasiparticle gap (Hartree): inverted below -eps_qp_gap, diverged above max_qp_gap
+   REAL(KIND=dp), PARAMETER, PUBLIC                   :: eps_qp_gap = 0.01_dp/evolt, &
+                                                         max_qp_gap = 200.0_dp/evolt
 
 CONTAINS
 
@@ -405,22 +458,19 @@ CONTAINS
       CALL safe_kpoints_release(bs_env%kpoints_chi_eps_W)
       CALL safe_kpoints_release(bs_env%kpoints_DOS)
       CALL safe_kpoints_release(bs_env%kpoints_scf_desymm)
-      CALL safe_kpoints_release(bs_env%kpoints_scf_desymm_2)
 
       IF (ALLOCATED(bs_env%wkp_s_p)) DEALLOCATE (bs_env%wkp_s_p)
       IF (ALLOCATED(bs_env%wkp_no_extra)) DEALLOCATE (bs_env%wkp_no_extra)
       IF (ALLOCATED(bs_env%l_RI)) DEALLOCATE (bs_env%l_RI)
       IF (ALLOCATED(bs_env%xkp_special)) DEALLOCATE (bs_env%xkp_special)
-      IF (ALLOCATED(bs_env%imag_time_points)) DEALLOCATE (bs_env%imag_time_points)
-      IF (ALLOCATED(bs_env%imag_time_weights_freq_zero)) DEALLOCATE (bs_env%imag_time_weights_freq_zero)
-      IF (ALLOCATED(bs_env%imag_freq_points)) DEALLOCATE (bs_env%imag_freq_points)
+      CALL time_frequency_grid_release(bs_env%time_frequency_grid)
+      CALL time_frequency_grid_release(bs_env%time_frequency_grid_sigma)
       IF (ALLOCATED(bs_env%eigenval_scf_Gamma)) DEALLOCATE (bs_env%eigenval_scf_Gamma)
       IF (ALLOCATED(bs_env%eigenval_scf)) DEALLOCATE (bs_env%eigenval_scf)
+      IF (ALLOCATED(bs_env%eigenval_GW)) DEALLOCATE (bs_env%eigenval_GW)
       IF (ALLOCATED(bs_env%eigenval_G0W0)) DEALLOCATE (bs_env%eigenval_G0W0)
       IF (ALLOCATED(bs_env%eigenval_HF)) DEALLOCATE (bs_env%eigenval_HF)
-      IF (ALLOCATED(bs_env%eigenval_scGW0)) DEALLOCATE (bs_env%eigenval_scGW0)
-      IF (ALLOCATED(bs_env%eigenval_scf_soc)) DEALLOCATE (bs_env%eigenval_scf_soc)
-      IF (ALLOCATED(bs_env%eigenval_G0W0_soc)) DEALLOCATE (bs_env%eigenval_G0W0_soc)
+      IF (ALLOCATED(bs_env%eigenval_evGW0)) DEALLOCATE (bs_env%eigenval_evGW0)
       IF (ALLOCATED(bs_env%i_ao_start_from_atom)) DEALLOCATE (bs_env%i_ao_start_from_atom)
       IF (ALLOCATED(bs_env%i_ao_end_from_atom)) DEALLOCATE (bs_env%i_ao_end_from_atom)
       IF (ALLOCATED(bs_env%i_RI_start_from_atom)) DEALLOCATE (bs_env%i_RI_start_from_atom)
@@ -469,9 +519,10 @@ CONTAINS
       CALL cp_fm_release(bs_env%fm_work_mo(3))
       CALL cp_fm_release(bs_env%fm_work_mo(4))
       CALL cp_fm_release(bs_env%fm_RI_RI)
+      CALL cp_fm_release(bs_env%fm_Minv_Gamma)
       CALL cp_fm_release(bs_env%fm_chi_Gamma_freq)
       CALL cp_fm_release(bs_env%fm_W_MIC_freq)
-      IF (bs_env%rtp_method == rtp_method_bse) CALL cp_fm_release(bs_env%fm_W_MIC_freq_zero)
+      CALL cp_fm_release(bs_env%fm_W_MIC_freq_zero)
       CALL cp_fm_release(bs_env%fm_W_MIC_freq_1_extra)
       CALL cp_fm_release(bs_env%fm_W_MIC_freq_1_no_extra)
       CALL cp_cfm_release(bs_env%cfm_work_mo)
@@ -498,6 +549,7 @@ CONTAINS
       CALL safe_cfm_destroy_2d(bs_env%cfm_ks_kp)
       CALL safe_cfm_destroy_2d(bs_env%cfm_mo_coeff_kp)
 
+      CALL ri_rs_release(bs_env%ri_rs)
       CALL mp_para_env_release(bs_env%para_env)
       IF (ASSOCIATED(bs_env%para_env_tensor)) CALL mp_para_env_release(bs_env%para_env_tensor)
 
@@ -507,23 +559,21 @@ CONTAINS
       CALL safe_dbt_destroy(bs_env%t_RI_AO__AO)
       CALL safe_dbt_destroy(bs_env%t_RI__AO_AO)
 
+      CALL store_3c_release(bs_env%store_3c_chi)
+      CALL store_3c_release(bs_env%store_3c_W)
+      CALL store_3c_release(bs_env%store_3c_Sigma)
+
       IF (ALLOCATED(bs_env%basis_set_AO)) DEALLOCATE (bs_env%basis_set_AO)
       IF (ALLOCATED(bs_env%basis_set_RI)) DEALLOCATE (bs_env%basis_set_RI)
 
       ! SOC cfm_1d and arrays
       CALL safe_dbcsr_deallocate_matrix_set_2d(bs_env%mat_V_SOC_xyz)
-      CALL cp_fm_release(bs_env%fm_V_SOC_xyz_mo(1))
-      CALL cp_fm_release(bs_env%fm_V_SOC_xyz_mo(2))
-      CALL cp_fm_release(bs_env%fm_V_SOC_xyz_mo(3))
       CALL safe_cfm_destroy_1d(bs_env%cfm_SOC_spinor_ao)
 
-      ! Deallocate RI-RS matrices
-      IF (bs_env%do_gw_ri_rs) CALL dbcsr_release(bs_env%ri_rs%mat_phi_mu_l)
-      IF (bs_env%do_gw_ri_rs) CALL dbcsr_release(bs_env%ri_rs%mat_Z_lP)
-      IF (ALLOCATED(bs_env%ri_rs%grid_points)) DEALLOCATE (bs_env%ri_rs%grid_points)
-      IF (ALLOCATED(bs_env%ri_rs%grid_cache)) DEALLOCATE (bs_env%ri_rs%grid_cache)
-      IF (ALLOCATED(bs_env%ri_rs%radius_ao_per_atom)) DEALLOCATE (bs_env%ri_rs%radius_ao_per_atom)
-      IF (ALLOCATED(bs_env%ri_rs%radius_ri_per_atom)) DEALLOCATE (bs_env%ri_rs%radius_ri_per_atom)
+      CALL auto_ri_release(bs_env%auto_ri)
+
+      IF (ALLOCATED(bs_env%spin_texture_atoms)) DEALLOCATE (bs_env%spin_texture_atoms)
+      IF (ALLOCATED(bs_env%soc_wf_state_index)) DEALLOCATE (bs_env%soc_wf_state_index)
 
       DEALLOCATE (bs_env)
 
@@ -555,6 +605,31 @@ CONTAINS
       END IF
 
    END SUBROUTINE release_dbcsr_p_type
+
+! **************************************************************************************************
+!> \brief Releases the kept 3-center integrals (the store is no longer in use).
+!> \param store ...
+! **************************************************************************************************
+   SUBROUTINE store_3c_release(store)
+      TYPE(store_3c_type), INTENT(INOUT)                 :: store
+
+      INTEGER                                            :: i, unused
+
+      IF (ALLOCATED(store%sets)) THEN
+         DO i = 1, store%nsets
+            IF (store%uncompressed) THEN
+               CALL safe_dbt_destroy(store%sets(i)%t_3c)
+            ELSE
+               CALL dealloc_containers(store%sets(i)%compressed, unused)
+            END IF
+         END DO
+         DEALLOCATE (store%sets)
+      END IF
+      store%nsets = 0
+      store%uncompressed = .FALSE.
+      store%memory = 0.0_dp
+
+   END SUBROUTINE store_3c_release
 
 ! **************************************************************************************************
 !> \brief ...

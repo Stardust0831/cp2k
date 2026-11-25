@@ -13,7 +13,8 @@ MODULE cp_dbcsr_contrib
         dbcsr_get_occupation, dbcsr_get_readonly_block_p, dbcsr_get_stored_coordinates, &
         dbcsr_has_symmetry, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
         dbcsr_iterator_readonly_start, dbcsr_iterator_start, dbcsr_iterator_stop, &
-        dbcsr_iterator_type, dbcsr_put_block, dbcsr_reserve_blocks, dbcsr_type
+        dbcsr_iterator_type, dbcsr_p_type, dbcsr_put_block, dbcsr_reserve_blocks, dbcsr_type, &
+        dbcsr_work_create
    USE dbm_tests,                       ONLY: generate_larnv_seed
    USE kinds,                           ONLY: default_string_length,&
                                               dp
@@ -32,7 +33,7 @@ MODULE cp_dbcsr_contrib
    PUBLIC :: dbcsr_reserve_diag_blocks
    PUBLIC :: dbcsr_reserve_all_blocks
    PUBLIC :: dbcsr_add_on_diag
-   PUBLIC :: dbcsr_dot
+   PUBLIC :: dbcsr_dot, dbcsr_dot_batch
    PUBLIC :: dbcsr_trace
    PUBLIC :: dbcsr_get_block_diag
    PUBLIC :: dbcsr_scale_by_vector
@@ -72,6 +73,9 @@ CONTAINS
       END IF
 
       CALL dbcsr_clear(matrix_c)
+      CALL dbcsr_work_create(matrix_c, work_mutable=.TRUE.)
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix_a, matrix_b, matrix_c) &
+!$OMP PRIVATE(iter, row, col, block_a, block_b, found_b)
       CALL dbcsr_iterator_readonly_start(iter, matrix_a)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block_a)
@@ -81,6 +85,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
       CALL dbcsr_finalize(matrix_c)
       CALL timestop(handle)
    END SUBROUTINE dbcsr_hadamard_product
@@ -105,12 +110,14 @@ CONTAINS
       CPASSERT(omp_get_num_threads() == 1)
 
       norm = 0.0_dp
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix) PRIVATE(iter, block) REDUCTION(MAX:norm)
       CALL dbcsr_iterator_readonly_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, block=block)
          norm = MAX(norm, MAXVAL(ABS(block)))
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL dbcsr_get_info(matrix, group=group)
       CALL group%max(norm)
@@ -140,6 +147,8 @@ CONTAINS
 
       has_symmetry = dbcsr_has_symmetry(matrix)
       norm = 0.0_dp
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, has_symmetry) &
+!$OMP PRIVATE(iter, row, col, block) REDUCTION(+:norm)
       CALL dbcsr_iterator_readonly_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block)
@@ -150,6 +159,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL dbcsr_get_info(matrix, group=group)
       CALL group%sum(norm)
@@ -172,7 +182,7 @@ CONTAINS
       INTEGER                                            :: col, col_offset, handle, i, j, ncol, &
                                                             nrow, row, row_offset
       LOGICAL                                            :: has_symmetry
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: buffer
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: buffer, buffer_priv
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
       TYPE(dbcsr_iterator_type)                          :: iter
       TYPE(mp_comm_type)                                 :: group
@@ -186,19 +196,28 @@ CONTAINS
       ALLOCATE (buffer(nrow))
       buffer = 0.0_dp
 
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, has_symmetry, nrow, buffer) &
+!$OMP PRIVATE(iter, row, col, block, row_offset, col_offset, i, j, buffer_priv)
+      ALLOCATE (buffer_priv(nrow))
+      buffer_priv(:) = 0.0_dp
       CALL dbcsr_iterator_readonly_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block, row_offset=row_offset, col_offset=col_offset)
          DO j = 1, SIZE(block, 2)
             DO i = 1, SIZE(block, 1)
-               buffer(row_offset + i - 1) = buffer(row_offset + i - 1) + ABS(block(i, j))
+               buffer_priv(row_offset + i - 1) = buffer_priv(row_offset + i - 1) + ABS(block(i, j))
                IF (has_symmetry .AND. row /= col) THEN
-                  buffer(col_offset + j - 1) = buffer(col_offset + j - 1) + ABS(block(i, j))
+                  buffer_priv(col_offset + j - 1) = buffer_priv(col_offset + j - 1) + ABS(block(i, j))
                END IF
             END DO
          END DO
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP CRITICAL(dbcsr_gershgorin_crit)
+      buffer(:) = buffer(:) + buffer_priv(:)
+!$OMP END CRITICAL(dbcsr_gershgorin_crit)
+      DEALLOCATE (buffer_priv)
+!$OMP END PARALLEL
 
       CALL dbcsr_get_info(matrix, group=group)
       CALL group%sum(buffer)
@@ -234,6 +253,8 @@ CONTAINS
       IF (.NOT. my_keep_sparsity) CALL dbcsr_reserve_all_blocks(matrix)
       CALL dbcsr_get_info(matrix, nblkrows_total=nrow, nblkcols_total=ncol)
 
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, nrow, ncol) &
+!$OMP PRIVATE(iter, row, col, block, row_size, col_size, iseed)
       CALL dbcsr_iterator_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block, row_size=row_size, col_size=col_size)
@@ -243,6 +264,7 @@ CONTAINS
          CALL dlarnv(1, iseed, row_size*col_size, block(1, 1))
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL timestop(handle)
    END SUBROUTINE dbcsr_init_random
@@ -342,6 +364,8 @@ CONTAINS
 
       CALL dbcsr_reserve_diag_blocks(matrix)
 
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, alpha) &
+!$OMP PRIVATE(iter, row, col, block, row_size, col_size, i)
       CALL dbcsr_iterator_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block, row_size=row_size, col_size=col_size)
@@ -353,6 +377,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL timestop(handle)
    END SUBROUTINE dbcsr_add_on_diag
@@ -364,12 +389,34 @@ CONTAINS
 !> \param trace ...
 ! **************************************************************************************************
    SUBROUTINE dbcsr_dot(matrix_a, matrix_b, trace)
-      TYPE(dbcsr_type), INTENT(IN)                       :: matrix_a, matrix_b
+      TYPE(dbcsr_type), INTENT(IN), TARGET               :: matrix_a, matrix_b
       REAL(KIND=dp), INTENT(OUT)                         :: trace
 
-      CHARACTER(len=*), PARAMETER                        :: routineN = 'dbcsr_dot'
+      REAL(KIND=dp)                                      :: values(1)
+      TYPE(dbcsr_p_type)                                 :: a(1), b(1)
 
-      INTEGER                                            :: col, handle, row
+      a(1)%matrix => matrix_a
+      b(1)%matrix => matrix_b
+      CALL dbcsr_dot_batch(a, b, values)
+      trace = values(1)
+   END SUBROUTINE dbcsr_dot
+
+! **************************************************************************************************
+!> \brief Evaluate several dot products in one OpenMP region; MPI reductions remain outside it.
+!> \param matrix_a first operands, in reduction order
+!> \param matrix_b second operands
+!> \param trace dot products
+!> \param comm optional common communicator; all operands must use this exact communicator
+! **************************************************************************************************
+   SUBROUTINE dbcsr_dot_batch(matrix_a, matrix_b, trace, comm)
+      TYPE(dbcsr_p_type), INTENT(IN)                     :: matrix_a(:), matrix_b(:)
+      REAL(KIND=dp), INTENT(OUT)                         :: trace(SIZE(matrix_a))
+
+      CLASS(mp_comm_type), INTENT(IN), OPTIONAL          :: comm
+
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'dbcsr_dot_batch'
+
+      INTEGER                                            :: col, handle, i, row
       LOGICAL                                            :: found_b, has_symmetry
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block_a, block_b
       TYPE(dbcsr_iterator_type)                          :: iter
@@ -378,30 +425,49 @@ CONTAINS
       CALL timeset(routineN, handle)
       CPASSERT(omp_get_num_threads() == 1)
 
-      CPASSERT(dbcsr_has_symmetry(matrix_a) .EQV. dbcsr_has_symmetry(matrix_b))
-      has_symmetry = dbcsr_has_symmetry(matrix_a)
-
-      trace = 0.0_dp
-      CALL dbcsr_iterator_readonly_start(iter, matrix_a)
-      DO WHILE (dbcsr_iterator_blocks_left(iter))
-         CALL dbcsr_iterator_next_block(iter, row, col, block_a)
-         IF (SIZE(block_a) == 0) CYCLE ! Skip zero-sized blocks.
-         CALL dbcsr_get_readonly_block_p(matrix_b, row, col, block_b, found_b)
-         IF (found_b) THEN
-            IF (has_symmetry .AND. row /= col) THEN
-               trace = trace + 2.0_dp*SUM(block_a*block_b)
-            ELSE
-               trace = trace + SUM(block_a*block_b)
-            END IF
+      CPASSERT(SIZE(matrix_a) == SIZE(matrix_b))
+      DO i = 1, SIZE(matrix_a)
+         has_symmetry = dbcsr_has_symmetry(matrix_a(i)%matrix)
+         CPASSERT(has_symmetry .EQV. dbcsr_has_symmetry(matrix_b(i)%matrix))
+         IF (PRESENT(comm)) THEN
+            CALL dbcsr_get_info(matrix_a(i)%matrix, group=group)
+            CPASSERT(group == comm)
          END IF
       END DO
-      CALL dbcsr_iterator_stop(iter)
 
-      CALL dbcsr_get_info(matrix_a, group=group)
-      CALL group%sum(trace)
+      trace = 0.0_dp
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix_a, matrix_b) &
+!$OMP PRIVATE(i, iter, row, col, block_a, block_b, found_b, has_symmetry) REDUCTION(+:trace)
+      DO i = 1, SIZE(matrix_a)
+         has_symmetry = dbcsr_has_symmetry(matrix_a(i)%matrix)
+         CALL dbcsr_iterator_readonly_start(iter, matrix_a(i)%matrix)
+         DO WHILE (dbcsr_iterator_blocks_left(iter))
+            CALL dbcsr_iterator_next_block(iter, row, col, block_a)
+            IF (SIZE(block_a) == 0) CYCLE ! Skip zero-sized blocks.
+            CALL dbcsr_get_readonly_block_p(matrix_b(i)%matrix, row, col, block_b, found_b)
+            IF (found_b) THEN
+               IF (has_symmetry .AND. row /= col) THEN
+                  trace(i) = trace(i) + 2.0_dp*SUM(block_a*block_b)
+               ELSE
+                  trace(i) = trace(i) + SUM(block_a*block_b)
+               END IF
+            END IF
+         END DO
+         CALL dbcsr_iterator_stop(iter)
+      END DO
+!$OMP END PARALLEL
+
+      IF (PRESENT(comm)) THEN
+         IF (SIZE(trace) > 0 .AND. comm%num_pe > 1) CALL comm%sum(trace)
+      ELSE
+         DO i = 1, SIZE(matrix_a)
+            CALL dbcsr_get_info(matrix_a(i)%matrix, group=group)
+            IF (group%num_pe > 1) CALL group%sum(trace(i))
+         END DO
+      END IF
 
       CALL timestop(handle)
-   END SUBROUTINE dbcsr_dot
+   END SUBROUTINE dbcsr_dot_batch
 
 ! **************************************************************************************************
 !> \brief Computes the trace of the given matrix, also known as the sum of its diagonal elements.
@@ -423,6 +489,8 @@ CONTAINS
       CPASSERT(omp_get_num_threads() == 1)
 
       trace = 0.0_dp
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix) &
+!$OMP PRIVATE(iter, row, col, block, row_size, col_size, i) REDUCTION(+:trace)
       CALL dbcsr_iterator_readonly_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block, row_size=row_size, col_size=col_size)
@@ -434,6 +502,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL dbcsr_get_info(matrix, group=group)
       CALL group%sum(trace)
@@ -462,7 +531,9 @@ CONTAINS
 
       CALL dbcsr_get_info(matrix, name=name)
       CALL dbcsr_create(diag, template=matrix, name='diag of '//name)
+      CALL dbcsr_work_create(diag, work_mutable=.TRUE.)
 
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, diag) PRIVATE(iter, row, col, block)
       CALL dbcsr_iterator_readonly_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block)
@@ -471,6 +542,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
       CALL dbcsr_finalize(diag)
 
       CALL timestop(handle)
@@ -515,6 +587,8 @@ CONTAINS
          CPASSERT(nfullrows_total == SIZE(alpha))
       END IF
 
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, alpha, right) &
+!$OMP PRIVATE(iter, block, row_size, col_size, row_offset, col_offset, i)
       CALL dbcsr_iterator_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, block=block, row_size=row_size, col_size=col_size, &
@@ -531,6 +605,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL timestop(handle)
    END SUBROUTINE dbcsr_scale_by_vector
@@ -560,6 +635,8 @@ CONTAINS
       CPASSERT(nfullrows_total == SIZE(diag))
 
       diag(:) = 0.0_dp
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, diag) &
+!$OMP PRIVATE(iter, row, col, block, row_size, col_size, row_offset, i)
       CALL dbcsr_iterator_readonly_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block, row_size=row_size, &
@@ -572,6 +649,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL timestop(handle)
    END SUBROUTINE dbcsr_get_diag
@@ -602,6 +680,8 @@ CONTAINS
 
       CALL dbcsr_reserve_diag_blocks(matrix)
 
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, diag) &
+!$OMP PRIVATE(iter, row, col, block, row_size, col_size, row_offset, i)
       CALL dbcsr_iterator_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, block, row_size=row_size, &
@@ -614,6 +694,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL timestop(handle)
    END SUBROUTINE dbcsr_set_diag
@@ -649,6 +730,9 @@ CONTAINS
       END IF
 
       checksum = 0.0_dp
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, my_pos) &
+!$OMP PRIVATE(iter, block, row_size, col_size, row_offset, col_offset, i, j, position_factor) &
+!$OMP REDUCTION(+:checksum)
       CALL dbcsr_iterator_readonly_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, block=block, row_size=row_size, col_size=col_size, &
@@ -665,6 +749,7 @@ CONTAINS
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL dbcsr_get_info(matrix, group=group)
       CALL group%sum(checksum)
@@ -714,18 +799,23 @@ CONTAINS
       WRITE (iw, *) "Blocked size:", nblkrows_total, "x", nblkcols_total
 
       ! Print matrix blocks.
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, iw, my_variable_name) &
+!$OMP PRIVATE(iter, block, row_size, col_size, row_offset, col_offset, i, j)
       CALL dbcsr_iterator_readonly_start(iter, matrix)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, block=block, row_size=row_size, col_size=col_size, &
                                         row_offset=row_offset, col_offset=col_offset)
+!$OMP CRITICAL(dbcsr_print_crit)
          DO i = 1, row_size
          DO j = 1, col_size
             WRITE (iw, '(A,I4,A,I4,A,E23.16,A)') TRIM(my_variable_name)//'(', &
                row_offset + i - 1, ',', col_offset + j - 1, ')=', block(i, j), ';'
          END DO
          END DO
+!$OMP END CRITICAL(dbcsr_print_crit)
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       CALL timestop(handle)
    END SUBROUTINE dbcsr_print

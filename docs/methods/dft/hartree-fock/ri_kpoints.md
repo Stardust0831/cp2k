@@ -46,10 +46,8 @@ In the RI-HFXk method, the real-space exact-exchange matrices are calculated wit
 atom-specific RI basis:
 
 $$
-\begin{aligned}
-    K_{\mu i,\nu j}^\textbf{b} = \sum_{\mathbf{a}, \mathbf{c}} \ &P^\mathbf{c}_{\sigma,\lambda} \ (\mu^\mathbf{0}_i\sigma^\mathbf{a}\lfloor P^\mathbf{0}_i)\ (P^\mathbf{0}_i\lfloor R^\mathbf{0}_i)^{-1}\ (R^\mathbf{0}_i | S^\mathbf{b}_j)\\
-    &(S^\mathbf{b}_j\lfloor Q^\mathbf{b}_j)^{-1}\ (Q^\mathbf{b}_j\lfloor \nu^\mathbf{b}_j \lambda^{\mathbf{a}+\mathbf{c}})
-\end{aligned}
+K_{\mu i,\nu j}^\textbf{b} = \sum_{\mathbf{a}, \mathbf{c}} \ &P^\mathbf{c}_{\sigma,\lambda} \ (\mu^\mathbf{0}_i\sigma^\mathbf{a}\lfloor P^\mathbf{0}_i)\ (P^\mathbf{0}_i\lfloor R^\mathbf{0}_i)^{-1}\ (R^\mathbf{0}_i | S^\mathbf{b}_j)\\
+&(S^\mathbf{b}_j\lfloor Q^\mathbf{b}_j)^{-1}\ (Q^\mathbf{b}_j\lfloor \nu^\mathbf{b}_j \lambda^{\mathbf{a}+\mathbf{c}})
 $$
 
 where indices $i,j$ refer to atoms, and $K^\mathbf{b}_{\mu i,\nu j}$ correspond to the $\mu,\nu$ AO
@@ -83,7 +81,7 @@ more workable CSV file.
 
 Note that in this input file, we select a value of $1.0\times 10^{-6}$ for
 [EPS_PGF_ORB](#CP2K_INPUT.FORCE_EVAL.DFT.XC.HF.RI.EPS_PGF_ORB). This parameter controls the range of
-AOs, and threfore the extent of the local atom-specific RI basis sets. This value leads to
+AOs, and therefore the extent of the local atom-specific RI basis sets. This value leads to
 particularly high accuracy. The default of $1.0\times 10^{-5}$ is typically enough.
 
 The HFX potential was selected as the Truncated Coulomb operator with a cutoff radius of $R_C = 5.0$
@@ -107,7 +105,8 @@ exact-exchange. Using a very tight value of
 initial PBE calculation leads to a lot of images there as well. An example is provided in the
 example file [bundle](https://github.com/cp2k/cp2k-examples/tree/master/RI_HFX). The example below
 takes about 5 minutes to run on 32 CPUs if restarted from a PBE wavefunction, and 10 minutes
-otherwise.
+otherwise. For detailed k-point restart parameters, see the
+[K-Point Wavefunction Restart](../../restarting.md#notes-about-k-point-sampling) section.
 
 ```none
 &GLOBAL

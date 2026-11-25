@@ -8,21 +8,79 @@
 #if defined(__LIBTORCH)
 
 #include <ATen/Parallel.h>
+#if defined(__LIBTORCH_CUDA)
+#include <ATen/cuda/CUDAContextLight.h>
+#include <c10/cuda/CUDAAllocatorConfig.h>
+#endif
 #include <c10/core/DeviceGuard.h>
 #include <torch/csrc/api/include/torch/cuda.h>
+#include <torch/csrc/autograd/autograd.h>
+#include <torch/csrc/jit/passes/freeze_module.h>
+#include <torch/csrc/jit/passes/inliner.h>
+#include <torch/csrc/jit/passes/subgraph_rewrite.h>
+#include <torch/csrc/jit/runtime/graph_executor.h>
 #include <torch/script.h>
 
 #include "offload/offload_library.h"
 
-#include <cassert>
+#if defined(__OPENBLAS)
+#include <cblas.h>
+#endif
+
+#include "base/cp_assert.h"
 
 #include <cfenv>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+#if defined(__OPENBLAS)
+// PyTorch's oneMKL batch ABI is not compatible with OpenBLAS's same-named
+// entry points. Expand grouped GEMMs into the portable CBLAS interface.
+extern "C" void
+cblas_sgemm_batch(const CBLAS_ORDER order, const CBLAS_TRANSPOSE *trans_a,
+                  const CBLAS_TRANSPOSE *trans_b, const int *m, const int *n,
+                  const int *k, const float *alpha, const float **a,
+                  const int *lda, const float **b, const int *ldb,
+                  const float *beta, float **c, const int *ldc,
+                  const int group_count, const int *group_size) {
+  int offset = 0;
+  for (int group = 0; group < group_count; ++group) {
+    for (int operation = 0; operation < group_size[group]; ++operation) {
+      const int index = offset + operation;
+      cblas_sgemm(order, trans_a[group], trans_b[group], m[group], n[group],
+                  k[group], alpha[group], a[index], lda[group], b[index],
+                  ldb[group], beta[group], c[index], ldc[group]);
+    }
+    offset += group_size[group];
+  }
+}
+
+extern "C" void
+cblas_dgemm_batch(const CBLAS_ORDER order, const CBLAS_TRANSPOSE *trans_a,
+                  const CBLAS_TRANSPOSE *trans_b, const int *m, const int *n,
+                  const int *k, const double *alpha, const double **a,
+                  const int *lda, const double **b, const int *ldb,
+                  const double *beta, double **c, const int *ldc,
+                  const int group_count, const int *group_size) {
+  int offset = 0;
+  for (int group = 0; group < group_count; ++group) {
+    for (int operation = 0; operation < group_size[group]; ++operation) {
+      const int index = offset + operation;
+      cblas_dgemm(order, trans_a[group], trans_b[group], m[group], n[group],
+                  k[group], alpha[group], a[index], lda[group], b[index],
+                  ldb[group], beta[group], c[index], ldc[group]);
+    }
+    offset += group_size[group];
+  }
+}
+#endif
 
 typedef torch::Tensor torch_c_tensor_t;
 typedef c10::Dict<std::string, torch::Tensor> torch_c_dict_t;
@@ -48,6 +106,22 @@ private:
  * \author Ole Schuett
  ******************************************************************************/
 static bool use_cuda_if_available = true;
+
+static void enable_expandable_cuda_segments_if_unconfigured() {
+#if defined(__LIBTORCH_CUDA)
+  static const bool initialized = []() {
+    const char *legacy_config = std::getenv("PYTORCH_CUDA_ALLOC_CONF");
+    const char *config = std::getenv("PYTORCH_ALLOC_CONF");
+    if ((legacy_config == nullptr || legacy_config[0] == '\0') &&
+        (config == nullptr || config[0] == '\0')) {
+      c10::cuda::CUDACachingAllocator::setAllocatorSettings(
+          "expandable_segments:True");
+    }
+    return true;
+  }();
+  (void)initialized;
+#endif
+}
 
 static bool get_positive_int_env(const char *name, int &value) {
   const char *raw = std::getenv(name);
@@ -84,13 +158,14 @@ static torch::Device get_device() {
   if (!use_cuda_if_available || !torch::cuda::is_available()) {
     return torch::kCPU;
   }
+  enable_expandable_cuda_segments_if_unconfigured();
   const auto device_count = torch::cuda::device_count();
   if (device_count <= 0) {
     return torch::kCPU;
   }
   const int chosen_device = offload_get_chosen_device();
   const int device = (chosen_device >= 0) ? chosen_device : 0;
-  assert(device < device_count);
+  cp_assert(device < device_count);
   return torch::Device(torch::kCUDA, device);
 }
 
@@ -100,6 +175,16 @@ static torch::Device get_device_with_guard(c10::OptionalDeviceGuard &guard) {
     guard.reset_device(device);
   }
   return device;
+}
+
+static bool use_batched_gradient_readback(const torch::Tensor &tensor) {
+#if defined(__LIBTORCH_CUDA)
+  return tensor.is_cuda() &&
+         at::cuda::getDeviceProperties(tensor.device().index())->integrated;
+#else
+  (void)tensor;
+  return false;
+#endif
 }
 
 static void set_jit_fusion_strategy() {
@@ -122,14 +207,150 @@ static bool can_load_directly_to_device(const torch::Device &device) {
          torch::cuda::device_count() == 1;
 }
 
-static torch::jit::Module load_module_for_device(const char *filename,
-                                                 const torch::Device &device) {
-  if (can_load_directly_to_device(device)) {
+static torch::jit::Module load_module_for_device(
+    const char *filename, const torch::Device &device,
+    std::unordered_map<std::string, std::string> *extra_files = nullptr,
+    const bool load_on_cpu = false) {
+  if (!load_on_cpu && can_load_directly_to_device(device)) {
+    if (extra_files != nullptr) {
+      return torch::jit::load(filename, device, *extra_files);
+    }
     return torch::jit::load(filename, device);
   }
-  auto model = torch::jit::load(filename, torch::kCPU);
+  auto model = (extra_files != nullptr)
+                   ? torch::jit::load(filename, torch::kCPU, *extra_files)
+                   : torch::jit::load(filename, torch::kCPU);
   model.to(device);
   return model;
+}
+
+static void remap_device_constants(torch::jit::Block *block,
+                                   const torch::Device &device) {
+  for (torch::jit::Node *node : block->nodes()) {
+    if (node->kind() == torch::jit::prim::Constant &&
+        node->outputs().size() == 1 &&
+        node->output()->type()->kind() == c10::TypeKind::DeviceObjType &&
+        node->hasAttribute(torch::jit::attr::value) &&
+        node->kindOf(torch::jit::attr::value) == torch::jit::AttributeKind::s) {
+      node->s_(torch::jit::attr::value, device.str());
+    }
+    bool has_tensor_input = false;
+    for (const torch::jit::Value *input : node->inputs()) {
+      has_tensor_input |= input->type()->kind() == c10::TypeKind::TensorType;
+    }
+    const auto *schema = node->maybeSchema();
+    if (!has_tensor_input && schema != nullptr) {
+      const auto &arguments = schema->arguments();
+      for (size_t i = 0; i < arguments.size() && i < node->inputs().size();
+           ++i) {
+        const auto input_value = torch::jit::toIValue(node->input(i));
+        if (arguments[i].name() == "device" && input_value.has_value() &&
+            input_value->isNone()) {
+          torch::jit::WithInsertPoint insertion_guard(node);
+          auto *device_value =
+              node->owningGraph()->insertConstant(torch::jit::IValue(device));
+          node->replaceInput(i, device_value);
+        }
+      }
+    }
+    for (torch::jit::Block *nested_block : node->blocks()) {
+      remap_device_constants(nested_block, device);
+    }
+  }
+}
+
+static void remap_model_device_constants(torch::jit::Module &model,
+                                         const torch::Device &device) {
+  for (const auto &attribute : model.named_attributes(false)) {
+    const auto &value = attribute.value;
+    if (value.isTensor()) {
+      model.setattr(attribute.name, value.toTensor().to(device));
+    } else if (value.isTensorList()) {
+      auto tensors = value.toTensorList();
+      for (size_t i = 0; i < tensors.size(); ++i) {
+        tensors.set(i, tensors.get(i).to(device));
+      }
+      model.setattr(attribute.name, tensors);
+    }
+  }
+  for (const auto &method : model.get_methods()) {
+    remap_device_constants(method.graph()->block(), device);
+  }
+  for (auto child : model.children()) {
+    remap_model_device_constants(child, device);
+  }
+}
+
+static void promote_float32_constants(torch::jit::Block *block) {
+  for (torch::jit::Node *node : block->nodes()) {
+    if (node->kind() == torch::jit::prim::Constant &&
+        node->hasAttribute(torch::jit::attr::value) &&
+        node->kindOf(torch::jit::attr::value) == torch::jit::AttributeKind::t) {
+      const auto tensor = node->t(torch::jit::attr::value);
+      if (tensor.defined() && tensor.scalar_type() == torch::kFloat32) {
+        const auto promoted = tensor.to(torch::kFloat64);
+        node->t_(torch::jit::attr::value, promoted);
+        node->output()->setType(c10::TensorType::create(promoted));
+      }
+    }
+    const auto *schema = node->maybeSchema();
+    if (schema != nullptr) {
+      const auto &arguments = schema->arguments();
+      for (size_t i = 0; i < arguments.size() && i < node->inputs().size();
+           ++i) {
+        const auto value = torch::jit::toIValue(node->input(i));
+        if (arguments[i].name() == "dtype" && value.has_value() &&
+            value->isInt() &&
+            value->toInt() == static_cast<int64_t>(torch::kFloat32)) {
+          // A dtype constant can also be used as a dimension or an index.
+          // Replace this edge only; leave other uses and integer tensors
+          // intact.
+          torch::jit::WithInsertPoint insertion_guard(node);
+          auto *dtype = node->owningGraph()->insertConstant(
+              static_cast<int64_t>(torch::kFloat64));
+          node->replaceInput(i, dtype);
+        }
+      }
+    }
+    for (torch::jit::Block *nested : node->blocks()) {
+      promote_float32_constants(nested);
+    }
+  }
+}
+
+static void promote_model_float32(torch::jit::Module &model) {
+  for (const auto &attribute : model.named_attributes(false)) {
+    const auto &value = attribute.value;
+    if (value.isTensor() && value.toTensor().defined() &&
+        value.toTensor().scalar_type() == torch::kFloat32) {
+      model.setattr(attribute.name, value.toTensor().to(torch::kFloat64));
+    } else if (value.isTensorList()) {
+      auto tensors = value.toTensorList();
+      for (size_t i = 0; i < tensors.size(); ++i) {
+        if (tensors.get(i).defined() &&
+            tensors.get(i).scalar_type() == torch::kFloat32) {
+          tensors.set(i, tensors.get(i).to(torch::kFloat64));
+        }
+      }
+      model.setattr(attribute.name, tensors);
+    }
+  }
+  for (const auto &method : model.get_methods()) {
+    torch::jit::Inline(*method.graph());
+    promote_float32_constants(method.graph()->block());
+  }
+  for (auto child : model.children()) {
+    promote_model_float32(child);
+  }
+}
+
+static void initialize_cuda_linalg(const torch::Device &device) {
+  static std::once_flag flag;
+  std::call_once(flag, [&]() {
+    const auto options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    static_cast<void>(at::linalg_eigh(torch::eye(1, options)));
+  });
 }
 
 /*******************************************************************************
@@ -163,14 +384,16 @@ static bool tensor_matches(const torch_c_tensor_t *tensor,
   return tensor->is_contiguous();
 }
 
-static void reset_tensor_from_array_double(torch_c_tensor_t **tensor,
+static bool reset_tensor_from_array_double(torch_c_tensor_t **tensor,
                                            const bool req_grad, const int ndims,
                                            const int64_t sizes[],
                                            double source[]) {
   c10::OptionalDeviceGuard guard;
   const auto device = get_device_with_guard(guard);
   const auto sizes_ref = c10::IntArrayRef(sizes, ndims);
-  if (!tensor_matches(*tensor, torch::kFloat64, device, ndims, sizes)) {
+  const bool reallocated =
+      !tensor_matches(*tensor, torch::kFloat64, device, ndims, sizes);
+  if (reallocated) {
     delete (*tensor);
     const auto opts =
         torch::TensorOptions().dtype(torch::kFloat64).device(device);
@@ -184,6 +407,7 @@ static void reset_tensor_from_array_double(torch_c_tensor_t **tensor,
     (*tensor)->mutable_grad() = torch::Tensor();
   }
   (*tensor)->set_requires_grad(req_grad);
+  return reallocated;
 }
 
 /*******************************************************************************
@@ -193,13 +417,13 @@ static void reset_tensor_from_array_double(torch_c_tensor_t **tensor,
 static void *get_data_ptr(const torch_c_tensor_t *tensor,
                           const torch::Dtype dtype, const int ndims,
                           int64_t sizes[]) {
-  assert(tensor->scalar_type() == dtype);
-  assert(tensor->ndimension() == ndims);
+  cp_assert(tensor->scalar_type() == dtype);
+  cp_assert(tensor->ndimension() == ndims);
   for (int i = 0; i < ndims; i++) {
     sizes[i] = tensor->size(i);
   }
 
-  assert(tensor->is_contiguous());
+  cp_assert(tensor->is_contiguous());
   return tensor->data_ptr();
 };
 
@@ -257,14 +481,14 @@ void torch_c_tensor_from_array_double(torch_c_tensor_t **tensor,
 void torch_c_free_string(char *content) { free(content); }
 
 /*******************************************************************************
- * \brief Reuses or creates a device tensor and copies double data into it.
+ * \brief Reuses or creates a device tensor and reports reallocation.
  ******************************************************************************/
-void torch_c_tensor_reset_from_array_double(torch_c_tensor_t **tensor,
-                                            const bool req_grad,
-                                            const int ndims,
-                                            const int64_t sizes[],
-                                            double source[]) {
-  reset_tensor_from_array_double(tensor, req_grad, ndims, sizes, source);
+bool torch_c_tensor_reset_from_array_double_status(torch_c_tensor_t **tensor,
+                                                   const bool req_grad,
+                                                   const int ndims,
+                                                   const int64_t sizes[],
+                                                   double source[]) {
+  return reset_tensor_from_array_double(tensor, req_grad, ndims, sizes, source);
 }
 
 /*******************************************************************************
@@ -275,11 +499,11 @@ void torch_c_tensor_expand_dim(const torch_c_tensor_t *tensor,
                                torch_c_tensor_t **result) {
   c10::OptionalDeviceGuard guard;
   get_device_with_guard(guard);
-  assert(*result == NULL);
-  assert(dim >= 0);
-  assert(dim < tensor->dim());
+  cp_assert(*result == NULL);
+  cp_assert(dim >= 0);
+  cp_assert(dim < tensor->dim());
   std::vector<int64_t> sizes(tensor->sizes().begin(), tensor->sizes().end());
-  assert(sizes[dim] == 1);
+  cp_assert(sizes[dim] == 1);
   sizes[dim] = size;
   *result = new torch_c_tensor_t(tensor->expand(sizes));
 }
@@ -292,12 +516,12 @@ void torch_c_tensor_narrow(const torch_c_tensor_t *tensor, const int64_t dim,
                            torch_c_tensor_t **result) {
   c10::OptionalDeviceGuard guard;
   const auto device = get_device_with_guard(guard);
-  assert(*result == NULL);
-  assert(dim >= 0);
-  assert(start_index >= 0);
-  assert(length >= 0);
-  assert(dim < tensor->ndimension());
-  assert(start_index + length <= tensor->size(dim));
+  cp_assert(*result == NULL);
+  cp_assert(dim >= 0);
+  cp_assert(start_index >= 0);
+  cp_assert(length >= 0);
+  cp_assert(dim < tensor->ndimension());
+  cp_assert(start_index + length <= tensor->size(dim));
   *result =
       new torch_c_tensor_t(tensor->narrow(dim, start_index, length).to(device));
 }
@@ -359,6 +583,75 @@ void torch_c_tensor_backward(const torch_c_tensor_t *tensor,
 }
 
 /*******************************************************************************
+ * \brief Apply a scalar tensor's Hessian to directions of its independent
+ * inputs.
+ ******************************************************************************/
+void torch_c_tensor_hessian_vector(const torch_c_tensor_t *tensor,
+                                   const int count,
+                                   const torch_c_tensor_t *const inputs[],
+                                   const torch_c_tensor_t *const directions[],
+                                   torch_c_tensor_t *responses[],
+                                   const bool to_host, int *status) {
+  *status = 0;
+  for (int i = 0; i < count; i++)
+    responses[i] = nullptr;
+  try {
+    TorchFloatingPointMaskGuard fpe_guard;
+    c10::OptionalDeviceGuard guard;
+    get_device_with_guard(guard);
+    TORCH_CHECK(
+        count > 0 && tensor->numel() == 1,
+        "Hessian-vector evaluation requires a scalar and input tensors");
+    std::vector<torch::Tensor> variables;
+    std::vector<torch::Tensor> active_variables;
+    std::vector<torch::Tensor> active_directions;
+    for (int i = 0; i < count; i++) {
+      TORCH_CHECK(inputs[i]->requires_grad() &&
+                      inputs[i]->sizes() == directions[i]->sizes() &&
+                      inputs[i]->device() == directions[i]->device(),
+                  "Hessian-vector inputs and directions must have matching "
+                  "shapes and devices");
+      variables.push_back(*inputs[i]);
+      if (directions[i]->count_nonzero().item<int64_t>() != 0) {
+        active_variables.push_back(*inputs[i]);
+        active_directions.push_back(directions[i]->detach());
+      }
+    }
+    std::vector<torch::Tensor> first(active_variables.size());
+    if (tensor->requires_grad() && !active_variables.empty()) {
+      first = torch::autograd::grad({*tensor}, active_variables, {}, true, true,
+                                    true);
+    }
+    torch::Tensor contraction;
+    for (size_t i = 0; i < first.size(); i++) {
+      if (first[i].defined() && first[i].requires_grad()) {
+        auto term = (first[i] * active_directions[i]).sum();
+        contraction = contraction.defined() ? contraction + term : term;
+      }
+    }
+    std::vector<torch::Tensor> second(count);
+    if (contraction.defined()) {
+      // Retain all mixed responses, even for inputs with a zero direction.
+      second = torch::autograd::grad({contraction}, variables, {}, false, false,
+                                     true);
+    }
+    for (int i = 0; i < count; i++) {
+      auto response = second[i].defined() ? second[i].detach()
+                                          : torch::zeros_like(*inputs[i]);
+      responses[i] = new torch_c_tensor_t(to_host ? response.cpu().contiguous()
+                                                  : response);
+    }
+  } catch (const std::exception &error) {
+    fprintf(stderr, "Torch Hessian evaluation failed: %s\n", error.what());
+    for (int i = 0; i < count; i++) {
+      delete responses[i];
+      responses[i] = nullptr;
+    }
+    *status = 1;
+  }
+}
+
+/*******************************************************************************
  * \brief Runs autograd on a scalar Torch tensor.
  ******************************************************************************/
 void torch_c_tensor_backward_scalar(const torch_c_tensor_t *tensor) {
@@ -387,6 +680,11 @@ void torch_c_tensor_to_device_leaf(torch_c_tensor_t **tensor,
 void torch_c_use_cuda(const bool use_cuda) { use_cuda_if_available = use_cuda; }
 
 /*******************************************************************************
+ * \brief Returns whether Torch wrappers currently select CUDA when available.
+ ******************************************************************************/
+bool torch_c_get_use_cuda() { return use_cuda_if_available; }
+
+/*******************************************************************************
  * \brief Returns the gradient of a Torch tensor which was computed by autograd.
  * \author Ole Schuett
  ******************************************************************************/
@@ -395,8 +693,57 @@ void torch_c_tensor_grad(const torch_c_tensor_t *tensor,
   c10::OptionalDeviceGuard guard;
   get_device_with_guard(guard);
   const torch::Tensor maybe_grad = tensor->grad();
-  assert(maybe_grad.defined());
-  *grad = new torch_c_tensor_t(maybe_grad.cpu().contiguous());
+  cp_assert(maybe_grad.defined());
+  torch::Tensor host_grad = maybe_grad.detach().cpu().contiguous();
+  if (maybe_grad.is_cpu()) {
+    host_grad = host_grad.clone();
+  }
+  *grad = new torch_c_tensor_t(std::move(host_grad));
+}
+
+/*******************************************************************************
+ * \brief Copies three autograd gradients to CPU memory.
+ ******************************************************************************/
+void torch_c_tensor_grad_batch3(const torch_c_tensor_t *tensor1,
+                                const torch_c_tensor_t *tensor2,
+                                const torch_c_tensor_t *tensor3,
+                                torch_c_tensor_t **grad1,
+                                torch_c_tensor_t **grad2,
+                                torch_c_tensor_t **grad3) {
+  c10::OptionalDeviceGuard guard;
+  const auto device = get_device_with_guard(guard);
+  cp_assert(*grad1 == nullptr && *grad2 == nullptr && *grad3 == nullptr);
+
+  const torch::Tensor source1 = tensor1->grad();
+  const torch::Tensor source2 = tensor2->grad();
+  const torch::Tensor source3 = tensor3->grad();
+  cp_assert(source1.defined() && source2.defined() && source3.defined());
+  cp_assert(source1.device() == source2.device());
+  cp_assert(source1.device() == source3.device());
+  if (use_batched_gradient_readback(source1)) {
+    auto host1 =
+        torch::empty(source1.sizes(),
+                     source1.options().device(torch::kCPU).pinned_memory(true));
+    auto host2 =
+        torch::empty(source2.sizes(),
+                     source2.options().device(torch::kCPU).pinned_memory(true));
+    auto host3 =
+        torch::empty(source3.sizes(),
+                     source3.options().device(torch::kCPU).pinned_memory(true));
+    host1.copy_(source1, true);
+    host2.copy_(source2, true);
+    host3.copy_(source3, true);
+    torch::cuda::synchronize(device.index());
+    *grad1 = new torch_c_tensor_t(std::move(host1));
+    *grad2 = new torch_c_tensor_t(std::move(host2));
+    *grad3 = new torch_c_tensor_t(std::move(host3));
+  } else {
+    // Materialize independent host buffers instead of aliasing gradients owned
+    // by the autograd graph when they are already contiguous CPU tensors.
+    *grad1 = new torch_c_tensor_t(source1.detach().cpu().contiguous().clone());
+    *grad2 = new torch_c_tensor_t(source2.detach().cpu().contiguous().clone());
+    *grad3 = new torch_c_tensor_t(source3.detach().cpu().contiguous().clone());
+  }
 }
 
 /*******************************************************************************
@@ -410,7 +757,7 @@ void torch_c_tensor_release(torch_c_tensor_t *tensor) { delete (tensor); }
  * \author Ole Schuett
  ******************************************************************************/
 void torch_c_dict_create(torch_c_dict_t **dict_out) {
-  assert(*dict_out == NULL);
+  cp_assert(*dict_out == NULL);
   *dict_out = new c10::Dict<std::string, torch::Tensor>();
 }
 
@@ -418,7 +765,7 @@ void torch_c_dict_create(torch_c_dict_t **dict_out) {
  * \brief Clones a Torch dictionary.
  ******************************************************************************/
 void torch_c_dict_clone(const torch_c_dict_t *dict, torch_c_dict_t **dict_out) {
-  assert(*dict_out == NULL);
+  cp_assert(*dict_out == NULL);
   torch_c_dict_t *clone = new c10::Dict<std::string, torch::Tensor>();
   for (const auto &entry : *dict) {
     clone->insert(entry.key(), entry.value());
@@ -443,7 +790,7 @@ void torch_c_dict_insert(const torch_c_dict_t *dict, const char *key,
  ******************************************************************************/
 void torch_c_dict_get(const torch_c_dict_t *dict, const char *key,
                       torch_c_tensor_t **tensor) {
-  assert(dict->contains(key));
+  cp_assert(dict->contains(key));
   *tensor = new torch_c_tensor_t(dict->at(key).cpu().contiguous());
 }
 
@@ -459,14 +806,96 @@ void torch_c_dict_release(torch_c_dict_t *dict) { delete (dict); }
  * \author Ole Schuett
  ******************************************************************************/
 void torch_c_model_load(torch_c_model_t **model_out, const char *filename) {
-  assert(*model_out == NULL);
+  cp_assert(*model_out == NULL);
   c10::OptionalDeviceGuard guard;
   const auto device = get_device_with_guard(guard);
   set_jit_fusion_strategy();
   torch::jit::Module *model = new torch::jit::Module();
   *model = load_module_for_device(filename, device);
-  model->eval(); // Set to evaluation mode to disable gradients, drop-out, etc.
+  model->eval(); // Set inference behavior for modules such as dropout.
   *model_out = model;
+}
+
+/*******************************************************************************
+ * \brief Loads a Torch model and reads two metadata entries.
+ ******************************************************************************/
+void torch_c_model_load_with_metadata(torch_c_model_t **model_out,
+                                      const char *filename, const char *key1,
+                                      const char *key2, char **content1,
+                                      int *length1, char **content2,
+                                      int *length2) {
+  cp_assert(*model_out == NULL);
+  c10::OptionalDeviceGuard guard;
+  const auto device = get_device_with_guard(guard);
+  std::unordered_map<std::string, std::string> extra_files = {{key1, ""},
+                                                              {key2, ""}};
+  set_jit_fusion_strategy();
+  torch::jit::Module *model = new torch::jit::Module();
+  // Deduplicate Skala constants on CPU without repeated CUDA synchronization.
+  *model =
+      load_module_for_device(filename, device, &extra_files, device.is_cuda());
+  model->eval(); // Set inference behavior for modules such as dropout.
+  *model_out = model;
+  copy_string_to_c_buffer(extra_files[key1], content1, length1);
+  copy_string_to_c_buffer(extra_files[key2], content2, length2);
+}
+
+/*******************************************************************************
+ * \brief Maps serialized TorchScript device constants to the active device.
+ ******************************************************************************/
+void torch_c_model_remap_device_constants(torch_c_model_t *model) {
+  c10::OptionalDeviceGuard guard;
+  const auto device = get_device_with_guard(guard);
+  if (device.is_cuda()) {
+    remap_model_device_constants(*model, device);
+    initialize_cuda_linalg(device);
+  }
+}
+
+/*******************************************************************************
+ * \brief Promote float32 model state and explicit numerical casts to float64.
+ *        Trained values are retained exactly; integer/index operations are
+ * kept.
+ ******************************************************************************/
+void torch_c_model_promote_float32(torch_c_model_t *model) {
+  TorchFloatingPointMaskGuard fpe_guard;
+  torch::NoGradGuard no_grad;
+  promote_model_float32(*model);
+}
+
+/*******************************************************************************
+ * \brief Prepare a model for higher input derivatives.
+ ******************************************************************************/
+void torch_c_model_prepare_higher_derivatives(torch_c_model_t *model) {
+  // Preserve parameter values while avoiding fp32 cancellation and saturated
+  // SiLU backward in higher input derivatives.
+  torch_c_model_promote_float32(model);
+  torch::jit::SubgraphRewriter rewriter;
+  rewriter.RegisterRewritePattern(
+      "graph(%x):\n %y = aten::silu(%x)\n return (%y)", R"IR(
+graph(%x):
+  %s = aten::sigmoid(%x)
+  %y = aten::mul(%x, %s)
+  return (%y))IR");
+  std::unordered_set<torch::jit::Graph *> prepared;
+  for (const auto &module : model->modules()) {
+    for (const auto &method : module.get_methods()) {
+      auto graph = method.graph();
+      if (prepared.insert(graph.get()).second) {
+        rewriter.runOnGraph(graph);
+      }
+    }
+  }
+}
+
+/*******************************************************************************
+ * \brief Disables gradients for inference-only model parameters.
+ ******************************************************************************/
+void torch_c_model_disable_parameter_gradients(torch_c_model_t *model) {
+  torch::NoGradGuard no_grad;
+  for (auto parameter : model->parameters()) {
+    parameter.set_requires_grad(false);
+  }
 }
 
 /*******************************************************************************
@@ -495,8 +924,13 @@ void torch_c_model_forward_mol_tensor(torch_c_model_t *model,
                                       torch_c_tensor_t **output) {
 
   c10::OptionalDeviceGuard guard;
-  get_device_with_guard(guard);
-  assert(*output == NULL);
+  const auto device = get_device_with_guard(guard);
+  // Avoid repeated TorchScript profiling of the frozen Skala model on CUDA.
+  std::optional<torch::jit::GraphOptimizerEnabledGuard> graph_optimization;
+  if (device.is_cuda()) {
+    graph_optimization.emplace(false);
+  }
+  cp_assert(*output == NULL);
   *output = new torch_c_tensor_t(
       model->get_method(method_name)({*inputs}).toTensor());
 }
@@ -578,6 +1012,16 @@ void torch_c_model_freeze(torch_c_model_t *model) {
   *model = torch::jit::freeze(*model);
 }
 
+/******************************************************************************
+ * \brief Freeze a Torch model while preserving one exported method.
+ ******************************************************************************/
+void torch_c_model_freeze_preserving_method(torch_c_model_t *model,
+                                            const char *method_name) {
+
+  const std::vector<std::string> preserved_methods = {method_name};
+  torch::jit::freeze_module_inplace(model, preserved_methods);
+}
+
 /*******************************************************************************
  * \brief Retrieves an int64 attribute. Must be called before model freeze.
  * \author Ole Schuett
@@ -603,7 +1047,7 @@ void torch_c_model_get_attr_double(const torch_c_model_t *model,
 void torch_c_model_get_attr_string(const torch_c_model_t *model,
                                    const char *key, char *dest) {
   const std::string &str = model->attr(key).toStringRef();
-  assert(str.size() < 80); // default_string_length
+  cp_assert(str.size() < 80); // default_string_length
   for (int i = 0; i < str.size(); i++) {
     dest[i] = str[i];
   }
@@ -627,7 +1071,7 @@ void torch_c_model_get_attr_strlist(const torch_c_model_t *model,
                                     char *dest) {
   const auto list = model->attr(key).toList();
   const std::string &str = list[index].toStringRef();
-  assert(str.size() < 80); // default_string_length
+  cp_assert(str.size() < 80); // default_string_length
   for (int i = 0; i < str.size(); i++) {
     dest[i] = str[i];
   }

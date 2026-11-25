@@ -1,0 +1,41 @@
+diff --git a/src/core/power.hpp b/src/core/power.hpp
+index e4ab753..8372515 100644
+--- a/src/core/power.hpp
++++ b/src/core/power.hpp
+@@ -91,7 +91,7 @@ class Profile
+     {
+         events_.emplace_back(label_, 0);
+     }
+-    inline static std::vector<Event> events_;
++    static std::vector<Event> events_;
+ };
+ 
+ inline std::string
+diff --git a/src/core/profiler.cpp b/src/core/profiler.cpp
+index 332ee31..24bf5ed 100644
+--- a/src/core/profiler.cpp
++++ b/src/core/profiler.cpp
+@@ -12,7 +12,10 @@
+  */
+ 
+ #include "profiler.hpp"
++#include "power.hpp"
+ 
+ namespace sirius {
++std::vector<power::Event> power::Profile::events_;
++
+ ::rt_graph::Timer global_rtgraph_timer;
+ 
+diff --git a/src/hamiltonian/hamiltonian.cpp b/src/hamiltonian/hamiltonian.cpp
+index e290967..5993740 100644
+--- a/src/hamiltonian/hamiltonian.cpp
++++ b/src/hamiltonian/hamiltonian.cpp
+@@ -342,7 +342,7 @@ Hamiltonian0<T>::generate_pw_coefs(Potential const& potential__)
+ 
+     int gv_count = this->ctx_.gvec_fft().count();
+ 
+-    auto& fft = this->ctx_.spfft<T>();
++    auto& fft = ctx_.spfft<T>();
+ 
+     /* temporaty output buffer */
+     mdarray<std::complex<T>, 1> fpw_fft({gv_count});

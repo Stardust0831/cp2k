@@ -6,7 +6,7 @@
 # author: Ole Schuett
 
 from configparser import ConfigParser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from os import path
 from pathlib import Path
@@ -17,6 +17,7 @@ import dataclasses
 import gzip
 import hashlib
 import html
+import tomllib
 import itertools
 import os
 import pickle
@@ -49,7 +50,7 @@ class GitLog:
             lines = entry.strip().split("\n")
             commit = Commit(
                 sha=GitSha(lines[0]),
-                date=datetime.fromtimestamp(float(lines[1])),
+                date=datetime.fromtimestamp(float(lines[1]), timezone.utc),
                 author_name=lines[2],
                 author_email=lines[3],
                 message=lines[4],
@@ -167,7 +168,7 @@ def gen_frontpage(
     output += "<tr><th>Name</th><th>Host</th><th>Status</th>"
     output += "<th>Commit</th><th>Summary</th><th>Last OK</th></tr>\n\n"
 
-    now = datetime.utcnow().replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
 
     for s in config.sections():
         print("Working on summary entry of: " + s)
@@ -175,7 +176,7 @@ def gen_frontpage(
         host = config.get(s, "host")
         report_url = config.get(s, "report_url")
         do_notify = config.getboolean(s, "notify", fallback=True)
-        timeout = config.getint(s, "timeout", fallback=24)
+        timeout = config.getint(s, "timeout", fallback=30)
 
         # find latest commit that should have been tested by now
         threshold = now - timedelta(hours=timeout)
@@ -590,7 +591,7 @@ def html_linkbox() -> str:
 
 # ======================================================================================
 def html_gitbox(log: GitLog) -> str:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     output = '<div class="sidebox">\n'
     output += "<h2>Recent Commits</h2>\n"
     for commit in log.commits[0:10]:
@@ -609,7 +610,7 @@ def html_gitbox(log: GitLog) -> str:
 
 # ======================================================================================
 def html_footer() -> str:
-    now = datetime.utcnow().replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
     output = f"<p><small>Page last updated: {now.isoformat()}</small></p>\n"
     output += "</body></html>"
     return output
@@ -705,9 +706,9 @@ def parse_report(report_txt: Optional[str], log: GitLog) -> Report:
         summary = re.findall(r"^Summary: (.+)$", report_txt, re.MULTILINE)[-1]
         status = re.findall(r"^Status: (.+)$", report_txt, re.MULTILINE)[-1]
         plot_matches = re.findall(r"^Plot: (.+)$", report_txt, re.MULTILINE)
-        plots = [cast(Plot, eval(f"Plot({m})")) for m in plot_matches]
+        plots = [parse_plot(m) for m in plot_matches]
         point_matches = re.findall(r"^PlotPoint: (.+)$", report_txt, re.MULTILINE)
-        points = [cast(PlotPoint, eval(f"PlotPoint({m})")) for m in point_matches]
+        points = [parse_plot_point(m) for m in point_matches]
 
         # Check that every plot has at least one PlotPoint
         if status == "OK":
@@ -723,6 +724,20 @@ def parse_report(report_txt: Optional[str], log: GitLog) -> Report:
     except Exception:
         traceback.print_exc()
         return Report("UNKNOWN", "Error while parsing report.")
+
+
+# ======================================================================================
+def parse_plot(text: str) -> Plot:
+    assert len(text) < 500
+    kwargs = tomllib.loads("plot = {" + text + "}")["plot"]
+    return Plot(**kwargs)
+
+
+# ======================================================================================
+def parse_plot_point(text: str) -> PlotPoint:
+    assert len(text) < 500
+    kwargs = tomllib.loads("point = {" + text + "}")["point"]
+    return PlotPoint(**kwargs)
 
 
 # ======================================================================================

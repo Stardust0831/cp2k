@@ -148,7 +148,7 @@ CONTAINS
 
          np = 2**il ! number of points to be generated at this level
          dl = n/(2*np) ! interval betw points (in index numbers)
-         vrnc = vrnc/2.0_dp; ! variance at this level (=t at level 0)
+         vrnc = vrnc/2.0_dp ! variance at this level (=t at level 0)
 
          ! loop over points added in this level
          DO ip = 0, np - 1
@@ -164,7 +164,7 @@ CONTAINS
 
             ! generate new point and save it under j
             DO ic = 1, 3
-               xc = (x(3*i1 + ic) + x(3*i2 + ic))/2.0
+               xc = (x(3*i1 + ic) + x(3*i2 + ic))/2.0_dp
                xc = xc + rng_gaussian%next(variance=vrnc)
                x(3*j + ic) = xc
             END DO

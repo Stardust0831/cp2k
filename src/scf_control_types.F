@@ -20,9 +20,12 @@ MODULE scf_control_types
                                               cp_logger_type
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
+   USE cp_parser_methods,               ONLY: read_integer_object
    USE cp_units,                        ONLY: cp_unit_from_cp2k
+   USE ieee_arithmetic,                 ONLY: ieee_is_finite
    USE input_constants,                 ONLY: &
-        atomic_guess, diag_ot, direct_p_mix, general_roks, high_spin_roks, no_guess, no_mix, &
+        atomic_guess, diag_ot, diag_update_method_adiis, diag_update_method_mixing, direct_p_mix, &
+        external_density_guess, general_roks, high_spin_roks, no_guess, no_mix, &
         ot_algo_taylor_or_diag, outer_scf_basis_center_opt, outer_scf_cdft_constraint, &
         outer_scf_ddapc_constraint, outer_scf_none, outer_scf_optimizer_bisect, &
         outer_scf_optimizer_broyden, outer_scf_optimizer_diis, outer_scf_optimizer_newton, &
@@ -41,13 +44,17 @@ MODULE scf_control_types
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
-   USE kinds,                           ONLY: dp
+   USE kinds,                           ONLY: default_path_length,&
+                                              default_string_length,&
+                                              dp
    USE outer_scf_control_types,         ONLY: outer_scf_control_type,&
                                               outer_scf_read_parameters
+   USE physcon,                         ONLY: evolt
    USE qs_cdft_opt_types,               ONLY: cdft_opt_type_release
    USE qs_ot_types,                     ONLY: ot_readwrite_input,&
                                               qs_ot_settings_init,&
                                               qs_ot_settings_type
+   USE string_utilities,                ONLY: uppercase
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -102,10 +109,12 @@ MODULE scf_control_types
    END TYPE smear_type
 
    TYPE diagonalization_type
-      INTEGER                               :: method = -1
+      INTEGER                               :: method = -1, update_method = -1, max_history = -1
       REAL(KIND=dp)                         :: eps_jacobi = -1.0_dp
       REAL(KIND=dp)                         :: jacobi_threshold = -1.0_dp
+      REAL(KIND=dp)                         :: adiis_shift = 0.0_dp
       INTEGER                               :: max_iter = -1, nkrylov = -1, nblock_krylov = -1
+      LOGICAL                               :: adiis_verbose = .FALSE.
       ! Maximum Overlap Method
       LOGICAL                               :: mom = .FALSE., mom_didguess = .FALSE.
       INTEGER                               :: mom_proj_formula = -1
@@ -129,6 +138,7 @@ MODULE scf_control_types
       TYPE(diagonalization_type)            :: diagonalization = diagonalization_type()
       TYPE(gce_type), POINTER               :: gce => NULL()
       INTEGER                               :: density_guess = -1, mixing_method = -1
+      CHARACTER(LEN=default_path_length)     :: external_density_file_name = ""
       REAL(KIND=dp)                         :: eps_eigval = -1.0_dp, eps_scf = -1.0_dp, eps_scf_hist = -1.0_dp, &
                                                level_shift = -1.0_dp, &
                                                eps_lumos = -1.0_dp, eps_diis = -1.0_dp
@@ -142,6 +152,7 @@ MODULE scf_control_types
       LOGICAL                               :: force_scf_calculation = .FALSE.
       LOGICAL                               :: non_selfconsistent = .FALSE.
       INTEGER, DIMENSION(2)                 :: added_mos = -1
+      LOGICAL, DIMENSION(2)                 :: added_mos_auto = .FALSE.
       INTEGER                               :: roks_scheme = -1
       REAL(KIND=dp)                         :: roks_f = -1.0_dp
       REAL(KIND=dp), DIMENSION(0:2, 0:2, 1:2) :: roks_parameter = -1.0_dp
@@ -203,6 +214,7 @@ CONTAINS
       scf_control%max_diis = 4
       scf_control%eps_diis = 0.1_dp
       scf_control%added_mos(:) = 0
+      scf_control%added_mos_auto(:) = .FALSE.
       scf_control%max_scf_hist = 0
 
       !Mixing
@@ -214,6 +226,10 @@ CONTAINS
 
       ! Diagonalization
       scf_control%diagonalization%method = 0
+      scf_control%diagonalization%update_method = diag_update_method_mixing
+      scf_control%diagonalization%max_history = 16
+      scf_control%diagonalization%adiis_shift = 0.0_dp
+      scf_control%diagonalization%adiis_verbose = .FALSE.
       scf_control%diagonalization%eps_jacobi = 0.0_dp
       scf_control%diagonalization%jacobi_threshold = 1.0E-7_dp
       scf_control%diagonalization%max_iter = 0
@@ -302,8 +318,9 @@ CONTAINS
       END IF
       DEALLOCATE (scf_control%smear)
 
-      IF (ASSOCIATED(scf_control%outer_scf%cdft_opt_control)) &
+      IF (ASSOCIATED(scf_control%outer_scf%cdft_opt_control)) THEN
          CALL cdft_opt_type_release(scf_control%outer_scf%cdft_opt_control)
+      END IF
 
       IF (ASSOCIATED(scf_control%gce)) THEN
          DEALLOCATE (scf_control%gce)
@@ -332,13 +349,16 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'scf_c_read_parameters'
 
-      INTEGER                                            :: cholesky_flag, handle, ialgo
-      INTEGER, DIMENSION(:), POINTER                     :: added_mos
+      CHARACTER(LEN=default_string_length)               :: added_mos_string, error_message
+      CHARACTER(LEN=default_string_length), &
+         DIMENSION(:), POINTER                           :: added_mos
+      INTEGER                                            :: added_mos_value, cholesky_flag, handle, &
+                                                            i, ialgo
       LOGICAL                                            :: do_mixing, explicit
       REAL(KIND=dp), DIMENSION(:), POINTER               :: roks_parameter
-      TYPE(section_vals_type), POINTER                   :: gce_section, mixing_section, &
-                                                            outer_scf_section, scf_section, &
-                                                            smear_section
+      TYPE(section_vals_type), POINTER                   :: adiis_section, gce_section, &
+                                                            mixing_section, outer_scf_section, &
+                                                            scf_section, smear_section
 
       CALL timeset(routineN, handle)
 
@@ -353,13 +373,19 @@ CONTAINS
       IF (scf_control%use_diag .AND. scf_control%use_ot) THEN
          ! don't allow both options to be true
          CPABORT("Don't activate OT and Diagonaliztion together")
-      ELSEIF (.NOT. (scf_control%use_diag .OR. scf_control%use_ot)) THEN
+      ELSE IF (.NOT. (scf_control%use_diag .OR. scf_control%use_ot)) THEN
          ! set default to diagonalization
          scf_control%use_diag = .TRUE.
       END IF
       CALL section_vals_val_get(scf_section, "OT%ALGORITHM", i_val=ialgo)
       scf_control%do_outer_scf_reortho = ialgo == ot_algo_taylor_or_diag
       CALL section_vals_val_get(scf_section, "SCF_GUESS", i_val=scf_control%density_guess)
+      CALL section_vals_val_get(scf_section, "EXTERNAL_DENSITY_FILE_NAME", &
+                                c_val=scf_control%external_density_file_name)
+      IF (scf_control%density_guess == external_density_guess .AND. &
+          LEN_TRIM(scf_control%external_density_file_name) == 0) THEN
+         CPABORT("SCF_GUESS EXTERNAL_DENSITY requires EXTERNAL_DENSITY_FILE_NAME")
+      END IF
       CALL section_vals_val_get(scf_section, "eps_eigval", r_val=scf_control%eps_eigval)
       CALL section_vals_val_get(scf_section, "cholesky", i_val=cholesky_flag)
       IF (scf_control%use_ot) THEN
@@ -386,6 +412,8 @@ CONTAINS
       IF (scf_control%use_diag) THEN
          CALL section_vals_val_get(scf_section, "DIAGONALIZATION%ALGORITHM", &
                                    i_val=scf_control%diagonalization%method)
+         CALL section_vals_val_get(scf_section, "DIAGONALIZATION%UPDATE_METHOD", &
+                                   i_val=scf_control%diagonalization%update_method)
          CALL section_vals_val_get(scf_section, "DIAGONALIZATION%EPS_JACOBI", &
                                    r_val=scf_control%diagonalization%eps_jacobi)
          CALL section_vals_val_get(scf_section, "DIAGONALIZATION%JACOBI_THRESHOLD", &
@@ -430,7 +458,27 @@ CONTAINS
                                       i_val=scf_control%diagonalization%mom_proj_formula)
          END IF
       END IF
-
+      ! Read ADIIS section
+      adiis_section => section_vals_get_subs_vals(scf_section, "ADIIS")
+      CALL section_vals_val_get(adiis_section, "MAX_HISTORY", &
+                                i_val=scf_control%diagonalization%max_history)
+      CALL section_vals_val_get(adiis_section, "ADAPTIVE_LEVEL_SHIFT", &
+                                r_val=scf_control%diagonalization%adiis_shift)
+      IF (.NOT. ieee_is_finite(scf_control%diagonalization%adiis_shift) .OR. &
+          scf_control%diagonalization%adiis_shift < 0.0_dp) THEN
+         CPABORT("ADIIS%ADAPTIVE_LEVEL_SHIFT must be finite and nonnegative")
+      END IF
+      IF (scf_control%diagonalization%adiis_shift > 0.0_dp) THEN
+         IF (scf_control%diagonalization%update_method /= diag_update_method_adiis .OR. &
+             scf_control%diagonalization%max_history < 2) THEN
+            CPABORT("ADAPTIVE_LEVEL_SHIFT requires UPDATE_METHOD ADIIS and MAX_HISTORY >= 2")
+         END IF
+         IF (scf_control%level_shift /= 0.0_dp) THEN
+            CPABORT("ADAPTIVE_LEVEL_SHIFT cannot be combined with SCF%LEVEL_SHIFT")
+         END IF
+      END IF
+      CALL section_vals_val_get(adiis_section, "VERBOSE", &
+                                l_val=scf_control%diagonalization%adiis_verbose)
       ! Read ROKS parameters
       CALL section_vals_val_get(scf_section, "ROKS_SCHEME", i_val=scf_control%roks_scheme)
 
@@ -458,12 +506,28 @@ CONTAINS
       CALL section_vals_val_get(scf_section, "max_iter_lumo", i_val=scf_control%max_iter_lumos)
 
       ! Extra MOs, e.g. for smearing
-      CALL section_vals_val_get(scf_section, "added_mos", i_vals=added_mos)
+      CALL section_vals_val_get(scf_section, "added_mos", c_vals=added_mos)
       CPASSERT(ASSOCIATED(added_mos))
       IF (SIZE(added_mos) > 0) THEN
-         scf_control%added_mos(1) = added_mos(1)
-         IF (SIZE(added_mos) > 1) THEN
-            scf_control%added_mos(2) = added_mos(2)
+         scf_control%added_mos_auto(:) = .FALSE.
+         DO i = 1, MIN(SIZE(added_mos), SIZE(scf_control%added_mos))
+            added_mos_string = ADJUSTL(added_mos(i))
+            CALL uppercase(added_mos_string)
+            IF (TRIM(added_mos_string) == "AUTO") THEN
+               scf_control%added_mos(i) = 0
+               scf_control%added_mos_auto(i) = .TRUE.
+            ELSE
+               CALL read_integer_object(TRIM(added_mos(i)), added_mos_value, error_message)
+               IF (LEN_TRIM(error_message) > 0) THEN
+                  CALL cp_abort(__LOCATION__, &
+                                "Invalid ADDED_MOS value '"//TRIM(added_mos(i))// &
+                                "'. Use an integer or AUTO.")
+               END IF
+               scf_control%added_mos(i) = added_mos_value
+            END IF
+         END DO
+         IF (SIZE(added_mos) == 1 .AND. scf_control%added_mos_auto(1)) THEN
+            scf_control%added_mos_auto(2) = .TRUE.
          END IF
       END IF
 
@@ -655,9 +719,29 @@ CONTAINS
                   "eps_diis:          ", scf_control%eps_diis, &
                   "eps_eigval:        ", scf_control%eps_eigval, &
                   "level_shift [a.u.]:", scf_control%level_shift
+
+               IF (scf_control%density_guess == external_density_guess) THEN
+                  WRITE (UNIT=output_unit, FMT="(T25,A,T51,A30)") &
+                     "External density:   ", ADJUSTR(TRIM(scf_control%external_density_file_name))
+               END IF
+
+               IF (scf_control%use_diag) THEN
+                  keyword => section_get_keyword(section, "DIAGONALIZATION%UPDATE_METHOD")
+                  CALL keyword_get(keyword, enum=enum)
+                  WRITE (UNIT=output_unit, FMT="(T25,A,T51,A30)") &
+                     "SCF update method:  ", &
+                     ADJUSTR(TRIM(enum_i2c(enum, scf_control%diagonalization%update_method)))
+                  IF (scf_control%diagonalization%update_method == diag_update_method_adiis) THEN
+                     WRITE (UNIT=output_unit, FMT="(T25,A,T71,I10)") &
+                        "ADIIS max history: ", scf_control%diagonalization%max_history
+                  END IF
+               END IF
             END IF
 
-            IF (SUM(ABS(scf_control%added_mos)) > 0) THEN
+            IF (ANY(scf_control%added_mos_auto)) THEN
+               WRITE (UNIT=output_unit, FMT="(T25,A,T71,2I5)") &
+                  "added MOs (auto)   ", scf_control%added_mos
+            ELSE IF (SUM(ABS(scf_control%added_mos)) > 0) THEN
                WRITE (UNIT=output_unit, FMT="(T25,A,T71,2I5)") &
                   "added MOs          ", scf_control%added_mos
             END IF
@@ -699,9 +783,10 @@ CONTAINS
                   WRITE (UNIT=output_unit, FMT="(T25,A,T71,ES10.2)") &
                      "Smearing width (sigma) [a.u.]:", scf_control%smear%smearing_width, &
                      "Accuracy threshold:", scf_control%smear%eps_fermi_dirac
-                  IF (scf_control%smear%fixed_mag_mom > 0.0_dp) &
+                  IF (scf_control%smear%fixed_mag_mom > 0.0_dp) THEN
                      WRITE (UNIT=output_unit, FMT="(T25,A,T61,F20.1)") &
-                     "Fixed magnetic moment set to:", scf_control%smear%fixed_mag_mom
+                        "Fixed magnetic moment set to:", scf_control%smear%fixed_mag_mom
+                  END IF
                CASE (smear_energy_window)
                   WRITE (UNIT=output_unit, FMT="(T25,A,T71,F10.6)") &
                      "Smear window [a.u.]:       ", scf_control%smear%window_size
@@ -709,9 +794,9 @@ CONTAINS
             END IF
 
             IF (scf_control%gce%do_gce) THEN
-               WRITE (UNIT=output_unit, FMT="(T25,A,/,T25,A,T61,F20.1)") &
+               WRITE (UNIT=output_unit, FMT="(T25,A,/,T25,A,T61,F20.6)") &
                   REPEAT("-", 56), &
-                  "Target workfunction [eV]:", scf_control%gce%target_workfunction
+                  "Target workfunction [eV]:", scf_control%gce%target_workfunction*evolt
                WRITE (UNIT=output_unit, FMT="(T25,A,T61,F20.1)") "Mixing coefficient:", scf_control%gce%mixing_coef
                WRITE (UNIT=output_unit, FMT="(T25,A)") "Grand canonical SCF is activated."
             END IF
@@ -828,7 +913,7 @@ CONTAINS
       ot_section => section_vals_get_subs_vals(scf_section, "DIAGONALIZATION%OT")
       CALL section_vals_get(ot_section, explicit=explicit)
 
-      CALL ot_readwrite_input(settings, ot_section, output_unit)
+      CALL ot_readwrite_input(settings, ot_section, output_unit, eigensolver=.TRUE.)
 
       CALL cp_print_key_finished_output(output_unit, logger, scf_section, &
                                         "PRINT%PROGRAM_RUN_INFO")

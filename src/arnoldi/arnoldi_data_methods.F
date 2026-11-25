@@ -18,11 +18,12 @@ MODULE arnoldi_data_methods
    USE arnoldi_types,                   ONLY: &
         arnoldi_control_type, arnoldi_data_type, arnoldi_env_type, get_control, get_data, &
         get_evals, get_sel_ind, set_control, set_data
-   USE arnoldi_vector,                  ONLY: create_col_vec_from_matrix
+   USE arnoldi_vector,                  ONLY: create_col_vec_from_matrix,&
+                                              transfer_dbcsr_to_local_array,&
+                                              transfer_local_array_to_dbcsr
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_distribution_get, dbcsr_distribution_type, dbcsr_get_data_p, dbcsr_get_info, &
-        dbcsr_get_matrix_type, dbcsr_mp_grid_setup, dbcsr_p_type, dbcsr_release, dbcsr_type, &
-        dbcsr_type_symmetric
+        dbcsr_distribution_get, dbcsr_distribution_type, dbcsr_get_info, dbcsr_get_matrix_type, &
+        dbcsr_mp_grid_setup, dbcsr_p_type, dbcsr_release, dbcsr_type, dbcsr_type_symmetric
    USE kinds,                           ONLY: dp
    USE util,                            ONLY: sort
 #include "../base/base_uses.f90"
@@ -138,13 +139,15 @@ CONTAINS
       CALL control%mp_group%set_handle(group_handle)
       CALL control%pcol_group%set_handle(pcol_handle)
 
-      IF (.NOT. subgroups_defined) &
+      IF (.NOT. subgroups_defined) THEN
          CPABORT("arnoldi only with subgroups")
+      END IF
 
       control%symmetric = .FALSE.
       ! Will need a fix for complex because there it has to be hermitian
-      IF (SIZE(matrix) == 1) &
+      IF (SIZE(matrix) == 1) THEN
          control%symmetric = dbcsr_get_matrix_type(matrix(1)%matrix) == dbcsr_type_symmetric
+      END IF
 
       ! Set the control parameters
       control%max_iter = max_iter
@@ -158,23 +161,28 @@ CONTAINS
       control%nrestart = nrestarts
       control%generalized_ev = generalized_ev
 
-      IF (control%nval_req > 1 .AND. control%nrestart > 0 .AND. .NOT. control%iram) &
+      IF (control%nval_req > 1 .AND. control%nrestart > 0 .AND. .NOT. control%iram) THEN
          CALL cp_abort(__LOCATION__, 'with more than one eigenvalue requested '// &
                        'internal restarting with a previous EVEC is a bad idea, set IRAM or nrestsart=0')
+      END IF
 
       ! some checks for the generalized EV mode
-      IF (control%generalized_ev .AND. selection_crit == 1) &
+      IF (control%generalized_ev .AND. selection_crit == 1) THEN
          CALL cp_abort(__LOCATION__, &
                        'generalized ev can only highest OR lowest EV')
-      IF (control%generalized_ev .AND. nval_request /= 1) &
+      END IF
+      IF (control%generalized_ev .AND. nval_request /= 1) THEN
          CALL cp_abort(__LOCATION__, &
                        'generalized ev can only compute one EV at the time')
-      IF (control%generalized_ev .AND. control%nrestart == 0) &
+      END IF
+      IF (control%generalized_ev .AND. control%nrestart == 0) THEN
          CALL cp_abort(__LOCATION__, &
                        'outer loops are mandatory for generalized EV, set nrestart appropriatly')
-      IF (SIZE(matrix) /= 2 .AND. control%generalized_ev) &
+      END IF
+      IF (SIZE(matrix) /= 2 .AND. control%generalized_ev) THEN
          CALL cp_abort(__LOCATION__, &
                        'generalized ev needs exactly two matrices as input (2nd is the metric)')
+      END IF
 
       ALLOCATE (control%selected_ind(max_iter))
       CALL set_control(arnoldi_env, control)
@@ -196,7 +204,6 @@ CONTAINS
       COMPLEX(dp), ALLOCATABLE, DIMENSION(:)             :: ritz_v
       INTEGER                                            :: i, myind, sspace_size, vsize
       INTEGER, DIMENSION(:), POINTER                     :: selected_ind
-      REAL(kind=dp), DIMENSION(:), POINTER               :: data_vec
       TYPE(arnoldi_control_type), POINTER                :: control
       TYPE(arnoldi_data_type), POINTER                   :: ar_data
 
@@ -215,10 +222,9 @@ CONTAINS
          DO i = 1, sspace_size
             ritz_v(:) = ritz_v(:) + ar_data%local_history(:, i)*ar_data%revec(i, myind)
          END DO
-         data_vec => dbcsr_get_data_p(vector)
          ! is a bit odd but ritz_v is always complex and matrix type determines where it goes
          ! again I hope the user knows what is required
-         data_vec(1:vsize) = REAL(ritz_v(1:vsize), KIND=dp)
+         CALL transfer_local_array_to_dbcsr(vector, REAL(ritz_v(1:vsize), KIND=dp), vsize, .TRUE.)
       END IF
 
       DEALLOCATE (ritz_v)
@@ -386,8 +392,9 @@ CONTAINS
       INTEGER                                            :: ev_ind
       INTEGER, DIMENSION(:), POINTER                     :: selected_ind
 
-      IF (ind > get_nval_out(arnoldi_env)) &
+      IF (ind > get_nval_out(arnoldi_env)) THEN
          CPABORT('outside range of indexed evals')
+      END IF
 
       selected_ind => get_sel_ind(arnoldi_env)
       ev_ind = selected_ind(ind)
@@ -411,8 +418,9 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: selected_ind
 
       NULLIFY (evals)
-      IF (SIZE(eval_out) < get_nval_out(arnoldi_env)) &
+      IF (SIZE(eval_out) < get_nval_out(arnoldi_env)) THEN
          CPABORT('array for eval output too small')
+      END IF
       selected_ind => get_sel_ind(arnoldi_env)
 
       evals => get_evals(arnoldi_env)
@@ -434,7 +442,6 @@ CONTAINS
       TYPE(dbcsr_type)                                   :: vector
 
       INTEGER                                            :: ncol_local, nrow_local
-      REAL(kind=dp), DIMENSION(:), POINTER               :: data_vec
       TYPE(arnoldi_control_type), POINTER                :: control
       TYPE(arnoldi_data_type), POINTER                   :: ar_data
 
@@ -443,8 +450,9 @@ CONTAINS
       ar_data => get_data(arnoldi_env)
 
       CALL dbcsr_get_info(matrix=vector, nfullrows_local=nrow_local, nfullcols_local=ncol_local)
-      data_vec => dbcsr_get_data_p(vector)
-      IF (nrow_local*ncol_local > 0) ar_data%f_vec(1:nrow_local) = data_vec(1:nrow_local)
+      IF (nrow_local*ncol_local > 0) THEN
+         CALL transfer_dbcsr_to_local_array(vector, ar_data%f_vec, nrow_local, .TRUE.)
+      END IF
 
    END SUBROUTINE set_arnoldi_initial_vector
 

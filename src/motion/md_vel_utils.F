@@ -153,7 +153,7 @@ CONTAINS
       DO i = 1, SIZE(part)
          atomic_kind => part(i)%atomic_kind
          CALL get_atomic_kind(atomic_kind=atomic_kind, mass=mass)
-         IF (mass /= 0.0) THEN
+         IF (mass /= 0.0_dp) THEN
             SELECT CASE (is_fixed(i))
             CASE (use_perd_x, use_perd_y, use_perd_z, use_perd_xy, use_perd_xz, use_perd_yz, use_perd_none)
                vcom(1) = vcom(1) + part(i)%v(1)*mass
@@ -269,7 +269,7 @@ CONTAINS
          my_ireg = ireg
          my_nfree = nfree
          my_temp = temp
-      ELSEIF (PRESENT(nfree)) THEN
+      ELSE IF (PRESENT(nfree)) THEN
          my_ireg = 0
          my_nfree = nfree
          my_temp = simpar%temp_ext
@@ -1197,7 +1197,7 @@ CONTAINS
          part(i)%v(1) = 0.0_dp
          part(i)%v(2) = 0.0_dp
          part(i)%v(3) = 0.0_dp
-         IF (mass /= 0.0) THEN
+         IF (mass /= 0.0_dp) THEN
             SELECT CASE (is_fixed(i))
             CASE (use_perd_x)
                part(i)%v(2) = globenv%gaussian_rng_stream%next()/SQRT(mass)
@@ -1257,8 +1257,9 @@ CONTAINS
 
       IF (simpar%soften_nsteps <= 0) RETURN !nothing todo
 
-      IF (ANY(is_fixed /= use_perd_none)) &
+      IF (ANY(is_fixed /= use_perd_none)) THEN
          CPABORT("Velocitiy softening with constraints is not supported.")
+      END IF
 
       !backup positions
       DO i = 1, SIZE(part)
@@ -2001,8 +2002,9 @@ CONTAINS
                CALL get_molecule_kind(molecule_kind=molecule_kind, fixd_list=fixd_list)
                IF (ASSOCIATED(fixd_list)) THEN
                   DO ifixd = 1, SIZE(fixd_list)
-                     IF (.NOT. fixd_list(ifixd)%restraint%active) &
+                     IF (.NOT. fixd_list(ifixd)%restraint%active) THEN
                         is_fixed(fixd_list(ifixd)%fixd) = fixd_list(ifixd)%itype
+                     END IF
                   END DO
                END IF
             END DO
@@ -2112,8 +2114,9 @@ CONTAINS
          CALL get_molecule_kind_set(molecule_kind_set=molecule_kinds%els, &
                                     nconstraint=nconstraint, &
                                     nconstraint_fixd=nconstraint_fixd)
-         IF (nconstraint - nconstraint_fixd /= 0) &
+         IF (nconstraint - nconstraint_fixd /= 0) THEN
             CPABORT("Only the fixed atom constraint is implemented for core-shell models")
+         END IF
 !MK    CPPostcondition(.NOT.simpar%constraint,cp_failure_level,routineP,failure)
          CPASSERT(ASSOCIATED(shell_particles))
          CPASSERT(ASSOCIATED(core_particles))
@@ -2251,8 +2254,9 @@ CONTAINS
       IF (init_cascade) THEN
 
          CALL section_vals_val_get(cascade_section, "ENERGY", r_val=energy)
-         IF (energy < 0.0_dp) &
+         IF (energy < 0.0_dp) THEN
             CPABORT("Error occurred reading &CASCADE section: Negative energy found")
+         END IF
 
          IF (iw > 0) THEN
             ekin = cp_unit_from_cp2k(energy, "keV")
@@ -2266,8 +2270,9 @@ CONTAINS
          atom_list_section => section_vals_get_subs_vals(cascade_section, "ATOM_LIST")
          CALL section_vals_val_get(atom_list_section, "_DEFAULT_KEYWORD_", n_rep_val=natom)
          CALL section_vals_list_get(atom_list_section, "_DEFAULT_KEYWORD_", list=atom_list)
-         IF (natom <= 0) &
+         IF (natom <= 0) THEN
             CPABORT("Error occurred reading &CASCADE section: No atom list found")
+         END IF
 
          IF (iw > 0) THEN
             WRITE (UNIT=iw, FMT="(T2,A,T11,A,3(11X,A),9X,A)") &
@@ -2286,12 +2291,15 @@ CONTAINS
             no_read_error = .FALSE.
             READ (UNIT=line, FMT=*, ERR=999) atom_index(iatom), vatom(1:3, iatom), weight(iatom)
             no_read_error = .TRUE.
-999         IF (.NOT. no_read_error) &
+999         IF (.NOT. no_read_error) THEN
                CPABORT("Error occurred reading &CASCADE section. Last line read <"//TRIM(line)//">")
-            IF ((atom_index(iatom) <= 0) .OR. ((atom_index(iatom) > nparticle))) &
+            END IF
+            IF ((atom_index(iatom) <= 0) .OR. ((atom_index(iatom) > nparticle))) THEN
                CPABORT("Error occurred reading &CASCADE section: Invalid atom index found")
-            IF (weight(iatom) < 0.0_dp) &
+            END IF
+            IF (weight(iatom) < 0.0_dp) THEN
                CPABORT("Error occurred reading &CASCADE section: Negative weight found")
+            END IF
             IF (iw > 0) THEN
                WRITE (UNIT=iw, FMT="(T2,A,I10,4(1X,F14.6))") &
                   "CASCADE| ", atom_index(iatom), vatom(1:3, iatom), weight(iatom)
@@ -2311,7 +2319,7 @@ CONTAINS
          END DO
          weight(:) = matom(:)*weight(:)*energy/norm
          DO iatom = 1, natom
-            norm = SQRT(DOT_PRODUCT(vatom(1:3, iatom), vatom(1:3, iatom)))
+            norm = NORM2(vatom(1:3, iatom))
             vatom(1:3, iatom) = vatom(1:3, iatom)/norm
          END DO
 

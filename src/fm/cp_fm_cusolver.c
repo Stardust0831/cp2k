@@ -7,8 +7,8 @@
 
 #if defined(__CUSOLVERMP)
 
+#include "../base/cp_assert.h"
 #include "../offload/offload_library.h"
-#include <assert.h>
 #include <cuComplex.h>
 #include <cuda_runtime.h>
 #include <cusolverMp.h>
@@ -237,78 +237,143 @@ static char *cusolverGetErrorString(cusolverStatus_t status) {
   } while (0)
 
 /*******************************************************************************
- * \brief Driver routine to diagonalize a matrix with the cuSOLVERMp library.
- * \author Ole Schuett
+ * \brief cuSOLVERMp execution resources owned by a BLACS environment.
  ******************************************************************************/
-void cp_fm_diag_cusolver(const int fortran_comm, const int matrix_desc[9],
-                         const int nprow, const int npcol, const int myprow,
-                         const int mypcol, const int n, const double *matrix,
-                         double *eigenvectors, double *eigenvalues) {
-
-  const int local_device = offload_get_chosen_device();
-
-  MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
-  int rank, nranks;
-  MPI_Comm_rank(comm, &rank);
-  MPI_Comm_size(comm, &nranks);
-
+typedef struct {
+  MPI_Comm comm;
+  int device, nprow, npcol;
+  cudaStream_t stream;
+  cusolverMpHandle_t handle;
+  cusolverMpGrid_t grid;
 #if defined(__CUSOLVERMP_NCCL)
-  check_nccl_device_visibility(comm, local_device);
+  ncclComm_t nccl_comm;
+#else
+  cal_comm_t cal_comm;
+#endif
+} cp_fm_cusolver_context;
+
+/*******************************************************************************
+ * \brief Lazily initialize the execution resources for a BLACS environment.
+ ******************************************************************************/
+static cp_fm_cusolver_context *get_context(void **context,
+                                           const int fortran_comm,
+                                           const int nprow, const int npcol) {
+  const int device = offload_get_chosen_device();
+  MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
+  cp_fm_cusolver_context *ctx = *context;
+#if defined(__CUSOLVERMP_NCCL)
+  if (!ctx) {
+    check_nccl_device_visibility(comm, device);
+  }
 #endif
   offload_activate_chosen_device();
+  if (ctx) {
+    int comparison;
+    MPI_Comm_compare(comm, ctx->comm, &comparison);
+    cp_assert(comparison == MPI_IDENT || comparison == MPI_CONGRUENT);
+    cp_assert(ctx->device == device && ctx->nprow == nprow &&
+              ctx->npcol == npcol);
+    return ctx;
+  }
+
+  ctx = calloc(1, sizeof(*ctx));
+  cp_assert(ctx);
+  MPI_Comm_dup(comm, &ctx->comm);
+  ctx->device = device;
+  ctx->nprow = nprow;
+  ctx->npcol = npcol;
+  int rank, nranks;
+  MPI_Comm_rank(ctx->comm, &rank);
+  MPI_Comm_size(ctx->comm, &nranks);
 
 #if defined(__CUSOLVERMP_NCCL)
-  // Create NCCL communicator.
   ncclUniqueId nccl_id;
   if (rank == 0) {
     NCCL_CHECK(ncclGetUniqueId(&nccl_id));
   }
-  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, comm);
-
-  ncclComm_t nccl_comm;
-  NCCL_CHECK(ncclCommInitRank(&nccl_comm, nranks, nccl_id, rank));
+  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, ctx->comm);
+  NCCL_CHECK(ncclCommInitRank(&ctx->nccl_comm, nranks, nccl_id, rank));
 #else
-  // Create CAL communicator.
-  cal_comm_t cal_comm = NULL;
   cal_comm_create_params_t params;
   params.allgather = &allgather;
   params.req_test = &req_test;
   params.req_free = &req_free;
-  params.data = &comm;
+  params.data = &ctx->comm;
   params.rank = rank;
   params.nranks = nranks;
-  params.local_device = local_device;
-  CAL_CHECK(cal_comm_create(params, &cal_comm));
+  params.local_device = device;
+  CAL_CHECK(cal_comm_create(params, &ctx->cal_comm));
 #endif
 
-  // Create various handles.
-  cudaStream_t stream = NULL;
-  CUDA_CHECK(cudaStreamCreate(&stream));
-
-  cusolverMpHandle_t cusolvermp_handle = NULL;
-  CUSOLVER_CHECK(cusolverMpCreate(&cusolvermp_handle, local_device, stream));
-
-  cusolverMpGrid_t grid = NULL;
+  CUDA_CHECK(cudaStreamCreate(&ctx->stream));
+  CUSOLVER_CHECK(cusolverMpCreate(&ctx->handle, device, ctx->stream));
 #if defined(__CUSOLVERMP_NCCL)
-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, nccl_comm,
-                                            nprow, npcol,
+  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(ctx->handle, &ctx->grid,
+                                            ctx->nccl_comm, nprow, npcol,
                                             CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
 #else
-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, cal_comm,
-                                            nprow, npcol,
+  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(ctx->handle, &ctx->grid,
+                                            ctx->cal_comm, nprow, npcol,
                                             CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
 #endif
+  *context = ctx;
+  return ctx;
+}
+
+/*******************************************************************************
+ * \brief Release execution resources before their BLACS environment is freed.
+ ******************************************************************************/
+void cp_fm_cusolver_context_destroy(void **context) {
+  cp_fm_cusolver_context *ctx = *context;
+  if (!ctx) {
+    return;
+  }
+
+  int device;
+  CUDA_CHECK(cudaGetDevice(&device));
+  CUDA_CHECK(cudaSetDevice(ctx->device));
+  CUSOLVER_CHECK(cusolverMpDestroyGrid(ctx->grid));
+  CUSOLVER_CHECK(cusolverMpDestroy(ctx->handle));
+  CUDA_CHECK(cudaStreamDestroy(ctx->stream));
+#if defined(__CUSOLVERMP_NCCL)
+  NCCL_CHECK(ncclCommDestroy(ctx->nccl_comm));
+#else
+  CAL_CHECK(cal_comm_destroy(ctx->cal_comm));
+#endif
+  MPI_Comm_free(&ctx->comm);
+  free(ctx);
+  *context = NULL;
+  CUDA_CHECK(cudaSetDevice(device));
+}
+
+/*******************************************************************************
+ * \brief Driver routine to diagonalize a matrix with the cuSOLVERMp library.
+ * \author Ole Schuett
+ ******************************************************************************/
+void cp_fm_diag_cusolver(void **context, const int fortran_comm,
+                         const int matrix_desc[9], const int nprow,
+                         const int npcol, const int myprow, const int mypcol,
+                         const int n, const double *matrix,
+                         double *eigenvectors, double *eigenvalues) {
+
+  cp_fm_cusolver_context *ctx =
+      get_context(context, fortran_comm, nprow, npcol);
+  const MPI_Comm comm = ctx->comm;
+  const cudaStream_t stream = ctx->stream;
+  const cusolverMpHandle_t cusolvermp_handle = ctx->handle;
+  const cusolverMpGrid_t grid = ctx->grid;
+
   const int mb = matrix_desc[4];
   const int nb = matrix_desc[5];
   const int rsrc = matrix_desc[6];
   const int csrc = matrix_desc[7];
   const int ldA = matrix_desc[8];
-  assert(rsrc == csrc);
-  assert(ldA >= 1);
+  cp_assert(rsrc == csrc);
+  cp_assert(ldA >= 1);
 
   const int np = cusolverMpNUMROC(n, mb, myprow, rsrc, nprow);
   const int nq = cusolverMpNUMROC(n, nb, mypcol, csrc, npcol);
-  assert(np == ldA);
+  cp_assert(np == ldA);
 
   const cublasFillMode_t fill_mode = CUBLAS_FILL_MODE_UPPER;
   const cudaDataType_t data_type = CUDA_R_64F; // double
@@ -358,13 +423,13 @@ void cp_fm_diag_cusolver(const int fortran_comm, const int matrix_desc[9],
   // Wait for solver to finish.
   CUDA_CHECK(cudaStreamSynchronize(stream));
 #if !defined(__CUSOLVERMP_NCCL)
-  CAL_CHECK(cal_stream_sync(cal_comm, stream));
+  CAL_CHECK(cal_stream_sync(ctx->cal_comm, stream));
 #endif
 
   // Check info.
   int info = -1;
   CUDA_CHECK(cudaMemcpy(&info, info_dev, sizeof(int), cudaMemcpyDeviceToHost));
-  assert(info == 0);
+  cp_assert(info == 0);
 
   // Download results.
   CUDA_CHECK(cudaMemcpyAsync(eigenvectors, eigenvectors_dev, matrix_local_size,
@@ -383,16 +448,8 @@ void cp_fm_diag_cusolver(const int fortran_comm, const int matrix_desc[9],
   CUDA_CHECK(cudaFree(work_dev));
   CUDA_CHECK(cudaFreeHost(work_host));
 
-  // Destroy handles.
+  // Destroy matrix descriptor.
   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(cusolvermp_matrix_desc));
-  CUSOLVER_CHECK(cusolverMpDestroyGrid(grid));
-  CUSOLVER_CHECK(cusolverMpDestroy(cusolvermp_handle));
-  CUDA_CHECK(cudaStreamDestroy(stream));
-#if defined(__CUSOLVERMP_NCCL)
-  NCCL_CHECK(ncclCommDestroy(nccl_comm));
-#else
-  CAL_CHECK(cal_comm_destroy(cal_comm));
-#endif
 
   // Sync MPI ranks to include load imbalance in total timings.
   MPI_Barrier(comm);
@@ -402,68 +459,21 @@ void cp_fm_diag_cusolver(const int fortran_comm, const int matrix_desc[9],
  * \brief Driver routine to solve A*x = lambda*B*x with cuSOLVERMp sygvd.
  * \author Jiri Vyskocil
  ******************************************************************************/
-void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
+void cp_fm_diag_cusolver_sygvd(void **context, const int fortran_comm,
                                const int a_matrix_desc[9],
                                const int b_matrix_desc[9], const int nprow,
                                const int npcol, const int myprow,
-                               const int mypcol, const int n,
+                               const int mypcol, const int n, const int nmo,
                                const double *aMatrix, const double *bMatrix,
                                double *eigenvectors, double *eigenvalues) {
 
-  const int local_device = offload_get_chosen_device();
-
-  MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
-  int rank, nranks;
-  MPI_Comm_rank(comm, &rank);
-  MPI_Comm_size(comm, &nranks);
-
-#if defined(__CUSOLVERMP_NCCL)
-  check_nccl_device_visibility(comm, local_device);
-#endif
-  offload_activate_chosen_device();
-
-#if defined(__CUSOLVERMP_NCCL)
-  // Create NCCL communicator.
-  ncclUniqueId nccl_id;
-  if (rank == 0) {
-    NCCL_CHECK(ncclGetUniqueId(&nccl_id));
-  }
-  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, comm);
-
-  ncclComm_t nccl_comm;
-  NCCL_CHECK(ncclCommInitRank(&nccl_comm, nranks, nccl_id, rank));
-#else
-  // Create CAL communicator
-  cal_comm_t cal_comm = NULL;
-  cal_comm_create_params_t params;
-  params.allgather = &allgather;
-  params.req_test = &req_test;
-  params.req_free = &req_free;
-  params.data = &comm;
-  params.rank = rank;
-  params.nranks = nranks;
-  params.local_device = local_device;
-  CAL_CHECK(cal_comm_create(params, &cal_comm));
-#endif
-
-  // Create CUDA stream and cuSOLVER handle
-  cudaStream_t stream = NULL;
-  CUDA_CHECK(cudaStreamCreate(&stream));
-
-  cusolverMpHandle_t cusolvermp_handle = NULL;
-  CUSOLVER_CHECK(cusolverMpCreate(&cusolvermp_handle, local_device, stream));
-
-  // Define grid for device computation
-  cusolverMpGrid_t grid = NULL;
-#if defined(__CUSOLVERMP_NCCL)
-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, nccl_comm,
-                                            nprow, npcol,
-                                            CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
-#else
-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, cal_comm,
-                                            nprow, npcol,
-                                            CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
-#endif
+  cp_assert(nmo >= 0 && nmo <= n);
+  cp_fm_cusolver_context *ctx =
+      get_context(context, fortran_comm, nprow, npcol);
+  const MPI_Comm comm = ctx->comm;
+  const cudaStream_t stream = ctx->stream;
+  const cusolverMpHandle_t cusolvermp_handle = ctx->handle;
+  const cusolverMpGrid_t grid = ctx->grid;
 
   // Matrix descriptors for A, B, and Z
   const int mb_a = a_matrix_desc[4];
@@ -479,9 +489,9 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
   const int ldB = b_matrix_desc[8];
 
   // Ensure consistency in block sizes, sources, and leading dimensions
-  assert(mb_a == mb_b && nb_a == nb_b);
-  assert(rsrc_a == rsrc_b && csrc_a == csrc_b);
-  assert(ldA == ldB);
+  cp_assert(mb_a == mb_b && nb_a == nb_b);
+  cp_assert(rsrc_a == rsrc_b && csrc_a == csrc_b);
+  cp_assert(ldA == ldB);
 
   const int np_a = cusolverMpNUMROC(n, mb_a, myprow, rsrc_a, nprow);
   const int nq_a = cusolverMpNUMROC(n, nb_a, mypcol, csrc_a, npcol);
@@ -559,7 +569,7 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
   // Wait for computation to finish
   CUDA_CHECK(cudaStreamSynchronize(stream));
 #if !defined(__CUSOLVERMP_NCCL)
-  CAL_CHECK(cal_stream_sync(cal_comm, stream));
+  CAL_CHECK(cal_stream_sync(ctx->cal_comm, stream));
 #endif
 
   // Check info
@@ -570,11 +580,20 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
     abort();
   }
 
-  // Copy results back to host
-  CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, matrix_local_size,
-                             cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaMemcpyAsync(eigenvalues, eigenvalues_dev, n * sizeof(double),
-                             cudaMemcpyDeviceToHost, stream));
+  // The requested eigenvectors occupy a contiguous prefix of the local columns.
+  const int nq_eigenvectors =
+      cusolverMpNUMROC(nmo, nb_a, mypcol, csrc_a, npcol);
+  const size_t eigenvectors_local_size =
+      (size_t)ldA * nq_eigenvectors * sizeof(double);
+  if (eigenvectors_local_size > 0) {
+    CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, eigenvectors_local_size,
+                               cudaMemcpyDeviceToHost, stream));
+  }
+  if (nmo > 0) {
+    CUDA_CHECK(cudaMemcpyAsync(eigenvalues, eigenvalues_dev,
+                               nmo * sizeof(double), cudaMemcpyDeviceToHost,
+                               stream));
+  }
 
   // Wait for copy to finish
   CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -590,14 +609,6 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrA));
   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrB));
   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrZ));
-  CUSOLVER_CHECK(cusolverMpDestroyGrid(grid));
-  CUSOLVER_CHECK(cusolverMpDestroy(cusolvermp_handle));
-  CUDA_CHECK(cudaStreamDestroy(stream));
-#if defined(__CUSOLVERMP_NCCL)
-  NCCL_CHECK(ncclCommDestroy(nccl_comm));
-#else
-  CAL_CHECK(cal_comm_destroy(cal_comm));
-#endif
 
   MPI_Barrier(comm); // Synchronize MPI ranks
 }
@@ -606,62 +617,19 @@ void cp_fm_diag_cusolver_sygvd(const int fortran_comm,
  * \brief Driver routine to solve A*x = lambda*B*x with cuSOLVERMp hegvd.
  ******************************************************************************/
 void cp_cfm_diag_cusolver_hegvd(
-    const int fortran_comm, const int a_matrix_desc[9],
+    void **context, const int fortran_comm, const int a_matrix_desc[9],
     const int b_matrix_desc[9], const int nprow, const int npcol,
-    const int myprow, const int mypcol, const int n,
+    const int myprow, const int mypcol, const int n, const int nmo,
     const cuDoubleComplex *aMatrix, const cuDoubleComplex *bMatrix,
     cuDoubleComplex *eigenvectors, double *eigenvalues) {
 
-  const int local_device = offload_get_chosen_device();
-
-  MPI_Comm comm = MPI_Comm_f2c(fortran_comm);
-  int rank, nranks;
-  MPI_Comm_rank(comm, &rank);
-  MPI_Comm_size(comm, &nranks);
-
-#if defined(__CUSOLVERMP_NCCL)
-  check_nccl_device_visibility(comm, local_device);
-#endif
-  offload_activate_chosen_device();
-
-#if defined(__CUSOLVERMP_NCCL)
-  ncclUniqueId nccl_id;
-  if (rank == 0) {
-    NCCL_CHECK(ncclGetUniqueId(&nccl_id));
-  }
-  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, comm);
-
-  ncclComm_t nccl_comm;
-  NCCL_CHECK(ncclCommInitRank(&nccl_comm, nranks, nccl_id, rank));
-#else
-  cal_comm_t cal_comm = NULL;
-  cal_comm_create_params_t params;
-  params.allgather = &allgather;
-  params.req_test = &req_test;
-  params.req_free = &req_free;
-  params.data = &comm;
-  params.rank = rank;
-  params.nranks = nranks;
-  params.local_device = local_device;
-  CAL_CHECK(cal_comm_create(params, &cal_comm));
-#endif
-
-  cudaStream_t stream = NULL;
-  CUDA_CHECK(cudaStreamCreate(&stream));
-
-  cusolverMpHandle_t cusolvermp_handle = NULL;
-  CUSOLVER_CHECK(cusolverMpCreate(&cusolvermp_handle, local_device, stream));
-
-  cusolverMpGrid_t grid = NULL;
-#if defined(__CUSOLVERMP_NCCL)
-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, nccl_comm,
-                                            nprow, npcol,
-                                            CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
-#else
-  CUSOLVER_CHECK(cusolverMpCreateDeviceGrid(cusolvermp_handle, &grid, cal_comm,
-                                            nprow, npcol,
-                                            CUSOLVERMP_GRID_MAPPING_ROW_MAJOR));
-#endif
+  cp_assert(nmo >= 0 && nmo <= n);
+  cp_fm_cusolver_context *ctx =
+      get_context(context, fortran_comm, nprow, npcol);
+  const MPI_Comm comm = ctx->comm;
+  const cudaStream_t stream = ctx->stream;
+  const cusolverMpHandle_t cusolvermp_handle = ctx->handle;
+  const cusolverMpGrid_t grid = ctx->grid;
 
   const int mb_a = a_matrix_desc[4];
   const int nb_a = a_matrix_desc[5];
@@ -675,13 +643,13 @@ void cp_cfm_diag_cusolver_hegvd(
   const int csrc_b = b_matrix_desc[7];
   const int ldB = b_matrix_desc[8];
 
-  assert(mb_a == mb_b && nb_a == nb_b);
-  assert(rsrc_a == rsrc_b && csrc_a == csrc_b);
-  assert(ldA == ldB);
+  cp_assert(mb_a == mb_b && nb_a == nb_b);
+  cp_assert(rsrc_a == rsrc_b && csrc_a == csrc_b);
+  cp_assert(ldA == ldB);
 
   const int np_a = cusolverMpNUMROC(n, mb_a, myprow, rsrc_a, nprow);
   const int nq_a = cusolverMpNUMROC(n, nb_a, mypcol, csrc_a, npcol);
-  assert(np_a == ldA);
+  cp_assert(np_a == ldA);
 
   const cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
   const cusolverEigType_t itype = CUSOLVER_EIG_TYPE_1;
@@ -747,7 +715,7 @@ void cp_cfm_diag_cusolver_hegvd(
 
   CUDA_CHECK(cudaStreamSynchronize(stream));
 #if !defined(__CUSOLVERMP_NCCL)
-  CAL_CHECK(cal_stream_sync(cal_comm, stream));
+  CAL_CHECK(cal_stream_sync(ctx->cal_comm, stream));
 #endif
 
   int info;
@@ -757,10 +725,20 @@ void cp_cfm_diag_cusolver_hegvd(
     abort();
   }
 
-  CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, matrix_local_size,
-                             cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaMemcpyAsync(eigenvalues, eigenvalues_dev, n * sizeof(double),
-                             cudaMemcpyDeviceToHost, stream));
+  // The requested eigenvectors occupy a contiguous prefix of the local columns.
+  const int nq_eigenvectors =
+      cusolverMpNUMROC(nmo, nb_a, mypcol, csrc_a, npcol);
+  const size_t eigenvectors_local_size =
+      (size_t)ldA * nq_eigenvectors * sizeof(cuDoubleComplex);
+  if (eigenvectors_local_size > 0) {
+    CUDA_CHECK(cudaMemcpyAsync(eigenvectors, dev_Z, eigenvectors_local_size,
+                               cudaMemcpyDeviceToHost, stream));
+  }
+  if (nmo > 0) {
+    CUDA_CHECK(cudaMemcpyAsync(eigenvalues, eigenvalues_dev,
+                               nmo * sizeof(double), cudaMemcpyDeviceToHost,
+                               stream));
+  }
 
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -774,14 +752,6 @@ void cp_cfm_diag_cusolver_hegvd(
   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrA));
   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrB));
   CUSOLVER_CHECK(cusolverMpDestroyMatrixDesc(descrZ));
-  CUSOLVER_CHECK(cusolverMpDestroyGrid(grid));
-  CUSOLVER_CHECK(cusolverMpDestroy(cusolvermp_handle));
-  CUDA_CHECK(cudaStreamDestroy(stream));
-#if defined(__CUSOLVERMP_NCCL)
-  NCCL_CHECK(ncclCommDestroy(nccl_comm));
-#else
-  CAL_CHECK(cal_comm_destroy(cal_comm));
-#endif
 
   MPI_Barrier(comm);
 }

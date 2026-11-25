@@ -5,8 +5,8 @@
 #!   SPDX-License-Identifier: GPL-2.0-or-later                                                     !
 #!-------------------------------------------------------------------------------------------------!
 
-if(CMAKE_VERSION VERSION_LESS "3.24")
-  message(FATAL_ERROR "CP2K requires CMake 3.24 or newer.")
+if(CMAKE_VERSION VERSION_LESS "3.25")
+  message(FATAL_ERROR "CP2K requires CMake 3.25 or newer.")
 endif()
 
 include(CMakeFindDependencyMacro)
@@ -23,7 +23,10 @@ if(NOT TARGET cp2k::cp2k)
 
   # Define LAPACK and BLAS TARGETS
   set(CP2K_BLAS_VENDOR @CP2K_BLAS_VENDOR@)
+  set(CP2K_BLAS_INTERFACE @CP2K_BLAS_INTERFACE@)
+  set(CP2K_BLAS_THREADING @CP2K_BLAS_THREADING@)
   set(CP2K_SCALAPACK_VENDOR @CP2K_SCALAPACK_VENDOR@)
+  set(CP2K_BLAS_INCLUDE_DIRS @CP2K_BLAS_INCLUDE_DIRS@)
   set(CP2K_BLAS_LINK_LIBRARIES @CP2K_BLAS_LINK_LIBRARIES@)
   set(CP2K_LAPACK_LINK_LIBRARIES @CP2K_LAPACK_LINK_LIBRARIES@)
   set(CP2K_SCALAPACK_LINK_LIBRARIES @CP2K_SCALAPACK_LINK_LIBRARIES@)
@@ -40,6 +43,13 @@ if(NOT TARGET cp2k::cp2k)
   set(cp2k_VERSION @cp2k_VERSION@)
 
   find_dependency(DBCSR 2.8 REQUIRED)
+
+  find_dependency(wignernj 0.8 CONFIG REQUIRED)
+
+  set(CP2K_USE_STANDALONE_FFTW3 @CP2K_USE_FFTW3_@)
+  if(CP2K_USE_STANDALONE_FFTW3)
+    find_dependency(Fftw REQUIRED)
+  endif()
 
   set(CP2K_USE_LIBXS @CP2K_USE_LIBXS@)
   set(CP2K_USE_LIBXSMM @CP2K_USE_LIBXSMM@)
@@ -79,13 +89,15 @@ if(NOT TARGET cp2k::cp2k)
 
   set(CP2K_USE_LIBXC @CP2K_USE_LIBXC@)
   if(CP2K_USE_LIBXC)
-    find_dependency(Libxc 7 REQUIRED CONFIG)
+    find_dependency(Libxc 7.1 CONFIG REQUIRED)
   endif()
 
   set(CP2K_USE_GAUXC @CP2K_USE_GAUXC@)
   if(CP2K_USE_GAUXC)
     find_dependency(gauxc REQUIRED CONFIG)
   endif()
+
+  set(CP2K_USE_SKALA_FTORCH @CP2K_USE_SKALA_FTORCH@)
 
   set(CP2K_USE_COSMA @CP2K_USE_COSMA@)
   if(CP2K_USE_COSMA)
@@ -95,11 +107,6 @@ if(NOT TARGET cp2k::cp2k)
       target_link_libraries(cp2k::cosma INTERFACE cosma::cosma_prefixed_pxgemm
                                                   cosma::cosma)
     endif()
-  endif()
-
-  set(CP2K_USE_FFTW3 @CP2K_USE_FFTW3@)
-  if(CP2K_USE_FFTW3)
-    find_dependency(Fftw REQUIRED)
   endif()
 
   set(CP2K_USE_LIBINT2 @CP2K_USE_LIBINT2@)
@@ -124,7 +131,11 @@ if(NOT TARGET cp2k::cp2k)
 
   set(CP2K_USE_SIRIUS @CP2K_USE_SIRIUS@)
   if(CP2K_USE_SIRIUS)
-    find_dependency(sirius 7.7.0 REQUIRED)
+    find_dependency(sirius 7.12 REQUIRED CONFIG)
+    set(CP2K_USE_SIRIUS_DFTD3 @CP2K_USE_SIRIUS_DFTD3@)
+    set(CP2K_USE_SIRIUS_DFTD4 @CP2K_USE_SIRIUS_DFTD4@)
+    set(CP2K_USE_SIRIUS_VCSQNM @CP2K_USE_SIRIUS_VCSQNM@)
+    set(CP2K_USE_SIRIUS_NLCG @CP2K_USE_SIRIUS_NLCG@)
   endif()
 
   set(CP2K_USE_PLUMED @CP2K_USE_PLUMED@)

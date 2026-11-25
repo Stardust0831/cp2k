@@ -167,8 +167,6 @@ MODULE qs_tddfpt2_types
       TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER             :: wpw_gspace_sub => NULL()
       !> group-specific copy of a real-space grid
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER             :: wpw_rspace_sub => NULL()
-      !> group-specific copy of a real-space grid for the kinetic energy density
-      TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER             :: wpw_tau_rspace_sub => NULL()
       !
       ! *** real space pw grid to hold fxc kernel <> A_ia_rspace_sub ***
       !
@@ -431,13 +429,11 @@ CONTAINS
       ! work plain-wave grids
       CALL pw_env_get(sub_env%pw_env, auxbas_pw_pool=auxbas_pw_pool)
       ALLOCATE (work_matrices%A_ia_rspace_sub(nspins))
-      ALLOCATE (work_matrices%wpw_gspace_sub(nspins), work_matrices%wpw_rspace_sub(nspins), &
-                work_matrices%wpw_tau_rspace_sub(nspins))
+      ALLOCATE (work_matrices%wpw_gspace_sub(nspins), work_matrices%wpw_rspace_sub(nspins))
       DO ispin = 1, nspins
          CALL auxbas_pw_pool%create_pw(work_matrices%A_ia_rspace_sub(ispin))
          CALL auxbas_pw_pool%create_pw(work_matrices%wpw_gspace_sub(ispin))
          CALL auxbas_pw_pool%create_pw(work_matrices%wpw_rspace_sub(ispin))
-         CALL auxbas_pw_pool%create_pw(work_matrices%wpw_tau_rspace_sub(ispin))
       END DO
 
       ! fxc kernel potential real space grid
@@ -465,7 +461,7 @@ CONTAINS
          CALL rho0_s_grid_create(sub_env%pw_env, work_matrices%local_rho_set%rho0_mpole)
          CALL hartree_local_create(work_matrices%hartree_local)
          CALL init_coulomb_local(work_matrices%hartree_local, natom)
-      ELSEIF (dft_control%qs_control%gapw_xc) THEN
+      ELSE IF (dft_control%qs_control%gapw_xc) THEN
          CALL get_qs_env(qs_env, &
                          atomic_kind_set=atomic_kind_set, &
                          qs_kind_set=qs_kind_set)
@@ -863,12 +859,10 @@ CONTAINS
          CALL pw_env_get(sub_env%pw_env, auxbas_pw_pool=auxbas_pw_pool)
          DO ispin = SIZE(work_matrices%wpw_rspace_sub), 1, -1
             CALL auxbas_pw_pool%give_back_pw(work_matrices%wpw_rspace_sub(ispin))
-            CALL auxbas_pw_pool%give_back_pw(work_matrices%wpw_tau_rspace_sub(ispin))
             CALL auxbas_pw_pool%give_back_pw(work_matrices%wpw_gspace_sub(ispin))
             CALL auxbas_pw_pool%give_back_pw(work_matrices%A_ia_rspace_sub(ispin))
          END DO
-         DEALLOCATE (work_matrices%A_ia_rspace_sub, work_matrices%wpw_gspace_sub, &
-                     work_matrices%wpw_rspace_sub, work_matrices%wpw_tau_rspace_sub)
+         DEALLOCATE (work_matrices%A_ia_rspace_sub, work_matrices%wpw_gspace_sub, work_matrices%wpw_rspace_sub)
          IF (ASSOCIATED(work_matrices%fxc_rspace_sub)) THEN
             DO ispin = SIZE(work_matrices%fxc_rspace_sub), 1, -1
                CALL auxbas_pw_pool%give_back_pw(work_matrices%fxc_rspace_sub(ispin))
@@ -939,8 +933,9 @@ CONTAINS
          CALL cp_fm_release(work_matrices%slambda)
          DEALLOCATE (work_matrices%slambda)
       END IF
-      IF (ASSOCIATED(work_matrices%S_eigenvalues)) &
+      IF (ASSOCIATED(work_matrices%S_eigenvalues)) THEN
          DEALLOCATE (work_matrices%S_eigenvalues)
+      END IF
       ! Ewald
       IF (ASSOCIATED(work_matrices%ewald_env)) THEN
          CALL ewald_env_release(work_matrices%ewald_env)

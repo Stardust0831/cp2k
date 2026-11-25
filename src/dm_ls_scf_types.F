@@ -158,11 +158,7 @@ MODULE dm_ls_scf_types
 
       LOGICAL :: calculate_forces = .FALSE.
 
-#if defined(__PEXSI)
-      TYPE(lib_pexsi_env) :: pexsi
-#else
       TYPE(lib_pexsi_env) :: pexsi = lib_pexsi_env()
-#endif
 
       TYPE(mp_para_env_type), POINTER :: para_env => NULL()
       LOGICAL                 :: do_pao = .FALSE.
@@ -208,10 +204,12 @@ CONTAINS
          DEALLOCATE (ls_scf_env%matrix_p)
       END IF
 
-      IF (ASSOCIATED(ls_scf_env%chebyshev%print_key_dos)) &
+      IF (ASSOCIATED(ls_scf_env%chebyshev%print_key_dos)) THEN
          CALL section_vals_release(ls_scf_env%chebyshev%print_key_dos)
-      IF (ASSOCIATED(ls_scf_env%chebyshev%print_key_cube)) &
+      END IF
+      IF (ASSOCIATED(ls_scf_env%chebyshev%print_key_cube)) THEN
          CALL section_vals_release(ls_scf_env%chebyshev%print_key_cube)
+      END IF
       IF (ASSOCIATED(ls_scf_env%chebyshev%min_energy)) THEN
          DEALLOCATE (ls_scf_env%chebyshev%min_energy)
       END IF
@@ -228,8 +226,9 @@ CONTAINS
          CALL lib_pexsi_finalize(ls_scf_env%pexsi)
       END IF
 
-      IF (ls_scf_env%do_pao) &
+      IF (ls_scf_env%do_pao) THEN
          CALL pao_finalize(ls_scf_env%pao_env)
+      END IF
 
       DEALLOCATE (ls_scf_env)
 

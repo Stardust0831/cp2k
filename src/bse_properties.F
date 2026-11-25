@@ -11,8 +11,8 @@
 !>      10.2024 created [Maximilian Graml]
 ! **************************************************************************************************
 MODULE bse_properties
-   USE bse_util,                        ONLY: fm_general_add_bse,&
-                                              print_bse_nto_cubes,&
+   USE bse_types,                       ONLY: bse_env_type
+   USE bse_util,                        ONLY: print_bse_nto_cubes,&
                                               reshuffle_eigvec,&
                                               trace_exciton_descr
    USE cp_files,                        ONLY: close_file,&
@@ -20,31 +20,21 @@ MODULE bse_properties
    USE cp_fm_basic_linalg,              ONLY: cp_fm_scale_and_add,&
                                               cp_fm_trace
    USE cp_fm_diag,                      ONLY: cp_fm_svd
+   USE cp_fm_redistribution,            ONLY: cp_fm_permute
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
                                               cp_fm_struct_type
-   USE cp_fm_types,                     ONLY: cp_fm_create,&
-                                              cp_fm_get_submatrix,&
-                                              cp_fm_release,&
-                                              cp_fm_set_all,&
-                                              cp_fm_to_fm,&
-                                              cp_fm_to_fm_submat,&
-                                              cp_fm_to_fm_submat_general,&
-                                              cp_fm_type
-   USE cp_log_handling,                 ONLY: cp_get_default_logger,&
-                                              cp_logger_get_default_unit_nr,&
-                                              cp_logger_type
+   USE cp_fm_types,                     ONLY: &
+        cp_fm_create, cp_fm_get_info, cp_fm_get_submatrix, cp_fm_release, cp_fm_set_all, &
+        cp_fm_to_fm, cp_fm_to_fm_submat, cp_fm_to_fm_submat_general, cp_fm_type
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
    USE kinds,                           ONLY: dp
    USE mathconstants,                   ONLY: pi
-   USE mp2_types,                       ONLY: mp2_type
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE physcon,                         ONLY: c_light_au,&
                                               evolt
-   USE qs_environment_types,            ONLY: get_qs_env,&
-                                              qs_environment_type
    USE qs_mo_types,                     ONLY: allocate_mo_set,&
                                               deallocate_mo_set,&
                                               init_mo_set,&
@@ -102,16 +92,13 @@ CONTAINS
 !> \param oscill_str Oscillator strength per excitation level
 !> \param polarizability_residues Residues of polarizability ("tensorial oscillator strength")
 !>          per excitation level
-!> \param mp2_env ...
 !> \param homo_red ...
 !> \param virtual_red ...
-!> \param unit_nr ...
 !> \param fm_eigvec_Y ...
 ! **************************************************************************************************
    SUBROUTINE get_oscillator_strengths(fm_eigvec_X, Exc_ens, fm_dipole_ai_trunc, &
                                        trans_mom_bse, oscill_str, polarizability_residues, &
-                                       mp2_env, homo_red, virtual_red, unit_nr, &
-                                       fm_eigvec_Y)
+                                       homo_red, virtual_red, fm_eigvec_Y)
 
       TYPE(cp_fm_type), INTENT(IN)                       :: fm_eigvec_X
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), &
@@ -123,13 +110,12 @@ CONTAINS
          INTENT(OUT)                                     :: oscill_str
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), &
          INTENT(OUT)                                     :: polarizability_residues
-      TYPE(mp2_type), INTENT(IN)                         :: mp2_env
-      INTEGER, INTENT(IN)                                :: homo_red, virtual_red, unit_nr
+      INTEGER, INTENT(IN)                                :: homo_red, virtual_red
       TYPE(cp_fm_type), INTENT(IN), OPTIONAL             :: fm_eigvec_Y
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'get_oscillator_strengths'
 
-      INTEGER                                            :: handle, idir, jdir, n
+      INTEGER                                            :: handle, idir, jdir, n, n_exc
       TYPE(cp_fm_struct_type), POINTER :: fm_struct_dipole_MO_trunc_reordered, &
          fm_struct_trans_mom_bse
       TYPE(cp_fm_type)                                   :: fm_eigvec_XYsum
@@ -138,10 +124,13 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
+      ! an iterative solver provides fewer excitations than transitions
+      CALL cp_fm_get_info(fm_eigvec_X, ncol_global=n_exc)
+
       CALL cp_fm_struct_create(fm_struct_dipole_MO_trunc_reordered, fm_eigvec_X%matrix_struct%para_env, &
                                fm_eigvec_X%matrix_struct%context, 1, homo_red*virtual_red)
       CALL cp_fm_struct_create(fm_struct_trans_mom_bse, fm_eigvec_X%matrix_struct%para_env, &
-                               fm_eigvec_X%matrix_struct%context, 1, homo_red*virtual_red)
+                               fm_eigvec_X%matrix_struct%context, 1, n_exc)
 
       ! Include excitonic amplitudes in dipoles, i.e. obtain "BSE dipoles":
       ! \vec{D}_n = sqrt(2) * sum_{i,a} \vec{D}_ai (X_{ai}^{(n)} + Y_{ai}^{(n)})
@@ -151,10 +140,8 @@ CONTAINS
          CALL cp_fm_create(fm_dipole_MO_trunc_reordered(idir), matrix_struct=fm_struct_dipole_MO_trunc_reordered, &
                            name="dipoles_mo_reordered")
          CALL cp_fm_set_all(fm_dipole_MO_trunc_reordered(idir), 0.0_dp)
-         CALL fm_general_add_bse(fm_dipole_MO_trunc_reordered(idir), fm_dipole_ai_trunc(idir), 1.0_dp, &
-                                 1, 1, &
-                                 1, virtual_red, &
-                                 unit_nr, [2, 4, 3, 1], mp2_env)
+         CALL cp_fm_permute(fm_dipole_MO_trunc_reordered(idir), fm_dipole_ai_trunc(idir), 1.0_dp, 1, 1, 1, &
+                            virtual_red, [2, 4, 3, 1])
          CALL cp_fm_release(fm_dipole_per_dir(idir))
       END DO
 
@@ -172,16 +159,16 @@ CONTAINS
          CALL cp_fm_scale_and_add(1.0_dp, fm_eigvec_XYsum, 1.0_dp, fm_eigvec_Y)
       END IF
       DO idir = 1, 3
-         CALL parallel_gemm('N', 'N', 1, homo_red*virtual_red, homo_red*virtual_red, SQRT(2.0_dp), &
+         CALL parallel_gemm('N', 'N', 1, n_exc, homo_red*virtual_red, SQRT(2.0_dp), &
                             fm_dipole_MO_trunc_reordered(idir), fm_eigvec_XYsum, 0.0_dp, fm_trans_mom_bse(idir))
       END DO
 
       ! Get oscillator strengths themselves
-      ALLOCATE (oscill_str(homo_red*virtual_red))
+      ALLOCATE (oscill_str(n_exc))
       ! trans_mom_bse needs to be a 2D array per direction idir, such that cp_fm_get_submatrix can directly
       !  write to it
-      ALLOCATE (trans_mom_bse(3, 1, homo_red*virtual_red))
-      ALLOCATE (polarizability_residues(3, 3, homo_red*virtual_red))
+      ALLOCATE (trans_mom_bse(3, 1, n_exc))
+      ALLOCATE (polarizability_residues(3, 3, n_exc))
       trans_mom_bse(:, :, :) = 0.0_dp
 
       ! Sum over all directions
@@ -189,7 +176,7 @@ CONTAINS
          CALL cp_fm_get_submatrix(fm_trans_mom_bse(idir), trans_mom_bse(idir, :, :))
       END DO
 
-      DO n = 1, homo_red*virtual_red
+      DO n = 1, n_exc
          DO idir = 1, 3
             DO jdir = 1, 3
                polarizability_residues(idir, jdir, n) = 2.0_dp*Exc_ens(n)*trans_mom_bse(idir, 1, n)*trans_mom_bse(jdir, 1, n)
@@ -221,10 +208,10 @@ CONTAINS
 !> \param Exc_ens ...
 !> \param info_approximation ...
 !> \param unit_nr ...
-!> \param mp2_env ...
+!> \param bse_env the BSE environment (settings; para_env, whose ionode writes the files)
 ! **************************************************************************************************
    SUBROUTINE compute_and_print_absorption_spectrum(oscill_str, polarizability_residues, Exc_ens, &
-                                                    info_approximation, unit_nr, mp2_env)
+                                                    info_approximation, unit_nr, bse_env)
 
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), &
          INTENT(IN)                                      :: oscill_str
@@ -234,7 +221,7 @@ CONTAINS
          INTENT(IN)                                      :: Exc_ens
       CHARACTER(LEN=10)                                  :: info_approximation
       INTEGER, INTENT(IN)                                :: unit_nr
-      TYPE(mp2_type), INTENT(INOUT)                      :: mp2_env
+      TYPE(bse_env_type), INTENT(IN)                     :: bse_env
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'compute_and_print_absorption_spectrum'
 
@@ -247,14 +234,13 @@ CONTAINS
                                                             omega
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: abs_cross_section, abs_spectrum
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eta_list
-      TYPE(cp_logger_type), POINTER                      :: logger
 
       CALL timeset(routineN, handle)
 
-      freq_step = mp2_env%bse%bse_spectrum_freq_step_size
-      freq_start = mp2_env%bse%bse_spectrum_freq_start
-      freq_end = mp2_env%bse%bse_spectrum_freq_end
-      eta_list => mp2_env%bse%bse_eta_spectrum_list
+      freq_step = bse_env%bse_spectrum_freq_step_size
+      freq_start = bse_env%bse_spectrum_freq_start
+      freq_end = bse_env%bse_spectrum_freq_end
+      eta_list => bse_env%bse_eta_spectrum_list
 
       ! Calculate number of steps to fit given frequency range
       num_steps = NINT((freq_end - freq_start)/freq_step) + 1
@@ -317,7 +303,7 @@ CONTAINS
          END DO
 
          !For debug runs: Export an entry of the two tensors to allow regtests on spectra
-         IF (mp2_env%bse%bse_debug_print) THEN
+         IF (bse_env%bse_debug_print) THEN
             IF (unit_nr > 0) THEN
                WRITE (unit_nr, '(T2,A10,T13,A,T65,F16.4)') 'BSE|DEBUG|', &
                   'Averaged dynamical dipole polarizability at 8.2 eV:', &
@@ -328,15 +314,9 @@ CONTAINS
             END IF
          END IF
 
-         ! Print it to file
-         logger => cp_get_default_logger()
-         IF (logger%para_env%is_source()) THEN
-            unit_nr_file = cp_logger_get_default_unit_nr()
-         ELSE
-            unit_nr_file = -1
-         END IF
-
-         IF (unit_nr_file > 0) THEN
+         ! Print it to file from the ionode of the BSE communicator, at every print level; the
+         ! default logger inside the MP2/GW driver is the subgroup's and would make every group's root write
+         IF (bse_env%para_env%is_source()) THEN
             CALL open_file(file_name_crosssection, unit_number=unit_nr_file, &
                            file_status="UNKNOWN", file_action="WRITE")
             WRITE (unit_nr_file, '(A,A6)') "# Photoabsorption cross section  σ_{µ µ'}(ω) =  -4πω/c * Im[ \sum_n "// &
@@ -352,7 +332,7 @@ CONTAINS
          END IF
          DEALLOCATE (abs_cross_section)
 
-         IF (unit_nr_file > 0) THEN
+         IF (bse_env%para_env%is_source()) THEN
             CALL open_file(file_name_spectrum, unit_number=unit_nr_file, &
                            file_status="UNKNOWN", file_action="WRITE")
             WRITE (unit_nr_file, '(A,A6)') "# Imaginary part of polarizability α_{µ µ'}(ω) = -\sum_n "// &
@@ -422,15 +402,14 @@ CONTAINS
 !> \param virtual ...
 !> \param info_approximation ...
 !> \param oscill_str ...
-!> \param qs_env ...
+!> \param bse_env the BSE environment (settings, the MO sets and the section of the NTO print keys)
 !> \param unit_nr ...
-!> \param mp2_env ...
 ! **************************************************************************************************
    SUBROUTINE calculate_NTOs(fm_X, fm_Y, &
                              mo_coeff, homo, virtual, &
                              info_approximation, &
                              oscill_str, &
-                             qs_env, unit_nr, mp2_env)
+                             bse_env, unit_nr)
 
       TYPE(cp_fm_type), INTENT(IN)                       :: fm_X
       TYPE(cp_fm_type), INTENT(IN), OPTIONAL             :: fm_Y
@@ -438,11 +417,11 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: homo, virtual
       CHARACTER(LEN=10)                                  :: info_approximation
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: oscill_str
-      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(bse_env_type), INTENT(IN)                     :: bse_env
       INTEGER, INTENT(IN)                                :: unit_nr
-      TYPE(mp2_type), INTENT(INOUT)                      :: mp2_env
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'calculate_NTOs'
+      REAL(KIND=dp), PARAMETER                           :: coeff_err = 1.0E-5_dp
 
       CHARACTER(LEN=20), DIMENSION(2)                    :: nto_name
       INTEGER                                            :: handle, homo_irred, i, i_nto, info_svd, &
@@ -458,17 +437,15 @@ CONTAINS
       TYPE(cp_fm_type) :: fm_eigvl, fm_eigvr_t, fm_m, fm_mo_coeff, fm_nto_coeff_holes, &
          fm_nto_coeff_particles, fm_nto_set, fm_X_ia, fm_Y_ai
       TYPE(mo_set_type), ALLOCATABLE, DIMENSION(:)       :: nto_set
-      TYPE(section_vals_type), POINTER                   :: bse_section, input, nto_section
+      TYPE(section_vals_type), POINTER                   :: bse_section, nto_section
 
       CALL timeset(routineN, handle)
-      CALL get_qs_env(qs_env=qs_env, &
-                      input=input)
-      bse_section => section_vals_get_subs_vals(input, "DFT%XC%WF_CORRELATION%RI_RPA%GW%BSE")
+      bse_section => bse_env%bse_section
 
-      nao_full = qs_env%mos(1)%nao
+      nao_full = bse_env%mos(1)%nao
       nao_trunc = homo + virtual
       ! This is not influenced by the BSE cutoff
-      homo_irred = qs_env%mos(1)%homo
+      homo_irred = bse_env%mos(1)%homo
       ! M will have a block structure and is quadratic in homo+virtual, i.e.
       !                          occ   virt
       !                       |   0    X_i,a |  occ  = homo
@@ -540,16 +517,16 @@ CONTAINS
             "The NTOs are calculated with the following settings:"
          WRITE (unit_nr, '(T2,A4)') 'BSE|'
          WRITE (unit_nr, '(T2,A4,T7,A,T71,I10)') 'BSE|', 'Number of excitations, for which NTOs are computed', &
-            mp2_env%bse%num_print_exc_ntos
-         IF (mp2_env%bse%eps_nto_osc_str > 0.0_dp) THEN
+            bse_env%num_print_exc_ntos
+         IF (bse_env%eps_nto_osc_str > 0.0_dp) THEN
             WRITE (unit_nr, '(T2,A4,T7,A,T71,F10.3)') 'BSE|', 'Threshold for oscillator strength f^n', &
-               mp2_env%bse%eps_nto_osc_str
+               bse_env%eps_nto_osc_str
          ELSE
             WRITE (unit_nr, '(T2,A4,T7,A,T71,A10)') 'BSE|', 'Threshold for oscillator strength f^n', &
                ADJUSTL("---")
          END IF
          WRITE (unit_nr, '(T2,A4,T7,A,T72,F10.3)') 'BSE|', 'Threshold for NTO weights (λ_I)^2', &
-            mp2_env%bse%eps_nto_eigval
+            bse_env%eps_nto_eigval
       END IF
 
       ! Write the header of NTO info table
@@ -567,12 +544,12 @@ CONTAINS
             'Excitation n', "TDA/ABBA", "Index of NTO I", 'NTO weights (λ_I)^2'
       END IF
 
-      DO j = 1, mp2_env%bse%num_print_exc_ntos
-         n_exc = mp2_env%bse%bse_nto_state_list_final(j)
+      DO j = 1, bse_env%num_print_exc_ntos
+         n_exc = bse_env%bse_nto_state_list_final(j)
          ! Takes care of unallocated oscill_str array in case of Triplet
-         IF (mp2_env%bse%eps_nto_osc_str > 0.0_dp) THEN
+         IF (bse_env%eps_nto_osc_str > 0.0_dp) THEN
             ! Check actual values
-            IF (oscill_str(n_exc) < mp2_env%bse%eps_nto_osc_str) THEN
+            IF (oscill_str(n_exc) < bse_env%eps_nto_osc_str) THEN
                ! Print skipped levels to table
                IF (unit_nr > 0) THEN
                   WRITE (unit_nr, '(T2,A4)') 'BSE|'
@@ -596,8 +573,7 @@ CONTAINS
          CALL cp_fm_set_all(fm_nto_coeff_particles, 0.0_dp)
 
          ! Reshuffle from X_ia,n_exc to X_i,a
-         CALL reshuffle_eigvec(fm_X, fm_X_ia, homo, virtual, n_exc, &
-                               .FALSE., unit_nr, mp2_env)
+         CALL reshuffle_eigvec(fm_X, fm_X_ia, homo, virtual, n_exc, .FALSE.)
 
          ! Copy X to upper block in M, i.e. starting from column homo+1
          CALL cp_fm_to_fm_submat(fm_X_ia, fm_m, &
@@ -608,8 +584,7 @@ CONTAINS
          ! Copy Y if present
          IF (PRESENT(fm_Y)) THEN
             ! Reshuffle from Y_ia,n_exc to Y_a,i
-            CALL reshuffle_eigvec(fm_Y, fm_Y_ai, homo, virtual, n_exc, &
-                                  .TRUE., unit_nr, mp2_env)
+            CALL reshuffle_eigvec(fm_Y, fm_Y_ai, homo, virtual, n_exc, .TRUE.)
 
             ! Copy Y^T to lower block in M, i.e. starting from row homo+1
             CALL cp_fm_to_fm_submat(fm_Y_ai, fm_m, &
@@ -658,7 +633,7 @@ CONTAINS
             eigval_svd_squ(:) = eigval_svd(:)**2
             ! Sanity check for TDA: In case of TDA, the sum should be \sum_ia |X_ia|^2 = 1
             IF (.NOT. PRESENT(fm_Y)) THEN
-               IF (ABS(SUM(eigval_svd_squ) - 1) >= 1e-5) THEN
+               IF (ABS(SUM(eigval_svd_squ) - 1) >= coeff_err) THEN
                   CPWARN("Sum of NTO coefficients deviates from 1!")
                END IF
             END IF
@@ -684,7 +659,7 @@ CONTAINS
             ! Extract number of significant NTOs
             n_nto = 0
             DO i_nto = 1, nao_trunc
-               IF (eigval_svd_squ(i_nto) > mp2_env%bse%eps_nto_eigval) THEN
+               IF (eigval_svd_squ(i_nto) > bse_env%eps_nto_eigval) THEN
                   n_nto = n_nto + 1
                ELSE
                   ! Since svd orders in descending order, we can exit the loop if smaller
@@ -720,7 +695,7 @@ CONTAINS
             CALL section_vals_val_get(nto_section, "STRIDE", i_vals=stride)
             CALL section_vals_val_get(nto_section, "APPEND", l_val=append_cube)
             IF (cube_file) THEN
-               CALL print_bse_nto_cubes(qs_env, nto_set, n_exc, info_approximation, &
+               CALL print_bse_nto_cubes(bse_env, nto_set, n_exc, info_approximation, &
                                         stride, append_cube, nto_section)
             END IF
 
@@ -781,7 +756,7 @@ CONTAINS
       REAL(KIND=dp)                                      :: norm_X, norm_XpY, norm_Y
       REAL(KIND=dp), DIMENSION(3)                        :: r_e_sq_X, r_e_sq_Y, r_e_X, r_e_Y, &
                                                             r_h_sq_X, r_h_sq_Y, r_h_X, r_h_Y
-      REAL(KIND=dp), DIMENSION(3, 3)                     :: r_e_h_XX, r_e_h_XY, r_e_h_YX, r_e_h_YY
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: r_e_h_XX, r_e_h_XY, r_e_h_YY
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct_ab, fm_struct_ia
       TYPE(cp_fm_type)                                   :: fm_work_ba, fm_work_ia, fm_work_ia_2
 
@@ -811,7 +786,6 @@ CONTAINS
       r_h_sq_Y(:) = 0.0_dp
       r_e_h_XX(:, :) = 0.0_dp
       r_e_h_XY(:, :) = 0.0_dp
-      r_e_h_YX(:, :) = 0.0_dp
       r_e_h_YY(:, :) = 0.0_dp
 
       norm_X = 0.0_dp
@@ -896,9 +870,10 @@ CONTAINS
       exc_descr(i_exc)%r_e_sq(:) = r_e_sq_X(:) + r_e_sq_Y(:)
 
       ! <r_e^\mu r_h^\mu'>_X
-      !   = Tr[ X^T µ'_ij X µ_ab  +  Y^T µ_ij Y µ'_ab + X µ'_ai Y µ_ai + Y µ_ai X µ'_ai]
-      !   = X_bj µ'_ji X_ia µ_ab + Y_bj µ_ji Y_ia µ'_ab + X_ia µ'_aj Y_jb µ_bi + Y_ia µ_aj X_jb µ'_bi
-      ! The i_dir and j_dir convert to mu and mu'
+      !   = Tr[ X^T µ'_ij X µ_ab  +  Y^T µ_ij Y µ'_ab  +  2 X µ_ai Y µ'_ai ]
+      !   = X_bj µ'_ji X_ia µ_ab + Y_bj µ_ji Y_ia µ'_ab + 2 X_ia µ_aj Y_jb µ'_bi
+      ! The i_dir and j_dir convert to mu and mu'. µ (electron) sits between a (from X) and j (from Y),
+      ! µ' (hole) between i (from X) and b (from Y); Tr[ Y µ'_ai X µ_ai ] = Tr[ X µ_ai Y µ'_ai ] by cyclicity, hence the 2.
       CALL cp_fm_create(fm_work_ia, fm_struct_ia)
       CALL cp_fm_create(fm_work_ia_2, fm_struct_ia)
       CALL cp_fm_create(fm_work_ba, fm_struct_ab)
@@ -930,51 +905,30 @@ CONTAINS
                CALL cp_fm_trace(fm_Y_ia, fm_work_ia_2, r_e_h_YY(i_dir, j_dir))
                r_e_h_YY(i_dir, j_dir) = r_e_h_YY(i_dir, j_dir)/norm_XpY
 
-               ! Third term - X µ'_ai Y µ_ai = X_ia µ'_aj Y_jb µ_bi
+               ! Third term (counted twice) - X µ_ai Y µ'_ai = X_ia µ_aj Y_jb µ'_bi
                !     Reshuffle for usage of trace (where first argument is transposed)
-               !     = µ'_aj Y_jb µ_bi X_ia =
+               !     = µ_aj Y_jb µ'_bi X_ia =
                !        \___________/
                !          fm_work_ai
-               !     fm_work_ai = µ'_aj Y_jb µ_bi
-               !     fm_work_ia = µ_ib Y_bj µ'_ja
-               !                        \_____/
-               !                       fm_work_ba
-               CALL cp_fm_set_all(fm_work_ba, 0.0_dp)
-               CALL cp_fm_set_all(fm_work_ia, 0.0_dp)
-               ! fm_work_ba = Y_bj µ'_ja
-               CALL parallel_gemm("T", "T", virtual, virtual, homo, 1.0_dp, &
-                                  fm_Y_ia, fm_multipole_ai_trunc(j_dir), 0.0_dp, fm_work_ba)
-               ! fm_work_ia = µ_ib fm_work_ba
-               CALL parallel_gemm("T", "N", homo, virtual, virtual, 1.0_dp, &
-                                  fm_multipole_ai_trunc(i_dir), fm_work_ba, 0.0_dp, fm_work_ia)
-               ! <r_h r_e>_X = ... + X_ia µ_aj Y_jb µ_bi
-               CALL cp_fm_trace(fm_work_ia, fm_X_ia, r_e_h_XY(i_dir, j_dir))
-               r_e_h_XY(i_dir, j_dir) = r_e_h_XY(i_dir, j_dir)/norm_XpY
-
-               ! Fourth term - Y µ_ai X µ'_ai = Y_ia µ_aj X_jb µ'_bi
-               !     Reshuffle for usage of trace (where first argument is transposed)
-               !     = µ_aj X_jb µ'_bi Y_ia =
-               !        \___________/
-               !         fm_work_ai
-               !     fm_work_ai = µ_aj X_jb µ'_bi
-               !     fm_work_ia = µ'_ib X_bj µ_ja
+               !     fm_work_ai = µ_aj Y_jb µ'_bi
+               !     fm_work_ia = µ'_ib Y_bj µ_ja
                !                         \_____/
-               !                       fm_work_ba
+               !                        fm_work_ba
                CALL cp_fm_set_all(fm_work_ba, 0.0_dp)
                CALL cp_fm_set_all(fm_work_ia, 0.0_dp)
                ! fm_work_ba = Y_bj µ_ja
                CALL parallel_gemm("T", "T", virtual, virtual, homo, 1.0_dp, &
-                                  fm_X_ia, fm_multipole_ai_trunc(i_dir), 0.0_dp, fm_work_ba)
+                                  fm_Y_ia, fm_multipole_ai_trunc(i_dir), 0.0_dp, fm_work_ba)
                ! fm_work_ia = µ'_ib fm_work_ba
                CALL parallel_gemm("T", "N", homo, virtual, virtual, 1.0_dp, &
                                   fm_multipole_ai_trunc(j_dir), fm_work_ba, 0.0_dp, fm_work_ia)
-               ! <r_h r_e>_X = ... + X_ia µ_aj Y_jb µ_bi
-               CALL cp_fm_trace(fm_work_ia, fm_Y_ia, r_e_h_YX(i_dir, j_dir))
-               r_e_h_YX(i_dir, j_dir) = r_e_h_YX(i_dir, j_dir)/norm_XpY
+               ! <r_e r_h>_X = ... + 2 X_ia µ_aj Y_jb µ'_bi
+               CALL cp_fm_trace(fm_work_ia, fm_X_ia, r_e_h_XY(i_dir, j_dir))
+               r_e_h_XY(i_dir, j_dir) = 2.0_dp*r_e_h_XY(i_dir, j_dir)/norm_XpY
             END IF
          END DO
       END DO
-      exc_descr(i_exc)%r_e_h(:, :) = r_e_h_XX(:, :) + r_e_h_XY(:, :) + r_e_h_YX(:, :) + r_e_h_YY(:, :)
+      exc_descr(i_exc)%r_e_h(:, :) = r_e_h_XX(:, :) + r_e_h_XY(:, :) + r_e_h_YY(:, :)
 
       CALL cp_fm_release(fm_work_ia)
       CALL cp_fm_release(fm_work_ia_2)

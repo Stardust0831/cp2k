@@ -118,8 +118,9 @@ CONTAINS
       END IF
 
       IF (PRESENT(needs)) THEN
-         IF (.NOT. PRESENT(lsd)) &
+         IF (.NOT. PRESENT(lsd)) THEN
             CPABORT("Arguments mismatch.")
+         END IF
          IF (lsd) THEN
             needs%rho_spin = .TRUE.
          ELSE
@@ -151,8 +152,7 @@ CONTAINS
       TYPE(xc_derivative_type), POINTER                  :: deriv
 
       calc = .FALSE.
-      IF (order >= 0) calc(0:order) = .TRUE.
-      IF (order < 0) calc(-order) = .TRUE.
+      calc(0:order) = .TRUE.
 
       n = PRODUCT(rho_set%local_bounds(2, :) - rho_set%local_bounds(1, :) + [1, 1, 1])
       ALLOCATE (rs(n))
@@ -217,8 +217,7 @@ CONTAINS
       TYPE(xc_derivative_type), POINTER                  :: deriv
 
       calc = .FALSE.
-      IF (order >= 0) calc(0:order) = .TRUE.
-      IF (order < 0) calc(-order) = .TRUE.
+      calc(0:order) = .TRUE.
 
       IF (calc(0)) THEN
          deriv => xc_dset_get_derivative(deriv_set, [INTEGER::], &

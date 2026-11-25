@@ -548,8 +548,9 @@ CONTAINS
          ! Read input string of fixed length (single line)
 
          ! Check for EOF
-         IF (parser%icol == -1) &
+         IF (parser%icol == -1) THEN
             CPABORT("Unexpectetly reached EOF"//TRIM(parser_location(parser)))
+         END IF
 
          length = MIN(len_trim_inputline - parser%icol1 + 1, length)
          parser%icol1 = parser%icol + 1
@@ -1000,7 +1001,7 @@ CONTAINS
          END IF
       END IF
 
-      IF (integer_object(parser%input_line(parser%icol1:parser%icol2))) THEN
+      IF (integer_object(TRIM(ADJUSTL(parser%input_line(parser%icol1:parser%icol2))))) THEN
          IF (parser%ilist%in_use) THEN
             object = parser%ilist%ipresent
             CALL ilist_reset(parser%ilist)
@@ -1174,18 +1175,20 @@ CONTAINS
 !> \param skip_lines ...
 !> \param string_length ...
 !> \param at_end ...
+!> \param allow_empty Accept explicitly quoted empty strings (missing tokens still fail).
 !> \date    22.11.1999
 !> \author  Matthias Krack (MK)
 !> \version 1.0
 ! **************************************************************************************************
    SUBROUTINE parser_get_string(parser, object, lower_to_upper, newline, skip_lines, &
-                                string_length, at_end)
+                                string_length, at_end, allow_empty)
 
       TYPE(cp_parser_type), INTENT(INOUT)                :: parser
       CHARACTER(LEN=*), INTENT(OUT)                      :: object
       LOGICAL, INTENT(IN), OPTIONAL                      :: lower_to_upper, newline
       INTEGER, INTENT(IN), OPTIONAL                      :: skip_lines, string_length
       LOGICAL, INTENT(out), OPTIONAL                     :: at_end
+      LOGICAL, INTENT(IN), OPTIONAL                      :: allow_empty
 
       INTEGER                                            :: input_string_length, nline
       LOGICAL                                            :: my_at_end
@@ -1219,6 +1222,10 @@ CONTAINS
 
       input_string_length = parser%icol2 - parser%icol1 + 1
 
+      ! An explicitly quoted empty string is distinct from a missing token.
+      IF (input_string_length == 0 .AND. PRESENT(allow_empty)) THEN
+         IF (allow_empty) RETURN
+      END IF
       IF (input_string_length <= 0) THEN
          CALL cp_abort(__LOCATION__, &
                        "A string type object was expected, found end of line"// &

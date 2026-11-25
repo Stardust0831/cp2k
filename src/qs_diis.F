@@ -19,14 +19,12 @@
 !> \author Matthias Krack (28.06.2000)
 ! **************************************************************************************************
 MODULE qs_diis
-   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_trace
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_scale_and_add_fm,&
+                                              cp_cfm_trace
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
                                               cp_cfm_get_info,&
-                                              cp_cfm_release,&
                                               cp_cfm_to_cfm,&
-                                              cp_cfm_to_fm,&
-                                              cp_cfm_type,&
-                                              cp_fm_to_cfm
+                                              cp_cfm_type
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_multiply, dbcsr_p_type, dbcsr_release, &
         dbcsr_set, dbcsr_transposed, dbcsr_type
@@ -34,7 +32,6 @@ MODULE qs_diis
                                               dbcsr_maxabs
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm
    USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
-                                              cp_fm_scale,&
                                               cp_fm_scale_and_add,&
                                               cp_fm_symm,&
                                               cp_fm_trace
@@ -42,7 +39,6 @@ MODULE qs_diis
    USE cp_fm_types,                     ONLY: cp_fm_create,&
                                               cp_fm_get_info,&
                                               cp_fm_maxabsval,&
-                                              cp_fm_release,&
                                               cp_fm_set_all,&
                                               cp_fm_to_fm,&
                                               cp_fm_type
@@ -55,6 +51,7 @@ MODULE qs_diis
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: default_string_length,&
                                               dp
+   USE local_gemm_api,                  ONLY: local_gemm_ctxt_type
    USE mathlib,                         ONLY: diag_complex,&
                                               diamat_all
    USE message_passing,                 ONLY: mp_para_env_type
@@ -84,6 +81,7 @@ MODULE qs_diis
              qs_diis_b_create_sparse, &
              qs_diis_b_step_4lscf
    PUBLIC :: qs_diis_b_clear_kp, &
+             qs_diis_b_check_i_alloc_kp, &
              qs_diis_b_create_kp, &
              qs_diis_b_step_kp, &
              qs_diis_b_calc_err_kp, &
@@ -251,11 +249,11 @@ CONTAINS
                                                             output_unit
       LOGICAL                                            :: eigenvectors_discarded, my_roks
       REAL(KIND=dp)                                      :: maxocc, tmp
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: ev, occ
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: ev, occ, traces
       REAL(KIND=dp), DIMENSION(:), POINTER               :: occa, occb
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: a, b
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
-      TYPE(cp_fm_type), POINTER                          :: c, new_errors, old_errors, parameters
+      TYPE(cp_fm_type), POINTER                          :: c, new_errors, parameters
       TYPE(cp_logger_type), POINTER                      :: logger
 
 ! -------------------------------------------------------------------------
@@ -275,7 +273,7 @@ CONTAINS
       my_nmixing = 2
       IF (PRESENT(nmixing)) my_nmixing = nmixing
 
-      NULLIFY (c, new_errors, old_errors, parameters, matrix_struct, a, b, occa, occb)
+      NULLIFY (c, new_errors, parameters, matrix_struct, a, b, occa, occb)
       logger => cp_get_default_logger()
 
       ! Quick return, if no DIIS is requested
@@ -297,6 +295,10 @@ CONTAINS
       ib = MODULO(diis_buffer%ncall, diis_buffer%nbuffer) + 1
       diis_buffer%ncall = diis_buffer%ncall + 1
       nb = MIN(diis_buffer%ncall, diis_buffer%nbuffer)
+
+      IF (PRESENT(s_matrix)) THEN
+         IF (.NOT. ALLOCATED(diis_buffer%overlap_copy_plan)) ALLOCATE (diis_buffer%overlap_copy_plan)
+      END IF
 
       DO ispin = 1, nspin
 
@@ -333,7 +335,7 @@ CONTAINS
             CALL cp_fm_symm("L", "U", nao, homo, 1.0_dp, parameters, sc, 0.0_dp, kc(ispin))
 
             IF (PRESENT(s_matrix)) THEN
-               CALL copy_dbcsr_to_fm(s_matrix(1)%matrix, new_errors)
+               CALL copy_dbcsr_to_fm(s_matrix(1)%matrix, new_errors, diis_buffer%overlap_copy_plan, check_plan=.TRUE.)
                ! SC <- S*C
                CALL cp_fm_symm("L", "U", nao, homo, 1.0_dp, new_errors, c, 0.0_dp, sc)
                CALL cp_fm_column_scale(sc, occ(1:homo))
@@ -354,7 +356,7 @@ CONTAINS
 
             IF (PRESENT(s_matrix)) THEN
                ! I guess that this copy can be avoided for LSD
-               CALL copy_dbcsr_to_fm(s_matrix(1)%matrix, new_errors)
+               CALL copy_dbcsr_to_fm(s_matrix(1)%matrix, new_errors, diis_buffer%overlap_copy_plan, check_plan=.TRUE.)
                ! sc <- S*C
                CALL cp_fm_symm("L", "U", nao, homo, 2.0_dp, new_errors, c, 0.0_dp, sc)
                ! new_errors <- KC*(SC)^T - (SC)*(KC)^T = K*P*S - S*P*K
@@ -407,14 +409,20 @@ CONTAINS
 
          b => diis_buffer%b_matrix
 
+         ALLOCATE (traces(nb))
+         b(1:nb, ib) = 0.0_dp
+         ! Batch history traces, but avoid starting OpenMP for a single entry.
+         DO ispin = 1, nspin
+            IF (nb == 1) THEN
+               CALL cp_fm_trace(diis_buffer%error(1, ispin), diis_buffer%error(ib, ispin), traces(1))
+            ELSE
+               CALL cp_fm_trace(diis_buffer%error(1:nb, ispin), diis_buffer%error(ib, ispin), traces)
+            END IF
+            b(1:nb, ib) = b(1:nb, ib) + traces(:)
+         END DO
+         DEALLOCATE (traces)
+
          DO jb = 1, nb
-            b(jb, ib) = 0.0_dp
-            DO ispin = 1, nspin
-               old_errors => diis_buffer%error(jb, ispin)
-               new_errors => diis_buffer%error(ib, ispin)
-               CALL cp_fm_trace(old_errors, new_errors, tmp)
-               b(jb, ib) = b(jb, ib) + tmp
-            END DO
             b(ib, jb) = b(jb, ib)
          END DO
 
@@ -571,6 +579,9 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
       CALL timeset(routineN, handle)
+      IF (ls_scf_env%do_pao) THEN
+         CPABORT("LS_SCF%LS_DIIS not compatible with PAO")
+      END IF
       nspin = ls_scf_env%nspins
       diis_step = .FALSE.
       my_nmixing = 2
@@ -943,9 +954,7 @@ CONTAINS
          ALLOCATE (diis_buffer%smat(nkp))
          DO ikp = 1, nkp
             CALL cp_cfm_create(diis_buffer%smat(ikp), &
-                               name="kp_cfm_smat("// &
-                               TRIM(ADJUSTL(cp_to_string(ibuffer)))//","// &
-                               TRIM(ADJUSTL(cp_to_string(ibuffer)))//")", &
+                               name="kp_cfm_smat("//TRIM(cp_to_string(ikp))//")", &
                                matrix_struct=matrix_struct)
          END DO
       END IF
@@ -1004,31 +1013,36 @@ CONTAINS
 !> \param sc ...
 !> \param ispin ...
 !> \param ikp ...
-!> \param nkp_local ...
-!> \param scf_section ...
-!> \note We assume that we always have an overlap matrix and complex matrices
+!> \param cmos caller-owned scratch; the controller preallocates it and the DIIS buffer
+!> \param real_wfn ...
+!> \param local use local GEMM on a one-rank k-point group
+!> \param gemm_ctx private local GEMM context, unused for distributed groups
+!> \note We assume that we always have an overlap matrix.
 !> TODO: do we need to pass the kp weight for the back Fourier transform?
 ! **************************************************************************************************
-   SUBROUTINE qs_diis_b_calc_err_kp(diis_buffer, ib, mos, kc, sc, ispin, ikp, nkp_local, scf_section)
+   SUBROUTINE qs_diis_b_calc_err_kp(diis_buffer, ib, mos, kc, sc, ispin, ikp, cmos, real_wfn, local, gemm_ctx)
       TYPE(qs_diis_buffer_type_kp), POINTER              :: diis_buffer
       INTEGER, INTENT(IN)                                :: ib
-      TYPE(mo_set_type), DIMENSION(:, :), POINTER        :: mos
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
       TYPE(cp_cfm_type), INTENT(INOUT)                   :: kc, sc
-      INTEGER, INTENT(IN)                                :: ispin, ikp, nkp_local
-      TYPE(section_vals_type), POINTER                   :: scf_section
+      INTEGER, INTENT(IN)                                :: ispin, ikp
+      TYPE(cp_cfm_type), INTENT(INOUT)                   :: cmos
+      LOGICAL, INTENT(IN), OPTIONAL                      :: real_wfn, local
+      TYPE(local_gemm_ctxt_type), INTENT(INOUT)          :: gemm_ctx
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_diis_b_calc_err_kp'
 
-      INTEGER                                            :: handle, homo, nao, nmo, nspin
+      INTEGER                                            :: handle, homo, nao
+      LOGICAL                                            :: my_real_wfn
       REAL(dp)                                           :: maxocc
-      TYPE(cp_cfm_type)                                  :: cmos
       TYPE(cp_cfm_type), POINTER                         :: new_errors, parameters, smat
-      TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
-      TYPE(cp_fm_type), POINTER                          :: imos, rmos
+      TYPE(cp_fm_type), POINTER                          :: rmos
 
-      NULLIFY (matrix_struct, imos, rmos, parameters, new_errors, smat)
+      NULLIFY (rmos, parameters, new_errors, smat)
 
       CALL timeset(routineN, handle)
+      my_real_wfn = .FALSE.
+      IF (PRESENT(real_wfn)) my_real_wfn = real_wfn
 
       !Calculate the error for this given k-point, store the KS matrix as well as the ovlp matrix
       !All of this happens within the kp subgroups
@@ -1038,21 +1052,15 @@ CONTAINS
          CALL timestop(handle)
          RETURN
       END IF
-      nspin = SIZE(mos, 2)
+      CALL get_mo_set(mos(ispin), nao=nao, homo=homo, maxocc=maxocc)
 
-      CALL cp_cfm_get_info(kc, matrix_struct=matrix_struct)
-      CALL qs_diis_b_check_i_alloc_kp(diis_buffer, &
-                                      matrix_struct=matrix_struct, &
-                                      nspin=nspin, nkp=nkp_local, &
-                                      scf_section=scf_section)
-
-      !We calculate: e(ikp) = F(ikp)*P(ikp)*S(ikp) - S(ikp)*P(ikp)*F(ikp)
-      CALL get_mo_set(mos(1, ispin), nao=nao, nmo=nmo, homo=homo, mo_coeff=rmos, maxocc=maxocc)
-      CALL get_mo_set(mos(2, ispin), mo_coeff=imos)
-      NULLIFY (matrix_struct)
-      CALL cp_fm_get_info(rmos, matrix_struct=matrix_struct)
-      CALL cp_cfm_create(cmos, matrix_struct)
-      CALL cp_fm_to_cfm(rmos, imos, cmos)
+      IF (my_real_wfn) THEN
+         CALL get_mo_set(mos(ispin), mo_coeff=rmos)
+         CALL cp_cfm_scale_and_add_fm(CMPLX(0.0_dp, KIND=dp), cmos, &
+                                      CMPLX(1.0_dp, KIND=dp), rmos)
+      ELSE
+         CALL cp_cfm_to_cfm(mos(ispin)%cmo_coeff, cmos)
+      END IF
 
       new_errors => diis_buffer%error(ib, ispin, ikp)
       parameters => diis_buffer%param(ib, ispin, ikp)
@@ -1062,17 +1070,37 @@ CONTAINS
       CALL cp_cfm_to_cfm(kc, parameters)
       CALL cp_cfm_to_cfm(sc, smat)
 
-      ! KC <- K*C
-      CALL parallel_gemm("N", "N", nao, homo, nao, CMPLX(maxocc, KIND=dp), parameters, cmos, (0.0_dp, 0.0_dp), kc)
-      ! SC <- S*C
-      CALL parallel_gemm("N", "N", nao, homo, nao, (2.0_dp, 0.0_dp), smat, cmos, (0.0_dp, 0.0_dp), sc)
-
-      ! new_errors <- KC*(SC)^T - (SC)*(KC)^T = K*P*S - S*P*K
-      CALL parallel_gemm("N", "T", nao, nao, homo, (1.0_dp, 0.0_dp), sc, kc, (0.0_dp, 0.0_dp), new_errors)
-      CALL parallel_gemm("N", "T", nao, nao, homo, (1.0_dp, 0.0_dp), kc, sc, (-1.0_dp, 0.0_dp), new_errors)
-
-      !clean-up
-      CALL cp_cfm_release(cmos)
+      ! KC <- K*C; SC <- S*C. Retain the existing factor of two in SC.
+      ! new_errors <- KC*(SC)^H - SC*(KC)^H.
+      IF (local) THEN
+         CPASSERT(PRODUCT(parameters%matrix_struct%context%num_pe) == 1)
+         CPASSERT(PRODUCT(cmos%matrix_struct%context%num_pe) == 1)
+         CPASSERT(PRODUCT(kc%matrix_struct%context%num_pe) == 1)
+         CPASSERT(PRODUCT(smat%matrix_struct%context%num_pe) == 1)
+         CPASSERT(PRODUCT(sc%matrix_struct%context%num_pe) == 1)
+         CPASSERT(PRODUCT(new_errors%matrix_struct%context%num_pe) == 1)
+         CALL gemm_ctx%gemm("N", "N", nao, homo, nao, CMPLX(maxocc, KIND=dp), &
+                            parameters%local_data, SIZE(parameters%local_data, 1), &
+                            cmos%local_data, SIZE(cmos%local_data, 1), (0.0_dp, 0.0_dp), &
+                            kc%local_data, SIZE(kc%local_data, 1))
+         CALL gemm_ctx%gemm("N", "N", nao, homo, nao, (2.0_dp, 0.0_dp), &
+                            smat%local_data, SIZE(smat%local_data, 1), &
+                            cmos%local_data, SIZE(cmos%local_data, 1), (0.0_dp, 0.0_dp), &
+                            sc%local_data, SIZE(sc%local_data, 1))
+         CALL gemm_ctx%gemm("N", "C", nao, nao, homo, (1.0_dp, 0.0_dp), &
+                            sc%local_data, SIZE(sc%local_data, 1), &
+                            kc%local_data, SIZE(kc%local_data, 1), (0.0_dp, 0.0_dp), &
+                            new_errors%local_data, SIZE(new_errors%local_data, 1))
+         CALL gemm_ctx%gemm("N", "C", nao, nao, homo, (1.0_dp, 0.0_dp), &
+                            kc%local_data, SIZE(kc%local_data, 1), &
+                            sc%local_data, SIZE(sc%local_data, 1), (-1.0_dp, 0.0_dp), &
+                            new_errors%local_data, SIZE(new_errors%local_data, 1))
+      ELSE
+         CALL parallel_gemm("N", "N", nao, homo, nao, CMPLX(maxocc, KIND=dp), parameters, cmos, (0.0_dp, 0.0_dp), kc)
+         CALL parallel_gemm("N", "N", nao, homo, nao, (2.0_dp, 0.0_dp), smat, cmos, (0.0_dp, 0.0_dp), sc)
+         CALL parallel_gemm("N", "C", nao, nao, homo, (1.0_dp, 0.0_dp), sc, kc, (0.0_dp, 0.0_dp), new_errors)
+         CALL parallel_gemm("N", "C", nao, nao, homo, (1.0_dp, 0.0_dp), kc, sc, (-1.0_dp, 0.0_dp), new_errors)
+      END IF
 
       CALL timestop(handle)
 
@@ -1093,10 +1121,10 @@ CONTAINS
 !> \param nkp_local ...
 !> \param nmixing ...
 !> \param scf_section ...
-!> \param para_env ...
+!> \param para_env_inter_kp communicator connecting the k-point groups
 ! **************************************************************************************************
    SUBROUTINE qs_diis_b_step_kp(diis_buffer, coeffs, ib, nb, delta, error_max, diis_step, eps_diis, &
-                                nspin, nkp, nkp_local, nmixing, scf_section, para_env)
+                                nspin, nkp, nkp_local, nmixing, scf_section, para_env_inter_kp)
 
       TYPE(qs_diis_buffer_type_kp), POINTER              :: diis_buffer
       COMPLEX(KIND=dp), DIMENSION(:), INTENT(INOUT)      :: coeffs
@@ -1108,7 +1136,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: nspin, nkp, nkp_local
       INTEGER, INTENT(IN), OPTIONAL                      :: nmixing
       TYPE(section_vals_type), POINTER                   :: scf_section
-      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(mp_para_env_type), POINTER                    :: para_env_inter_kp
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'qs_diis_b_step_kp'
       REAL(KIND=dp), PARAMETER :: eigenvalue_threshold = 1.0E-12_dp
@@ -1120,10 +1148,8 @@ CONTAINS
                                                             output_unit
       LOGICAL                                            :: eigenvectors_discarded
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: ev
-      TYPE(cp_cfm_type)                                  :: old_errors
       TYPE(cp_cfm_type), POINTER                         :: new_errors
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
-      TYPE(cp_fm_type)                                   :: ierr, rerr
       TYPE(cp_logger_type), POINTER                      :: logger
 
       NULLIFY (matrix_struct, new_errors, logger)
@@ -1148,28 +1174,25 @@ CONTAINS
 
       ! Calculate the DIIS buffer, and update it if max_error < eps_diis
       CALL cp_cfm_get_info(diis_buffer%error(ib, 1, 1), matrix_struct=matrix_struct)
-      CALL cp_fm_create(ierr, matrix_struct)
-      CALL cp_fm_create(rerr, matrix_struct)
-      CALL cp_cfm_create(old_errors, matrix_struct)
       ALLOCATE (b(nb, nb))
       b = 0.0_dp
       DO jb = 1, nb
          DO ikp = 1, nkp_local
             DO ispin = 1, nspin
                new_errors => diis_buffer%error(ib, ispin, ikp)
-               CALL cp_cfm_to_fm(diis_buffer%error(jb, ispin, ikp), rerr, ierr)
-               CALL cp_fm_scale(-1.0_dp, ierr)
-               CALL cp_fm_to_cfm(rerr, ierr, old_errors)
-               CALL cp_cfm_trace(old_errors, new_errors, tmp)
+               CALL cp_cfm_trace(diis_buffer%error(jb, ispin, ikp), new_errors, tmp, &
+                                 conjugate_a=.TRUE., local=.TRUE.)
                b(jb, ib) = b(jb, ib) + 1.0_dp/REAL(nkp, dp)*tmp
             END DO
          END DO
+      END DO
+      ! Accumulate local AO entries and k points first, then reduce the new history column.
+      ! Each inter-group communicator contains one corresponding rank per k-point group.
+      CALL matrix_struct%para_env%sum(b(:, ib))
+      CALL para_env_inter_kp%sum(b(:, ib))
+      DO jb = 1, nb
          b(ib, jb) = CONJG(b(jb, ib))
       END DO
-      CALL cp_fm_release(ierr)
-      CALL cp_fm_release(rerr)
-      CALL cp_cfm_release(old_errors)
-      CALL para_env%sum(b)
 
       error_max = SQRT(REAL(b(ib, ib))**2 + AIMAG(b(ib, ib))**2)
 

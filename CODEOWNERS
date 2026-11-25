@@ -2,18 +2,21 @@
 /*                           @cp2k/cp2k-admins
 
 # Data
-/data/                       @mkrack @juerghutter
+/data/                       @mkrack
 
 # CMake
 /cmake/                      @mkrack @mtaillefumier @RMeli
 /CMakeLists.txt              @mkrack @mtaillefumier @RMeli
+/CMakePresets.json           @mkrack @mtaillefumier @RMeli
+/src/CMakeLists.txt          @mkrack @mtaillefumier @RMeli
 
 # Spack
-/tools/spack/                @mkrack @mtaillefumier @RMeli
-/make_cp2k.sh                @mkrack @mtaillefumier @RMeli
+/make_cp2k.sh                @mkrack
+/tools/make_cp2k/            @mkrack
+/tools/spack/                @mkrack
 
 # Toolchain
-/tools/toolchain/            @mkrack @oschuett
+/tools/toolchain/            @mkrack @Growl1234
 
 # Testing + Conventions
 /tools/conventions/          @mkrack @oschuett
@@ -31,9 +34,13 @@
 /src/dbx/                    @fstein93 @oschuett
 /src/base/                   @fstein93 @oschuett
 /src/start/                  @fstein93 @oschuett
+/src/common/                 @mkrack   @oschuett
 /src/f77_interface.F         @fstein93 @oschuett
 /tests/do_regtest.py         @fstein93 @oschuett
 /tests/matcher_classes.py    @fstein93 @oschuett
+
+# Exclude bibliography
+/src/common/bibliography.F
 
 # Offload + Grid
 /src/offload/                @mtaillefumier @oschuett
@@ -55,9 +62,15 @@
 /src/motion/helium_*         @hforbert
 /src/nnp_*                   @hforbert
 
-# Dispersion + tblite
+# Pseudopotentials
+/src/pseudopotentials/       @DCM-Uni-Paderborn
+
+# Dispersion
 /src/qs_dispersion_*         @jpoto
-/src/tblite_*                @jpoto
+
+# Tight-binding + tblite
+/src/tb/                     @DCM-Uni-Paderborn
+/src/tb/tblite_*             @jpoto @DCM-Uni-Paderborn
 
 # NEGF
 /src/negf_*                  @dryndyk
@@ -66,8 +79,15 @@
 /src/mp2_*                   @JWilhelm @fstein93
 /src/rpa_*                   @JWilhelm @fstein93
 /src/gw_*                    @JWilhelm @fstein93
+/src/ri_rs_*                 @JWilhelm @fstein93
 
 # Post SCF
-/src/qs_scf_post_*           @marci73 @juerghutter
+/src/qs_scf_post_*           @marci73
+/src/tb/qs_scf_post_tb.F     @marci73 @DCM-Uni-Paderborn
+
+# Fedora
+/tools/fedora                @Growl1234
+/.packit.yaml                @Growl1234
+/.fmf/                       @Growl1234
 
 #EOF

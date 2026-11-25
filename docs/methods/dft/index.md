@@ -7,10 +7,12 @@ maxdepth: 2
 ---
 gpw
 gapw
+electrostatics/index
 hartree-fock/index
 basis_sets
 pseudopotentials
 k-points
+orbital_transformation
 convergence
 cutoff
 local_ri

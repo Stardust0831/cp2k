@@ -116,33 +116,37 @@ CONTAINS
       ! Before continuing let's do some consistency check between keywords
       IF (neb_env%pot_type /= pot_neb_full) THEN
          ! Requires the use of colvars
-         IF (.NOT. neb_env%use_colvar) &
+         IF (.NOT. neb_env%use_colvar) THEN
             CALL cp_abort(__LOCATION__, &
                           "A potential energy function based on free energy or minimum energy"// &
                           " was requested without enabling the usage of COLVARS. Both methods"// &
                           " are based on COLVARS definition.")
+         END IF
          ! Moreover let's check if the proper sections have been defined..
          SELECT CASE (neb_env%pot_type)
          CASE (pot_neb_fe)
             wrk_section => section_vals_get_subs_vals(neb_env%root_section, "MOTION%MD")
             CALL section_vals_get(wrk_section, explicit=explicit)
-            IF (.NOT. explicit) &
+            IF (.NOT. explicit) THEN
                CALL cp_abort(__LOCATION__, &
                              "A free energy BAND (colvars projected) calculation is requested"// &
                              " but NONE MD section was defined in the input.")
+            END IF
          CASE (pot_neb_me)
             wrk_section => section_vals_get_subs_vals(neb_env%root_section, "MOTION%GEO_OPT")
             CALL section_vals_get(wrk_section, explicit=explicit)
-            IF (.NOT. explicit) &
+            IF (.NOT. explicit) THEN
                CALL cp_abort(__LOCATION__, &
                              "A minimum energy BAND (colvars projected) calculation is requested"// &
                              " but NONE GEO_OPT section was defined in the input.")
+            END IF
          END SELECT
       ELSE
-         IF (neb_env%use_colvar) &
+         IF (neb_env%use_colvar) THEN
             CALL cp_abort(__LOCATION__, &
                           "A band calculation was requested with a full potential energy. USE_COLVAR cannot"// &
                           " be set for this kind of calculation!")
+         END IF
       END IF
       ! String Method
       CALL section_vals_val_get(neb_section, "STRING_METHOD%SMOOTHING", r_val=neb_env%smoothing)
@@ -183,6 +187,7 @@ CONTAINS
                                                             replica_str, title
       CHARACTER(LEN=4)                                   :: l_ener
       CHARACTER(LEN=5)                                   :: pbc_str
+      CHARACTER(LEN=8)                                   :: energy_key
       INTEGER                                            :: irep, iw
       LOGICAL                                            :: print_kind
       REAL(KIND=dp)                                      :: unit_conv
@@ -191,13 +196,15 @@ CONTAINS
 
       NULLIFY (final_band_section)
       final_band_section => section_vals_get_subs_vals(neb_env%neb_section, "FINAL_BAND")
-      CALL force_env_get(neb_env%force_env, cell=cell) ! For now NEB has constant cell
+      CALL force_env_get(neb_env%force_env, cell=cell)
       pbc_str = "F F F"
       IF (cell%perd(1) == 1) pbc_str(1:1) = "T"
       IF (cell%perd(2) == 1) pbc_str(3:3) = "T"
       IF (cell%perd(3) == 1) pbc_str(5:5) = "T"
       WRITE (UNIT=cell_str, FMT="(9(1X,F19.10))") &
          cell%hmat(:, 1)*angstrom, cell%hmat(:, 2)*angstrom, cell%hmat(:, 3)*angstrom
+      energy_key = "Energy"
+      IF (neb_env%solid_state) energy_key = "Enthalpy"
       unit_conv = cp_unit_from_cp2k(1.0_dp, "angstrom")
 
       ! Print a message to log
@@ -221,6 +228,7 @@ CONTAINS
       CALL section_vals_val_get(neb_env%neb_section, "FINAL_BAND%PRINT_ATOM_KIND", &
                                 l_val=print_kind)
       DO irep = 1, neb_env%number_of_replica
+         IF (neb_env%solid_state) WRITE (cell_str, '(9(1X,F19.10))') coords%cells(:, :, irep)*angstrom
          l_ener = "(**)"
          IF (irep > 1) THEN
             IF (energies(irep) - energies(irep - 1) > 0) THEN
@@ -251,7 +259,7 @@ CONTAINS
             'Properties=species:S:1:pos:R:3 '// &
             'pbc="'//pbc_str//'" '// &
             'Replica='//TRIM(ADJUSTL(replica_str))//' '// &
-            'Energy='//TRIM(ADJUSTL(ener_str))//' '// &
+            TRIM(energy_key)//'='//TRIM(ADJUSTL(ener_str))//' '// &
             TRIM(ADJUSTL(lm_str))
          IF (iw > 0) THEN
             ! The iw condition does not hold for certain ranks/processes
@@ -263,9 +271,10 @@ CONTAINS
          END IF
       END DO
 
-      IF (output_unit > 0) &
+      IF (output_unit > 0) THEN
          WRITE (UNIT=output_unit, FMT='(/,T2,A)') &
-         routineN//": Done!"
+            routineN//": Done!"
+      END IF
 
       CALL cp_print_key_finished_output(iw, logger, neb_env%neb_section, "FINAL_BAND")
 
@@ -299,6 +308,8 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'dump_neb_info'
 
       CHARACTER(LEN=20)                                  :: mytype
+      CHARACTER(LEN=22)                                  :: energy_label, total_label
+      CHARACTER(LEN=29)                                  :: plot_label
       CHARACTER(LEN=4)                                   :: l_ener
       CHARACTER(LEN=default_string_length)               :: line, title, unit_str
       INTEGER                                            :: crd, ener, frc, handle, i, irep, n_max, &
@@ -393,6 +404,14 @@ CONTAINS
          ALLOCATE (temperatures(neb_env%number_of_replica))
          ALLOCATE (ekin(neb_env%number_of_replica))
          CALL get_temperatures(vels, particle_set, temperatures, ekin=ekin)
+         energy_label = "ENERGY [au]"
+         total_label = "BAND TOTAL ENERGY"
+         plot_label = "o-------------------------> E"
+         IF (neb_env%solid_state) THEN
+            energy_label = "ENTHALPY [au]"
+            total_label = "BAND TOTAL ENTHALPY"
+            plot_label = "o-------------------------> H"
+         END IF
          WRITE (output_unit, '(/)', ADVANCE="NO")
          WRITE (output_unit, FMT='(A,A)') ' **************************************', &
             '*****************************************'
@@ -445,10 +464,11 @@ CONTAINS
             CPASSERT(SIZE(temperatures) == neb_env%number_of_replica)
             ener_min = MINVAL(energies(:))
             ener_range = MAXVAL(energies(:)) - ener_min
+            ener_range = MAX(ener_range, TINY(1.0_dp))
             n_max = 0
             n_min = 0
             WRITE (output_unit, '(T2,A,T22,A,T35,A,T52,A)') &
-               'REPLICA', 'ENERGY [au]', 'TEMPERATURE [K]', 'o-------------------------> E'
+               'REPLICA', TRIM(energy_label), 'TEMPERATURE [K]', plot_label
             DO i = 1, SIZE(distances)
                plt = FLOOR((energies(i) - ener_min)/ener_range*25)
                l_ener = "(**)"
@@ -500,8 +520,11 @@ CONTAINS
             IF (SIZE(distances) > 4) THEN
                WRITE (output_unit, '( T17,4F16.6)') distances(5:SIZE(distances))
             END IF
-            WRITE (output_unit, '( A,T17,4F16.6)') &
-               ' ENERGIES [au] =', energies(1:MIN(4, SIZE(energies)))
+            IF (neb_env%solid_state) THEN
+               WRITE (output_unit, '(A,T20,4F16.6)') ' ENTHALPIES [au] =', energies(1:MIN(4, SIZE(energies)))
+            ELSE
+               WRITE (output_unit, '(A,T17,4F16.6)') ' ENERGIES [au] =', energies(1:MIN(4, SIZE(energies)))
+            END IF
             IF (SIZE(energies) > 4) THEN
                WRITE (output_unit, '( T17,4F16.6)') energies(5:SIZE(energies))
             END IF
@@ -515,7 +538,7 @@ CONTAINS
             END IF
          END IF
          WRITE (output_unit, '( A,T56,F25.14)') &
-            ' BAND TOTAL ENERGY [au]        =', SUM(energies(:) + ekin(:)) + &
+            ' '//TRIM(total_label)//' [au]        =', SUM(energies(:) + ekin(:)) + &
             neb_env%spring_energy
          WRITE (output_unit, FMT='(A,A)') ' **************************************', &
             '*****************************************'
@@ -541,6 +564,7 @@ CONTAINS
                          vels=vels)
       CALL cp_rm_default_logger()
 
+      IF (output_unit > 0) CALL m_flush(output_unit)
       CALL timestop(handle)
 
    END SUBROUTINE dump_neb_info
@@ -623,11 +647,14 @@ CONTAINS
       CALL section_vals_val_set(root_section, "GLOBAL%OUTPUT_FILE_NAME", &
                                 c_val=TRIM(output_file_path))
       IF (logger%default_global_unit_nr > 0) THEN
-         CALL close_file(logger%default_global_unit_nr)
-         CALL open_file(file_name=output_file_path, file_status="UNKNOWN", &
-                        file_action="WRITE", file_position="APPEND", &
-                        unit_number=logger%default_global_unit_nr, &
-                        skip_get_unit_number=.TRUE.)
+         CALL close_file(unit_number=logger%default_global_unit_nr)
+         ! The replica output file may already be open (e.g. by the logger of the replica), then
+         ! its unit is shared, otherwise a free unit is used
+         CALL open_file(file_name=output_file_path, &
+                        file_status="UNKNOWN", &
+                        file_action="WRITE", &
+                        file_position="APPEND", &
+                        unit_number=logger%default_global_unit_nr)
          WRITE (UNIT=logger%default_global_unit_nr, FMT="(/,(T2,A79))") &
             "*******************************************************************************", &
             "**                 BAND EVALUATION OF ENERGIES AND FORCES                    **", &
@@ -653,12 +680,14 @@ CONTAINS
 
                unit_nr = sub_logger%default_global_unit_nr
                IF (unit_nr > 0) THEN
-                  CALL close_file(unit_nr)
-
+                  CALL close_file(unit_number=unit_nr)
                   output_file_path = replica_proj_name(1:lp)//"-r-"//TRIM(ADJUSTL(cp_to_string(i)))//".out"
-                  CALL open_file(file_name=output_file_path, file_status="UNKNOWN", &
-                                 file_action="WRITE", file_position="APPEND", &
-                                 unit_number=unit_nr, skip_get_unit_number=.TRUE.)
+                  CALL open_file(file_name=output_file_path, &
+                                 file_status="UNKNOWN", &
+                                 file_action="WRITE", &
+                                 file_position="APPEND", &
+                                 unit_number=unit_nr)
+                  sub_logger%default_global_unit_nr = unit_nr
                END IF
             END IF
          END DO
@@ -737,11 +766,13 @@ CONTAINS
             "**                                                                           **"
       END IF
       DO irep = 1, n_rep_neb, n_rep
-         replica_proj_name = get_replica_project_name(rep_env, n_rep_neb, irep + rep_env%local_rep_indices(1) - 1)
-         IF (output_unit > 0) THEN
-            WRITE (UNIT=output_unit, FMT='(T2,A,I6,T32,A,T79,A)') &
-               "** Band Replica   Nr.: ", irep + rep_env%local_rep_indices(1) - 1, &
-               "Output available on file: "//TRIM(replica_proj_name)//".out", "**"
+         IF (irep + rep_env%local_rep_indices(1) - 1 <= n_rep_neb) THEN
+            replica_proj_name = get_replica_project_name(rep_env, n_rep_neb, irep + rep_env%local_rep_indices(1) - 1)
+            IF (output_unit > 0) THEN
+               WRITE (UNIT=output_unit, FMT='(T2,A,I6,T32,A,T79,A)') &
+                  "** Band Replica   Nr.: ", irep + rep_env%local_rep_indices(1) - 1, &
+                  "Output available on file: "//TRIM(replica_proj_name)//".out", "**"
+            END IF
          END IF
       END DO
       IF (output_unit > 0) THEN

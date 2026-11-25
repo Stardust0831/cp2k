@@ -16,6 +16,8 @@ The most useful choices are:
 - **K-point MO dump** ([&MO_KP](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.MO_KP)): export MO information for
   k-point calculations in the CP2K-specific `.mokp` text format, including k-points, eigenvalues,
   occupations, complex MO coefficients, and AO information.
+- **Chargemol WFX file** ([&CHARGEMOL](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.CHARGEMOL)): export occupied
+  Gamma-point orbitals and Gaussian basis information for external charge analysis with Chargemol.
 - **TREXIO file** ([&TREXIO](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.TREXIO)): export orbital information
   in TREXIO HDF5 format for interoperability with quantum-chemistry post-processing tools. This
   requires TREXIO support in the CP2K build.
@@ -61,9 +63,36 @@ Useful controls include:
 - [CARTESIAN_OVERLAP](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.MO.CARTESIAN_OVERLAP): print the Cartesian
   overlap matrix together with Cartesian MO coefficients.
 
-For diagonalization calculations, unoccupied orbitals must be available through
-[ADDED_MOS](#CP2K_INPUT.FORCE_EVAL.DFT.SCF.ADDED_MOS). For OT calculations, CP2K can generate the
-requested virtual orbitals for printing through the OT eigensolver.
+For diagonalization calculations, an explicit positive `MO_INDEX_RANGE` or `-1` as its last index
+automatically makes the requested orbitals available, up to the AO basis size. Use
+[ADDED_MOS](#CP2K_INPUT.FORCE_EVAL.DFT.SCF.ADDED_MOS) when virtual orbitals are needed independently
+of this print request, for example for smearing or a subsequent method. For OT calculations, CP2K
+can generate the requested virtual orbitals for printing through the OT eigensolver.
+
+### Standard diagonalization and the number of orbitals
+
+With [ALGORITHM STANDARD](#CP2K_INPUT.FORCE_EVAL.DFT.SCF.DIAGONALIZATION.ALGORITHM), CP2K constructs
+the Kohn--Sham matrix $H$ and overlap matrix $S$ in the atomic-orbital (AO) basis and solves
+
+$$
+H C = S C \varepsilon.
+$$
+
+For a k-point calculation, CP2K solves this generalized eigenproblem separately at every k-point and
+spin channel. It is not a projection of $H$ onto the occupied-MO subspace. Depending on the selected
+diagonalization backend, CP2K either computes only the requested lowest eigenpairs or computes the
+complete spectrum and retains the requested part.
+
+The number of stored orbitals is normally the number needed for the occupied states plus
+`ADDED_MOS`, capped by the AO basis size. `ADDED_MOS -1` requests all available orbitals. At zero
+electronic temperature, virtual orbitals do not contribute to the density matrix, but calculating
+and storing more of them increases the cost.
+
+For Gamma-point calculations close to SCF convergence, `STANDARD` may use a block-Jacobi
+pseudo-diagonalization sweep controlled by
+[EPS_JACOBI](#CP2K_INPUT.FORCE_EVAL.DFT.SCF.DIAGONALIZATION.EPS_JACOBI). This is distinct from the
+optional [DIAG_SUB_SCF](#CP2K_INPUT.FORCE_EVAL.DFT.SCF.DIAGONALIZATION.DIAG_SUB_SCF) inner loop,
+which keeps the MOs fixed while refining occupations and is not available with k-points.
 
 ### Interpreting MO energies and energy gaps
 
@@ -258,6 +287,34 @@ s      5    1.00
 `&MO`, or `&MO_CUBES` depending on the intended use.
 ```
 
+## Chargemol WFX file
+
+[&CHARGEMOL](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.CHARGEMOL) writes a `.wfx` file for analysis with the
+external Chargemol program. The file contains the Gaussian primitives and the coefficients,
+energies, occupations, and spin labels of the occupied orbitals. For all-electron calculations, it
+includes both core and valence electrons.
+
+```text
+&FORCE_EVAL
+  &DFT
+    &PRINT
+      &CHARGEMOL ON
+        FILENAME =orbitals.wfx
+      &END CHARGEMOL
+    &END PRINT
+  &END DFT
+&END FORCE_EVAL
+```
+
+The export supports restricted and unrestricted Hartree--Fock and Kohn--Sham calculations at Gamma
+only. For periodic Gamma-only calculations, set
+[PERIODIC](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.CHARGEMOL.PERIODIC) to `T` in `&CHARGEMOL` to include
+the periodic cell vectors.
+
+With orbital transformation (OT), the occupied orbitals must have uniform occupations within each
+spin channel. CP2K canonicalizes a copy of the occupied orbitals for export without changing the SCF
+state.
+
 ## TREXIO HDF5 file
 
 ```{important}
@@ -440,6 +497,8 @@ and therefore the output size. More advanced openPMD runtime options can be pass
   and the goal is visualization in common molecular-orbital viewers.
 - Use [&MO_KP](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.MO_KP) when the calculation uses k-points and a
   post-processing tool needs k-point-resolved coefficients.
+- Use [&CHARGEMOL](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.CHARGEMOL) for external charge analysis with
+  Chargemol.
 - Use [&TREXIO](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.TREXIO) when a structured HDF5 orbital file is
   needed for interoperability with external quantum-chemistry tools.
 - Use [&MO_CUBES](#CP2K_INPUT.FORCE_EVAL.DFT.PRINT.MO_CUBES) or

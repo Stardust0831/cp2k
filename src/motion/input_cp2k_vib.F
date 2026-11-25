@@ -138,6 +138,13 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="EPS_SYMMETRY", &
+                          description="Accuracy for detection of rotational symmetry number.", &
+                          usage="EPS_SYMMETRY {REAL}", &
+                          default_r_val=1.0e-4_dp, repeats=.FALSE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL create_mode_selective_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
@@ -180,6 +187,13 @@ CONTAINS
       CALL cp_print_key_section_create(print_key, __LOCATION__, "MOLDEN_VIB", &
                                        description="Controls the printing for visualization in molden format", &
                                        print_level=low_print_level, add_last=add_last_numeric, filename="VIBRATIONS")
+      CALL keyword_create(keyword, __LOCATION__, name="WRITE_CELL", &
+                          description="Controls whether the CP2K [Cell] extension is written to the MOLDEN file. "// &
+                          "The cell vectors are written in atomic units to match the vibrational coordinates.", &
+                          usage="WRITE_CELL T", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
       CALL section_add_subsection(section, print_key)
       CALL section_release(print_key)
 
@@ -205,26 +219,14 @@ CONTAINS
                                        "in the main vibrational analysis output", &
                                        print_level=low_print_level, &
                                        add_last=add_last_numeric, &
-                                       filename="VIBRATIONS")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       filename="VIBRATIONS", do_backup=.TRUE.)
       CALL section_add_subsection(section, print_key)
       CALL section_release(print_key)
 
       CALL cp_print_key_section_create(print_key, __LOCATION__, name="NAMD_PRINT", &
                                        description="Adjust cartesian eigenvalues / vectors to NewtonX format.", &
                                        print_level=debug_print_level + 1, add_last=add_last_numeric, &
-                                       filename="FullNormalizedCartesian")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       filename="FullNormalizedCartesian", do_backup=.TRUE.)
       CALL section_add_subsection(section, print_key)
       CALL section_release(print_key)
 

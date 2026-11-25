@@ -83,8 +83,8 @@ CONTAINS
       LOGICAL                                            :: do_adiabatic_rescaling, do_hfx, gapw, &
                                                             gapw_xc
       REAL(dp)                                           :: adiabatic_lambda, adiabatic_omega, &
-                                                            scale_dDFA, scale_ddW0, scale_dEx1, &
-                                                            scale_dEx2, total_energy_xc
+                                                            edisp, scale_dDFA, scale_ddW0, &
+                                                            scale_dEx1, scale_dEx2, total_energy_xc
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: rho_ao_resp
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
       TYPE(dft_control_type), POINTER                    :: dft_control
@@ -134,10 +134,11 @@ CONTAINS
       CASE (do_adiabatic_hybrid_mcy3)
          SELECT CASE (adiabatic_model)
          CASE (do_adiabatic_model_pade)
-            IF (n_rep_hf /= 2) &
+            IF (n_rep_hf /= 2) THEN
                CALL cp_abort(__LOCATION__, &
                              "For this kind of adiababatic hybrid functional 2 HF sections have to be provided. "// &
                              "Please check your input file.")
+            END IF
             CALL rescale_MCY3_pade(qs_env, hf_energy, energy, adiabatic_lambda, &
                                    adiabatic_omega, scale_dEx1, scale_ddW0, scale_dDFA, &
                                    scale_dEx2, total_energy_xc)
@@ -165,12 +166,15 @@ CONTAINS
             IF (gapw_xc) THEN
                CALL qs_vxc_create(ks_env=ks_env, rho_struct=rho_xc, xc_section=xc_section, &
                                   vxc_rho=v_rspace_new, vxc_tau=v_tau_rspace, exc=energy%exc, &
+                                  edisp=edisp, dispersion_env=qs_env%dispersion_env, &
                                   just_energy=just_energy, adiabatic_rescale_factor=scale_dDFA)
             ELSE
                CALL qs_vxc_create(ks_env=ks_env, rho_struct=rho, xc_section=xc_section, &
                                   vxc_rho=v_rspace_new, vxc_tau=v_tau_rspace, exc=energy%exc, &
+                                  edisp=edisp, dispersion_env=qs_env%dispersion_env, &
                                   just_energy=just_energy, adiabatic_rescale_factor=scale_dDFA)
             END IF
+            IF (edisp /= 0.0_dp) energy%dispersion = edisp
 
             ! Calculate vxc and rescale it
             IF (gapw .OR. gapw_xc) THEN

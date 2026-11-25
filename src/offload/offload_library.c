@@ -7,7 +7,6 @@
 #include "offload_library.h"
 #include "offload_runtime.h"
 
-#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,6 +191,18 @@ int offload_host_free(void *ptr__) {
 #else
   free(ptr__);
   return EXIT_SUCCESS;
+#endif
+}
+
+/*******************************************************************************
+ * \brief Blocks until all outstanding device work has completed.
+ * \author Samal Bibek
+ ******************************************************************************/
+void offload_device_synchronize(void) {
+#if defined(__OFFLOAD_CUDA)
+  OFFLOAD_CHECK(cudaDeviceSynchronize());
+#elif defined(__OFFLOAD_HIP)
+  OFFLOAD_CHECK(hipDeviceSynchronize());
 #endif
 }
 

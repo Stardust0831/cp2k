@@ -39,6 +39,7 @@ MODULE cp_cfm_types
 
    PUBLIC :: cp_cfm_type, cp_cfm_p_type, copy_cfm_info_type
    PUBLIC :: cp_cfm_cleanup_copy_general, &
+             cp_cfm_copy_general, &
              cp_cfm_create, &
              cp_cfm_finish_copy_general, &
              cp_cfm_get_element, &
@@ -277,9 +278,9 @@ CONTAINS
 
       IF ((iprow == myprow) .AND. (ipcol == mypcol)) THEN
          alpha = matrix%local_data(irow_local, icol_local)
-         CALL context%ZGEBS2D('All', ' ', 1, 1, alpha, 1)
+         CALL context%ZGEBS2D('A', ' ', 1, 1, alpha, 1)
       ELSE
-         CALL context%ZGEBR2D('All', ' ', 1, 1, alpha, 1, iprow, ipcol)
+         CALL context%ZGEBR2D('A', ' ', 1, 1, alpha, 1, iprow, ipcol)
       END IF
 
 #else
@@ -439,8 +440,9 @@ CONTAINS
          !  * the source matrix is distributed across a number of processes, or
          !  * not all elements of the target matrix will be assigned, e.g.
          !        when the target matrix is larger then the source matrix
-         IF (do_zero) &
+         IF (do_zero) THEN
             CALL zcopy(SIZE(target_m), z_zero, 0, target_m(1, 1), 1)
+         END IF
 
          IF (tr_a) THEN
             DO j = start_col_local, end_col_local
@@ -668,14 +670,17 @@ CONTAINS
           cp_fm_struct_equivalent(source%matrix_struct, &
                                   destination%matrix_struct)) THEN
          IF (SIZE(source%local_data, 1) /= SIZE(destination%local_data, 1) .OR. &
-             SIZE(source%local_data, 2) /= SIZE(destination%local_data, 2)) &
+             SIZE(source%local_data, 2) /= SIZE(destination%local_data, 2)) THEN
             CPABORT("internal local_data has different sizes")
+         END IF
          CALL zcopy(SIZE(source%local_data), source%local_data(1, 1), 1, destination%local_data(1, 1), 1)
       ELSE
-         IF (source%matrix_struct%nrow_global /= destination%matrix_struct%nrow_global) &
+         IF (source%matrix_struct%nrow_global /= destination%matrix_struct%nrow_global) THEN
             CPABORT("cannot copy between full matrixes of differen sizes")
-         IF (source%matrix_struct%ncol_global /= destination%matrix_struct%ncol_global) &
+         END IF
+         IF (source%matrix_struct%ncol_global /= destination%matrix_struct%ncol_global) THEN
             CPABORT("cannot copy between full matrixes of differen sizes")
+         END IF
 #if defined(__parallel)
          CALL pzcopy(source%matrix_struct%nrow_global* &
                      source%matrix_struct%ncol_global, &
@@ -889,6 +894,36 @@ CONTAINS
    END SUBROUTINE cp_fm_to_cfm
 
 ! **************************************************************************************************
+!> \brief General copy of a cfm matrix to another cfm matrix.
+!>        Uses non-blocking MPI rather than ScaLAPACK.
+!> \param source input cfm matrix
+!> \param destination output cfm matrix
+!> \param para_env parallel environment corresponding to the BLACS env that covers all parts
+!>                  of the input and output matrices
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_copy_general(source, destination, para_env)
+      TYPE(cp_cfm_type), INTENT(IN)                      :: source, destination
+      TYPE(mp_para_env_type), INTENT(IN), POINTER        :: para_env
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'cp_cfm_copy_general'
+
+      INTEGER                                            :: handle
+      TYPE(copy_cfm_info_type)                           :: info
+
+      CALL timeset(routineN, handle)
+
+      CALL cp_cfm_start_copy_general(source, destination, para_env, info)
+      IF (ASSOCIATED(destination%matrix_struct)) THEN
+         CALL cp_cfm_finish_copy_general(destination, info)
+      END IF
+      IF (ASSOCIATED(source%matrix_struct)) THEN
+         CALL cp_cfm_cleanup_copy_general(info)
+      END IF
+
+      CALL timestop(handle)
+   END SUBROUTINE cp_cfm_copy_general
+
+! **************************************************************************************************
 !> \brief Initiate the copy operation: get distribution data, post MPI isend and irecvs.
 !> \param source       input complex-valued fm matrix
 !> \param destination  output complex-valued fm matrix
@@ -1068,7 +1103,8 @@ CONTAINS
          !      pack send buffers
          !      call isend
          !  DEST_2
-         !      wait for the recvs and unpack buffers (this part eventually will go into another routine to allow comms to run concurrently)
+         !      wait for the recvs and unpack buffers (this part eventually will go into another
+         !         routine to allow comms to run concurrently)
          !  SRC_2
          !      wait for the sends
 

@@ -25,7 +25,7 @@ class Gauxc(CMakePackage, CudaPackage, ROCmPackage):
     license("BSD-3-Clause")
 
     version("master", branch="master")
-    version("dev20260608", branch="skala", commit="36aeab80bf7b2245087bdfeffd8e61b11206b3bd")
+    version("dev20260717", branch="skala", commit="ea0f1fc7c02497aa950376eda61686ba30256999")
     version(
         "1.2.dev2",
         sha256="6659d00522b443f2557a960a9ba0217449d2ee25df809634d6becca23eb0f1ff",
@@ -33,10 +33,16 @@ class Gauxc(CMakePackage, CudaPackage, ROCmPackage):
     )
     version("1.1", sha256="17de077fb23e44d03b0ed14dcd8117c01e5b3431fbefa2352d751639ada7f91c")
 
+    # Avoid dividing by zero when inverting the diagonal of the RAB distance
+    # matrix. The diagonal is zero by construction and unused, and dividing it
+    # produces inf/NaN that raises SIGFPE when the caller enables FP traps
+    # (e.g. CP2K's Debug build with -ffpe-trap=zero).
+    patch("gauxc-dev-no-diag-rab-inv.patch", when="@dev20260717")
+
     variant("c", default=True, description="Build with C API support", when="@master")
     variant("c", default=True, description="Build with C API support", when="@1.2.dev2")
-    variant("c", default=True, description="Build with C API support", when="@dev20260608")
-    variant("fortran", default=True, description="Build with Fortran support", when="@dev20260608")
+    variant("c", default=True, description="Build with C API support", when="@dev20260717")
+    variant("fortran", default=True, description="Build with Fortran support", when="@dev20260717")
     variant("host", default=True, description="Build with host integrator")
     variant("mpi", default=False, description="Build with MPI support")
     variant("openmp", default=True, description="Build with OpenMP support")
@@ -52,16 +58,43 @@ class Gauxc(CMakePackage, CudaPackage, ROCmPackage):
     variant("pic", default=True, description="Build position independent code")
 
     # Skala resource file
-    SKALA_RESOURCES = {"1.1": "0c8432ac3f03c8f1276372df9aca5b7ee7f8939d47a8789eb158976e89aa0606"}
-    variant("skala_version", default="none", values=("none", *SKALA_RESOURCES.keys()), multi=False)
-    for skala_version, sha256 in SKALA_RESOURCES.items():
+    SKALA_RESOURCES = {
+        "1.1": {
+            "cpu": (
+                "skala-1.1-rev1.fun",
+                "7f3e8622e1eb520ccd88a55464c3e359ac4d7e5ccbd1fb77a26afa1e1c20a5cd",
+            ),
+            "cuda": (
+                "skala-1.1-rev1-cuda.fun",
+                "f848eae769dca91741a518ae7275d10caac398ab21db649f91bc1f136872f223",
+            ),
+        }
+    }
+    variant(
+        "skala_version",
+        default="none",
+        values=("none", *SKALA_RESOURCES.keys()),
+        multi=False,
+        description="SKALA model version to install",
+    )
+    for skala_version, artifacts in SKALA_RESOURCES.items():
+        cpu_file, cpu_sha256 = artifacts["cpu"]
         resource(
             name=f"skala_fun_{skala_version}",
-            url=f"https://huggingface.co/microsoft/skala-{skala_version}/resolve/main/skala-{skala_version}.fun",
-            sha256=sha256,
+            url=f"https://huggingface.co/microsoft/skala-{skala_version}/resolve/main/{cpu_file}",
+            sha256=cpu_sha256,
             expand=False,
-            placement="onedft_models",
+            placement={cpu_file: cpu_file},
             when=f"+skala skala_version={skala_version}",
+        )
+        cuda_file, cuda_sha256 = artifacts["cuda"]
+        resource(
+            name=f"skala_cuda_fun_{skala_version}",
+            url=f"https://huggingface.co/microsoft/skala-{skala_version}/resolve/main/{cuda_file}",
+            sha256=cuda_sha256,
+            expand=False,
+            placement={cuda_file: cuda_file},
+            when=f"+skala+cuda skala_version={skala_version}",
         )
 
     conflicts("+magma", when="~cuda ~rocm", msg="MAGMA requires CUDA or HIP")
@@ -75,7 +108,6 @@ class Gauxc(CMakePackage, CudaPackage, ROCmPackage):
     depends_on("cmake@3.20:", type="build")
     depends_on("ninja@1.10:", type="build")
     depends_on("exchcxx~cuda", when="~cuda")
-    depends_on("exchcxx+cuda", when="+cuda")
     depends_on("integratorxx")
     depends_on("blas")
     depends_on("hdf5", when="+hdf5")
@@ -86,10 +118,14 @@ class Gauxc(CMakePackage, CudaPackage, ROCmPackage):
     depends_on("gau2grid")
     depends_on("nlohmann-json", when="+skala")
     depends_on("py-torch@2:~cuda", when="+skala~cuda")
-    depends_on("py-torch@2:+cuda", when="+skala+cuda")
     depends_on("magma", when="+magma")
     depends_on("nccl", when="+nccl")
     depends_on("cutlass", when="+cutlass")
+
+    for arch in CudaPackage.cuda_arch_values:
+        cuda_spec = f"+cuda cuda_arch={arch}"
+        depends_on(f"exchcxx{cuda_spec}", when=cuda_spec)
+        depends_on(f"py-torch@2:{cuda_spec}", when=f"+skala {cuda_spec}")
 
     generator("ninja")
 
@@ -114,6 +150,9 @@ class Gauxc(CMakePackage, CudaPackage, ROCmPackage):
             self.define_from_variant("GAUXC_ENABLE_CUTLASS", "cutlass"),
             self.define_from_variant("CMAKE_POSITION_INDEPENDENT_CODE", "pic"),
         ]
+        # The PyTorch headers require C++20 starting with version 2.14
+        if spec.satisfies("+skala ^py-torch@2.14:"):
+            args.append(self.define("CMAKE_CXX_STANDARD", "20"))
         if spec.satisfies("+cuda"):
             archs = spec.variants["cuda_arch"].value
             if "none" not in archs:
@@ -130,7 +169,21 @@ class Gauxc(CMakePackage, CudaPackage, ROCmPackage):
         super().install(spec, prefix)
         if spec.satisfies("+skala"):
             skala_version = spec.variants["skala_version"].value
-            skala_file = f"skala-{skala_version}.fun"
             target_dir = prefix.share.gauxc.join("onedft_models")
             mkdirp(target_dir)
-            install(join_path("onedft_models", skala_file), target_dir)
+            cpu_file = self.SKALA_RESOURCES[skala_version]["cpu"][0]
+            install(cpu_file, target_dir)
+            if spec.satisfies("+cuda"):
+                cuda_file = self.SKALA_RESOURCES[skala_version]["cuda"][0]
+                install(cuda_file, target_dir)
+
+    def setup_run_environment(self, env):
+        spec = self.spec
+        if spec.satisfies("+skala"):
+            skala_version = spec.variants["skala_version"].value
+            model_dir = self.prefix.share.gauxc.join("onedft_models")
+            cpu_file = self.SKALA_RESOURCES[skala_version]["cpu"][0]
+            env.set("GAUXC_SKALA_MODEL", model_dir.join(cpu_file))
+            if spec.satisfies("+cuda"):
+                cuda_file = self.SKALA_RESOURCES[skala_version]["cuda"][0]
+                env.set("GAUXC_SKALA_CUDA_MODEL", model_dir.join(cuda_file))

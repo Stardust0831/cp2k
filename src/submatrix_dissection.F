@@ -145,7 +145,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(IN)                     :: matrix_p
 
       INTEGER                                          :: cur_row, cur_col, i, j, k, l, m, l_limit_left, l_limit_right, &
-                                                          bufsize, bufsize_next
+                                                          bufsize, bufsize_next, my_i, nblks_local
       INTEGER, DIMENSION(:), ALLOCATABLE               :: blocks_per_rank, coo_dsplcmnts, num_blockids_send, num_blockids_recv
       TYPE(dbcsr_iterator_type)                        :: iter
       TYPE(set_type)                                   :: nonzero_rows
@@ -198,13 +198,17 @@ CONTAINS
       ! therefore deferred.
 
       ! Determine number of locally stored blocks
-      this%local_blocks = 0
+      nblks_local = 0
+!$OMP PARALLEL DEFAULT(NONE) SHARED(this) PRIVATE(iter, cur_row, cur_col) &
+!$OMP REDUCTION(+:nblks_local)
       CALL dbcsr_iterator_readonly_start(iter, this%dbcsr_mat)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, cur_row, cur_col)
-         this%local_blocks = this%local_blocks + 1
+         nblks_local = nblks_local + 1
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
+      this%local_blocks = nblks_local
 
       ALLOCATE (this%coo_cols_local(this%local_blocks), this%coo_rows_local(this%local_blocks), blocks_per_rank(this%numnodes), &
                 coo_dsplcmnts(this%numnodes), this%coo_col_offsets_local(this%nblkcols + 1), &
@@ -214,14 +218,19 @@ CONTAINS
                 this%result_blocks_for_rank_buf_offsets(0:this%numnodes - 1))
 
       i = 1
+!$OMP PARALLEL DEFAULT(NONE) SHARED(this, i) PRIVATE(iter, cur_row, cur_col, my_i)
       CALL dbcsr_iterator_readonly_start(iter, this%dbcsr_mat)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, cur_row, cur_col)
-         this%coo_cols_local(i) = cur_col
-         this%coo_rows_local(i) = cur_row
+!$OMP ATOMIC CAPTURE
+         my_i = i
          i = i + 1
+!$OMP END ATOMIC
+         this%coo_cols_local(my_i) = cur_col
+         this%coo_rows_local(my_i) = cur_row
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP END PARALLEL
 
       ! We only know how many blocks we own. What's with the other ranks?
       CALL this%group%allgather(msgout=this%local_blocks, msgin=blocks_per_rank)
@@ -323,7 +332,7 @@ CONTAINS
       ! Figure out which blocks we need to receive. Blocks are identified here as indices into our COO representation.
       ! TODO: This currently shows limited parallel efficiency. Investigate further.
 
-      !$OMP PARALLEL DEFAULT(OMP_DEFAULT_NONE_WITH_OOP) &
+      !$OMP PARALLEL DEFAULT(NONE) &
       !$OMP          NUM_THREADS(numthreads) &
       !$OMP          PRIVATE(i,j,k,l,m,l_limit_left,l_limit_right,cur_col,cur_row,mytid) &
       !$OMP          SHARED(result_blocks_from_rank_t,result_blocks_for_rank_t,blocks_from_rank_t,this,numthreads,nonzero_rows_t)

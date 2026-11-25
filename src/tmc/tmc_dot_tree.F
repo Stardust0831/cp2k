@@ -92,7 +92,7 @@ CONTAINS
       WRITE (file_ptr, *) "digraph G {"
       WRITE (file_ptr, *) '  size="8.27,11.69"'
       CALL write_legend(file_ptr)
-      CALL close_file(unit_number=file_ptr, keep_preconnection=.TRUE.)
+      CALL close_file(unit_number=file_ptr)
 
       ! subtrees
       DO i = 1, SIZE(tmc_params%Temp)
@@ -101,7 +101,7 @@ CONTAINS
          WRITE (file_ptr, *) "digraph G {"
          WRITE (file_ptr, *) '  size="8.27,11.69"'
          CALL write_legend(file_ptr)
-         CALL close_file(unit_number=file_ptr, keep_preconnection=.TRUE.)
+         CALL close_file(unit_number=file_ptr)
       END DO
    END SUBROUTINE init_draw_trees
 
@@ -233,7 +233,7 @@ CONTAINS
       CASE DEFAULT
          CPABORT("element status"//cp_to_string(stat))
       END SELECT
-      CALL close_file(unit_number=file_ptr, keep_preconnection=.TRUE.)
+      CALL close_file(unit_number=file_ptr)
    END SUBROUTINE write_color
 
 ! **************************************************************************************************
@@ -263,7 +263,7 @@ CONTAINS
       ELSE
          WRITE (file_ptr, *) parent_nr, " -> ", child_nr, ":ne [color=coral]"
       END IF
-      CALL close_file(unit_number=file_ptr, keep_preconnection=.TRUE.)
+      CALL close_file(unit_number=file_ptr)
    END SUBROUTINE create_dot_branch
 
 ! **************************************************************************************************
@@ -339,10 +339,11 @@ CONTAINS
       END IF
 
       IF (.NOT. ASSOCIATED(new_element%parent)) THEN
-         IF (new_element%nr > 1) &
+         IF (new_element%nr > 1) THEN
             CALL cp_warn(__LOCATION__, &
                          "try to create dot, but no parent on node "// &
                          cp_to_string(new_element%nr)//"exists")
+         END IF
       ELSE
          CALL create_dot_branch(parent_nr=new_element%parent%nr, &
                                 child_nr=new_element%nr, &
@@ -362,7 +363,7 @@ CONTAINS
             new_element%conf(new_element%mv_conf)%elem%move_type, '\n ', &
             TRIM(ADJUSTL(list_of_nr)), '"]'
       END IF
-      CALL close_file(file_ptr, keep_preconnection=.TRUE.)
+      CALL close_file(file_ptr)
    END SUBROUTINE create_global_tree_dot
 
 ! **************************************************************************************************

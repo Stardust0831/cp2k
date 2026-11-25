@@ -38,6 +38,7 @@ MODULE qs_tddfpt2_fhxc
                                               pw_r3d_rs_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
+   USE qs_fxc,                          ONLY: qs_fxc_apply
    USE qs_gapw_densities,               ONLY: prepare_gapw_den
    USE qs_integrate_potential,          ONLY: integrate_v_rspace,&
                                               integrate_v_rspace_one_center
@@ -50,13 +51,11 @@ MODULE qs_tddfpt2_fhxc
    USE qs_tddfpt2_densities,            ONLY: tddfpt_construct_aux_fit_density
    USE qs_tddfpt2_lri_utils,            ONLY: tddfpt2_lri_Amat
    USE qs_tddfpt2_operators,            ONLY: tddfpt_apply_coulomb,&
-                                              tddfpt_apply_xc,&
                                               tddfpt_apply_xc_potential
    USE qs_tddfpt2_stda_types,           ONLY: stda_env_type
    USE qs_tddfpt2_stda_utils,           ONLY: stda_calculate_kernel
    USE qs_tddfpt2_subgroups,            ONLY: tddfpt_subgroup_env_type
    USE qs_tddfpt2_types,                ONLY: tddfpt_work_matrices
-   USE qs_vxc_atom,                     ONLY: calculate_xc_2nd_deriv_atom
    USE task_list_types,                 ONLY: task_list_type
 #include "./base/base_uses.f90"
 
@@ -116,9 +115,10 @@ CONTAINS
       INTEGER                                            :: handle, ikind, ispin, ivect, nao, &
                                                             nao_aux, nkind, nspins, nvects, &
                                                             spinflip
-      INTEGER, DIMENSION(:), POINTER                     :: blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_sizes
       INTEGER, DIMENSION(maxspins)                       :: nactive
-      LOGICAL                                            :: do_noncol, gapw, gapw_xc
+      LOGICAL                                            :: do_noncol, do_onecenter, do_scale, gapw, &
+                                                            gapw_xc
       TYPE(admm_type), POINTER                           :: admm_env
       TYPE(cp_fm_type)                                   :: work_aux_orb, work_orb_orb
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: A_xc_munu_sub, rho_ia_ao, &
@@ -129,8 +129,7 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER        :: rho_ia_g, rho_ia_g_aux_fit
       TYPE(pw_pool_type), POINTER                        :: auxbas_pw_pool
-      TYPE(pw_r3d_rs_type), ALLOCATABLE, DIMENSION(:)    :: V_rspace_sub
-      TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho_ia_r, rho_ia_r_aux_fit
+      TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: fxc_tau, rho_ia_r, rho_ia_r_aux_fit
       TYPE(pw_r3d_rs_type), POINTER                      :: weights
       TYPE(rho_atom_type), DIMENSION(:), POINTER         :: rho1_atom_set, rho_atom_set
       TYPE(task_list_type), POINTER                      :: task_list
@@ -150,6 +149,8 @@ CONTAINS
       spinflip = dft_control%tddfpt2_control%spinflip
 
       do_noncol = spinflip == tddfpt_sf_noncol
+      do_scale = is_rks_triplets
+      do_onecenter = gapw .OR. gapw_xc
 
       CALL cp_fm_get_info(evects(1, 1), nrow_global=nao)
       DO ispin = 1, nspins
@@ -167,6 +168,8 @@ CONTAINS
 
       NULLIFY (weights)
       CALL get_qs_env(qs_env, xcint_weights=weights)
+      CALL pw_env_get(sub_env%pw_env, auxbas_pw_pool=auxbas_pw_pool)
+      NULLIFY (fxc_tau)
 
       DO ivect = 1, nvects
 
@@ -201,8 +204,8 @@ CONTAINS
                                       para_env_external=sub_env%para_env, &
                                       tddfpt_lri_env=kernel_env%lri_env, &
                                       tddfpt_lri_density=kernel_env%lri_density)
-         ELSEIF (dft_control%qs_control%lrigpw .OR. &
-                 dft_control%qs_control%rigpw) THEN
+         ELSE IF (dft_control%qs_control%lrigpw .OR. &
+                  dft_control%qs_control%rigpw) THEN
             CALL qs_rho_update_tddfpt(work_matrices%rho_orb_struct_sub, qs_env, &
                                       pw_env_external=sub_env%pw_env, &
                                       task_list_external=sub_env%task_list_orb, &
@@ -216,7 +219,7 @@ CONTAINS
                                       para_env_external=sub_env%para_env)
                CALL prepare_gapw_den(qs_env, work_matrices%local_rho_set, &
                                      do_rho0=(.NOT. is_rks_triplets), pw_env_sub=sub_env%pw_env)
-            ELSEIF (gapw_xc) THEN
+            ELSE IF (gapw_xc) THEN
                CALL qs_rho_update_rho(work_matrices%rho_orb_struct_sub, qs_env, &
                                       rho_xc_external=work_matrices%rho_xc_struct_sub, &
                                       local_rho_set=work_matrices%local_rho_set, &
@@ -249,17 +252,26 @@ CONTAINS
             IF ((.NOT. dft_control%tddfpt2_control%do_bse_gw_only)) THEN
                ! C_x d^{2}E_{x}^{DFT}[\rho] / d\rho^2
                ! + C_{HF} d^{2}E_{x, ADMM}^{DFT}[\rho] / d\rho^2 in case of ADMM calculation
+               IF (do_onecenter) THEN
+                  rho_atom_set => sub_env%local_rho_set%rho_atom_set
+                  rho1_atom_set => work_matrices%local_rho_set%rho_atom_set
+               END IF
+               !
                IF (gapw_xc) THEN
                   IF (kernel_env%do_exck) THEN
                      CPABORT("NYA")
                   ELSE
-                     CALL tddfpt_apply_xc(A_ia_rspace=work_matrices%A_ia_rspace_sub, kernel_env=kernel_env, &
-                                          rho_ia_struct=work_matrices%rho_xc_struct_sub, &
-                                          is_rks_triplets=is_rks_triplets, pw_env=sub_env%pw_env, &
-                                          weights=weights, &
-                                          work_v_xc=work_matrices%wpw_rspace_sub, &
-                                          work_v_xc_tau=work_matrices%wpw_tau_rspace_sub, &
-                                          spinflip=spinflip)
+                     CALL qs_fxc_apply(qs_env, kernel_env%xc_deriv_set, kernel_env%xc_rho_set, &
+                                       work_matrices%rho_xc_struct_sub, rho_atom_set, &
+                                       kernel_env%xc_section, do_onecenter, work_matrices%wpw_rspace_sub, &
+                                       fxc_tau, rho1_atom_set, &
+                                       do_scale=do_scale, is_triplet=is_rks_triplets, spinflip=do_noncol, &
+                                       pw_env_ext=sub_env%pw_env, para_env_external=sub_env%para_env)
+                     DO ispin = 1, nspins
+                        CALL pw_axpy(work_matrices%wpw_rspace_sub(ispin), &
+                                     work_matrices%A_ia_rspace_sub(ispin), kernel_env%alpha)
+                     END DO
+
                   END IF
                   DO ispin = 1, nspins
                      CALL pw_scale(work_matrices%A_ia_rspace_sub(ispin), &
@@ -276,26 +288,38 @@ CONTAINS
                      CALL tddfpt_apply_xc_potential(work_matrices%A_ia_rspace_sub, work_matrices%fxc_rspace_sub, &
                                                     work_matrices%rho_orb_struct_sub, is_rks_triplets)
                   ELSE
-                     CALL tddfpt_apply_xc(A_ia_rspace=work_matrices%A_ia_rspace_sub, kernel_env=kernel_env, &
-                                          rho_ia_struct=work_matrices%rho_orb_struct_sub, &
-                                          is_rks_triplets=is_rks_triplets, pw_env=sub_env%pw_env, &
-                                          weights=weights, &
-                                          work_v_xc=work_matrices%wpw_rspace_sub, &
-                                          work_v_xc_tau=work_matrices%wpw_tau_rspace_sub, &
-                                          spinflip=spinflip)
+                     CALL qs_fxc_apply(qs_env, kernel_env%xc_deriv_set, kernel_env%xc_rho_set, &
+                                       work_matrices%rho_orb_struct_sub, rho_atom_set, &
+                                       kernel_env%xc_section, do_onecenter, work_matrices%wpw_rspace_sub, &
+                                       fxc_tau, rho1_atom_set, &
+                                       do_scale=do_scale, is_triplet=is_rks_triplets, spinflip=do_noncol, &
+                                       pw_env_ext=sub_env%pw_env, para_env_external=sub_env%para_env)
+                     DO ispin = 1, nspins
+                        CALL pw_axpy(work_matrices%wpw_rspace_sub(ispin), &
+                                     work_matrices%A_ia_rspace_sub(ispin), kernel_env%alpha)
+                     END DO
+
                   END IF
-               END IF
-               IF (gapw .OR. gapw_xc) THEN
-                  rho_atom_set => sub_env%local_rho_set%rho_atom_set
-                  rho1_atom_set => work_matrices%local_rho_set%rho_atom_set
-                  CALL calculate_xc_2nd_deriv_atom(rho_atom_set, rho1_atom_set, qs_env, kernel_env%xc_section, &
-                                                   sub_env%para_env, do_tddfpt2=.TRUE., do_triplet=is_rks_triplets, &
-                                                   do_sf=do_noncol)
                END IF
 
             END IF ! do_bse
             END IF  ! do_bse
          END IF ! spin-flip
+
+         ! Complete the meta-GGA response before the ADMM call reuses the XC work grids.
+         ! compute_tau includes the factor 1/2 in the gradient-product integral.
+         IF (ASSOCIATED(fxc_tau)) THEN
+            task_list => sub_env%task_list_orb
+            IF (do_onecenter) task_list => sub_env%task_list_orb_soft
+            DO ispin = 1, nspins
+               CALL pw_scale(fxc_tau(ispin), kernel_env%alpha*fxc_tau(ispin)%pw_grid%dvol)
+               CALL integrate_v_rspace(v_rspace=fxc_tau(ispin), hmat=work_matrices%A_ia_munu_sub(ispin), &
+                                       qs_env=qs_env, calculate_forces=.FALSE., compute_tau=.TRUE., gapw=do_onecenter, &
+                                       pw_env_external=sub_env%pw_env, task_list_external=task_list)
+               CALL auxbas_pw_pool%give_back_pw(fxc_tau(ispin))
+            END DO
+            DEALLOCATE (fxc_tau)
+         END IF
 
          ! ADMM correction
          IF ((.NOT. dft_control%tddfpt2_control%do_bse) .AND. (.NOT. dft_control%tddfpt2_control%do_bse_w_only) &
@@ -322,13 +346,6 @@ CONTAINS
                      CALL dbcsr_set(A_xc_munu_sub(ispin)%matrix, 0.0_dp)
                   END DO
 
-                  CALL pw_env_get(sub_env%pw_env, auxbas_pw_pool=auxbas_pw_pool)
-                  ALLOCATE (V_rspace_sub(nspins))
-                  DO ispin = 1, nspins
-                     CALL auxbas_pw_pool%create_pw(V_rspace_sub(ispin))
-                     CALL pw_zero(V_rspace_sub(ispin))
-                  END DO
-
                   IF (admm_env%do_gapw) THEN
                      basis_type = "AUX_FIT_SOFT"
                      task_list => sub_env%task_list_aux_fit_soft
@@ -337,17 +354,21 @@ CONTAINS
                      task_list => sub_env%task_list_aux_fit
                   END IF
 
-                  CALL tddfpt_apply_xc(A_ia_rspace=V_rspace_sub, &
-                                       kernel_env=kernel_env_admm_aux, &
-                                       rho_ia_struct=work_matrices%rho_aux_fit_struct_sub, &
-                                       is_rks_triplets=is_rks_triplets, pw_env=sub_env%pw_env, &
-                                       weights=weights, &
-                                       work_v_xc=work_matrices%wpw_rspace_sub, &
-                                       work_v_xc_tau=work_matrices%wpw_tau_rspace_sub, &
-                                       spinflip=spinflip)
+                  IF (admm_env%do_gapw) THEN
+                     rho_atom_set => sub_env%local_rho_set_admm%rho_atom_set
+                     rho1_atom_set => work_matrices%local_rho_set_admm%rho_atom_set
+                  END IF
+                  CALL qs_fxc_apply(qs_env, kernel_env_admm_aux%xc_deriv_set, kernel_env_admm_aux%xc_rho_set, &
+                                    work_matrices%rho_aux_fit_struct_sub, rho_atom_set, &
+                                    kernel_env_admm_aux%xc_section, admm_env%do_gapw, &
+                                    work_matrices%wpw_rspace_sub, fxc_tau, rho1_atom_set, &
+                                    do_scale=do_scale, is_triplet=is_rks_triplets, spinflip=do_noncol, &
+                                    pw_env_ext=sub_env%pw_env, kind_set_external=admm_env%admm_gapw_env%admm_kind_set, &
+                                    para_env_external=sub_env%para_env)
                   DO ispin = 1, nspins
-                     CALL pw_scale(V_rspace_sub(ispin), V_rspace_sub(ispin)%pw_grid%dvol)
-                     CALL integrate_v_rspace(v_rspace=V_rspace_sub(ispin), &
+                     CALL pw_scale(work_matrices%wpw_rspace_sub(ispin), &
+                                   kernel_env_admm_aux%alpha*work_matrices%wpw_rspace_sub(ispin)%pw_grid%dvol)
+                     CALL integrate_v_rspace(v_rspace=work_matrices%wpw_rspace_sub(ispin), &
                                              hmat=A_xc_munu_sub(ispin), &
                                              qs_env=qs_env, calculate_forces=.FALSE., &
                                              pw_env_external=sub_env%pw_env, &
@@ -355,13 +376,6 @@ CONTAINS
                                              task_list_external=task_list)
                   END DO
                   IF (admm_env%do_gapw) THEN
-                     rho_atom_set => sub_env%local_rho_set_admm%rho_atom_set
-                     rho1_atom_set => work_matrices%local_rho_set_admm%rho_atom_set
-                     CALL calculate_xc_2nd_deriv_atom(rho_atom_set, rho1_atom_set, qs_env, &
-                                                      kernel_env_admm_aux%xc_section, &
-                                                      sub_env%para_env, do_tddfpt2=.TRUE., &
-                                                      do_triplet=is_rks_triplets, do_sf=do_noncol, &
-                                                      kind_set_external=admm_env%admm_gapw_env%admm_kind_set)
                      CALL update_ks_atom(qs_env, A_xc_munu_sub, rho_ia_ao_aux_fit, forces=.FALSE., tddft=.TRUE., &
                                          rho_atom_external=rho1_atom_set, &
                                          kind_set_external=admm_env%admm_gapw_env%admm_kind_set, &
@@ -387,10 +401,6 @@ CONTAINS
                   END DO
                   CALL dbcsr_release(dbwork)
                   DEALLOCATE (dbwork)
-                  DO ispin = 1, nspins
-                     CALL auxbas_pw_pool%give_back_pw(V_rspace_sub(ispin))
-                  END DO
-                  DEALLOCATE (V_rspace_sub)
                   CALL cp_fm_release(work_aux_orb)
                   CALL cp_fm_release(work_orb_orb)
                   DO ispin = 1, nspins
@@ -398,18 +408,22 @@ CONTAINS
                   END DO
                   DEALLOCATE (A_xc_munu_sub)
                ELSE
-                  CALL tddfpt_apply_xc(A_ia_rspace=work_matrices%A_ia_rspace_sub, &
-                                       kernel_env=kernel_env_admm_aux, &
-                                       rho_ia_struct=work_matrices%rho_aux_fit_struct_sub, &
-                                       is_rks_triplets=is_rks_triplets, pw_env=sub_env%pw_env, &
-                                       weights=weights, &
-                                       work_v_xc=work_matrices%wpw_rspace_sub, &
-                                       work_v_xc_tau=work_matrices%wpw_tau_rspace_sub, &
-                                       spinflip=spinflip)
                   IF (admm_env%do_gapw) THEN
                      CPWARN("GAPW/ADMM needs symmetric ADMM kernel")
                      CPABORT("GAPW/ADMM@TDDFT")
                   END IF
+                  CALL qs_fxc_apply(qs_env, kernel_env_admm_aux%xc_deriv_set, kernel_env_admm_aux%xc_rho_set, &
+                                    work_matrices%rho_aux_fit_struct_sub, rho_atom_set, &
+                                    kernel_env_admm_aux%xc_section, admm_env%do_gapw, &
+                                    work_matrices%wpw_rspace_sub, fxc_tau, rho1_atom_set, &
+                                    do_scale=do_scale, is_triplet=is_rks_triplets, spinflip=do_noncol, &
+                                    pw_env_ext=sub_env%pw_env)
+
+                  DO ispin = 1, nspins
+                     CALL pw_axpy(work_matrices%wpw_rspace_sub(ispin), &
+                                  work_matrices%A_ia_rspace_sub(ispin), kernel_env_admm_aux%alpha)
+                  END DO
+
                END IF
             END IF
          END IF
@@ -447,7 +461,7 @@ CONTAINS
                                           qs_env=qs_env, calculate_forces=.FALSE., gapw=gapw, &
                                           pw_env_external=sub_env%pw_env, &
                                           task_list_external=sub_env%task_list_orb_soft)
-               ELSEIF (gapw_xc) THEN
+               ELSE IF (gapw_xc) THEN
                   IF (.NOT. is_rks_triplets) THEN
                      CALL integrate_v_rspace(v_rspace=work_matrices%A_ia_rspace_sub(ispin), &
                                              hmat=work_matrices%A_ia_munu_sub(ispin), &

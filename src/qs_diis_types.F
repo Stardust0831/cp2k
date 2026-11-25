@@ -16,6 +16,7 @@ MODULE qs_diis_types
                                               cp_cfm_type
    USE cp_dbcsr_api,                    ONLY: dbcsr_p_type,&
                                               dbcsr_release
+   USE cp_dbcsr_operations,             ONLY: dbcsr_fm_copy_plan_type
    USE cp_fm_types,                     ONLY: cp_fm_release,&
                                               cp_fm_type
    USE kinds,                           ONLY: dp
@@ -46,18 +47,8 @@ MODULE qs_diis_types
       TYPE(cp_fm_type), DIMENSION(:, :), POINTER       :: error => NULL()
       TYPE(cp_fm_type), DIMENSION(:, :), POINTER       :: param => NULL()
       REAL(KIND=dp), DIMENSION(:, :), POINTER          :: b_matrix => NULL()
+      TYPE(dbcsr_fm_copy_plan_type), ALLOCATABLE        :: overlap_copy_plan
    END TYPE qs_diis_buffer_type
-
-! **************************************************************************************************
-!> \brief build array of pointers to diis buffers
-!> \param diis_buffer the diis buffer pointer
-!> \par History
-!>      02.2003 created [fawzi]
-!> \author fawzi
-! **************************************************************************************************
-   TYPE qs_diis_buffer_p_type
-      TYPE(qs_diis_buffer_type), POINTER :: diis_buffer => NULL()
-   END TYPE qs_diis_buffer_p_type
 
 ! **************************************************************************************************
 !> \brief build array of pointers to diis buffers for sparse matrix case
@@ -73,10 +64,6 @@ MODULE qs_diis_types
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER     :: param => NULL()
       REAL(KIND=dp), DIMENSION(:, :), POINTER          :: b_matrix => NULL()
    END TYPE qs_diis_buffer_type_sparse
-
-   TYPE qs_diis_buffer_p_type_sparse
-      TYPE(qs_diis_buffer_type_sparse), POINTER        :: diis_buffer => NULL()
-   END TYPE qs_diis_buffer_p_type_sparse
 
 ! **************************************************************************************************
 !> \brief build arrau of pointers to diis buffers in the k-point (complex full matrices) case
@@ -94,10 +81,6 @@ MODULE qs_diis_types
       COMPLEX(KIND=dp), DIMENSION(:, :), POINTER       :: b_matrix => NULL()
    END TYPE qs_diis_buffer_type_kp
 
-   TYPE qs_diis_buffer_p_type_kp
-      TYPE(qs_diis_buffer_type_kp), POINTER            :: diis_buffer => NULL()
-   END TYPE qs_diis_buffer_p_type_kp
-
 CONTAINS
 
 ! **************************************************************************************************
@@ -110,6 +93,7 @@ CONTAINS
    SUBROUTINE qs_diis_b_release(diis_buffer)
       TYPE(qs_diis_buffer_type), INTENT(INOUT)           :: diis_buffer
 
+      IF (ALLOCATED(diis_buffer%overlap_copy_plan)) DEALLOCATE (diis_buffer%overlap_copy_plan)
       IF (ASSOCIATED(diis_buffer%b_matrix)) THEN
          DEALLOCATE (diis_buffer%b_matrix)
       END IF

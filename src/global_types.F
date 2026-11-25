@@ -21,6 +21,7 @@
 MODULE global_types
 
    USE cp_blacs_env,                    ONLY: BLACS_GRID_SQUARE
+   USE fft_api,                         ONLY: FFT_LIBRARY_BACKEND_DEFAULT
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
@@ -68,10 +69,9 @@ MODULE global_types
       TYPE(rng_stream_type), ALLOCATABLE      :: gaussian_rng_stream
       CHARACTER(LEN=default_string_length)    :: diag_library = "ScaLAPACK"
       CHARACTER(LEN=default_string_length)    :: cholesky_library = "ScaLAPACK"
-      CHARACTER(LEN=default_string_length)    :: default_fft_library = "FFTSG"
+      INTEGER    :: default_fft_library = FFT_LIBRARY_BACKEND_DEFAULT
       CHARACTER(LEN=default_path_length)      :: fftw_wisdom_file_name = "/etc/fftw/wisdom"
       CHARACTER(LEN=default_string_length)    :: default_dgemm_library = "BLAS"
-
       INTEGER :: fft_pool_scratch_limit = 0 ! limit number of used FFT scratches
       INTEGER :: fftw_plan_type = 0 ! which kind of planning to use with FFTW
       INTEGER :: idum = 0 ! random number seed
@@ -79,7 +79,10 @@ MODULE global_types
       INTEGER :: run_type_id = 0 ! index to define the run_tupe
       INTEGER :: blacs_grid_layout = BLACS_GRID_SQUARE ! will store the user preference for the BLACS grid
       INTEGER :: k_elpa = 1 ! optimized kernel for the ELPA diagonalization library
+      INTEGER :: k_elpa_c = -1 ! optimized kernel for the ELPA diagonalization library (complex matrices)
       INTEGER :: elpa_neigvec_min = 0 ! Minimum number of eigenvectors for ELPA usage
+      LOGICAL :: fftw_wisdom_file_explicit = .FALSE. ! FFTW wisdom file name was specified in the input
+      LOGICAL :: fftw_use_guru_interface = .TRUE. ! use the FFTW guru interface when available
       LOGICAL :: elpa_qr = .TRUE. ! allow ELPA to use QR during diagonalization
       LOGICAL :: elpa_print = .FALSE. ! if additional information about ELPA diagonalization should be printed
       LOGICAL :: elpa_one_stage = .FALSE. ! enable one-stage ELPA solver
@@ -139,8 +142,9 @@ CONTAINS
          CPASSERT(globenv%ref_count > 0)
          globenv%ref_count = globenv%ref_count - 1
          IF (globenv%ref_count == 0) THEN
-            IF (ALLOCATED(globenv%gaussian_rng_stream)) &
+            IF (ALLOCATED(globenv%gaussian_rng_stream)) THEN
                DEALLOCATE (globenv%gaussian_rng_stream)
+            END IF
             DEALLOCATE (globenv)
          END IF
       END IF

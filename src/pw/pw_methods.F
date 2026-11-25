@@ -36,15 +36,10 @@ MODULE pw_methods
    USE mathconstants, ONLY: gaussi, &
                             z_zero
    USE pw_copy_all, ONLY: pw_copy_match
-   USE pw_fpga, ONLY: pw_fpga_c1dr3d_3d_dp, &
-                      pw_fpga_c1dr3d_3d_sp, &
-                      pw_fpga_init_bitstream, &
-                      pw_fpga_r3dc1d_3d_dp, &
-                      pw_fpga_r3dc1d_3d_sp
-   USE pw_gpu, ONLY: pw_gpu_c1dr3d_3d, &
-                     pw_gpu_c1dr3d_3d_ps, &
-                     pw_gpu_r3dc1d_3d, &
-                     pw_gpu_r3dc1d_3d_ps
+   USE fft_gpu, ONLY: fft_gpu_c1dr3d_3d, &
+                      fft_gpu_c1dr3d_3d_ps, &
+                      fft_gpu_r3dc1d_3d, &
+                      fft_gpu_r3dc1d_3d_ps
    USE pw_grid_types, ONLY: HALFSPACE, &
                             PW_MODE_DISTRIBUTED, &
                             PW_MODE_LOCAL, &
@@ -412,12 +407,13 @@ CONTAINS
          SUBROUTINE pw_gather_p_${kind}$ (pw, c, scale)
 
             TYPE(pw_${kind}$_gs_type), INTENT(INOUT)                       :: pw
-            COMPLEX(KIND=dp), DIMENSION(:, :), CONTIGUOUS, INTENT(IN)      :: c
+            COMPLEX(KIND=dp), DIMENSION(:, :), CONTIGUOUS, INTENT(IN), TARGET :: c
             REAL(KIND=dp), INTENT(IN), OPTIONAL                :: scale
 
             CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_gather_p'
 
-            INTEGER                                            :: gpt, handle, l, m, mn, n
+            INTEGER                                            :: gpt, handle
+            COMPLEX(KIND=dp), CONTIGUOUS, DIMENSION(:), POINTER :: c_1d
 
             CALL timeset(routineN, handle)
 
@@ -425,31 +421,24 @@ CONTAINS
                CPABORT("This grid type is not distributed")
             END IF
 
-            ASSOCIATE (mapl => pw%pw_grid%mapl%pos, mapm => pw%pw_grid%mapm%pos, mapn => pw%pw_grid%mapn%pos, &
-                       ngpts => SIZE(pw%pw_grid%gsq), ghat => pw%pw_grid%g_hat, yzq => pw%pw_grid%para%yzq)
+            ! Rank-1 pointer remap of contiguous c for flat g_hatmap indexing
+            c_1d(1:SIZE(c)) => c
+            ASSOCIATE (ngpts => SIZE(pw%pw_grid%gsq), g_hatmap => pw%pw_grid%g_hatmap)
 
                IF (PRESENT(scale)) THEN
 !$OMP PARALLEL DO DEFAULT(NONE) &
-!$OMP             PRIVATE(l, m, mn, n) &
-!$OMP             SHARED(c, pw, scale)
+!$OMP             PRIVATE(gpt) &
+!$OMP             SHARED(c_1d, pw, scale)
                   DO gpt = 1, ngpts
-                     l = mapl(ghat(1, gpt)) + 1
-                     m = mapm(ghat(2, gpt)) + 1
-                     n = mapn(ghat(3, gpt)) + 1
-                     mn = yzq(m, n)
-                     pw%array(gpt) = scale*${type2type("c(l, mn)", "c3d", kind)}$
+                     pw%array(gpt) = scale*${type2type("c_1d(g_hatmap(gpt, 1) + 1)", "c3d", kind)}$
                   END DO
 !$OMP END PARALLEL DO
                ELSE
 !$OMP PARALLEL DO DEFAULT(NONE) &
-!$OMP             PRIVATE(l, m, mn, n) &
-!$OMP             SHARED(c, pw)
+!$OMP             PRIVATE(gpt) &
+!$OMP             SHARED(c_1d, pw)
                   DO gpt = 1, ngpts
-                     l = mapl(ghat(1, gpt)) + 1
-                     m = mapm(ghat(2, gpt)) + 1
-                     n = mapn(ghat(3, gpt)) + 1
-                     mn = yzq(m, n)
-                     pw%array(gpt) = ${type2type("c(l, mn)", "c3d", kind)}$
+                     pw%array(gpt) = ${type2type("c_1d(g_hatmap(gpt, 1) + 1)", "c3d", kind)}$
                   END DO
 !$OMP END PARALLEL DO
                END IF
@@ -468,12 +457,13 @@ CONTAINS
 ! **************************************************************************************************
          SUBROUTINE pw_scatter_p_${kind}$ (pw, c, scale)
             TYPE(pw_${kind}$_gs_type), INTENT(IN)                          :: pw
-            COMPLEX(KIND=dp), DIMENSION(:, :), CONTIGUOUS, INTENT(INOUT)   :: c
+            COMPLEX(KIND=dp), DIMENSION(:, :), CONTIGUOUS, INTENT(INOUT), TARGET :: c
             REAL(KIND=dp), INTENT(IN), OPTIONAL                :: scale
 
             CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_scatter_p'
 
-            INTEGER                                            :: gpt, handle, l, m, mn, n
+            INTEGER                                            :: gpt, handle
+            COMPLEX(KIND=dp), CONTIGUOUS, DIMENSION(:), POINTER :: c_1d
 
             CALL timeset(routineN, handle)
 
@@ -481,71 +471,52 @@ CONTAINS
                CPABORT("This grid type is not distributed")
             END IF
 
-            ASSOCIATE (mapl => pw%pw_grid%mapl%pos, mapm => pw%pw_grid%mapm%pos, mapn => pw%pw_grid%mapn%pos, &
-                       ghat => pw%pw_grid%g_hat, yzq => pw%pw_grid%para%yzq, ngpts => SIZE(pw%pw_grid%gsq))
+            ! Rank-1 pointer remap of contiguous c for flat g_hatmap indexing
+            c_1d(1:SIZE(c)) => c
+            ASSOCIATE (g_hatmap => pw%pw_grid%g_hatmap, ngpts => SIZE(pw%pw_grid%gsq))
 
                IF (.NOT. PRESENT(scale)) c = z_zero
 
                IF (PRESENT(scale)) THEN
 !$OMP PARALLEL DO DEFAULT(NONE) &
-!$OMP             PRIVATE(l, m, mn, n) &
-!$OMP             SHARED(c, pw, scale)
+!$OMP             PRIVATE(gpt) &
+!$OMP             SHARED(c_1d, pw, scale)
                   DO gpt = 1, ngpts
-                     l = mapl(ghat(1, gpt)) + 1
-                     m = mapm(ghat(2, gpt)) + 1
-                     n = mapn(ghat(3, gpt)) + 1
-                     mn = yzq(m, n)
-                     c(l, mn) = ${type2type("scale*pw%array(gpt)", kind, "c3d")}$
+                     c_1d(g_hatmap(gpt, 1) + 1) = ${type2type("scale*pw%array(gpt)", kind, "c3d")}$
                   END DO
 !$OMP END PARALLEL DO
                ELSE
 !$OMP PARALLEL DO DEFAULT(NONE) &
-!$OMP             PRIVATE(l, m, mn, n) &
-!$OMP             SHARED(c, pw)
+!$OMP             PRIVATE(gpt) &
+!$OMP             SHARED(c_1d, pw)
                   DO gpt = 1, ngpts
-                     l = mapl(ghat(1, gpt)) + 1
-                     m = mapm(ghat(2, gpt)) + 1
-                     n = mapn(ghat(3, gpt)) + 1
-                     mn = yzq(m, n)
-                     c(l, mn) = ${type2type("pw%array(gpt)", kind, "c3d")}$
+                     c_1d(g_hatmap(gpt, 1) + 1) = ${type2type("pw%array(gpt)", kind, "c3d")}$
                   END DO
 !$OMP END PARALLEL DO
                END IF
 
-            END ASSOCIATE
-
-            IF (pw%pw_grid%grid_span == HALFSPACE) THEN
-
-               ASSOCIATE (mapm => pw%pw_grid%mapm%neg, mapn => pw%pw_grid%mapn%neg, mapl => pw%pw_grid%mapl%neg, &
-                          ghat => pw%pw_grid%g_hat, ngpts => SIZE(pw%pw_grid%gsq), yzq => pw%pw_grid%para%yzq)
+               IF (pw%pw_grid%grid_span == HALFSPACE) THEN
 
                   IF (PRESENT(scale)) THEN
 !$OMP PARALLEL DO DEFAULT(NONE) &
-!$OMP             PRIVATE(l, m, mn, n) &
-!$OMP             SHARED(c, pw, scale)
+!$OMP             PRIVATE(gpt) &
+!$OMP             SHARED(c_1d, pw, scale)
                      DO gpt = 1, ngpts
-                        l = mapl(ghat(1, gpt)) + 1
-                        m = mapm(ghat(2, gpt)) + 1
-                        n = mapn(ghat(3, gpt)) + 1
-                        mn = yzq(m, n)
-                        c(l, mn) = scale*#{if kind[0]=="c"}#CONJG#{endif}#(${type2type("pw%array(gpt)", kind, "c3d")}$)
+                        c_1d(g_hatmap(gpt, 2) + 1) = scale*#{if kind[0]=="c"}#CONJG#{endif}#(${type2type("pw%array(gpt)", kind, "c3d")}$)
                      END DO
 !$OMP END PARALLEL DO
                   ELSE
 !$OMP PARALLEL DO DEFAULT(NONE) &
-!$OMP             PRIVATE(l, m, mn, n) &
-!$OMP             SHARED(c, pw)
+!$OMP             PRIVATE(gpt) &
+!$OMP             SHARED(c_1d, pw)
                      DO gpt = 1, ngpts
-                        l = mapl(ghat(1, gpt)) + 1
-                        m = mapm(ghat(2, gpt)) + 1
-                        n = mapn(ghat(3, gpt)) + 1
-                        mn = yzq(m, n)
-                        c(l, mn) = #{if kind[0]=="c"}#CONJG#{endif}#(${type2type("pw%array(gpt)", kind, "c3d")}$)
+                        c_1d(g_hatmap(gpt, 2) + 1) = #{if kind[0]=="c"}#CONJG#{endif}#(${type2type("pw%array(gpt)", kind, "c3d")}$)
                      END DO
 !$OMP END PARALLEL DO
                   END IF
-               END ASSOCIATE
-            END IF
+               END IF
+
+            END ASSOCIATE
 
             CALL timestop(handle)
 
@@ -1075,17 +1046,9 @@ CONTAINS
 
                      END IF
 
-                     IF (.NOT. my_just_sum) THEN
-                        #:if space == "rs"
-                           integral_value = integral_value*pw1%pw_grid%dvol
-                        #:elif space == "gs"
-                           integral_value = integral_value*pw1%pw_grid%vol
-                        #:else
-                           #:stop "Unknown space: "+space
-                        #:endif
-                     END IF
-
                      #:if kind[1]=="1"
+                        ! Apply reciprocal multiplicity before scaling the integral;
+                        ! the unpaired G=0 term must receive the same volume factor.
                         IF (pw1%pw_grid%grid_span == HALFSPACE) THEN
                            integral_value = 2.0_dp*integral_value
                            IF (pw1%pw_grid%have_g0) integral_value = integral_value - &
@@ -1098,6 +1061,16 @@ CONTAINS
                               #:endif
                            END IF
                         #:endif
+
+                        IF (.NOT. my_just_sum) THEN
+                           #:if space == "rs"
+                              integral_value = integral_value*pw1%pw_grid%dvol
+                           #:elif space == "gs"
+                              integral_value = integral_value*pw1%pw_grid%vol
+                           #:else
+                              #:stop "Unknown space: "+space
+                           #:endif
+                        END IF
 
                         IF (.NOT. my_local_only .AND. pw1%pw_grid%para%mode == PW_MODE_DISTRIBUTED) &
                            CALL pw1%pw_grid%para%group%sum(integral_value)
@@ -1187,8 +1160,8 @@ CONTAINS
                                                                                        out_unit
                                  #:if (space=="rs" and kind=="r3d" and kind2=="c1d") or (space=="gs" and kind=="c1d" and kind2=="r3d")
                                     INTEGER, DIMENSION(3)                              :: nloc
-#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
-                                    LOGICAL                                            :: use_pw_gpu
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_FFT)
+                                    LOGICAL                                            :: use_fft_gpu
 #endif
                                  #:endif
                                  INTEGER, DIMENSION(:), POINTER                     :: n
@@ -1258,27 +1231,8 @@ CONTAINS
                                           CALL pw_gather_s_${kind2}$_c3d(pw2, c_out)
                                           DEALLOCATE (c_out)
                                        #:elif kind=="r3d" and kind2=="c1d"
-#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
-                                          CALL pw_gpu_r3dc1d_3d(pw1, pw2)
-#elif defined (__PW_FPGA)
-                                          ALLOCATE (c_out(n(1), n(2), n(3)))
-                                          ! check if bitstream for the fft size is present
-                                          ! if not, perform fft3d in CPU
-                                          IF (pw_fpga_init_bitstream(n) == 1) THEN
-                                             CALL pw_copy_to_array(pw1, c_out)
-#if (__PW_FPGA_SP && __PW_FPGA)
-                                             CALL pw_fpga_r3dc1d_3d_sp(n, c_out)
-#else
-                                             CALL pw_fpga_r3dc1d_3d_dp(n, c_out)
-#endif
-                                             CALL zdscal(n(1)*n(2)*n(3), 1.0_dp/pw1%pw_grid%ngpts, c_out, 1)
-                                             CALL pw_gather_s_${kind2}$_c3d(pw2, c_out)
-                                          ELSE
-                                             CALL pw_copy_to_array(pw1, c_out)
-                                             CALL fft3d(FWFFT, n, c_out, debug=test)
-                                             CALL pw_gather_s_${kind2}$_c3d(pw2, c_out)
-                                          END IF
-                                          DEALLOCATE (c_out)
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_FFT)
+                                          CALL fft_gpu_r3dc1d_3d(pw1, pw2)
 #else
                                           ALLOCATE (c_out(n(1), n(2), n(3)))
                                           c_out = 0.0_dp
@@ -1307,33 +1261,8 @@ CONTAINS
                                           CALL pw_scatter_s_${kind}$_c3d(pw1, c_out)
                                           CALL fft3d(BWFFT, n, c_out, debug=test)
                                        #:elif kind=="c1d" and kind2=="r3d"
-#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
-                                          CALL pw_gpu_c1dr3d_3d(pw1, pw2)
-#elif defined (__PW_FPGA)
-                                          ALLOCATE (c_out(n(1), n(2), n(3)))
-                                          ! check if bitstream for the fft size is present
-                                          ! if not, perform fft3d in CPU
-                                          IF (pw_fpga_init_bitstream(n) == 1) THEN
-                                             CALL pw_scatter_s_${kind}$_c3d(pw1, c_out)
-                                             ! transform using FPGA
-#if (__PW_FPGA_SP && __PW_FPGA)
-                                             CALL pw_fpga_c1dr3d_3d_sp(n, c_out)
-#else
-                                             CALL pw_fpga_c1dr3d_3d_dp(n, c_out)
-#endif
-                                             CALL zdscal(n(1)*n(2)*n(3), 1.0_dp, c_out, 1)
-                                             ! use real part only
-                                             CALL pw_copy_from_array(pw2, c_out)
-                                          ELSE
-                                             IF (test .AND. out_unit > 0) WRITE (out_unit, '(A)') "  PW_SCATTER : 3d -> 1d "
-                                             CALL pw_scatter_s_${kind}$_c3d(pw1, c_out)
-                                             ! transform
-                                             CALL fft3d(BWFFT, n, c_out, debug=test)
-                                             ! use real part only
-                                             IF (test .AND. out_unit > 0) WRITE (out_unit, '(A)') "  REAL part "
-                                             CALL pw_copy_from_array(pw2, c_out)
-                                          END IF
-                                          DEALLOCATE (c_out)
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_FFT)
+                                          CALL fft_gpu_c1dr3d_3d(pw1, pw2)
 #else
                                           ALLOCATE (c_out(n(1), n(2), n(3)))
                                           IF (test .AND. out_unit > 0) WRITE (out_unit, '(A)') "  PW_SCATTER : 3d -> 1d "
@@ -1392,11 +1321,11 @@ CONTAINS
                                              WRITE (out_unit, '(A)') "  PW_GATHER : 2d -> 1d "
                                           CALL pw_gather_p_${kind2}$ (pw2, grays)
                                        #:elif kind=="r3d" and kind2=="c1d"
-#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_FFT)
                                           ! (no ray dist. is not efficient in CUDA)
-                                          use_pw_gpu = pw1%pw_grid%para%ray_distribution
-                                          IF (use_pw_gpu) THEN
-                                             CALL pw_gpu_r3dc1d_3d_ps(pw1, pw2)
+                                          use_fft_gpu = pw1%pw_grid%para%ray_distribution
+                                          IF (use_fft_gpu) THEN
+                                             CALL fft_gpu_r3dc1d_3d_ps(pw1, pw2)
                                           ELSE
 #endif
 !..   prepare input
@@ -1419,7 +1348,7 @@ CONTAINS
                                              CALL pw_gather_p_${kind2}$ (pw2, grays)
                                              DEALLOCATE (c_in)
 
-#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_FFT)
                                           END IF
 #endif
                                        #:endif
@@ -1442,11 +1371,11 @@ CONTAINS
                                           END IF
                                           !..prepare output (nothing to do)
                                        #:elif kind=="c1d" and kind2=="r3d"
-#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_FFT)
                                           ! (no ray dist. is not efficient in CUDA)
-                                          use_pw_gpu = pw1%pw_grid%para%ray_distribution
-                                          IF (use_pw_gpu) THEN
-                                             CALL pw_gpu_c1dr3d_3d_ps(pw1, pw2)
+                                          use_fft_gpu = pw1%pw_grid%para%ray_distribution
+                                          IF (use_fft_gpu) THEN
+                                             CALL fft_gpu_c1dr3d_3d_ps(pw1, pw2)
                                           ELSE
 #endif
 !..   prepare input
@@ -1470,7 +1399,7 @@ CONTAINS
                                                 WRITE (out_unit, '(A)') "  Real part "
                                              CALL pw_copy_from_array(pw2, c_in)
                                              DEALLOCATE (c_in)
-#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_FFT)
                                           END IF
 #endif
                                        #:endif
@@ -1522,34 +1451,34 @@ CONTAINS
                         SUBROUTINE pw_gather_s_${kind}$_${kind2}$ (pw, c, scale)
 
                            TYPE(pw_${kind}$_gs_type), INTENT(INOUT)                       :: pw
-                           ${type2}$, CONTIGUOUS, INTENT(IN)   :: c
-                           REAL(KIND=dp), INTENT(IN), OPTIONAL                :: scale
+                           ${type2}$, CONTIGUOUS, INTENT(IN), TARGET                      :: c
+                           REAL(KIND=dp), INTENT(IN), OPTIONAL                            :: scale
 
-                           CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_gather_s'
+                           CHARACTER(len=*), PARAMETER                                    :: routineN = 'pw_gather_s'
 
-                           INTEGER                                            :: gpt, handle, l, m, n
+                           INTEGER                                                        :: gpt, handle
+                           #:if kind2[0] == "c"
+                              COMPLEX(KIND=dp), CONTIGUOUS, DIMENSION(:), POINTER         :: c_1d
+                           #:else
+                              REAL(KIND=dp), CONTIGUOUS, DIMENSION(:), POINTER            :: c_1d
+                           #:endif
 
                            CALL timeset(routineN, handle)
 
-                           ASSOCIATE (mapl => pw%pw_grid%mapl%pos, mapm => pw%pw_grid%mapm%pos, mapn => pw%pw_grid%mapn%pos, &
-                                      ngpts => SIZE(pw%pw_grid%gsq), ghat => pw%pw_grid%g_hat)
+                           ! Rank-1 pointer remap of contiguous c for flat g_hatmap indexing
+                           c_1d(1:SIZE(c)) => c
+                           ASSOCIATE (ngpts => SIZE(pw%pw_grid%gsq), g_hatmap => pw%pw_grid%g_hatmap)
 
                               IF (PRESENT(scale)) THEN
-!$OMP PARALLEL DO PRIVATE(gpt, l, m, n) DEFAULT(NONE) SHARED(c, pw, scale)
+!$OMP PARALLEL DO PRIVATE(gpt) DEFAULT(NONE) SHARED(c_1d, pw, scale)
                                  DO gpt = 1, ngpts
-                                    l = mapl(ghat(1, gpt)) + 1
-                                    m = mapm(ghat(2, gpt)) + 1
-                                    n = mapn(ghat(3, gpt)) + 1
-                                    pw%array(gpt) = scale*${type2type("c(l, m, n)", kind2, kind)}$
+                                    pw%array(gpt) = scale*${type2type("c_1d(g_hatmap(gpt, 1) + 1)", kind2, kind)}$
                                  END DO
 !$OMP END PARALLEL DO
                               ELSE
-!$OMP PARALLEL DO PRIVATE(gpt, l, m, n) DEFAULT(NONE) SHARED(c, pw)
+!$OMP PARALLEL DO PRIVATE(gpt) DEFAULT(NONE) SHARED(c_1d, pw)
                                  DO gpt = 1, ngpts
-                                    l = mapl(ghat(1, gpt)) + 1
-                                    m = mapm(ghat(2, gpt)) + 1
-                                    n = mapn(ghat(3, gpt)) + 1
-                                    pw%array(gpt) = ${type2type("c(l, m, n)", kind2, kind)}$
+                                    pw%array(gpt) = ${type2type("c_1d(g_hatmap(gpt, 1) + 1)", kind2, kind)}$
                                  END DO
 !$OMP END PARALLEL DO
                               END IF
@@ -1590,72 +1519,61 @@ CONTAINS
 ! **************************************************************************************************
                         SUBROUTINE pw_scatter_s_${kind}$_${kind2}$ (pw, c, scale)
 
-                           TYPE(pw_${kind}$_gs_type), INTENT(IN)                 :: pw
-                           ${type2}$, CONTIGUOUS, INTENT(INOUT)               :: c
-                           REAL(KIND=dp), INTENT(IN), OPTIONAL                :: scale
+                           TYPE(pw_${kind}$_gs_type), INTENT(IN)                          :: pw
+                           ${type2}$, CONTIGUOUS, INTENT(INOUT), TARGET                   :: c
+                           REAL(KIND=dp), INTENT(IN), OPTIONAL                            :: scale
 
-                           CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_scatter_s'
+                           CHARACTER(len=*), PARAMETER                                    :: routineN = 'pw_scatter_s'
 
-                           INTEGER                                            :: gpt, handle, l, m, n
+                           INTEGER                                                        :: gpt, handle
+                           #:if kind2[0] == "c"
+                              COMPLEX(KIND=dp), CONTIGUOUS, DIMENSION(:), POINTER         :: c_1d
+                           #:else
+                              REAL(KIND=dp), CONTIGUOUS, DIMENSION(:), POINTER            :: c_1d
+                           #:endif
 
                            CALL timeset(routineN, handle)
 
-                           ASSOCIATE (mapl => pw%pw_grid%mapl%pos, mapm => pw%pw_grid%mapm%pos, mapn => pw%pw_grid%mapn%pos, &
-                                      ghat => pw%pw_grid%g_hat, ngpts => SIZE(pw%pw_grid%gsq))
+                           ! Rank-1 pointer remap of contiguous c for flat g_hatmap indexing
+                           c_1d(1:SIZE(c)) => c
+                           ASSOCIATE (g_hatmap => pw%pw_grid%g_hatmap, ngpts => SIZE(pw%pw_grid%gsq))
 
                               ! should only zero the unused bits (but the zero is needed)
                               IF (.NOT. PRESENT(scale)) c = 0.0_dp
 
                               IF (PRESENT(scale)) THEN
-!$OMP PARALLEL DO PRIVATE(gpt, l, m, n) DEFAULT(NONE) SHARED(c, pw, scale)
+!$OMP PARALLEL DO PRIVATE(gpt) DEFAULT(NONE) SHARED(c_1d, pw, scale)
                                  DO gpt = 1, ngpts
-                                    l = mapl(ghat(1, gpt)) + 1
-                                    m = mapm(ghat(2, gpt)) + 1
-                                    n = mapn(ghat(3, gpt)) + 1
-                                    c(l, m, n) = scale*${type2type("pw%array(gpt)", kind, kind2)}$
+                                    c_1d(g_hatmap(gpt, 1) + 1) = scale*${type2type("pw%array(gpt)", kind, kind2)}$
                                  END DO
 !$OMP END PARALLEL DO
                               ELSE
-!$OMP PARALLEL DO PRIVATE(gpt, l, m, n) DEFAULT(NONE) SHARED(c, pw)
+!$OMP PARALLEL DO PRIVATE(gpt) DEFAULT(NONE) SHARED(c_1d, pw)
                                  DO gpt = 1, ngpts
-                                    l = mapl(ghat(1, gpt)) + 1
-                                    m = mapm(ghat(2, gpt)) + 1
-                                    n = mapn(ghat(3, gpt)) + 1
-                                    c(l, m, n) = ${type2type("pw%array(gpt)", kind, kind2)}$
+                                    c_1d(g_hatmap(gpt, 1) + 1) = ${type2type("pw%array(gpt)", kind, kind2)}$
                                  END DO
 !$OMP END PARALLEL DO
                               END IF
 
-                           END ASSOCIATE
-
-                           IF (pw%pw_grid%grid_span == HALFSPACE) THEN
-
-                              ASSOCIATE (mapl => pw%pw_grid%mapl%neg, mapm => pw%pw_grid%mapm%neg, mapn => pw%pw_grid%mapn%neg, &
-                                         ghat => pw%pw_grid%g_hat, ngpts => SIZE(pw%pw_grid%gsq))
+                              IF (pw%pw_grid%grid_span == HALFSPACE) THEN
 
                                  IF (PRESENT(scale)) THEN
-!$OMP PARALLEL DO PRIVATE(gpt, l, m, n) DEFAULT(NONE) SHARED(c, pw, scale)
+!$OMP PARALLEL DO PRIVATE(gpt) DEFAULT(NONE) SHARED(c_1d, pw, scale)
                                     DO gpt = 1, ngpts
-                                       l = mapl(ghat(1, gpt)) + 1
-                                       m = mapm(ghat(2, gpt)) + 1
-                                       n = mapn(ghat(3, gpt)) + 1
-                                       c(l, m, n) = scale*#{if kind[0]=="c" and kind2[0]=="c"}#CONJG#{endif}#(${type2type("pw%array(gpt)", kind, kind2)}$)
+                                       c_1d(g_hatmap(gpt, 2) + 1) = scale*#{if kind[0]=="c" and kind2[0]=="c"}#CONJG#{endif}#(${type2type("pw%array(gpt)", kind, kind2)}$)
                                     END DO
 !$OMP END PARALLEL DO
                                  ELSE
-!$OMP PARALLEL DO PRIVATE(gpt, l, m, n) DEFAULT(NONE) SHARED(c, pw)
+!$OMP PARALLEL DO PRIVATE(gpt) DEFAULT(NONE) SHARED(c_1d, pw)
                                     DO gpt = 1, ngpts
-                                       l = mapl(ghat(1, gpt)) + 1
-                                       m = mapm(ghat(2, gpt)) + 1
-                                       n = mapn(ghat(3, gpt)) + 1
-                                       c(l, m, n) = #{if kind[0]=="c" and kind2[0]=="c"}#CONJG#{endif}#(${type2type("pw%array(gpt)", kind, kind2)}$)
+                                       c_1d(g_hatmap(gpt, 2) + 1) = #{if kind[0]=="c" and kind2[0]=="c"}#CONJG#{endif}#(${type2type("pw%array(gpt)", kind, kind2)}$)
                                     END DO
 !$OMP END PARALLEL DO
                                  END IF
 
-                              END ASSOCIATE
+                              END IF
 
-                           END IF
+                           END ASSOCIATE
 
                            CALL timestop(handle)
 
@@ -1931,7 +1849,7 @@ CONTAINS
                         IF (tmp >= 0.005_dp) THEN
                            tmp2 = 1.0_dp - COS(tmp)
                         ELSE
-                           tmp2 = tmp**2/2.0_dp*(1.0 - tmp**2/12.0_dp)
+                           tmp2 = tmp**2/2.0_dp*(1.0_dp - tmp**2/12.0_dp)
                         END IF
                         pw%array(i) = pw%array(i)*tmp2
                      END DO

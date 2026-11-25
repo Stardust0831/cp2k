@@ -11,7 +11,7 @@
  *
  *  Copyright (C) 2021-2023 Alexander Oleynichenko
  */
-#include <assert.h>
+#include "../base/cp_assert.h"
 
 #include "grpp_parameters.h"
 
@@ -42,24 +42,30 @@ void libgrpp_set_default_parameters() {
 
 void libgrpp_set_radial_tolerance(double tolerance) {
   // #pragma omp critical
-  { libgrpp_params.radial_tolerance = tolerance; }
+  {
+    libgrpp_params.radial_tolerance = tolerance;
+  }
 }
 
 void libgrpp_set_angular_screening_tolerance(double tolerance) {
   // #pragma omp critical
-  { libgrpp_params.angular_screening_tolerance = tolerance; }
+  {
+    libgrpp_params.angular_screening_tolerance = tolerance;
+  }
 }
 
 void libgrpp_set_modified_bessel_tolerance(double tolerance) {
   // #pragma omp critical
-  { libgrpp_params.modified_bessel_tolerance = tolerance; }
+  {
+    libgrpp_params.modified_bessel_tolerance = tolerance;
+  }
 }
 
 void libgrpp_set_cartesian_order(int order) {
   // #pragma omp critical
   {
-    assert(order == LIBGRPP_CART_ORDER_DIRAC ||
-           order == LIBGRPP_CART_ORDER_TURBOMOLE);
+    cp_assert(order == LIBGRPP_CART_ORDER_DIRAC ||
+              order == LIBGRPP_CART_ORDER_TURBOMOLE);
 
     if (order == LIBGRPP_CART_ORDER_DIRAC) {
       libgrpp_set_cartesian_generator(cartesian_generator_dirac);
@@ -72,7 +78,9 @@ void libgrpp_set_cartesian_order(int order) {
 void libgrpp_set_cartesian_generator(
     int (*cartesian_generator)(int L, int *cart_list)) {
   // #pragma omp critical
-  { libgrpp_params.cartesian_generator = cartesian_generator; }
+  {
+    libgrpp_params.cartesian_generator = cartesian_generator;
+  }
 }
 
 static int cartesian_generator_dirac(int L, int *cart_list) {

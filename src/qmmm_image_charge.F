@@ -213,6 +213,7 @@ CONTAINS
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'calc_image_coeff_iterative'
+      REAL(KIND=dp), PARAMETER                           :: eps_rsnew = 1.0E-16_dp
 
       INTEGER                                            :: handle, iter_steps, natom, output_unit
       REAL(KIND=dp)                                      :: alpha, eta, rsnew, rsold, V0
@@ -285,7 +286,7 @@ CONTAINS
          rsnew = DOT_PRODUCT(r, z)
          iter_steps = iter_steps + 1
          ! SQRT(rsnew) < 1.0E-08
-         IF (rsnew < 1.0E-16) THEN
+         IF (rsnew < eps_rsnew) THEN
             CALL auxpot_Ad_rspace%release()
             EXIT
          END IF
@@ -587,11 +588,12 @@ CONTAINS
             CALL calculate_image_matrix(image_matrix=qs_env%image_matrix, &
                                         ipiv=qs_env%ipiv, qs_env=qs_env, qmmm_env=qmmm_env)
             qmmm_env%image_charge_pot%state_image_matrix = calc_once_done
-            IF (qmmm_env%center_qm_subsys0) &
+            IF (qmmm_env%center_qm_subsys0) THEN
                CALL cp_warn(__LOCATION__, &
                             "The image atoms are fully "// &
                             "constrained and the image matrix is only calculated once. "// &
                             "To be safe, set CENTER to NEVER ")
+            END IF
          CASE (calc_once_done)
             ! do nothing image matrix is stored
          CASE DEFAULT

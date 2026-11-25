@@ -79,6 +79,8 @@ CONTAINS
       TYPE(section_vals_type), POINTER                   :: atom_section
       INTEGER, INTENT(IN)                                :: iw
 
+      REAL(KIND=dp), PARAMETER                           :: error_threshold = 1.0E-12_dp
+
       CHARACTER(len=default_string_length)               :: abas, basname
       CHARACTER(len=default_string_length), DIMENSION(1) :: basline
       CHARACTER(len=default_string_length), DIMENSION(3) :: headline
@@ -152,8 +154,9 @@ CONTAINS
       CALL allocate_grid_atom(basis%grid)
       CALL section_vals_val_get(grb_section, "QUADRATURE", i_val=quadtype)
       CALL section_vals_val_get(grb_section, "GRID_POINTS", i_val=ngp)
-      IF (ngp <= 0) &
+      IF (ngp <= 0) THEN
          CPABORT("# point radial grid < 0")
+      END IF
       CALL create_grid_atom(basis%grid, ngp, 1, 1, 0, quadtype)
       basis%grid%nr = ngp
       !
@@ -199,7 +202,7 @@ CONTAINS
                basis%bf(k, i, l) = rk**l*ear
                basis%dbf(k, i, l) = (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear
                basis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**(l - 2) - &
-                                      2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))*ear
+                                      2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))*ear
             END DO
          END DO
       END DO
@@ -314,7 +317,7 @@ CONTAINS
          DO i = 1, n
             amat(i, i) = amat(i, i) - 1._dp
          END DO
-         IF (MAXVAL(ABS(amat)) > 1.e-12) THEN
+         IF (MAXVAL(ABS(amat)) > error_threshold) THEN
             IF (iw > 0) WRITE (iw, '(A,G20.10)') " Orthogonality error  ", MAXVAL(ABS(amat))
          END IF
          DEALLOCATE (amat)
@@ -385,7 +388,7 @@ CONTAINS
                                               + (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear*basis_vrb%cm(i, j, l)
                      basis_vrb%ddbf(k, j, l) = basis_vrb%ddbf(k, j, l) + &
                                                (REAL(l*(l - 1), dp)*rk**(l - 2) - 2._dp*al*REAL(2*l + 1, dp)*rk**(l) + &
-                                                4._dp*al*rk**(l + 2))*ear*basis_vrb%cm(i, j, l)
+                                                4._dp*al**2*rk**(l + 2))*ear*basis_vrb%cm(i, j, l)
                   END DO
                END DO
             END DO
@@ -555,7 +558,7 @@ CONTAINS
                                               + (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear*basis_vrb%cm(i, j, l)
                      basis_vrb%ddbf(k, j, l) = basis_vrb%ddbf(k, j, l) + &
                                                (REAL(l*(l - 1), dp)*rk**(l - 2) - 2._dp*al*REAL(2*l + 1, dp)*rk**(l) + &
-                                                4._dp*al*rk**(l + 2))*ear*basis_vrb%cm(i, j, l)
+                                                4._dp*al**2*rk**(l + 2))*ear*basis_vrb%cm(i, j, l)
                   END DO
                END DO
             END DO
@@ -1006,7 +1009,7 @@ CONTAINS
                      basis%bf(k, i, l) = rk**l*ear
                      basis%dbf(k, i, l) = (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear
                      basis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**(l - 2) - &
-                                            2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))*ear
+                                            2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))*ear
                   END DO
                END DO
             END DO
@@ -1058,7 +1061,7 @@ CONTAINS
                basis%bf(k, i, l) = rk**l*ear
                basis%dbf(k, i, l) = (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear
                basis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**(l - 2) - &
-                                      2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))*ear
+                                      2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))*ear
             END DO
          END DO
       END DO

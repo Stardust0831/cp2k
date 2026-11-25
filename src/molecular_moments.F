@@ -49,7 +49,8 @@ MODULE molecular_moments
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: get_qs_kind,&
                                               qs_kind_type
-   USE qs_loc_types,                    ONLY: qs_loc_env_type
+   USE qs_loc_types,                    ONLY: loc_coeff_index,&
+                                              qs_loc_env_type
    USE qs_moments,                      ONLY: build_local_moment_matrix
 #include "./base/base_uses.f90"
 
@@ -82,8 +83,8 @@ CONTAINS
       TYPE(molecule_type), POINTER                       :: molecule_set(:)
 
       INTEGER :: akind, first_atom, i, iatom, ikind, imol, imol_now, iounit, iproc, ispin, j, lx, &
-         ly, lz, molkind, n, n1, n2, natom, ncol_global, nm, nmol, nmols, norder, nrow_global, ns, &
-         nspins
+         ly, lz, molkind, n, n1, n2, natom, ncol_global, ncol_local, nm, nmol, nmols, norder, &
+         nrow_global, nrow_local, ns, nspins
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: states
       INTEGER, DIMENSION(2)                              :: nstates
       LOGICAL                                            :: floating, ghost
@@ -163,7 +164,8 @@ CONTAINS
                END IF
                CALL para_env%bcast(states, iproc)
                ! assemble local states for this molecule
-               ASSOCIATE (mo_localized => mo_local(ispin))
+               ! in RTP mo_local holds the real and imaginary parts of each spin
+               ASSOCIATE (mo_localized => mo_local(loc_coeff_index(SIZE(mo_local), nspins, ispin)))
                   CALL cp_fm_get_info(mo_localized, ncol_global=ncol_global, nrow_global=nrow_global)
                   CALL cp_fm_struct_create(fm_struct, nrow_global=nrow_global, ncol_global=ns, &
                                            para_env=mo_localized%matrix_struct%para_env, &
@@ -172,6 +174,7 @@ CONTAINS
                   CALL cp_fm_create(omvector, fm_struct, name="omvector")
                   CALL cp_fm_create(momv, fm_struct, name="omvector")
                   CALL cp_fm_struct_release(fm_struct)
+                  CALL cp_fm_get_info(momv, ncol_local=ncol_local, nrow_local=nrow_local)
                   !
                   DO i = 1, ns
                      CALL cp_fm_to_fm(mo_localized, mvector, 1, states(i), i)
@@ -180,7 +183,8 @@ CONTAINS
                DO i = 1, nm
                   CALL cp_dbcsr_sm_fm_multiply(moments(i)%matrix, mvector, omvector, ns)
                   CALL cp_fm_schur_product(mvector, omvector, momv)
-                  moment_set(i, imol) = moment_set(i, imol) - zwfc*SUM(momv%local_data)
+                  moment_set(i, imol) = moment_set(i, imol) - &
+                                        zwfc*SUM(momv%local_data(1:nrow_local, 1:ncol_local))
                END DO
                !
                CALL cp_fm_release(mvector)
@@ -274,4 +278,3 @@ CONTAINS
    !------------------------------------------------------------------------------
 
 END MODULE molecular_moments
-

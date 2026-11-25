@@ -23,7 +23,6 @@ MODULE gopt_f_types
                                               dimer_env_retain,&
                                               dimer_env_type
    USE force_env_types,                 ONLY: force_env_get,&
-                                              force_env_get_natom,&
                                               force_env_release,&
                                               force_env_retain,&
                                               force_env_type
@@ -31,12 +30,14 @@ MODULE gopt_f_types
    USE gopt_param_types,                ONLY: gopt_param_read,&
                                               gopt_param_type
    USE input_constants,                 ONLY: default_cell_method_id,&
+                                              default_cg_method_id,&
                                               default_dimer_method_id,&
                                               default_minimization_method_id,&
                                               default_shellcore_method_id,&
                                               default_ts_method_id
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
-                                              section_vals_type
+                                              section_vals_type,&
+                                              section_vals_val_get
    USE kinds,                           ONLY: default_string_length,&
                                               dp
    USE particle_list_types,             ONLY: particle_list_type
@@ -59,11 +60,11 @@ MODULE gopt_f_types
 ! **************************************************************************************************
    TYPE gopt_f_type
       INTEGER                                  :: ref_count = 0
-      INTEGER                                  :: nfree = 0
       INTEGER                                  :: type_id = default_cell_method_id
       INTEGER                                  :: ts_method_id = 0
       INTEGER                                  :: shellcore_method_id = 0
       LOGICAL                                  :: dimer_rotation = .FALSE., do_line_search = .FALSE., eval_opt_geo = .FALSE.
+      LOGICAL                                  :: solid_state_dimer = .FALSE.
       CHARACTER(LEN=default_string_length)     :: label = "", tag = ""
       TYPE(force_env_type), POINTER            :: force_env => NULL()
       TYPE(global_environment_type), POINTER   :: globenv => NULL()
@@ -74,9 +75,27 @@ MODULE gopt_f_types
       TYPE(gopt_param_type), POINTER           :: gopt_dimer_param => NULL()
       TYPE(cell_opt_env_type), POINTER         :: cell_env => NULL()
       TYPE(spgr_type), POINTER                 :: spgr => NULL()
+      PROCEDURE(gopt_f_dimer_rotation_optimizer), POINTER, NOPASS :: dimer_rotation_optimizer => NULL()
       REAL(KIND=dp), DIMENSION(3, 3)           :: h_ref = 0.0_dp
       LOGICAL                                  :: require_consistent_energy_force = .FALSE.
    END TYPE gopt_f_type
+
+   ABSTRACT INTERFACE
+! **************************************************************************************************
+!> \brief ...
+!> \param gopt_env ...
+!> \param x0 ...
+!> \param gopt_param ...
+!> \param geo_section ...
+! **************************************************************************************************
+      SUBROUTINE gopt_f_dimer_rotation_optimizer(gopt_env, x0, gopt_param, geo_section)
+         IMPORT :: dp, gopt_f_type, gopt_param_type, section_vals_type
+         TYPE(gopt_f_type), POINTER                         :: gopt_env
+         REAL(KIND=dp), DIMENSION(:), POINTER               :: x0
+         TYPE(gopt_param_type), POINTER                     :: gopt_param
+         TYPE(section_vals_type), POINTER                   :: geo_section
+      END SUBROUTINE gopt_f_dimer_rotation_optimizer
+   END INTERFACE
 
 CONTAINS
 
@@ -102,7 +121,7 @@ CONTAINS
       TYPE(section_vals_type), POINTER                   :: geo_opt_section
       LOGICAL, INTENT(IN), OPTIONAL                      :: eval_opt_geo
 
-      INTEGER                                            :: natom, nshell
+      INTEGER                                            :: nshell
       TYPE(cp_subsys_type), POINTER                      :: subsys
       TYPE(particle_list_type), POINTER                  :: particles, shell_particles
       TYPE(section_vals_type), POINTER                   :: dimer_section, rot_opt_section
@@ -116,6 +135,12 @@ CONTAINS
       gopt_env%dimer_rotation = .FALSE.
       gopt_env%do_line_search = .FALSE.
       ALLOCATE (gopt_env%spgr)
+      ! This routine reads the space-group flags once. The optimizer
+      ! drivers consume spgr%* only.
+      CALL section_vals_val_get(geo_opt_section, "KEEP_SPACE_GROUP", &
+                                l_val=gopt_env%spgr%keep_space_group)
+      CALL section_vals_val_get(geo_opt_section, "SHOW_SPACE_GROUP", &
+                                l_val=gopt_env%spgr%show_space_group)
       CALL force_env_retain(force_env)
       gopt_env%force_env => force_env
       gopt_env%motion_section => section_vals_get_subs_vals(force_env%root_section, "MOTION")
@@ -134,7 +159,6 @@ CONTAINS
                             shell_particles=shell_particles)
          IF (ASSOCIATED(shell_particles)) nshell = shell_particles%n_els
          ! The same number of shell and core particles is assumed
-         gopt_env%nfree = particles%n_els + nshell
          gopt_env%label = "GEO_OPT"
          gopt_env%tag = "GEOMETRY"
          SELECT CASE (gopt_param%type_id)
@@ -144,36 +168,49 @@ CONTAINS
             CASE (default_dimer_method_id)
                ! For the Dimer method we use the same framework of geometry optimizers
                ! already defined for cp2k..
-               natom = force_env_get_natom(force_env)
                dimer_section => section_vals_get_subs_vals(geo_opt_section, "TRANSITION_STATE%DIMER")
                CALL dimer_env_create(gopt_env%dimer_env, subsys, globenv, dimer_section, force_env)
+               gopt_env%solid_state_dimer = gopt_env%dimer_env%solid_state
 
                ! Setup the GEO_OPT environment for the rotation of the Dimer
                rot_opt_section => section_vals_get_subs_vals(dimer_section, "ROT_OPT")
                ALLOCATE (gopt_env%gopt_dimer_param)
                CALL gopt_param_read(gopt_env%gopt_dimer_param, rot_opt_section, &
                                     type_id=default_minimization_method_id)
+               IF (gopt_param%method_id /= default_cg_method_id .OR. &
+                   gopt_env%gopt_dimer_param%method_id /= default_cg_method_id) THEN
+                  CALL cp_abort(__LOCATION__, "Dimer requires CG for translation and rotation.")
+               END IF
+               IF (gopt_env%solid_state_dimer .AND. gopt_env%spgr%keep_space_group) THEN
+                  CALL cp_abort(__LOCATION__, "Solid-state Dimer does not support KEEP_SPACE_GROUP.")
+               END IF
                gopt_env%gopt_dimer_param%type_id = default_ts_method_id
 
                CALL gopt_f_create(gopt_env%gopt_dimer_env, gopt_env%gopt_dimer_param, force_env=force_env, &
                                   globenv=globenv, geo_opt_section=rot_opt_section, eval_opt_geo=eval_opt_geo)
                CALL dimer_env_retain(gopt_env%dimer_env)
                gopt_env%gopt_dimer_env%dimer_env => gopt_env%dimer_env
+               gopt_env%gopt_dimer_env%solid_state_dimer = gopt_env%solid_state_dimer
                gopt_env%gopt_dimer_env%label = "ROT_OPT"
                gopt_env%gopt_dimer_env%dimer_rotation = .TRUE.
+               ! Dimer rotation optimizes a 3D unit vector, so space-group
+               ! symmetry does not apply.
+               gopt_env%gopt_dimer_env%spgr%keep_space_group = .FALSE.
+               gopt_env%gopt_dimer_env%spgr%show_space_group = .FALSE.
             END SELECT
          END SELECT
       CASE (default_cell_method_id)
-         gopt_env%nfree = 6
          gopt_env%label = "CELL_OPT"
          gopt_env%tag = "  CELL  "
          ALLOCATE (gopt_env%cell_env)
          CALL cell_opt_env_create(gopt_env%cell_env, force_env, gopt_env%geo_section)
       CASE (default_shellcore_method_id)
-         gopt_env%nfree = subsys%shell_particles%n_els
          gopt_env%label = "SHELL_OPT"
          gopt_env%tag = "  SHELL-CORE  "
          gopt_env%shellcore_method_id = gopt_param%shellcore_method_id
+         ! Shell-core relaxation bypasses the geometry-optimizer lifecycle.
+         gopt_env%spgr%keep_space_group = .FALSE.
+         gopt_env%spgr%show_space_group = .FALSE.
       END SELECT
    END SUBROUTINE gopt_f_create
 

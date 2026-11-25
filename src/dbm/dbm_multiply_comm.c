@@ -8,14 +8,41 @@
 #include "../mpiwrap/cp_mpi.h"
 #include "../offload/offload_mempool.h"
 
-#include <assert.h>
+#include "../base/cp_assert.h"
 #include <limits.h>
+#include <omp.h>
 #include <stdlib.h>
 #include <string.h>
 
 #if 1
 #define DBM_MULTIPLY_COMM_MEMPOOL
 #endif
+
+/*******************************************************************************
+ * \brief Private routine for allocating a communication buffer, which is taken
+ *        from the memory pool (DBM_MULTIPLY_COMM_MEMPOOL) rather than mapping
+ *        fresh pages for every multiplication.
+ * \author Hans Pabst
+ ******************************************************************************/
+static void *allocate_comm_buffer(const size_t size) {
+#if defined(DBM_MULTIPLY_COMM_MEMPOOL)
+  return offload_mempool_host_malloc(size);
+#else
+  return cp_mpi_alloc_mem(size);
+#endif
+}
+
+/*******************************************************************************
+ * \brief Private routine for releasing a buffer from allocate_comm_buffer.
+ * \author Hans Pabst
+ ******************************************************************************/
+static void free_comm_buffer(void *mem) {
+#if defined(DBM_MULTIPLY_COMM_MEMPOOL)
+  offload_mempool_host_free(mem);
+#else
+  cp_mpi_free_mem(mem);
+#endif
+}
 
 /*******************************************************************************
  * \brief Private routine for computing greatest common divisor of two numbers.
@@ -41,9 +68,9 @@ static int lcm(const int a, const int b) { return (a * b) / gcd(a, b); }
 static int checked_byte_count(const int nelements, const size_t element_size) {
   // MPI displacements/counts are int; unchecked multiplication could overflow
   // silently and corrupt the alltoallv layout.
-  assert(0 <= nelements);
-  assert(element_size <= INT_MAX);
-  assert(nelements <= INT_MAX / (int)element_size);
+  cp_assert(0 <= nelements);
+  cp_assert(element_size <= INT_MAX);
+  cp_assert(nelements <= INT_MAX / (int)element_size);
   return nelements * (int)element_size;
 }
 
@@ -93,8 +120,8 @@ static void compute_data_recv_count(const int nranks,
           &blks_recv[blks_recv_displ[irank] + i];
       const int block_size =
           free_index_sizes[blk->free_index] * sum_index_sizes[blk->sum_index];
-      assert(block_size >= 0);
-      assert(data_recv_count[irank] <= INT_MAX - block_size);
+      cp_assert(block_size >= 0);
+      cp_assert(data_recv_count[irank] <= INT_MAX - block_size);
       data_recv_count[irank] += block_size;
     }
   }
@@ -141,7 +168,7 @@ static void create_pack_plans(const bool trans_matrix, const bool trans_dist,
     // 1st pass: Compute number of blocks that will be send in each pack.
     int nblks_mythread[npacks];
     memset(nblks_mythread, 0, npacks * sizeof(int));
-#pragma omp for schedule(static)
+#pragma omp for schedule(static) nowait
     for (int ishard = 0; ishard < dbm_get_num_shards(matrix); ishard++) {
       dbm_shard_t *shard = &matrix->shards[ishard];
       for (int iblock = 0; iblock < shard->nblocks; iblock++) {
@@ -164,13 +191,13 @@ static void create_pack_plans(const bool trans_matrix, const bool trans_dist,
     for (int ipack = 0; ipack < npacks; ipack++) {
       const int nblks = nblks_per_pack[ipack];
       plans_per_pack[ipack] = malloc(nblks * sizeof(plan_t));
-      assert(plans_per_pack[ipack] != NULL || nblks == 0);
+      cp_assert(plans_per_pack[ipack] != NULL || nblks == 0);
     }
 
     // 2nd pass: Plan where to send each block.
     int ndata_mythread[npacks];
     memset(ndata_mythread, 0, npacks * sizeof(int));
-#pragma omp for schedule(static) // Need static to match previous loop.
+#pragma omp for schedule(static) nowait // Need static to match previous loop.
     for (int ishard = 0; ishard < dbm_get_num_shards(matrix); ishard++) {
       dbm_shard_t *shard = &matrix->shards[ishard];
       for (int iblock = 0; iblock < shard->nblocks; iblock++) {
@@ -204,6 +231,38 @@ static void create_pack_plans(const bool trans_matrix, const bool trans_dist,
 }
 
 /*******************************************************************************
+ * \brief Private routine for copying a block and computing its squared norm.
+ ******************************************************************************/
+static void copy_pack_block(const bool trans_matrix, const dbm_block_t *blk,
+                            const int row_size, const int col_size,
+                            const double shard_data[], double pack_data[],
+                            const int offset, dbm_pack_block_t *pack_block) {
+  double norm = 0.0; // Compute norm as double, store as float.
+  if (trans_matrix) {
+    // Transpose block to allow for outer-product style multiplication.
+    for (int i = 0; i < row_size; i++) {
+      for (int j = 0; j < col_size; j++) {
+        const double element = shard_data[blk->offset + j * row_size + i];
+        pack_data[offset + i * col_size + j] = element;
+        norm += element * element;
+      }
+    }
+    pack_block->free_index = blk->col;
+    pack_block->sum_index = blk->row;
+  } else {
+    for (int i = 0; i < row_size * col_size; i++) {
+      const double element = shard_data[blk->offset + i];
+      pack_data[offset + i] = element;
+      norm += element * element;
+    }
+    pack_block->free_index = blk->row;
+    pack_block->sum_index = blk->col;
+  }
+  pack_block->norm = (float)norm;
+  pack_block->offset = offset;
+}
+
+/*******************************************************************************
  * \brief Private routine for filling send buffers.
  * \author Ole Schuett
  ******************************************************************************/
@@ -222,7 +281,7 @@ static void fill_send_buffers(
     int nblks_mythread[nranks], ndata_mythread[nranks];
     memset(nblks_mythread, 0, nranks * sizeof(int));
     memset(ndata_mythread, 0, nranks * sizeof(int));
-#pragma omp for schedule(static)
+#pragma omp for schedule(static) nowait
     for (int iblock = 0; iblock < nblks_send; iblock++) {
       const plan_t *plan = &plans[iblock];
       nblks_mythread[plan->rank] += 1;
@@ -245,19 +304,17 @@ static void fill_send_buffers(
       icumsum(nranks, blks_send_count, blks_send_displ);
       icumsum(nranks, data_send_count, data_send_displ);
       const int m = nranks - 1;
-      assert(nblks_send == blks_send_displ[m] + blks_send_count[m]);
-      assert(ndata_send == data_send_displ[m] + data_send_count[m]);
+      cp_assert(nblks_send == blks_send_displ[m] + blks_send_count[m]);
+      cp_assert(ndata_send == data_send_displ[m] + data_send_count[m]);
     }
-#pragma omp barrier
 
     // 4th pass: Fill blks_send and data_send arrays.
-#pragma omp for schedule(static) // Need static to match previous loop.
+#pragma omp for schedule(static) nowait // Match the previous loop.
     for (int iblock = 0; iblock < nblks_send; iblock++) {
       const plan_t *const plan = &plans[iblock];
       const dbm_block_t *const blk = plan->blk;
       const int ishard = dbm_get_shard_index(matrix, blk->row, blk->col);
       const dbm_shard_t *const shard = &matrix->shards[ishard];
-      const double *blk_data = &shard->data[blk->offset];
       const int row_size = plan->row_size, col_size = plan->col_size;
       const int plan_size = row_size * col_size;
       const int irank = plan->rank;
@@ -270,28 +327,8 @@ static void fill_send_buffers(
       const int offset = data_send_displ[irank] + ndata_mythread[irank];
       const int jblock = blks_send_displ[irank] + nblks_mythread[irank];
 
-      double norm = 0.0; // Compute norm as double...
-      if (trans_matrix) {
-        // Transpose block to allow for outer-product style multiplication.
-        for (int i = 0; i < row_size; i++) {
-          for (int j = 0; j < col_size; j++) {
-            const double element = blk_data[j * row_size + i];
-            data_send[offset + i * col_size + j] = element;
-            norm += element * element;
-          }
-        }
-        blks_send[jblock].free_index = plan->blk->col;
-        blks_send[jblock].sum_index = plan->blk->row;
-      } else {
-        for (int i = 0; i < plan_size; i++) {
-          const double element = blk_data[i];
-          data_send[offset + i] = element;
-          norm += element * element;
-        }
-        blks_send[jblock].free_index = plan->blk->row;
-        blks_send[jblock].sum_index = plan->blk->col;
-      }
-      blks_send[jblock].norm = (float)norm; // ...store norm as float.
+      copy_pack_block(trans_matrix, blk, row_size, col_size, shard->data,
+                      data_send, offset, &blks_send[jblock]);
 
       // After the block exchange data_recv_displ will be added to the offsets.
       blks_send[jblock].offset = offset - data_send_displ[irank];
@@ -310,6 +347,105 @@ static int compare_pack_blocks_by_sum_index(const void *a, const void *b) {
 }
 
 /*******************************************************************************
+ * \brief Private routine for packing a local matrix directly by target shard.
+ ******************************************************************************/
+static dbm_pack_t pack_local_matrix(const bool trans_matrix,
+                                    const dbm_matrix_t *matrix,
+                                    const int nshards, double *seconds_sort) {
+  dbm_pack_t pack = {0};
+  if (dbm_get_num_blocks(matrix) == 0) {
+    return pack;
+  }
+  const int nthreads = omp_get_max_threads();
+  const size_t count = (size_t)nthreads * nshards;
+  int *const workspace = malloc(2 * count * sizeof(int));
+  cp_assert(workspace != NULL);
+  int *const block_offsets = workspace;
+  int *const data_offsets = workspace + count;
+  int shard_start[nshards + 1];
+  double sort_start = 0.0;
+
+#pragma omp parallel
+  {
+    const size_t thread_start = (size_t)omp_get_thread_num() * nshards;
+    int blocks[nshards], data[nshards];
+    memset(blocks, 0, sizeof(blocks));
+    memset(data, 0, sizeof(data));
+    // Count directly by the output's free-index shard; input shards may differ.
+#pragma omp for schedule(static) nowait
+    for (int ishard = 0; ishard < dbm_get_num_shards(matrix); ishard++) {
+      const dbm_shard_t *const shard = &matrix->shards[ishard];
+      for (int i = 0; i < shard->nblocks; i++) {
+        const dbm_block_t *const blk = &shard->blocks[i];
+        const int free_index = trans_matrix ? blk->col : blk->row;
+        const int target = free_index % nshards;
+        blocks[target]++;
+        data[target] +=
+            matrix->row_sizes[blk->row] * matrix->col_sizes[blk->col];
+      }
+    }
+    memcpy(block_offsets + thread_start, blocks, sizeof(blocks));
+    memcpy(data_offsets + thread_start, data, sizeof(data));
+#pragma omp barrier
+
+#pragma omp master
+    {
+      for (int ishard = 0; ishard < nshards; ishard++) {
+        shard_start[ishard] = pack.nblocks;
+        for (int ithread = 0; ithread < omp_get_num_threads(); ithread++) {
+          const size_t i = (size_t)ithread * nshards + ishard;
+          const int nblocks = block_offsets[i], ndata = data_offsets[i];
+          block_offsets[i] = pack.nblocks;
+          data_offsets[i] = pack.data_size;
+          pack.nblocks += nblocks;
+          pack.data_size += ndata;
+        }
+      }
+      shard_start[nshards] = pack.nblocks;
+      pack.blocks =
+          allocate_comm_buffer(pack.nblocks * sizeof(dbm_pack_block_t));
+      pack.data = allocate_comm_buffer(pack.data_size * sizeof(double));
+    }
+#pragma omp barrier
+    // Keep the frequently updated cursors private to avoid false sharing.
+    memcpy(blocks, block_offsets + thread_start, sizeof(blocks));
+    memcpy(data, data_offsets + thread_start, sizeof(data));
+
+#pragma omp for schedule(static) // Match the counting pass.
+    for (int ishard = 0; ishard < dbm_get_num_shards(matrix); ishard++) {
+      const dbm_shard_t *const shard = &matrix->shards[ishard];
+      for (int i = 0; i < shard->nblocks; i++) {
+        const dbm_block_t *const blk = &shard->blocks[i];
+        const int free_index = trans_matrix ? blk->col : blk->row;
+        const int target = free_index % nshards;
+        const int row_size = matrix->row_sizes[blk->row];
+        const int col_size = matrix->col_sizes[blk->col];
+        copy_pack_block(trans_matrix, blk, row_size, col_size, shard->data,
+                        pack.data, data[target],
+                        &pack.blocks[blocks[target]++]);
+        data[target] += row_size * col_size;
+      }
+    }
+
+#pragma omp master
+    sort_start = omp_get_wtime();
+#pragma omp barrier
+#pragma omp for nowait
+    for (int ishard = 0; ishard < nshards; ishard++) {
+      const int nblocks = shard_start[ishard + 1] - shard_start[ishard];
+      if (nblocks > 1) {
+        qsort(&pack.blocks[shard_start[ishard]], nblocks,
+              sizeof(dbm_pack_block_t), &compare_pack_blocks_by_sum_index);
+      }
+    }
+  }
+
+  *seconds_sort += omp_get_wtime() - sort_start;
+  free(workspace);
+  return pack;
+}
+
+/*******************************************************************************
  * \brief Private routine for post-processing received blocks.
  * \author Ole Schuett
  ******************************************************************************/
@@ -318,28 +454,41 @@ static void postprocess_received_blocks(
     const int blks_recv_count[nranks], const int blks_recv_displ[nranks],
     const int data_recv_displ[nranks],
     dbm_pack_block_t blks_recv[nblocks_recv]) {
-  int nblocks_per_shard[nshards], shard_start[nshards];
-  memset(nblocks_per_shard, 0, nshards * sizeof(int));
-  dbm_pack_block_t *blocks_tmp =
-      malloc(nblocks_recv * sizeof(dbm_pack_block_t));
-  assert(blocks_tmp != NULL || nblocks_recv == 0);
-
-#pragma omp parallel
-  {
-    // Add data_recv_displ to recveived block offsets.
+  if (nblocks_recv == 0) {
+    return;
+  }
+  if (nshards == 1) {
     for (int irank = 0; irank < nranks; irank++) {
-#pragma omp for
       for (int i = 0; i < blks_recv_count[irank]; i++) {
         blks_recv[blks_recv_displ[irank] + i].offset += data_recv_displ[irank];
       }
     }
+    if (nblocks_recv > 1) {
+      qsort(blks_recv, nblocks_recv, sizeof(dbm_pack_block_t),
+            &compare_pack_blocks_by_sum_index);
+    }
+    return;
+  }
 
+  int nblocks_per_shard[nshards], shard_start[nshards];
+  memset(nblocks_per_shard, 0, nshards * sizeof(int));
+  dbm_pack_block_t *blocks_tmp =
+      malloc(nblocks_recv * sizeof(dbm_pack_block_t));
+  cp_assert(blocks_tmp != NULL || nblocks_recv == 0);
+
+#pragma omp parallel
+  {
     // First use counting sort to group blocks by their free_index shard.
     int nblocks_mythread[nshards];
     memset(nblocks_mythread, 0, nshards * sizeof(int));
-#pragma omp for schedule(static)
+    int irank = 0;
+#pragma omp for schedule(static) nowait
     for (int iblock = 0; iblock < nblocks_recv; iblock++) {
+      while (iblock >= blks_recv_displ[irank] + blks_recv_count[irank]) {
+        irank++;
+      }
       blocks_tmp[iblock] = blks_recv[iblock];
+      blocks_tmp[iblock].offset += data_recv_displ[irank];
       const int ishard = blks_recv[iblock].free_index % nshards;
       nblocks_mythread[ishard]++;
     }
@@ -351,7 +500,6 @@ static void postprocess_received_blocks(
 #pragma omp barrier
 #pragma omp single
     icumsum(nshards, nblocks_per_shard, shard_start);
-#pragma omp barrier
 #pragma omp for schedule(static) // Need static to match previous loop.
     for (int iblock = 0; iblock < nblocks_recv; iblock++) {
       const int ishard = blocks_tmp[iblock].free_index % nshards;
@@ -360,7 +508,7 @@ static void postprocess_received_blocks(
     }
 
     // Then sort blocks within each shard by their sum_index.
-#pragma omp for
+#pragma omp for nowait
     for (int ishard = 0; ishard < nshards; ishard++) {
       if (nblocks_per_shard[ishard] > 1) {
         qsort(&blks_recv[shard_start[ishard]], nblocks_per_shard[ishard],
@@ -380,8 +528,9 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
                                        const bool trans_dist,
                                        const dbm_matrix_t *restrict matrix,
                                        const dbm_distribution_t *restrict dist,
-                                       const int nticks) {
-  assert(cp_mpi_comms_are_similar(matrix->dist->comm, dist->comm));
+                                       const int nticks,
+                                       dbm_comm_iterator_t *iter) {
+  cp_assert(cp_mpi_comms_are_similar(matrix->dist->comm, dist->comm));
 
   // The row/col indicies are distributed along one cart dimension and the
   // ticks are distributed along the other cart dimension.
@@ -394,13 +543,23 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
 
   // Allocate packed matrix.
   const int nsend_packs = nticks / dist_ticks->nranks;
-  assert(nsend_packs * dist_ticks->nranks == nticks);
+  cp_assert(nsend_packs * dist_ticks->nranks == nticks);
   dbm_packed_matrix_t packed;
   packed.dist_indices = dist_indices;
   packed.dist_ticks = dist_ticks;
   packed.nsend_packs = nsend_packs;
   packed.send_packs = malloc(nsend_packs * sizeof(dbm_pack_t));
-  assert(packed.send_packs != NULL || nsend_packs == 0);
+  cp_assert(packed.send_packs != NULL || nsend_packs == 0);
+
+  if (dist->nranks == 1) {
+    cp_assert(nsend_packs == 1);
+    packed.send_packs[0] = pack_local_matrix(
+        trans_matrix, matrix, dist_indices->nshards, &iter->seconds_sort);
+    packed.recv_pack = (dbm_pack_t){0};
+    packed.max_nblocks = packed.send_packs[0].nblocks;
+    packed.max_data_size = packed.send_packs[0].data_size;
+    return packed;
+  }
 
   // Plan all packs.
   plan_t *plans_per_pack[nsend_packs];
@@ -416,8 +575,8 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
     ndata_send_max = imax(ndata_send_max, ndata_send_per_pack[ipack]);
   }
   dbm_pack_block_t *blks_send =
-      cp_mpi_alloc_mem(nblks_send_max * sizeof(dbm_pack_block_t));
-  double *data_send = cp_mpi_alloc_mem(ndata_send_max * sizeof(double));
+      allocate_comm_buffer(nblks_send_max * sizeof(dbm_pack_block_t));
+  double *data_send = allocate_comm_buffer(ndata_send_max * sizeof(double));
 
   // Cannot parallelize over packs (there might be too few of them).
   for (int ipack = 0; ipack < nsend_packs; ipack++) {
@@ -432,6 +591,7 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
     free(plans_per_pack[ipack]);
 
     // 1st communication: Exchange block counts.
+    double tick = omp_get_wtime();
     int blks_recv_count[nranks], blks_recv_displ[nranks];
     cp_mpi_alltoall_int(blks_send_count, 1, blks_recv_count, 1, dist->comm);
     icumsum(nranks, blks_recv_count, blks_recv_displ);
@@ -439,7 +599,7 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
 
     // 2nd communication: Exchange blocks.
     dbm_pack_block_t *blks_recv =
-        cp_mpi_alloc_mem(nblocks_recv * sizeof(dbm_pack_block_t));
+        allocate_comm_buffer(nblocks_recv * sizeof(dbm_pack_block_t));
     int blks_send_count_byte[nranks], blks_send_displ_byte[nranks];
     int blks_recv_count_byte[nranks], blks_recv_displ_byte[nranks];
     for (int i = 0; i < nranks; i++) { // TODO: this is ugly!
@@ -451,6 +611,10 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
           checked_byte_count(blks_recv_count[i], sizeof(dbm_pack_block_t));
       blks_recv_displ_byte[i] =
           checked_byte_count(blks_recv_displ[i], sizeof(dbm_pack_block_t));
+    }
+    for (int i = 0; i < nranks; i++) {
+      iter->bytes_alltoall += blks_send_count_byte[i] +
+                              (int64_t)data_send_count[i] * sizeof(double);
     }
     cp_mpi_alltoallv_byte(blks_send, blks_send_count_byte, blks_send_displ_byte,
                           blks_recv, blks_recv_count_byte, blks_recv_displ_byte,
@@ -465,20 +629,18 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
     const int ndata_recv = isum(nranks, data_recv_count);
 
     // 4th communication: Exchange data.
-#if defined(DBM_MULTIPLY_COMM_MEMPOOL)
-    double *data_recv =
-        offload_mempool_host_malloc(ndata_recv * sizeof(double));
-#else
-    double *data_recv = cp_mpi_alloc_mem(ndata_recv * sizeof(double));
-#endif
+    double *data_recv = allocate_comm_buffer(ndata_recv * sizeof(double));
     cp_mpi_alltoallv_double(data_send, data_send_count, data_send_displ,
                             data_recv, data_recv_count, data_recv_displ,
                             dist->comm);
 
     // 5th post-process received blocks and assemble them into a pack.
+    const double tock = omp_get_wtime();
+    iter->seconds_alltoall += tock - tick;
     postprocess_received_blocks(nranks, dist_indices->nshards, nblocks_recv,
                                 blks_recv_count, blks_recv_displ,
                                 data_recv_displ, blks_recv);
+    iter->seconds_sort += omp_get_wtime() - tock;
     packed.send_packs[ipack].nblocks = nblocks_recv;
     packed.send_packs[ipack].data_size = ndata_recv;
     packed.send_packs[ipack].blocks = blks_recv;
@@ -486,8 +648,8 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
   }
 
   // Deallocate send buffers.
-  cp_mpi_free_mem(blks_send);
-  cp_mpi_free_mem(data_send);
+  free_comm_buffer(blks_send);
+  free_comm_buffer(data_send);
 
   // Allocate pack_recv.
   int max_nblocks = 0, max_data_size = 0;
@@ -495,19 +657,16 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
     max_nblocks = imax(max_nblocks, packed.send_packs[ipack].nblocks);
     max_data_size = imax(max_data_size, packed.send_packs[ipack].data_size);
   }
+  const double tick = omp_get_wtime();
   cp_mpi_max_int(&max_nblocks, 1, packed.dist_ticks->comm);
   cp_mpi_max_int(&max_data_size, 1, packed.dist_ticks->comm);
+  iter->seconds_alltoall += omp_get_wtime() - tick;
   packed.max_nblocks = max_nblocks;
   packed.max_data_size = max_data_size;
   packed.recv_pack.blocks =
-      cp_mpi_alloc_mem(packed.max_nblocks * sizeof(dbm_pack_block_t));
-#if defined(DBM_MULTIPLY_COMM_MEMPOOL)
+      allocate_comm_buffer(packed.max_nblocks * sizeof(dbm_pack_block_t));
   packed.recv_pack.data =
-      offload_mempool_host_malloc(packed.max_data_size * sizeof(double));
-#else
-  packed.recv_pack.data =
-      cp_mpi_alloc_mem(packed.max_data_size * sizeof(double));
-#endif
+      allocate_comm_buffer(packed.max_data_size * sizeof(double));
 
   return packed; // Ownership of packed transfers to caller.
 }
@@ -517,7 +676,7 @@ static dbm_packed_matrix_t pack_matrix(const bool trans_matrix,
  * \author Ole Schuett
  ******************************************************************************/
 static dbm_pack_t *sendrecv_pack(const int itick, const int nticks,
-                                 dbm_packed_matrix_t *packed) {
+                                 dbm_packed_matrix_t *packed, int64_t *bytes) {
   const int nranks = packed->dist_ticks->nranks;
   const int my_rank = packed->dist_ticks->my_rank;
 
@@ -526,7 +685,7 @@ static dbm_pack_t *sendrecv_pack(const int itick, const int nticks,
   const int send_rank = (my_rank + nticks - itick_of_rank0) % nranks;
   const int send_itick = (itick_of_rank0 + send_rank) % nticks;
   const int send_ipack = send_itick / nranks;
-  assert(send_itick % nranks == my_rank);
+  cp_assert(send_itick % nranks == my_rank);
 
   // Compute receive rank and pack.
   const int recv_rank = itick % nranks;
@@ -534,9 +693,11 @@ static dbm_pack_t *sendrecv_pack(const int itick, const int nticks,
 
   dbm_pack_t *send_pack = &packed->send_packs[send_ipack];
   if (send_rank == my_rank) {
-    assert(send_rank == recv_rank && send_ipack == recv_ipack);
+    cp_assert(send_rank == recv_rank && send_ipack == recv_ipack);
     return send_pack; // Local pack, no mpi needed.
   } else {
+    *bytes += (int64_t)send_pack->nblocks * sizeof(dbm_pack_block_t) +
+              (int64_t)send_pack->data_size * sizeof(double);
     // Exchange blocks.
     const int nblocks_in_bytes = cp_mpi_sendrecv_byte(
         /*sendbuf=*/send_pack->blocks,
@@ -551,7 +712,7 @@ static dbm_pack_t *sendrecv_pack(const int itick, const int nticks,
         /*recvtag=*/recv_ipack,
         /*comm=*/packed->dist_ticks->comm);
 
-    assert(nblocks_in_bytes % sizeof(dbm_pack_block_t) == 0);
+    cp_assert(nblocks_in_bytes % sizeof(dbm_pack_block_t) == 0);
     packed->recv_pack.nblocks = nblocks_in_bytes / sizeof(dbm_pack_block_t);
 
     // Exchange data.
@@ -575,19 +736,11 @@ static dbm_pack_t *sendrecv_pack(const int itick, const int nticks,
  * \author Ole Schuett
  ******************************************************************************/
 static void free_packed_matrix(dbm_packed_matrix_t *packed) {
-  cp_mpi_free_mem(packed->recv_pack.blocks);
-#if defined(DBM_MULTIPLY_COMM_MEMPOOL)
-  offload_mempool_host_free(packed->recv_pack.data);
-#else
-  cp_mpi_free_mem(packed->recv_pack.data);
-#endif
+  free_comm_buffer(packed->recv_pack.blocks);
+  free_comm_buffer(packed->recv_pack.data);
   for (int ipack = 0; ipack < packed->nsend_packs; ipack++) {
-    cp_mpi_free_mem(packed->send_packs[ipack].blocks);
-#if defined(DBM_MULTIPLY_COMM_MEMPOOL)
-    offload_mempool_host_free(packed->send_packs[ipack].data);
-#else
-    cp_mpi_free_mem(packed->send_packs[ipack].data);
-#endif
+    free_comm_buffer(packed->send_packs[ipack].blocks);
+    free_comm_buffer(packed->send_packs[ipack].data);
   }
   free(packed->send_packs);
 }
@@ -602,7 +755,7 @@ dbm_comm_iterator_t *dbm_comm_iterator_start(const bool transa,
                                              const dbm_matrix_t *matrix_b,
                                              const dbm_matrix_t *matrix_c) {
   dbm_comm_iterator_t *iter = malloc(sizeof(dbm_comm_iterator_t));
-  assert(iter != NULL);
+  cp_assert(iter != NULL);
   iter->dist = matrix_c->dist;
 
   // During each communication tick we'll fetch a pack_a and pack_b.
@@ -610,12 +763,14 @@ dbm_comm_iterator_t *dbm_comm_iterator_start(const bool transa,
   // chosen as the least common multiple of the cart's dimensions.
   iter->nticks = lcm(iter->dist->rows.nranks, iter->dist->cols.nranks);
   iter->itick = 0;
+  iter->seconds_alltoall = iter->seconds_sort = 0.0;
+  iter->bytes_alltoall = iter->bytes_shift = 0;
 
   // 1.arg=source dimension, 2.arg=target dimension, false=rows, true=columns.
   iter->packed_a =
-      pack_matrix(transa, false, matrix_a, iter->dist, iter->nticks);
+      pack_matrix(transa, false, matrix_a, iter->dist, iter->nticks, iter);
   iter->packed_b =
-      pack_matrix(!transb, true, matrix_b, iter->dist, iter->nticks);
+      pack_matrix(!transb, true, matrix_b, iter->dist, iter->nticks, iter);
 
   return iter;
 }
@@ -633,8 +788,10 @@ bool dbm_comm_iterator_next(dbm_comm_iterator_t *iter, dbm_pack_t **pack_a,
   // Start each rank at a different tick to spread the load on the sources.
   const int shift = iter->dist->rows.my_rank + iter->dist->cols.my_rank;
   const int itick = (iter->itick + shift) % iter->nticks;
-  *pack_a = sendrecv_pack(itick, iter->nticks, &iter->packed_a);
-  *pack_b = sendrecv_pack(itick, iter->nticks, &iter->packed_b);
+  *pack_a =
+      sendrecv_pack(itick, iter->nticks, &iter->packed_a, &iter->bytes_shift);
+  *pack_b =
+      sendrecv_pack(itick, iter->nticks, &iter->packed_b, &iter->bytes_shift);
 
   ++iter->itick;
   return true;

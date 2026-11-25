@@ -41,7 +41,8 @@ MODULE atom_types
                                               section_vals_val_get
    USE input_val_types,                 ONLY: val_get,&
                                               val_type
-   USE kinds,                           ONLY: default_string_length,&
+   USE kinds,                           ONLY: default_path_length,&
+                                              default_string_length,&
                                               dp
    USE mathconstants,                   ONLY: dfac,&
                                               fac,&
@@ -342,6 +343,11 @@ MODULE atom_types
    PUBLIC :: no_pseudo, gth_pseudo, sgp_pseudo, upf_pseudo, ecp_pseudo
    PUBLIC :: setup_hf_section
 
+   INTERFACE read_ecp_potential
+      MODULE PROCEDURE read_ecp_potential_file, &
+         read_ecp_potential_files
+   END INTERFACE
+
 ! **************************************************************************************************
 
 CONTAINS
@@ -392,7 +398,8 @@ CONTAINS
          27508345.793637_dp, 51649961.080194_dp, 96978513.342764_dp, 182087882.613702_dp, &
          341890134.751331_dp]
 
-      CHARACTER(LEN=default_string_length)               :: basis_fn, basis_name
+      CHARACTER(LEN=default_path_length)                 :: basis_fn
+      CHARACTER(LEN=default_string_length)               :: basis_name
       INTEGER                                            :: basistype, handle, i, j, k, l, ll, m, &
                                                             ngp, nl, nr, nu, quadtype
       INTEGER, DIMENSION(0:lmat)                         :: starti
@@ -414,8 +421,9 @@ CONTAINS
       CALL allocate_grid_atom(basis%grid)
       CALL section_vals_val_get(basis_section, "QUADRATURE", i_val=quadtype)
       CALL section_vals_val_get(basis_section, "GRID_POINTS", i_val=ngp)
-      IF (ngp <= 0) &
+      IF (ngp <= 0) THEN
          CPABORT("The number of radial grid points must be greater than zero.")
+      END IF
       CALL create_grid_atom(basis%grid, ngp, 1, 1, 0, quadtype)
       basis%grid%nr = ngp
       basis%geometrical = .FALSE.
@@ -494,7 +502,7 @@ CONTAINS
                   basis%bf(k, i, l) = rk**l*ear
                   basis%dbf(k, i, l) = (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear
                   basis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**(l - 2) - &
-                                         2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))*ear
+                                         2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))*ear
                END DO
             END DO
          END DO
@@ -579,7 +587,7 @@ CONTAINS
                   basis%bf(k, i, l) = rk**l*ear
                   basis%dbf(k, i, l) = (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear
                   basis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**(l - 2) - &
-                                         2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))*ear
+                                         2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))*ear
                END DO
             END DO
          END DO
@@ -611,7 +619,7 @@ CONTAINS
                      basis%dbf(k, j, l) = basis%dbf(k, j, l) &
                                           + (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear*basis%cm(i, j, l)
                      basis%ddbf(k, j, l) = basis%ddbf(k, j, l) + &
-                                    (REAL(l*(l - 1), dp)*rk**(l - 2) - 2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))* &
+                                 (REAL(l*(l - 1), dp)*rk**(l - 2) - 2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))* &
                                            ear*basis%cm(i, j, l)
                   END DO
                END DO
@@ -772,7 +780,7 @@ CONTAINS
                basis%bf(k, i, l) = rk**l*ear
                basis%dbf(k, i, l) = (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear
                basis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**(l - 2) - &
-                                      2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))*ear
+                                      2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))*ear
             END DO
          END DO
       END DO
@@ -793,8 +801,7 @@ CONTAINS
       TYPE(atom_basis_type), INTENT(INOUT)               :: gbasis
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: r, rab
 
-      INTEGER                                            :: i, j, k, l, m, n1, n2, n3, ngp, nl, nr, &
-                                                            quadtype
+      INTEGER                                            :: i, j, k, l, m, n1, n2, n3, ngp, nl, nr
       REAL(KIND=dp)                                      :: al, ear, pf, rk
 
       NULLIFY (gbasis%am, gbasis%cm, gbasis%as, gbasis%ns, gbasis%bf, gbasis%dbf, gbasis%ddbf)
@@ -839,10 +846,12 @@ CONTAINS
       NULLIFY (gbasis%grid)
       CALL allocate_grid_atom(gbasis%grid)
       ngp = SIZE(r)
-      quadtype = do_gapw_log
-      IF (ngp <= 0) &
+      IF (ngp <= 0) THEN
          CPABORT("The number of radial grid points must be greater than zero.")
-      CALL create_grid_atom(gbasis%grid, ngp, 1, 1, 0, quadtype)
+      END IF
+      CPASSERT(SIZE(rab) == ngp)
+      ! The supplied radial mesh needs no generated quadrature or angular grid.
+      ALLOCATE (gbasis%grid%rad(ngp), gbasis%grid%rad2(ngp), gbasis%grid%wr(ngp))
       gbasis%grid%nr = ngp
       gbasis%grid%rad(:) = r(:)
       gbasis%grid%rad2(:) = r(:)*r(:)
@@ -860,6 +869,7 @@ CONTAINS
 
       SELECT CASE (gbasis%basis_type)
       CASE (GTO_BASIS)
+         ! Zero prefactors must not evaluate negative powers at the UPF origin.
          DO l = 0, lmat
             DO i = 1, gbasis%nbas(l)
                al = gbasis%am(i, l)
@@ -867,9 +877,9 @@ CONTAINS
                   rk = gbasis%grid%rad(k)
                   ear = EXP(-al*gbasis%grid%rad(k)**2)
                   gbasis%bf(k, i, l) = rk**l*ear
-                  gbasis%dbf(k, i, l) = (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear
-                  gbasis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**(l - 2) - &
-                                          2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))*ear
+                  gbasis%dbf(k, i, l) = (REAL(l, dp)*rk**MAX(0, l - 1) - 2._dp*al*rk**(l + 1))*ear
+                  gbasis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**MAX(0, l - 2) - &
+                                          2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))*ear
                END DO
             END DO
          END DO
@@ -883,9 +893,9 @@ CONTAINS
                   DO j = 1, gbasis%nbas(l)
                      gbasis%bf(k, j, l) = gbasis%bf(k, j, l) + rk**l*ear*gbasis%cm(i, j, l)
                      gbasis%dbf(k, j, l) = gbasis%dbf(k, j, l) &
-                                           + (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear*gbasis%cm(i, j, l)
+                                           + (REAL(l, dp)*rk**MAX(0, l - 1) - 2._dp*al*rk**(l + 1))*ear*gbasis%cm(i, j, l)
                      gbasis%ddbf(k, j, l) = gbasis%ddbf(k, j, l) + &
-                                    (REAL(l*(l - 1), dp)*rk**(l - 2) - 2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))* &
+                           (REAL(l*(l - 1), dp)*rk**MAX(0, l - 2) - 2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))* &
                                             ear*gbasis%cm(i, j, l)
                   END DO
                END DO
@@ -2205,39 +2215,32 @@ CONTAINS
       CHARACTER(LEN=*), INTENT(IN)                       :: basis_set_name, basis_set_file
       TYPE(section_vals_type), POINTER                   :: basis_section
 
-      INTEGER, PARAMETER                                 :: maxpri = 40, maxset = 20
+      TYPE basis_set_type
+         INTEGER :: lmin, lmax
+         INTEGER, ALLOCATABLE :: l(:)
+         REAL(dp), ALLOCATABLE :: zet(:), gcc(:, :)
+      END TYPE basis_set_type
 
       CHARACTER(len=20*default_string_length)            :: line_att
       CHARACTER(LEN=240)                                 :: line
       CHARACTER(LEN=242)                                 :: line2
       CHARACTER(LEN=LEN(basis_set_name))                 :: bsname
-      CHARACTER(LEN=LEN(basis_set_name)+2)               :: bsname2
+      CHARACTER(LEN=LEN(basis_set_name) + 2)               :: bsname2
       CHARACTER(LEN=LEN(element_symbol))                 :: symbol
-      CHARACTER(LEN=LEN(element_symbol)+2)               :: symbol2
-      INTEGER                                            :: i, ii, ipgf, irep, iset, ishell, j, k, &
-                                                            lshell, nj, nmin, ns, nset, strlen1, &
-                                                            strlen2
-      INTEGER, DIMENSION(maxpri, maxset)                 :: l
-      INTEGER, DIMENSION(maxset)                         :: lmax, lmin, n, npgf, nshell
+      CHARACTER(LEN=LEN(element_symbol) + 2)               :: symbol2
+      INTEGER                                            :: i, ii, ipgf, iset, ishell, j, k, &
+                                                            lshell, n, nj, npgf, ns, nset, nshell, &
+                                                            strlen1, strlen2
+      INTEGER, ALLOCATABLE                               :: shells(:)
       LOGICAL                                            :: found, is_ok, match, read_from_input
       REAL(dp)                                           :: expzet, gcca, prefac, zeta
-      REAL(dp), DIMENSION(maxpri, maxpri, maxset)        :: gcc
-      REAL(dp), DIMENSION(maxpri, maxset)                :: zet
+      TYPE(basis_set_type), ALLOCATABLE                  :: sets(:)
+      TYPE(cp_parser_type)                              :: parser
       TYPE(cp_sll_val_type), POINTER                     :: list
       TYPE(val_type), POINTER                            :: val
 
       bsname = basis_set_name
       symbol = element_symbol
-      irep = 0
-
-      nset = 0
-      lmin = 0
-      lmax = 0
-      npgf = 0
-      n = 0
-      l = 0
-      zet = 0._dp
-      gcc = 0._dp
 
       read_from_input = .FALSE.
       CALL section_vals_get(basis_section, explicit=read_from_input)
@@ -2250,111 +2253,107 @@ CONTAINS
          CPASSERT(is_ok)
          CALL val_get(val, c_val=line_att)
          READ (line_att, *) nset
-         CPASSERT(nset <= maxset)
-         DO iset = 1, nset
-            is_ok = cp_sll_val_next(list, val)
-            CPASSERT(is_ok)
-            CALL val_get(val, c_val=line_att)
-            READ (line_att, *) n(iset)
-            CALL remove_word(line_att)
-            READ (line_att, *) lmin(iset)
-            CALL remove_word(line_att)
-            READ (line_att, *) lmax(iset)
-            CALL remove_word(line_att)
-            READ (line_att, *) npgf(iset)
-            CALL remove_word(line_att)
-            CPASSERT(npgf(iset) <= maxpri)
-            nshell(iset) = 0
-            DO lshell = lmin(iset), lmax(iset)
-               nmin = n(iset) + lshell - lmin(iset)
-               READ (line_att, *) ishell
-               CALL remove_word(line_att)
-               nshell(iset) = nshell(iset) + ishell
-               DO i = 1, ishell
-                  l(nshell(iset) - ishell + i, iset) = lshell
-               END DO
-            END DO
-            CPASSERT(LEN_TRIM(line_att) == 0)
-            DO ipgf = 1, npgf(iset)
+      ELSE
+         CALL parser_create(parser, basis_set_file)
+         ! Search for the requested basis set in the basis set file
+         ! until the basis set is found or the end of file is reached
+         search_loop: DO
+            CALL parser_search_string(parser, TRIM(bsname), .TRUE., found, line)
+            IF (found) THEN
+               CALL uppercase(symbol)
+               CALL uppercase(bsname)
+               match = .FALSE.
+               CALL uppercase(line)
+               ! Check both the element symbol and the basis set name
+               line2 = " "//line//" "
+               symbol2 = " "//TRIM(symbol)//" "
+               bsname2 = " "//TRIM(bsname)//" "
+               strlen1 = LEN_TRIM(symbol2) + 1
+               strlen2 = LEN_TRIM(bsname2) + 1
+
+               IF ((INDEX(line2, symbol2(:strlen1)) > 0) .AND. &
+                   (INDEX(line2, bsname2(:strlen2)) > 0)) match = .TRUE.
+
+               IF (match) THEN
+                  ! Read the basis set information
+                  CALL parser_get_object(parser, nset, newline=.TRUE.)
+                  EXIT search_loop
+
+               END IF
+            ELSE
+               ! Stop program, if the end of file is reached
+               CPABORT("End of file reached and the requested basis set was not found.")
+            END IF
+
+         END DO search_loop
+      END IF
+
+      CPASSERT(nset > 0)
+      ALLOCATE (sets(nset))
+      DO iset = 1, nset
+         ASSOCIATE (set => sets(iset))
+            IF (read_from_input) THEN
                is_ok = cp_sll_val_next(list, val)
                CPASSERT(is_ok)
                CALL val_get(val, c_val=line_att)
-               READ (line_att, *) zet(ipgf, iset), (gcc(ipgf, ishell, iset), ishell=1, nshell(iset))
-            END DO
-         END DO
-      ELSE
-         BLOCK
-            TYPE(cp_parser_type)                      :: parser
-            CALL parser_create(parser, basis_set_file)
-            ! Search for the requested basis set in the basis set file
-            ! until the basis set is found or the end of file is reached
-            search_loop: DO
-               CALL parser_search_string(parser, TRIM(bsname), .TRUE., found, line)
-               IF (found) THEN
-                  CALL uppercase(symbol)
-                  CALL uppercase(bsname)
-                  match = .FALSE.
-                  CALL uppercase(line)
-                  ! Check both the element symbol and the basis set name
-                  line2 = " "//line//" "
-                  symbol2 = " "//TRIM(symbol)//" "
-                  bsname2 = " "//TRIM(bsname)//" "
-                  strlen1 = LEN_TRIM(symbol2) + 1
-                  strlen2 = LEN_TRIM(bsname2) + 1
-
-                  IF ((INDEX(line2, symbol2(:strlen1)) > 0) .AND. &
-                      (INDEX(line2, bsname2(:strlen2)) > 0)) match = .TRUE.
-
-                  IF (match) THEN
-                     ! Read the basis set information
-                     CALL parser_get_object(parser, nset, newline=.TRUE.)
-                     CPASSERT(nset <= maxset)
-                     DO iset = 1, nset
-                        CALL parser_get_object(parser, n(iset), newline=.TRUE.)
-                        CALL parser_get_object(parser, lmin(iset))
-                        CALL parser_get_object(parser, lmax(iset))
-                        CALL parser_get_object(parser, npgf(iset))
-                        CPASSERT(npgf(iset) <= maxpri)
-                        nshell(iset) = 0
-                        DO lshell = lmin(iset), lmax(iset)
-                           nmin = n(iset) + lshell - lmin(iset)
-                           CALL parser_get_object(parser, ishell)
-                           nshell(iset) = nshell(iset) + ishell
-                           DO i = 1, ishell
-                              l(nshell(iset) - ishell + i, iset) = lshell
-                           END DO
-                        END DO
-                        DO ipgf = 1, npgf(iset)
-                           CALL parser_get_object(parser, zet(ipgf, iset), newline=.TRUE.)
-                           DO ishell = 1, nshell(iset)
-                              CALL parser_get_object(parser, gcc(ipgf, ishell, iset))
-                           END DO
-                        END DO
-                     END DO
-
-                     EXIT search_loop
-
-                  END IF
+               READ (line_att, *) n, set%lmin, set%lmax, npgf
+               DO i = 1, 4
+                  CALL remove_word(line_att)
+               END DO
+            ELSE
+               CALL parser_get_object(parser, n, newline=.TRUE.)
+               CALL parser_get_object(parser, set%lmin)
+               CALL parser_get_object(parser, set%lmax)
+               CALL parser_get_object(parser, npgf)
+            END IF
+            CPASSERT(set%lmin >= 0 .AND. set%lmax >= set%lmin .AND. npgf > 0)
+            ALLOCATE (shells(set%lmin:set%lmax))
+            DO lshell = set%lmin, set%lmax
+               IF (read_from_input) THEN
+                  READ (line_att, *) shells(lshell)
+                  CALL remove_word(line_att)
                ELSE
-                  ! Stop program, if the end of file is reached
-                  CPABORT("End of file reached and the requested basis set was not found.")
+                  CALL parser_get_object(parser, shells(lshell))
                END IF
-
-            END DO search_loop
-
-            CALL parser_release(parser)
-         END BLOCK
-      END IF
+            END DO
+            IF (read_from_input) THEN
+               CPASSERT(LEN_TRIM(line_att) == 0)
+            END IF
+            CPASSERT(ALL(shells >= 0))
+            nshell = SUM(shells)
+            ALLOCATE (set%l(nshell), set%zet(npgf), set%gcc(npgf, nshell))
+            ishell = 0
+            DO lshell = set%lmin, set%lmax
+               set%l(ishell + 1:ishell + shells(lshell)) = lshell
+               ishell = ishell + shells(lshell)
+            END DO
+            DEALLOCATE (shells)
+            DO ipgf = 1, npgf
+               IF (read_from_input) THEN
+                  is_ok = cp_sll_val_next(list, val)
+                  CPASSERT(is_ok)
+                  CALL val_get(val, c_val=line_att)
+                  READ (line_att, *) set%zet(ipgf), set%gcc(ipgf, :)
+               ELSE
+                  CALL parser_get_object(parser, set%zet(ipgf), newline=.TRUE.)
+                  DO ishell = 1, nshell
+                     CALL parser_get_object(parser, set%gcc(ipgf, ishell))
+                  END DO
+               END IF
+            END DO
+         END ASSOCIATE
+      END DO
+      IF (.NOT. read_from_input) CALL parser_release(parser)
 
       ! fill in the basis data structures
       basis%nprim = 0
       basis%nbas = 0
       DO i = 1, nset
-         DO j = lmin(i), MIN(lmax(i), lmat)
-            basis%nprim(j) = basis%nprim(j) + npgf(i)
+         DO j = sets(i)%lmin, MIN(sets(i)%lmax, lmat)
+            basis%nprim(j) = basis%nprim(j) + SIZE(sets(i)%zet)
          END DO
-         DO j = 1, nshell(i)
-            k = l(j, i)
+         DO j = 1, SIZE(sets(i)%l)
+            k = sets(i)%l(j)
             IF (k <= lmat) basis%nbas(k) = basis%nbas(k) + 1
          END DO
       END DO
@@ -2370,19 +2369,19 @@ CONTAINS
          nj = 0
          ns = 0
          DO i = 1, nset
-            IF (j >= lmin(i) .AND. j <= lmax(i)) THEN
-               DO ipgf = 1, npgf(i)
-                  basis%am(nj + ipgf, j) = zet(ipgf, i)
+            IF (j >= sets(i)%lmin .AND. j <= sets(i)%lmax) THEN
+               DO ipgf = 1, SIZE(sets(i)%zet)
+                  basis%am(nj + ipgf, j) = sets(i)%zet(ipgf)
                END DO
-               DO ii = 1, nshell(i)
-                  IF (l(ii, i) == j) THEN
+               DO ii = 1, SIZE(sets(i)%l)
+                  IF (sets(i)%l(ii) == j) THEN
                      ns = ns + 1
-                     DO ipgf = 1, npgf(i)
-                        basis%cm(nj + ipgf, ns, j) = gcc(ipgf, ii, i)
+                     DO ipgf = 1, SIZE(sets(i)%zet)
+                        basis%cm(nj + ipgf, ns, j) = sets(i)%gcc(ipgf, ii)
                      END DO
                   END IF
                END DO
-               nj = nj + npgf(i)
+               nj = nj + SIZE(sets(i)%zet)
             END IF
          END DO
       END DO
@@ -2438,7 +2437,8 @@ CONTAINS
       TYPE(section_vals_type), POINTER                   :: potential_section
       INTEGER, INTENT(IN)                                :: zval
 
-      CHARACTER(LEN=default_string_length)               :: pseudo_fn, pseudo_name
+      CHARACTER(LEN=default_path_length)                 :: pseudo_fn
+      CHARACTER(LEN=default_string_length)               :: pseudo_name
       INTEGER                                            :: ic
       REAL(dp), DIMENSION(:), POINTER                    :: convals
       TYPE(section_vals_type), POINTER                   :: ecp_potential_section, &
@@ -2890,14 +2890,16 @@ CONTAINS
 !> \param pseudo_name ...
 !> \param pseudo_file ...
 !> \param potential_section ...
+!> \param potential_found ...
 ! **************************************************************************************************
-   SUBROUTINE read_ecp_potential(element_symbol, potential, pseudo_name, pseudo_file, &
-                                 potential_section)
+   SUBROUTINE read_ecp_potential_file(element_symbol, potential, pseudo_name, pseudo_file, &
+                                      potential_section, potential_found)
 
       CHARACTER(LEN=*), INTENT(IN)                       :: element_symbol
       TYPE(atom_ecppot_type), INTENT(INOUT)              :: potential
       CHARACTER(LEN=*), INTENT(IN)                       :: pseudo_name, pseudo_file
       TYPE(section_vals_type), POINTER                   :: potential_section
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: potential_found
 
       CHARACTER(LEN=240)                                 :: line
       CHARACTER(len=5*default_string_length)             :: line_att
@@ -2910,6 +2912,7 @@ CONTAINS
 
       apname = pseudo_name
       symbol = element_symbol
+      IF (PRESENT(potential_found)) potential_found = .FALSE.
       CALL get_ptable_info(symbol, number=ncore)
 
       potential%symbol = symbol
@@ -2979,6 +2982,7 @@ CONTAINS
                   match_loop: DO
                      CALL parser_get_object(parser, line, newline=.TRUE.)
                      IF (TRIM(line) == element_symbol) THEN
+                        IF (PRESENT(potential_found)) potential_found = .TRUE.
                         CALL parser_get_object(parser, line, lower_to_upper=.TRUE.)
                         CPASSERT(TRIM(line) == "NELEC")
                         ! read number of electrons
@@ -3017,10 +3021,18 @@ CONTAINS
                         END DO
                         EXIT search_loop
                      ELSE IF (line == "END") THEN
+                        IF (PRESENT(potential_found)) THEN
+                           CALL parser_release(parser)
+                           RETURN
+                        END IF
                         CPABORT("Element not found in ECP library")
                      END IF
                   END DO match_loop
                ELSE
+                  IF (PRESENT(potential_found)) THEN
+                     CALL parser_release(parser)
+                     RETURN
+                  END IF
                   CPABORT("ECP type not found in library")
                END IF
 
@@ -3029,6 +3041,8 @@ CONTAINS
             CALL parser_release(parser)
          END BLOCK
       END IF
+
+      IF (read_from_input .AND. PRESENT(potential_found)) potential_found = .TRUE.
 
       ! set up econf
       potential%econf(0:3) = ptable(ncore)%e_conv(0:3)
@@ -3067,7 +3081,45 @@ CONTAINS
       !
       CPASSERT(ALL(potential%econf >= 0))
 
-   END SUBROUTINE read_ecp_potential
+   END SUBROUTINE read_ecp_potential_file
+
+! **************************************************************************************************
+!> \brief Read an ECP potential from an ordered list of library files.
+!> \param element_symbol ...
+!> \param potential ...
+!> \param pseudo_name ...
+!> \param pseudo_files ...
+!> \param potential_section ...
+! **************************************************************************************************
+   SUBROUTINE read_ecp_potential_files(element_symbol, potential, pseudo_name, pseudo_files, &
+                                       potential_section)
+
+      CHARACTER(LEN=*), INTENT(IN)                       :: element_symbol
+      TYPE(atom_ecppot_type), INTENT(INOUT)              :: potential
+      CHARACTER(LEN=*), INTENT(IN)                       :: pseudo_name
+      CHARACTER(LEN=*), DIMENSION(:), INTENT(IN)         :: pseudo_files
+      TYPE(section_vals_type), POINTER                   :: potential_section
+
+      CHARACTER(LEN=:), ALLOCATABLE                      :: file_list
+      INTEGER                                            :: i
+      LOGICAL                                            :: potential_found
+
+      DO i = 1, SIZE(pseudo_files)
+         CALL read_ecp_potential_file(element_symbol, potential, pseudo_name, pseudo_files(i), &
+                                      potential_section, potential_found)
+         IF (potential_found) RETURN
+      END DO
+
+      file_list = ""
+      DO i = 1, SIZE(pseudo_files)
+         file_list = TRIM(file_list)//"<"//TRIM(pseudo_files(i))//"> "
+      END DO
+      CALL cp_abort(__LOCATION__, &
+                    "The requested ECP potential <"//TRIM(pseudo_name)// &
+                    "> for element <"//TRIM(element_symbol)// &
+                    "> was not found in the potential files "//TRIM(file_list))
+
+   END SUBROUTINE read_ecp_potential_files
 ! **************************************************************************************************
 !> \brief ...
 !> \param grid1 ...

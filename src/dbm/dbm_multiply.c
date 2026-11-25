@@ -13,8 +13,9 @@
 #include "dbm_multiply_comm.h"
 #include "dbm_multiply_cpu.h"
 #include "dbm_multiply_gpu.h"
+#include "dbm_multiply_gpu_kernel.h"
 
-#include <assert.h>
+#include "../base/cp_assert.h"
 #include <limits.h>
 #include <math.h>
 #include <omp.h>
@@ -31,7 +32,7 @@ static float *compute_rows_max_eps(const bool trans, const dbm_matrix_t *matrix,
   const int nrows = (trans) ? matrix->ncols : matrix->nrows;
   int *nblocks_per_row = calloc(nrows, sizeof(int));
   float *row_max_eps = malloc(nrows * sizeof(float));
-  assert((nblocks_per_row != NULL && row_max_eps != NULL) || nrows == 0);
+  cp_assert((nblocks_per_row != NULL && row_max_eps != NULL) || nrows == 0);
 
 #pragma omp parallel
   {
@@ -107,13 +108,38 @@ static bool backend_upload_packs(const dbm_pack_t *pack_a,
 #endif
 }
 
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_DBM)
+/*******************************************************************************
+ * \brief Private routine for ordering a batch in place as the GPU backend asks.
+ *        The batch is the page-locked array that is uploaded subsequently.
+ * \author Hans Pabst
+ ******************************************************************************/
+static void backend_order_batch(dbm_batch_t *batch) {
+  const int order_kind = dbm_multiply_gpu_task_order();
+  const int ntasks = batch->ntasks;
+  if (DBM_TASK_ORDER_NONE != order_kind && 1 < ntasks) {
+    dbm_task_t *const copy =
+        offload_mempool_host_malloc(sizeof(dbm_task_t) * ntasks);
+    int *const order = malloc(sizeof(int) * ntasks);
+    cp_assert(NULL != copy && NULL != order);
+    memcpy(copy, batch->tasks, sizeof(dbm_task_t) * ntasks);
+    dbm_multiply_cpu_task_order(ntasks, copy, order);
+    for (int itask = 0; itask < ntasks; ++itask) {
+      batch->tasks[itask] = copy[order[itask]];
+    }
+    free(order);
+    offload_mempool_host_free(copy);
+  }
+}
+#endif
+
 /*******************************************************************************
  * \brief Private routine for sending a batch to the multiplication backend.
+ *        The batch is left empty, i.e., ready to be filled again.
  * \author Ole Schuett
  ******************************************************************************/
-static void backend_process_batch(const int ntasks,
-                                  const dbm_task_t batch[ntasks],
-                                  const double alpha, const dbm_pack_t *pack_a,
+static void backend_process_batch(dbm_batch_t *batch, const double alpha,
+                                  const dbm_pack_t *pack_a,
                                   const dbm_pack_t *pack_b, const int kshard,
                                   dbm_shard_t *shard_c, const bool finish,
                                   const bool force_cpu,
@@ -121,21 +147,25 @@ static void backend_process_batch(const int ntasks,
   if (NULL != ctx) {
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_DBM)
     if (!force_cpu) {
-      dbm_multiply_gpu_process_batch(ntasks, batch, alpha, shard_c, kshard,
-                                     finish, &ctx->gpu);
+      backend_order_batch(batch);
+      dbm_multiply_gpu_process_batch(batch, alpha, shard_c, kshard, finish,
+                                     &ctx->gpu);
     } else
 #endif
     {
       (void)kshard;
       (void)finish;
       (void)force_cpu;
-      dbm_multiply_cpu_process_batch(ntasks, batch, alpha, pack_a, pack_b,
-                                     shard_c, ctx->cpu_options);
+      dbm_multiply_cpu_process_batch(batch, alpha, pack_a, pack_b, shard_c,
+                                     ctx->cpu_options);
     }
   } else { // Validate against host (aka CPU).
-    dbm_multiply_cpu_process_batch(ntasks, batch, alpha, pack_a, pack_b,
-                                   shard_c, DBM_MULTIPLY_BLAS_LIBRARY);
+    dbm_multiply_cpu_process_batch(batch, alpha, pack_a, pack_b, shard_c,
+                                   DBM_MULTIPLY_BLAS_LIBRARY);
   }
+  batch->max_m = batch->max_n = batch->max_k = 0;
+  batch->flops = 0;
+  batch->ntasks = 0;
 }
 
 /*******************************************************************************
@@ -147,6 +177,17 @@ static void backend_stop(backend_context_t *ctx) {
   dbm_multiply_gpu_stop(&ctx->gpu);
 #endif
   free(ctx);
+}
+
+/*******************************************************************************
+ * \brief Private routine returning the seconds since tick, which it resets.
+ * \author Hans Pabst
+ ******************************************************************************/
+static double phase_lap(double *tick) {
+  const double now = omp_get_wtime();
+  const double result = now - *tick;
+  *tick = now;
+  return result;
 }
 
 /*******************************************************************************
@@ -184,7 +225,7 @@ static void multiply_packs(const bool transa, const bool transb,
   const int nshard_cols = matrix_c->dist->cols.nshards;
   int *shard_row_start = calloc(nshard_rows, sizeof(int));
   int *shard_col_start = calloc(nshard_cols, sizeof(int));
-  assert(NULL != shard_row_start && NULL != shard_col_start);
+  cp_assert(NULL != shard_row_start && NULL != shard_col_start);
 
   const int *sum_index_sizes_a =
       (transa) ? matrix_a->row_sizes : matrix_a->col_sizes;
@@ -197,9 +238,12 @@ static void multiply_packs(const bool transa, const bool transb,
 
 #pragma omp parallel reduction(+ : flop_sum)
   {
-    // Thread-private array covering given work in piece-wise fashion.
-    dbm_task_t *batch =
+    // Thread-private batch covering given work in piece-wise fashion.
+    dbm_batch_t batch = {0};
+    batch.tasks =
         offload_mempool_host_malloc(sizeof(dbm_task_t) * DBM_MAX_BATCH_SIZE);
+    // Thread-local stats, added to the library's counters once at the end.
+    int64_t counters[DBM_NUM_COUNTERS] = {0};
 
     // Blocks are ordered first by shard. Creating lookup tables of boundaries.
 #pragma omp for nowait
@@ -226,7 +270,7 @@ static void multiply_packs(const bool transa, const bool transb,
       for (int shard_col = 0; shard_col < nshard_cols; shard_col++) {
         const int ishard = shard_row * nshard_cols + shard_col;
         dbm_shard_t *const shard_c = &matrix_c->shards[ishard];
-        int ntasks = 0;
+        cp_assert(0 == batch.ntasks); // left empty by the previous shard
 
         // Determine contiguous block ranges for this shard in A and B.
         // Use a merge-join to find pairs of blocks with matching sum indices.
@@ -248,8 +292,8 @@ static void multiply_packs(const bool transa, const bool transb,
           }
         }
         if (iblock_start >= iblock_end || jblock_start >= jblock_end) {
-          backend_process_batch(ntasks, batch, alpha, pack_a, pack_b, ishard,
-                                shard_c, true, force_cpu, context);
+          backend_process_batch(&batch, alpha, pack_a, pack_b, ishard, shard_c,
+                                true, force_cpu, context);
           continue;
         }
 
@@ -292,6 +336,18 @@ static void multiply_packs(const bool transa, const bool transb,
           for (int jb = b_range_start; jb < b_range_end; ++jb) {
             const dbm_pack_block_t *const blk_b = &pack_b->blocks[jb];
 
+            // Overlap the two dependent cache misses of upcoming lookups.
+            if (jb + DBM_PREFETCH_SLOT < b_range_end) {
+              dbm_shard_prefetch_slot(
+                  shard_c, blk_a->free_index,
+                  pack_b->blocks[jb + DBM_PREFETCH_SLOT].free_index);
+            }
+            if (jb + DBM_PREFETCH_BLOCK < b_range_end) {
+              dbm_shard_prefetch_block(
+                  shard_c, blk_a->free_index,
+                  pack_b->blocks[jb + DBM_PREFETCH_BLOCK].free_index);
+            }
+
             // Norm filter first (early reject).
             const float result_norm = alpha2 * blk_a->norm * blk_b->norm;
             if (result_norm < rows_max_eps[blk_a->free_index]) {
@@ -302,9 +358,9 @@ static void multiply_packs(const bool transa, const bool transb,
             const int m = free_index_sizes_a[blk_a->free_index];
             const int n = free_index_sizes_b[blk_b->free_index];
             const int k = sum_index_sizes_a[sum_a];
-            assert(m == matrix_c->row_sizes[blk_a->free_index]);
-            assert(n == matrix_c->col_sizes[blk_b->free_index]);
-            assert(k == sum_index_sizes_b[blk_b->sum_index]);
+            cp_assert(m == matrix_c->row_sizes[blk_a->free_index]);
+            cp_assert(n == matrix_c->col_sizes[blk_b->free_index]);
+            cp_assert(k == sum_index_sizes_b[blk_b->sum_index]);
 
             if (m == 0 || n == 0 || k == 0) {
               continue;
@@ -317,43 +373,49 @@ static void multiply_packs(const bool transa, const bool transb,
               if (retain_sparsity) {
                 continue;
               }
-              assert(dbm_get_shard_index(matrix_c, row, col) == ishard);
-              assert(dbm_get_stored_coordinates(matrix_c, row, col) ==
-                     matrix_c->dist->my_rank);
+              cp_assert(dbm_get_shard_index(matrix_c, row, col) == ishard);
+              cp_assert(dbm_get_stored_coordinates(matrix_c, row, col) ==
+                        matrix_c->dist->my_rank);
               blk_c = dbm_shard_promise_new_block(shard_c, row, col, m * n);
             }
 
             // Count flops.
             const int64_t task_flops = 2LL * m * n * k;
             flop_sum += task_flops;
-            dbm_library_counter_increment(m, n, k);
+            ++counters[dbm_library_counter_index(m, n, k)];
+
+            // Track the shape of the batch.
+            batch.max_m = imax(batch.max_m, m);
+            batch.max_n = imax(batch.max_n, n);
+            batch.max_k = imax(batch.max_k, k);
+            batch.flops += task_flops;
 
             // Add block multiplication to batch.
-            dbm_task_t *const tptr = &batch[ntasks];
+            dbm_task_t *const tptr = &batch.tasks[batch.ntasks];
             tptr->offset_a = blk_a->offset;
             tptr->offset_b = blk_b->offset;
             tptr->offset_c = blk_c->offset;
             tptr->m = m;
             tptr->n = n;
             tptr->k = k;
-            ++ntasks;
+            ++batch.ntasks;
 
-            if (ntasks == DBM_MAX_BATCH_SIZE) {
-              backend_process_batch(ntasks, batch, alpha, pack_a, pack_b,
-                                    ishard, shard_c, false, force_cpu, context);
-              ntasks = 0;
+            if (batch.ntasks == DBM_MAX_BATCH_SIZE) {
+              backend_process_batch(&batch, alpha, pack_a, pack_b, ishard,
+                                    shard_c, false, force_cpu, context);
             }
           }
 
           // Advance i; if next A block has same sum_index, B range is reused.
           ++i;
         }
-        backend_process_batch(ntasks, batch, alpha, pack_a, pack_b, ishard,
-                              shard_c, true, force_cpu, context);
+        backend_process_batch(&batch, alpha, pack_a, pack_b, ishard, shard_c,
+                              true, force_cpu, context);
       }
     }
 
-    offload_mempool_host_free(batch);
+    dbm_library_counters_add(counters);
+    offload_mempool_host_free(batch.tasks);
   }
 
   free(shard_row_start);
@@ -374,8 +436,10 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
                   const double beta, dbm_matrix_t *matrix_c,
                   const bool retain_sparsity, const double filter_eps,
                   int64_t *flop) {
-  assert(omp_get_num_threads() == 1);
-  assert(matrix_a != NULL && matrix_b != NULL && matrix_c != NULL);
+  cp_assert(omp_get_num_threads() == 1);
+  cp_assert(matrix_a != NULL && matrix_b != NULL && matrix_c != NULL);
+  double phase[DBM_NUM_PHASES] = {0}, tick = omp_get_wtime();
+  int64_t phase_bytes[DBM_NUM_PHASES] = {0};
 
   // Throughout the matrix multiplication code the "sum_index" and "free_index"
   // denote the summation (aka dummy) and free index from the Einstein notation.
@@ -385,9 +449,9 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
   const int num_free_index_b = (transb) ? matrix_b->nrows : matrix_b->ncols;
 
   // Sanity check matrix dimensions.
-  assert(num_sum_index_a == num_sum_index_b);
-  assert(num_free_index_a == matrix_c->nrows);
-  assert(num_free_index_b == matrix_c->ncols);
+  cp_assert(num_sum_index_a == num_sum_index_b);
+  cp_assert(num_free_index_a == matrix_c->nrows);
+  cp_assert(num_free_index_b == matrix_c->ncols);
 
   // Prepare matrix_c (host).
   dbm_scale(matrix_c, beta);
@@ -399,11 +463,13 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
   const int verify =
       (NULL == verify_env ? (NULL == maxeps_env ? 0 : 1) : atoi(verify_env));
   dbm_matrix_t *matrix_d = NULL;
+  phase[DBM_PHASE_SETUP] += phase_lap(&tick);
   if (0 != verify) {
     dbm_distribution_t *const dist_shared = matrix_c->dist;
     dbm_create(&matrix_d, dist_shared, matrix_c->name, matrix_c->nrows,
                matrix_c->ncols, matrix_c->row_sizes, matrix_c->col_sizes);
     dbm_copy(matrix_d, matrix_c);
+    tick = omp_get_wtime(); // validation is not a phase
   }
 
   // Compute filter thresholds for each row.
@@ -411,10 +477,17 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
 
   // Start uploading matrix_c to the GPU.
   backend_context_t *ctx = backend_start(matrix_c);
+  phase[DBM_PHASE_SETUP] += phase_lap(&tick);
 
   // Redistribute matrix_a and matrix_b across MPI ranks.
   dbm_comm_iterator_t *iter =
       dbm_comm_iterator_start(transa, transb, matrix_a, matrix_b, matrix_c);
+  const double redistribute = phase_lap(&tick);
+  phase[DBM_PHASE_ALLTOALL] += iter->seconds_alltoall;
+  phase[DBM_PHASE_SORT] += iter->seconds_sort;
+  phase_bytes[DBM_PHASE_ALLTOALL] += iter->bytes_alltoall;
+  phase[DBM_PHASE_PACK] +=
+      redistribute - iter->seconds_alltoall - iter->seconds_sort;
 
   // Count flops if requested.
   if (NULL != flop) {
@@ -424,16 +497,22 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
   // Main loop.
   dbm_pack_t *pack_a, *pack_b;
   while (dbm_comm_iterator_next(iter, &pack_a, &pack_b)) {
+    phase[DBM_PHASE_SHIFT] += phase_lap(&tick);
     const bool uploaded = backend_upload_packs(pack_a, pack_b, ctx);
     (void)uploaded; // mark used
+    phase[DBM_PHASE_UPLOAD] += phase_lap(&tick);
     multiply_packs(transa, transb, alpha, pack_a, pack_b, matrix_a, matrix_b,
                    matrix_c, rows_max_eps, retain_sparsity, false /*!uploaded*/,
                    flop, ctx);
+    phase[DBM_PHASE_MULTIPLY] += phase_lap(&tick);
   }
 
   // Wait for all other MPI ranks to complete, then release ressources.
+  phase_bytes[DBM_PHASE_SHIFT] += iter->bytes_shift;
   dbm_comm_iterator_stop(iter);
+  phase[DBM_PHASE_SHIFT] += phase_lap(&tick);
   backend_stop(ctx);
+  phase[DBM_PHASE_FINISH] += phase_lap(&tick);
 
   if (NULL != matrix_d) {
     ctx = backend_start(matrix_d);
@@ -455,6 +534,7 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
       }
     }
     dbm_release(matrix_d);
+    tick = omp_get_wtime(); // validation is not a phase
   }
 
   // Release filter thresholds.
@@ -462,6 +542,8 @@ void dbm_multiply(const bool transa, const bool transb, const double alpha,
 
   // Final filter pass.
   dbm_filter(matrix_c, filter_eps);
+  phase[DBM_PHASE_SETUP] += phase_lap(&tick);
+  dbm_library_phases_add(phase, phase_bytes);
 }
 
 // EOF

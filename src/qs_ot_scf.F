@@ -16,7 +16,8 @@ MODULE qs_ot_scf
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_copy, dbcsr_get_info, dbcsr_init_p, dbcsr_multiply, dbcsr_p_type, dbcsr_release, &
         dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
-   USE cp_dbcsr_contrib,                ONLY: dbcsr_dot,&
+   USE cp_dbcsr_contrib,                ONLY: dbcsr_add_on_diag,&
+                                              dbcsr_dot,&
                                               dbcsr_get_diag,&
                                               dbcsr_scale_by_vector,&
                                               dbcsr_set_diag
@@ -38,11 +39,13 @@ MODULE qs_ot_scf
    USE qs_ot,                           ONLY: qs_ot_get_orbitals,&
                                               qs_ot_get_orbitals_ref,&
                                               qs_ot_get_p
-   USE qs_ot_minimizer,                 ONLY: ot_mini
+   USE qs_ot_minimizer,                 ONLY: ot_mini,&
+                                              ot_mini_prepare
    USE qs_ot_types,                     ONLY: ot_readwrite_input,&
                                               qs_ot_allocate,&
                                               qs_ot_destroy,&
                                               qs_ot_init,&
+                                              qs_ot_set_context,&
                                               qs_ot_settings_init,&
                                               qs_ot_type
    USE scf_control_types,               ONLY: smear_type
@@ -66,10 +69,12 @@ CONTAINS
 !> \brief ...
 !> \param qs_ot_env ...
 !> \param scf_section ...
+!> \param do_kpoints ...
 ! **************************************************************************************************
-   SUBROUTINE ot_scf_read_input(qs_ot_env, scf_section)
+   SUBROUTINE ot_scf_read_input(qs_ot_env, scf_section, do_kpoints)
       TYPE(qs_ot_type), DIMENSION(:), POINTER            :: qs_ot_env
       TYPE(section_vals_type), POINTER                   :: scf_section
+      LOGICAL, INTENT(IN)                                :: do_kpoints
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_scf_read_input'
 
@@ -91,7 +96,8 @@ CONTAINS
       ot_section => section_vals_get_subs_vals(scf_section, "OT")
       CALL section_vals_get(ot_section, explicit=explicit)
 
-      CALL ot_readwrite_input(qs_ot_env(1)%settings, ot_section, output_unit)
+      CALL ot_readwrite_input(qs_ot_env(1)%settings, ot_section, output_unit, &
+                              complex_kpoints=do_kpoints)
 
       CALL cp_print_key_finished_output(output_unit, logger, scf_section, &
                                         "PRINT%PROGRAM_RUN_INFO")
@@ -135,17 +141,21 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'ot_scf_mini'
 
       INTEGER                                            :: handle, ispin, k, n, nspin
+      LOGICAL                                            :: need_gradient, restart_history
       REAL(KIND=dp)                                      :: ener_nondiag, trace
       TYPE(cp_1d_r_p_type), ALLOCATABLE, DIMENSION(:)    :: expectation_values, occupation_numbers, &
                                                             scaling_factor
       TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_dedc_scaled
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_dedc_physical, matrix_dedc_scaled
       TYPE(dbcsr_type), POINTER                          :: mo_coeff
 
       CALL timeset(routineN, handle)
 
       NULLIFY (logger)
       logger => cp_get_default_logger()
+
+      CALL ot_mini_prepare(qs_ot_env, restart_history)
+      need_gradient = .NOT. qs_ot_env(1)%energy_only .OR. restart_history
 
       nspin = SIZE(mo_array)
 
@@ -253,26 +263,40 @@ CONTAINS
          END DO
       END IF
 
-      ! this is kind of a hack so far (costly memory wise), we locally recreate the scaled matrix_hc, and
-      ! use it in the following, eventually, as occupations numbers get more integrated, it should become possible
-      ! to remove this.
-      ALLOCATE (matrix_dedc_scaled(SIZE(matrix_dedc)))
-      DO ispin = 1, SIZE(matrix_dedc)
-         ALLOCATE (matrix_dedc_scaled(ispin)%matrix)
-         CALL dbcsr_copy(matrix_dedc_scaled(ispin)%matrix, matrix_dedc(ispin)%matrix)
-
-         ! as a preconditioner, one might want to scale only with a constant, not with f(i)
-         ! for the convergence criterion, maybe take it back out
+      ! The minimizer does not read derivative matrices on an energy-only trial.
+      matrix_dedc_scaled => matrix_dedc
+      NULLIFY (matrix_dedc_physical)
+      IF (need_gradient) THEN
+         ALLOCATE (matrix_dedc_scaled(SIZE(matrix_dedc)))
          IF (qs_ot_env(1)%settings%occupation_preconditioner) THEN
-            scaling_factor(ispin)%array = 2.0_dp
+            ALLOCATE (matrix_dedc_physical(SIZE(matrix_dedc)))
          END IF
-         CALL dbcsr_scale_by_vector(matrix_dedc_scaled(ispin)%matrix, alpha=scaling_factor(ispin)%array, side='right')
-      END DO
+         DO ispin = 1, SIZE(matrix_dedc)
+            ALLOCATE (matrix_dedc_scaled(ispin)%matrix)
+            CALL dbcsr_copy(matrix_dedc_scaled(ispin)%matrix, matrix_dedc(ispin)%matrix)
+
+            IF (qs_ot_env(1)%settings%occupation_preconditioner) THEN
+               ALLOCATE (matrix_dedc_physical(ispin)%matrix)
+               CALL dbcsr_copy(matrix_dedc_physical(ispin)%matrix, matrix_dedc(ispin)%matrix)
+               CALL dbcsr_scale_by_vector(matrix_dedc_physical(ispin)%matrix, &
+                                          alpha=2.0_dp*occupation_numbers(ispin)%array, side='right')
+               scaling_factor(ispin)%array = 2.0_dp
+            END IF
+            CALL dbcsr_scale_by_vector(matrix_dedc_scaled(ispin)%matrix, alpha=scaling_factor(ispin)%array, side='right')
+         END DO
+      END IF
 
       ! notice we use qs_ot_env(1) for driving all output and the minimization in case of LSD
       qs_ot_env(1)%etotal = energy + ener_nondiag
 
-      CALL ot_mini(qs_ot_env, matrix_dedc_scaled)
+      IF (ASSOCIATED(matrix_dedc_physical) .AND. &
+          (qs_ot_env(1)%settings%ot_method == "CG" .OR. &
+           qs_ot_env(1)%settings%ot_method == "SD")) THEN
+         CALL ot_mini(qs_ot_env, matrix_dedc_scaled, matrix_hc_physical=matrix_dedc_physical, &
+                      restart_history=restart_history)
+      ELSE
+         CALL ot_mini(qs_ot_env, matrix_dedc_scaled, restart_history=restart_history)
+      END IF
 
       delta = qs_ot_env(1)%delta
       energy_only = qs_ot_env(1)%energy_only
@@ -326,11 +350,20 @@ CONTAINS
          DEALLOCATE (expectation_values)
       END IF
       DEALLOCATE (occupation_numbers)
-      DO ispin = 1, SIZE(matrix_dedc_scaled)
-         CALL dbcsr_release(matrix_dedc_scaled(ispin)%matrix)
-         DEALLOCATE (matrix_dedc_scaled(ispin)%matrix)
-      END DO
-      DEALLOCATE (matrix_dedc_scaled)
+      IF (need_gradient) THEN
+         DO ispin = 1, SIZE(matrix_dedc_scaled)
+            CALL dbcsr_release(matrix_dedc_scaled(ispin)%matrix)
+            DEALLOCATE (matrix_dedc_scaled(ispin)%matrix)
+         END DO
+         DEALLOCATE (matrix_dedc_scaled)
+      END IF
+      IF (ASSOCIATED(matrix_dedc_physical)) THEN
+         DO ispin = 1, SIZE(matrix_dedc_physical)
+            CALL dbcsr_release(matrix_dedc_physical(ispin)%matrix)
+            DEALLOCATE (matrix_dedc_physical(ispin)%matrix)
+         END DO
+         DEALLOCATE (matrix_dedc_physical)
+      END IF
 
       CALL timestop(handle)
 
@@ -386,6 +419,8 @@ CONTAINS
 
       DO ispin = 1, nspin
 
+         CALL qs_ot_set_context(qs_ot_env(ispin), spin_index=ispin)
+
          NULLIFY (mo_coeff)
          CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff_b=mo_coeff, mo_coeff=mo_coeff_fm)
          CALL copy_fm_to_dbcsr(mo_coeff_fm, mo_coeff) !fm -> dbcsr
@@ -413,6 +448,8 @@ CONTAINS
 
          IF (qs_ot_env(ispin)%settings%do_rotation) THEN
             CALL dbcsr_set(qs_ot_env(ispin)%rot_mat_x, 0.0_dp)
+            CALL dbcsr_set(qs_ot_env(ispin)%rot_mat_u, 0.0_dp)
+            CALL dbcsr_add_on_diag(qs_ot_env(ispin)%rot_mat_u, 1.0_dp)
          END IF
 
          IF (qs_ot_env(ispin)%settings%do_ener) THEN
@@ -449,4 +486,3 @@ CONTAINS
    END SUBROUTINE ot_scf_destroy
 
 END MODULE qs_ot_scf
-

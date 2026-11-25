@@ -33,6 +33,8 @@ MODULE optimize_basis_utils
    USE optimize_basis_types,            ONLY: basis_optimization_type,&
                                               derived_basis_info,&
                                               flex_basis_type,&
+                                              method_mo_fit_occ,&
+                                              method_mo_fit_occ_virtual,&
                                               subset_type
    USE powell,                          ONLY: opt_state_type
    USE string_utilities,                ONLY: uppercase
@@ -44,7 +46,7 @@ MODULE optimize_basis_utils
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'optimize_basis_utils'
 
    PUBLIC :: optimize_basis_init_read_input, get_set_and_basis_id, &
-             update_derived_basis_sets
+             update_derived_basis_sets, write_basis
 
 CONTAINS
 
@@ -53,52 +55,122 @@ CONTAINS
 !> \param opt_bas ...
 !> \param root_section ...
 !> \param para_env ...
+!> \param quiet_output ...
+!> \param embedded_training ...
 !> \author Florian Schiffmann
 ! **************************************************************************************************
 
-   SUBROUTINE optimize_basis_init_read_input(opt_bas, root_section, para_env)
+   SUBROUTINE optimize_basis_init_read_input(opt_bas, root_section, para_env, quiet_output, embedded_training)
       TYPE(basis_optimization_type)                      :: opt_bas
       TYPE(section_vals_type), POINTER                   :: root_section
       TYPE(mp_para_env_type), POINTER                    :: para_env
+      LOGICAL, INTENT(IN), OPTIONAL                      :: quiet_output, embedded_training
 
       CHARACTER(LEN=default_path_length)                 :: main_dir
-      INTEGER                                            :: iset, iweight, nrep
-      TYPE(section_vals_type), POINTER                   :: kind_section, optbas_section, &
-                                                            powell_section, train_section
+      INTEGER                                            :: ikind, iset, iweight, nrep
+      LOGICAL                                            :: frontier_orbitals_explicit, &
+                                                            use_embedded_training
+      TYPE(section_vals_type), POINTER                   :: frontier_orbitals_section, kind_section, &
+                                                            optbas_section, powell_section, &
+                                                            train_section
 
       optbas_section => section_vals_get_subs_vals(root_section, "OPTIMIZE_BASIS")
       powell_section => section_vals_get_subs_vals(optbas_section, "OPTIMIZATION")
       train_section => section_vals_get_subs_vals(optbas_section, "TRAINING_FILES")
       kind_section => section_vals_get_subs_vals(optbas_section, "FIT_KIND")
+      frontier_orbitals_section => section_vals_get_subs_vals(optbas_section, "FRONTIER_ORBITALS")
+
+      IF (PRESENT(quiet_output)) opt_bas%quiet_output = quiet_output
+      use_embedded_training = .FALSE.
+      IF (PRESENT(embedded_training)) use_embedded_training = embedded_training
 
       CALL section_vals_val_get(optbas_section, "BASIS_TEMPLATE_FILE", c_val=opt_bas%template_basis_file)
-      CALL section_vals_val_get(optbas_section, "BASIS_WORK_FILE", c_val=opt_bas%work_basis_file)
       CALL section_vals_val_get(optbas_section, "BASIS_OUTPUT_FILE", c_val=opt_bas%output_basis_file)
       CALL m_getcwd(main_dir)
-      opt_bas%work_basis_file = TRIM(ADJUSTL(main_dir))//"/"//TRIM(ADJUSTL(opt_bas%work_basis_file))
 
       CALL section_vals_val_get(optbas_section, "WRITE_FREQUENCY", i_val=opt_bas%write_frequency)
       CALL section_vals_val_get(optbas_section, "USE_CONDITION_NUMBER", l_val=opt_bas%use_condition_number)
 
       CALL generate_initial_basis(kind_section, opt_bas, para_env)
 
+      CALL section_vals_get(frontier_orbitals_section, explicit=frontier_orbitals_explicit)
+      IF (use_embedded_training) THEN
+         opt_bas%method = method_mo_fit_occ_virtual
+      ELSE IF (frontier_orbitals_explicit) THEN
+         opt_bas%method = method_mo_fit_occ_virtual
+         CALL section_vals_val_get(frontier_orbitals_section, "OCCUPIED_WEIGHT", &
+                                   r_val=opt_bas%occupied_weight)
+         CALL section_vals_val_get(frontier_orbitals_section, "VIRTUAL_WEIGHT", &
+                                   r_val=opt_bas%virtual_weight)
+         CALL section_vals_val_get(frontier_orbitals_section, "EMPTY_OVERLAP_WEIGHT", &
+                                   r_val=opt_bas%empty_overlap_weight)
+         CALL section_vals_val_get(frontier_orbitals_section, "GAP_WEIGHT", &
+                                   r_val=opt_bas%gap_weight)
+         CALL section_vals_val_get(frontier_orbitals_section, "COEFFICIENT_WEIGHT", &
+                                   r_val=opt_bas%coefficient_weight)
+         CALL section_vals_val_get(frontier_orbitals_section, "GAP_ENERGY_SCALE", &
+                                   r_val=opt_bas%gap_energy_scale)
+         CALL section_vals_val_get(frontier_orbitals_section, "VIRTUAL_ENERGY_CUTOFF", &
+                                   r_val=opt_bas%virtual_energy_cutoff)
+         CALL section_vals_val_get(frontier_orbitals_section, "VIRTUAL_ENERGY_SMOOTHING", &
+                                   r_val=opt_bas%virtual_energy_smoothing)
+      END IF
+      IF (opt_bas%method == method_mo_fit_occ) THEN
+         CALL section_vals_val_get(optbas_section, "BASIS_WORK_FILE", c_val=opt_bas%work_basis_file)
+         opt_bas%work_basis_file = TRIM(ADJUSTL(main_dir))//"/"//TRIM(ADJUSTL(opt_bas%work_basis_file))
+      END IF
+      IF (frontier_orbitals_explicit) THEN
+         IF (opt_bas%gap_energy_scale <= 0.0_dp) CPABORT("GAP_ENERGY_SCALE must be positive")
+         IF (opt_bas%virtual_energy_smoothing <= 0.0_dp) THEN
+            CPABORT("VIRTUAL_ENERGY_SMOOTHING must be positive")
+         END IF
+         IF (MIN(opt_bas%occupied_weight, opt_bas%virtual_weight, &
+                 opt_bas%empty_overlap_weight, opt_bas%gap_weight, &
+                 opt_bas%coefficient_weight) < 0.0_dp) THEN
+            CPABORT("FRONTIER_ORBITALS weights must be non-negative")
+         END IF
+      END IF
+      IF (opt_bas%method == method_mo_fit_occ_virtual) THEN
+         DO ikind = 1, opt_bas%nkind
+            DO iset = 1, opt_bas%kind_basis(ikind)%flex_basis(0)%nsets
+               IF (ANY(opt_bas%kind_basis(ikind)%flex_basis(0)%subset(iset)%opt_exps)) THEN
+                  CPABORT("FRONTIER_ORBITALS requires fixed Gaussian exponents")
+               END IF
+            END DO
+         END DO
+      END IF
+
       CALL section_vals_get(train_section, n_repetition=opt_bas%ntraining_sets)
-      IF (opt_bas%ntraining_sets == 0) &
+      IF (use_embedded_training) THEN
+         IF (opt_bas%ntraining_sets /= 0) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "TRAINING_FILES is not allowed together with FRONTIER_ORBITAL_SCREENING "// &
+                          "because it is overwritten automatically")
+         END IF
+         opt_bas%ntraining_sets = 1
+      ELSE IF (opt_bas%ntraining_sets == 0) THEN
          CPABORT("No training set was specified in the Input")
+      END IF
 
       ALLOCATE (opt_bas%training_input(opt_bas%ntraining_sets))
       ALLOCATE (opt_bas%training_dir(opt_bas%ntraining_sets))
-      DO iset = 1, opt_bas%ntraining_sets
-         CALL section_vals_val_get(train_section, "DIRECTORY", c_val=opt_bas%training_dir(iset), &
-                                   i_rep_section=iset)
-         CALL section_vals_val_get(train_section, "INPUT_FILE_NAME", c_val=opt_bas%training_input(iset), &
-                                   i_rep_section=iset)
-      END DO
+      IF (use_embedded_training) THEN
+         opt_bas%training_input(1) = ""
+         opt_bas%training_dir(1) = "."
+      ELSE
+         DO iset = 1, opt_bas%ntraining_sets
+            CALL section_vals_val_get(train_section, "DIRECTORY", c_val=opt_bas%training_dir(iset), &
+                                      i_rep_section=iset)
+            CALL section_vals_val_get(train_section, "INPUT_FILE_NAME", c_val=opt_bas%training_input(iset), &
+                                      i_rep_section=iset)
+         END DO
+      END IF
 
       CALL init_powell_var(opt_bas%powell_param, powell_section)
       opt_bas%powell_param%nvar = SIZE(opt_bas%x_opt)
 
-      CALL generate_derived_basis_sets(opt_bas, para_env)
+      CALL generate_derived_basis_sets( &
+         opt_bas, para_env, write_work_file=opt_bas%method == method_mo_fit_occ)
 
       CALL generate_basis_combinations(opt_bas, optbas_section)
 
@@ -120,7 +192,7 @@ CONTAINS
 
       CALL generate_computation_groups(opt_bas, optbas_section, para_env)
 
-      CALL print_opt_info(opt_bas)
+      IF (.NOT. opt_bas%quiet_output) CALL print_opt_info(opt_bas)
 
    END SUBROUTINE optimize_basis_init_read_input
 
@@ -136,8 +208,9 @@ CONTAINS
 
       logger => cp_get_default_logger()
       unit_nr = -1
-      IF (logger%para_env%is_source()) &
+      IF (logger%para_env%is_source()) THEN
          unit_nr = cp_logger_get_default_unit_nr(logger)
+      END IF
 
       IF (unit_nr > 0) THEN
          WRITE (unit_nr, '(1X,A,A)') "BASOPT| Total number of calculations ", &
@@ -294,14 +367,16 @@ CONTAINS
          CALL section_vals_val_get(optbas_section, "GROUP_PARTITION", i_vals=i_vals)
          isize = SIZE(i_vals)
          nptot = SUM(i_vals)
-         IF (nptot /= nproc) &
+         IF (nptot /= nproc) THEN
             CALL cp_abort(__LOCATION__, &
                           "Number of processors in group distribution does not match number of MPI tasks."// &
                           " Please change input.")
-         IF (.NOT. isize <= ncalc) &
+         END IF
+         IF (.NOT. isize <= ncalc) THEN
             CALL cp_abort(__LOCATION__, &
                           "Number of Groups larger than number of calculations"// &
                           " Please change input.")
+         END IF
          CPASSERT(nptot == nproc)
          ALLOCATE (opt_bas%comp_group(isize))
          ALLOCATE (opt_bas%group_partition(0:isize - 1))
@@ -408,12 +483,14 @@ CONTAINS
 !> \brief Initial generation of the basis set from the file and DERIVED_SET
 !> \param opt_bas ...
 !> \param para_env ...
+!> \param write_work_file ...
 !> \author Florian Schiffmann
 ! **************************************************************************************************
 
-   SUBROUTINE generate_derived_basis_sets(opt_bas, para_env)
+   SUBROUTINE generate_derived_basis_sets(opt_bas, para_env, write_work_file)
       TYPE(basis_optimization_type)                      :: opt_bas
       TYPE(mp_para_env_type), POINTER                    :: para_env
+      LOGICAL, INTENT(IN)                                :: write_work_file
 
       INTEGER                                            :: ibasis, ikind, iref, jbasis, unit_nr
 
@@ -432,7 +509,7 @@ CONTAINS
          END DO
       END DO
 
-      IF (para_env%is_source()) THEN
+      IF (write_work_file .AND. para_env%is_source()) THEN
          CALL open_file(file_name=opt_bas%work_basis_file, file_status="UNKNOWN", &
                         file_action="WRITE", unit_number=unit_nr)
       ELSE
@@ -447,11 +524,13 @@ CONTAINS
                opt_bas%kind_basis(ikind)%flex_basis(ibasis)%basis_name = &
                   TRIM(ADJUSTL(opt_bas%kind_basis(ikind)%basis_name))//"-DERIVED_SET-"//ADJUSTL(cp_to_string(ibasis))
             END IF
-            CALL write_basis(opt_bas%kind_basis(ikind)%flex_basis(ibasis), opt_bas%kind_basis(ikind)%element, &
-                             unit_nr)
+            IF (write_work_file) THEN
+               CALL write_basis(opt_bas%kind_basis(ikind)%flex_basis(ibasis), &
+                                opt_bas%kind_basis(ikind)%element, unit_nr)
+            END IF
          END DO
       END DO
-      IF (para_env%is_source()) CALL close_file(unit_number=unit_nr)
+      IF (write_work_file .AND. para_env%is_source()) CALL close_file(unit_number=unit_nr)
 
    END SUBROUTINE generate_derived_basis_sets
 
@@ -741,12 +820,14 @@ CONTAINS
          CALL section_vals_val_get(const_section, "USE_EXP", i_vals=def_exp, i_rep_section=irep)
          CALL section_vals_val_get(const_section, "BOUNDARIES", explicit=is_bound, i_rep_section=irep)
          CALL section_vals_val_get(const_section, "MAX_VAR_FRACTION", explicit=is_varlim, i_rep_section=irep)
-         IF (is_bound .AND. is_varlim) &
+         IF (is_bound .AND. is_varlim) THEN
             CALL cp_abort(__LOCATION__, "Exponent has two constraints. "// &
                           "This is not possible at the moment. Please change input.")
-         IF (.NOT. is_bound .AND. .NOT. is_varlim) &
+         END IF
+         IF (.NOT. is_bound .AND. .NOT. is_varlim) THEN
             CALL cp_abort(__LOCATION__, "Exponent is declared to be constraint but none is given"// &
                           " Please change input.")
+         END IF
          IF (def_exp(1) == -1) THEN
             DO iset = 1, flex_basis%nsets
                IF (def_exp(2) == -1) THEN
@@ -754,27 +835,30 @@ CONTAINS
                      CALL set_constraint(flex_basis, iset, ipgf, const_section, is_bound, is_varlim, irep)
                   END DO
                ELSE
-                  IF (def_exp(2) <= flex_basis%subset(iset)%nexp) &
+                  IF (def_exp(2) <= flex_basis%subset(iset)%nexp) THEN
                      CALL cp_abort(__LOCATION__, &
                                    "Exponent declared in constraint is larger than number of exponents in the set"// &
                                    " Please change input.")
+                  END IF
                   CALL set_constraint(flex_basis, iset, def_exp(2), const_section, is_bound, is_varlim, irep)
                END IF
             END DO
          ELSE
-            IF (.NOT. def_exp(1) <= flex_basis%nsets) &
+            IF (.NOT. def_exp(1) <= flex_basis%nsets) THEN
                CALL cp_abort(__LOCATION__, &
                              "Set number of constraint is larger than number of sets in the template basis set."// &
                              " Please change input.")
+            END IF
             IF (def_exp(2) == -1) THEN
                DO ipgf = 1, flex_basis%subset(iset)%nexp
                   CALL set_constraint(flex_basis, def_exp(1), ipgf, const_section, is_bound, is_varlim, irep)
                END DO
             ELSE
-               IF (.NOT. def_exp(2) <= flex_basis%subset(def_exp(1))%nexp) &
+               IF (.NOT. def_exp(2) <= flex_basis%subset(def_exp(1))%nexp) THEN
                   CALL cp_abort(__LOCATION__, &
                                 "Exponent declared in constraint is larger than number of exponents in the set"// &
                                 " Please change input.")
+               END IF
                CALL set_constraint(flex_basis, def_exp(1), def_exp(2), const_section, is_bound, is_varlim, irep)
             END IF
          END IF
@@ -805,10 +889,11 @@ CONTAINS
       REAL(KIND=dp)                                      :: r_val
       REAL(KIND=dp), DIMENSION(:), POINTER               :: r_vals
 
-      IF (flex_basis%subset(iset)%exp_has_const(ipgf)) &
+      IF (flex_basis%subset(iset)%exp_has_const(ipgf)) THEN
          CALL cp_abort(__LOCATION__, &
                        "Multiple constraints due to collision in CONSTRAIN_EXPONENTS."// &
                        " Please change input.")
+      END IF
       flex_basis%subset(iset)%exp_has_const(ipgf) = .TRUE.
       IF (is_bound) THEN
          flex_basis%subset(iset)%exp_const(ipgf)%const_type = 0
@@ -816,12 +901,13 @@ CONTAINS
          flex_basis%subset(iset)%exp_const(ipgf)%llim = MINVAL(r_vals)
          flex_basis%subset(iset)%exp_const(ipgf)%ulim = MAXVAL(r_vals)
          r_val = flex_basis%subset(iset)%exps(ipgf)
-         IF (flex_basis%subset(iset)%exps(ipgf) > MAXVAL(r_vals) .OR. flex_basis%subset(iset)%exps(ipgf) < MINVAL(r_vals)) &
+         IF (flex_basis%subset(iset)%exps(ipgf) > MAXVAL(r_vals) .OR. flex_basis%subset(iset)%exps(ipgf) < MINVAL(r_vals)) THEN
             CALL cp_abort(__LOCATION__, &
                           "Exponent "//cp_to_string(r_val)// &
                           " declared in constraint is out of bounds of constraint"//cp_to_string(MINVAL(r_vals))// &
                           " to"//cp_to_string(MAXVAL(r_vals))// &
                           " Please change input.")
+         END IF
          flex_basis%subset(iset)%exp_const(ipgf)%init = SUM(r_vals)/2.0_dp
          flex_basis%subset(iset)%exp_const(ipgf)%var_fac = MAXVAL(r_vals)/flex_basis%subset(iset)%exp_const(ipgf)%init - 1.0_dp
       END IF
@@ -888,8 +974,9 @@ CONTAINS
       TYPE(mp_para_env_type), POINTER                    :: para_env
       INTEGER                                            :: ikind
 
-      INTEGER                                            :: icont, idof, ipgf, irep, iset, nrep
+      INTEGER                                            :: icont, idof, il, ipgf, irep, iset, nrep
       INTEGER, DIMENSION(:), POINTER                     :: switch
+      LOGICAL :: optimize_augmentation_functions
 
       CALL parse_basis(flex_basis, template_basis_file, element, basis_name, para_env)
 
@@ -912,6 +999,20 @@ CONTAINS
             CPABORT("No initialization available?????")
          END SELECT
       END DO
+
+      CALL section_vals_val_get(kind1_section, "OPTIMIZE_AUGMENTATION_FUNCTIONS", &
+                                l_val=optimize_augmentation_functions, i_rep_section=ikind)
+      IF (optimize_augmentation_functions) THEN
+         DO iset = 1, flex_basis%nsets
+            flex_basis%subset(iset)%opt_coeff = .FALSE.
+            flex_basis%subset(iset)%opt_exps = .FALSE.
+            icont = 0
+            DO il = 1, flex_basis%subset(iset)%nl
+               icont = icont + flex_basis%subset(iset)%l(il)
+               flex_basis%subset(iset)%opt_coeff(:, icont) = .TRUE.
+            END DO
+         END DO
+      END IF
 
       CALL section_vals_val_get(kind1_section, "SWITCH_CONTRACTION_STATE", n_rep_val=nrep, i_rep_section=ikind)
       DO irep = 1, nrep
@@ -1139,8 +1240,7 @@ CONTAINS
 
       ! just to get an understandable basis normalize coefficients
       DO icon1 = 1, subset%ncon_tot
-         subset%coeff(:, icon1) = subset%coeff(:, icon1)/ &
-                                  SQRT(DOT_PRODUCT(subset%coeff(:, icon1), subset%coeff(:, icon1)))
+         subset%coeff(:, icon1) = subset%coeff(:, icon1)/NORM2(subset%coeff(:, icon1))
       END DO
       DEALLOCATE (r_val)
 

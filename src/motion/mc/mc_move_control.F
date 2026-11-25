@@ -387,8 +387,9 @@ CONTAINS
 
       SELECT CASE (flag)
       CASE DEFAULT
-         WRITE (*, *) 'flag =', flag
-         CPABORT("Wrong option passed")
+         CALL cp_abort(__LOCATION__, &
+                       "<trans>, <volume> are supported as the <flag> for mc_move_update, "// &
+                       "found unknown option <"//TRIM(flag)//">")
       CASE ("trans")
 
 ! we need to update all the displacements for every molecule type
@@ -401,8 +402,8 @@ CONTAINS
 ! first account for the extreme cases
             IF (move_updates%bias_bond%successes == 0) THEN
                rmbond(molecule_type) = rmbond(molecule_type)/2.0E0_dp
-            ELSEIF (move_updates%bias_bond%successes == &
-                    move_updates%bias_bond%attempts) THEN
+            ELSE IF (move_updates%bias_bond%successes == &
+                     move_updates%bias_bond%attempts) THEN
                rmbond(molecule_type) = rmbond(molecule_type)*2.0E0_dp
             ELSE
 ! now for the middle case
@@ -429,8 +430,8 @@ CONTAINS
 ! first account for the extreme cases
             IF (move_updates%bias_angle%successes == 0) THEN
                rmangle(molecule_type) = rmangle(molecule_type)/2.0E0_dp
-            ELSEIF (move_updates%bias_angle%successes == &
-                    move_updates%bias_angle%attempts) THEN
+            ELSE IF (move_updates%bias_angle%successes == &
+                     move_updates%bias_angle%attempts) THEN
                rmangle(molecule_type) = rmangle(molecule_type)*2.0E0_dp
             ELSE
 ! now for the middle case
@@ -459,8 +460,8 @@ CONTAINS
 ! first account for the extreme cases
             IF (move_updates%bias_dihedral%successes == 0) THEN
                rmdihedral(molecule_type) = rmdihedral(molecule_type)/2.0E0_dp
-            ELSEIF (move_updates%bias_dihedral%successes == &
-                    move_updates%bias_dihedral%attempts) THEN
+            ELSE IF (move_updates%bias_dihedral%successes == &
+                     move_updates%bias_dihedral%attempts) THEN
                rmdihedral(molecule_type) = rmdihedral(molecule_type)*2.0E0_dp
             ELSE
 ! now for the middle case
@@ -489,8 +490,8 @@ CONTAINS
 ! first account for the extreme cases
             IF (move_updates%bias_trans%successes == 0) THEN
                rmtrans(molecule_type) = rmtrans(molecule_type)/2.0E0_dp
-            ELSEIF (move_updates%bias_trans%successes == &
-                    move_updates%bias_trans%attempts) THEN
+            ELSE IF (move_updates%bias_trans%successes == &
+                     move_updates%bias_trans%attempts) THEN
                rmtrans(molecule_type) = rmtrans(molecule_type)*2.0E0_dp
             ELSE
 ! now for the middle case
@@ -502,8 +503,9 @@ CONTAINS
             END IF
 
             ! make an upper bound...10 a.u.
-            IF (rmtrans(molecule_type) > 10.0E0_dp) &
+            IF (rmtrans(molecule_type) > 10.0E0_dp) THEN
                rmtrans(molecule_type) = 10.0E0_dp
+            END IF
 
             ! clear the counters
             move_updates%bias_trans%attempts = 0
@@ -520,8 +522,8 @@ CONTAINS
 ! first account for the extreme cases
             IF (move_updates%bias_cltrans%successes == 0) THEN
                rmcltrans = rmcltrans/2.0E0_dp
-            ELSEIF (move_updates%bias_cltrans%successes == &
-                    move_updates%bias_cltrans%attempts) THEN
+            ELSE IF (move_updates%bias_cltrans%successes == &
+                     move_updates%bias_cltrans%attempts) THEN
                rmcltrans = rmcltrans*2.0E0_dp
             ELSE
 ! now for the middle case
@@ -533,8 +535,9 @@ CONTAINS
             END IF
 
             ! make an upper bound...10 a.u.
-            IF (rmcltrans > 10.0E0_dp) &
+            IF (rmcltrans > 10.0E0_dp) THEN
                rmcltrans = 10.0E0_dp
+            END IF
 
             ! clear the counters
             move_updates%bias_cltrans%attempts = 0
@@ -554,8 +557,8 @@ CONTAINS
 
                IF (rmrot(molecule_type) > pi) rmrot(molecule_type) = pi
 
-            ELSEIF (move_updates%bias_rot%successes == &
-                    move_updates%bias_rot%attempts) THEN
+            ELSE IF (move_updates%bias_rot%successes == &
+                     move_updates%bias_rot%attempts) THEN
                rmrot(molecule_type) = rmrot(molecule_type)*2.0E0_dp
 
 ! more than pi rotation is meaningless
@@ -592,8 +595,8 @@ CONTAINS
             IF (move_updates%volume%successes == 0) THEN
                rmvolume = rmvolume/2.0E0_dp
 
-            ELSEIF (move_updates%volume%successes == &
-                    move_updates%volume%attempts) THEN
+            ELSE IF (move_updates%volume%successes == &
+                     move_updates%volume%attempts) THEN
                rmvolume = rmvolume*2.0E0_dp
             ELSE
 ! now for the middle case

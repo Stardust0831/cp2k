@@ -50,8 +50,8 @@ MODULE qs_initial_guess
                                               sgp_potential_type
    USE hfx_types,                       ONLY: hfx_type
    USE input_constants,                 ONLY: &
-        atomic_guess, core_guess, eht_guess, history_guess, mopac_guess, no_guess, random_guess, &
-        restart_guess, sparse_guess
+        atomic_guess, core_guess, eht_guess, external_density_guess, history_guess, mopac_guess, &
+        no_guess, random_guess, restart_guess, sparse_guess
    USE input_cp2k_hfx,                  ONLY: ri_mo
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
@@ -240,6 +240,10 @@ CONTAINS
       nspin = dft_control%nspins
       ofgpw = dft_control%qs_control%ofgpw
       density_guess = scf_control%density_guess
+      ! The cube density initializes the first KS potential. Keep an atomic AO
+      ! density matrix and MO set as auxiliary state until the first regular
+      ! solver step creates a density matrix consistent with that potential.
+      IF (density_guess == external_density_guess) density_guess = atomic_guess
       do_std_diag = .FALSE.
 
       do_hfx_ri_mo = .FALSE.
@@ -249,12 +253,12 @@ CONTAINS
          END IF
       END IF
 
-      IF (ASSOCIATED(scf_env%krylov_space)) do_std_diag = (scf_env%krylov_space%eps_std_diag > 0.0_dp)
+      IF (ASSOCIATED(scf_env%krylov_settings)) do_std_diag = (scf_env%krylov_settings%eps_std_diag > 0.0_dp)
 
       need_mos = scf_control%use_ot .OR. scf_env%method == ot_diag_method_nr .OR. &
-                 (scf_env%method == block_krylov_diag_method_nr .AND. .NOT. do_std_diag) &
-                 .OR. dft_control%do_admm .OR. scf_env%method == block_davidson_diag_method_nr &
-                 .OR. do_hfx_ri_mo
+                 (scf_env%method == block_krylov_diag_method_nr .AND. .NOT. do_kpoints .AND. .NOT. do_std_diag) &
+                 .OR. dft_control%do_admm .OR. do_hfx_ri_mo .OR. &
+                 (scf_env%method == block_davidson_diag_method_nr .AND. .NOT. do_kpoints)
 
       safe_density_guess = atomic_guess
       IF (dft_control%qs_control%semi_empirical .OR. dft_control%qs_control%dftb) THEN
@@ -330,8 +334,9 @@ CONTAINS
             IF (j /= 0) THEN
                filename = TRIM(file_name)//".bak-"//ADJUSTL(cp_to_string(j))
             END IF
-            IF (para_env%is_source()) &
+            IF (para_env%is_source()) THEN
                INQUIRE (FILE=filename, exist=exist)
+            END IF
             CALL para_env%bcast(exist)
             IF ((.NOT. exist) .AND. (i < not_read)) THEN
                not_read = i
@@ -406,18 +411,13 @@ CONTAINS
                density_guess = safe_density_guess
             ELSE
                DO ispin = 1, nspin
-                  IF (scf_control%level_shift /= 0.0_dp) THEN
-                     CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff=mo_coeff)
-                     CALL cp_fm_to_fm(mo_coeff, ortho)
-                  END IF
-
                   ! make all nmo vectors present orthonormal
                   CALL get_mo_set(mo_set=mo_array(ispin), &
                                   mo_coeff=mo_coeff, nmo=nmo, homo=homo)
 
                   IF (has_unit_metric) THEN
                      CALL make_basis_simple(mo_coeff, nmo)
-                  ELSEIF (dft_control%smear) THEN
+                  ELSE IF (dft_control%smear) THEN
                      CALL make_basis_lowdin(vmatrix=mo_coeff, ncol=nmo, &
                                             matrix_s=s_sparse(1)%matrix)
                   ELSE
@@ -477,11 +477,6 @@ CONTAINS
                                              dft_section=dft_section, out_unit=ounit)
 
                DO ispin = 1, nspin
-                  IF (scf_control%level_shift /= 0.0_dp) THEN
-                     CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff=mo_coeff)
-                     CALL cp_fm_to_fm(mo_coeff, ortho)
-                  END IF
-
                   ! make all nmo vectors present orthonormal
                   CALL get_mo_set(mo_set=mo_array(ispin), mo_coeff=mo_coeff, nmo=nmo, homo=homo)
 
@@ -937,11 +932,11 @@ CONTAINS
                            WRITE (ounit, *) 'wrong', i, SUM(buff**2)
                         END IF
                      END IF
-                     length = SQRT(DOT_PRODUCT(buff(:, 1), buff(:, 1)))
+                     length = NORM2(buff(:, 1))
                      buff(:, :) = buff(:, :)/length
                      DO j = i + 1, nmo
                         CALL cp_fm_get_submatrix(mo_coeff, buff2, 1, j, nao, 1)
-                        length = SQRT(DOT_PRODUCT(buff2(:, 1), buff2(:, 1)))
+                        length = NORM2(buff2(:, 1))
                         buff2(:, :) = buff2(:, :)/length
                         IF (ABS(DOT_PRODUCT(buff(:, 1), buff2(:, 1)) - 1.0_dp) < 1E-10_dp) THEN
                            IF (ounit > 0) THEN
@@ -1258,7 +1253,6 @@ CONTAINS
       pdiag(:) = 0.0_dp
 
       ALLOCATE (sdiag(nao))
-
       sdiag(:) = 0.0_dp
       IF (has_unit_metric) THEN
          sdiag(:) = 1.0_dp
@@ -1289,10 +1283,10 @@ CONTAINS
                                         lmax=maxll, occupation=edftb)
                maxll = MIN(maxll, maxl)
                econf(0:maxl) = edftb(0:maxl)
-            ELSEIF (dft_control%qs_control%xtb) THEN
+            ELSE IF (dft_control%qs_control%xtb) THEN
                CALL get_qs_kind(qs_kind_set(ikind), xtb_parameter=xtb_kind)
                CALL get_xtb_atom_param(xtb_kind, z=z, natorb=nsgf, nao=naox, lao=laox, occupation=occupation)
-            ELSEIF (has_pot) THEN
+            ELSE IF (has_pot) THEN
                CALL get_atomic_kind(atomic_kind_set(ikind), z=z)
                CALL get_qs_kind(qs_kind_set(ikind), nsgf=nsgf, elec_conf=elec_conf, zeff=zeff)
                maxll = MIN(SIZE(elec_conf) - 1, maxl)
@@ -1334,24 +1328,25 @@ CONTAINS
                      END SELECT
                   END DO
                END DO
-            ELSEIF (dft_control%qs_control%xtb) THEN
+            ELSE IF (dft_control%qs_control%xtb) THEN
                DO iatom = 1, natom
                   atom_a = atom_list(iatom)
                   isgfa = first_sgf(atom_a)
                   IF (z == 1 .AND. nsgf == 2) THEN
                      ! Hydrogen 2s basis
-                     pdiag(isgfa) = 1.0_dp
+                     pdiag(isgfa) = 1.0_dp/REAL(nspin, dp)
                      pdiag(isgfa + 1) = 0.0_dp
                   ELSE
                      DO isgf = 1, nsgf
                         na = naox(isgf)
                         la = laox(isgf)
                         occ = REAL(occupation(la + 1), dp)/REAL(2*la + 1, dp)
+                        occ = occ/REAL(nspin, dp)
                         pdiag(isgfa + isgf - 1) = occ
                      END DO
                   END IF
                END DO
-            ELSEIF (dft_control%qs_control%semi_empirical) THEN
+            ELSE IF (dft_control%qs_control%semi_empirical) THEN
                yy = REAL(dft_control%charge, KIND=dp)/REAL(nao, KIND=dp)
                DO iatom = 1, natom
                   atom_a = atom_list(iatom)
@@ -1455,8 +1450,11 @@ CONTAINS
             END DO
             DO ispin = 1, nspin
                IF (nelectron_spin(ispin) /= 0) THEN
+                  rscale = SUM(pdiag)/REAL(nelectron_spin(ispin), dp)
                   matrix_p => pmat(ispin)%matrix
+                  pdiag = pdiag/rscale
                   CALL dbcsr_set_diag(matrix_p, pdiag)
+                  pdiag = pdiag*rscale
                END IF
             END DO
          ELSE

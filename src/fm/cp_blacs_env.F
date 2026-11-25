@@ -13,6 +13,8 @@
 !> \author Fawzi Mohamed
 ! **************************************************************************************************
 MODULE cp_blacs_env
+   USE ISO_C_BINDING,                   ONLY: C_NULL_PTR,&
+                                              C_PTR
    USE cp_array_utils,                  ONLY: cp_2d_i_write
    USE cp_blacs_types,                  ONLY: cp_blacs_type
    USE kinds,                           ONLY: dp
@@ -56,6 +58,7 @@ MODULE cp_blacs_env
       INTEGER, DIMENSION(:, :), POINTER :: blacs2mpi => NULL()
       INTEGER, DIMENSION(:, :), POINTER :: mpi2blacs => NULL()
       LOGICAL :: repeatable = .FALSE.
+      TYPE(C_PTR) :: cusolver_context = C_NULL_PTR
    CONTAINS
       PROCEDURE, PUBLIC, PASS, NON_OVERRIDABLE :: create => cp_blacs_env_create_low
       PROCEDURE, PUBLIC, PASS, NON_OVERRIDABLE :: retain => cp_blacs_env_retain
@@ -63,6 +66,15 @@ MODULE cp_blacs_env
       PROCEDURE, PUBLIC, PASS, NON_OVERRIDABLE :: get => get_blacs_info
       PROCEDURE, PUBLIC, PASS, NON_OVERRIDABLE :: write => cp_blacs_env_write
    END TYPE cp_blacs_env_type
+
+#if defined(__CUSOLVERMP)
+   INTERFACE
+      SUBROUTINE cp_fm_cusolver_context_destroy(context) BIND(C)
+         IMPORT :: C_PTR
+         TYPE(C_PTR), INTENT(INOUT) :: context
+      END SUBROUTINE cp_fm_cusolver_context_destroy
+   END INTERFACE
+#endif
 
 !***
 CONTAINS
@@ -203,9 +215,9 @@ CONTAINS
       my_row_major = .TRUE.
       IF (PRESENT(row_major)) my_row_major = row_major
       IF (my_row_major) THEN
-         CALL blacs_env%gridinit(para_env, "Row-major", nprow, npcol)
+         CALL blacs_env%gridinit(para_env, "R", nprow, npcol)
       ELSE
-         CALL blacs_env%gridinit(para_env, "Col-major", nprow, npcol)
+         CALL blacs_env%gridinit(para_env, "C", nprow, npcol)
       END IF
 
       ! We set the components of blacs_env here such that we can still use INTENT(OUT) with gridinit
@@ -220,7 +232,7 @@ CONTAINS
 
 #else
       ! In serial mode, we just have to setup the object
-      CALL blacs_env%gridinit(para_env, "Row-major", 1, 1)
+      CALL blacs_env%gridinit(para_env, "R", 1, 1)
 
       blacs_env%ref_count = 1
       blacs_env%my_pid = 0
@@ -293,6 +305,10 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE cp_blacs_env_release_low(blacs_env)
       CLASS(cp_blacs_env_type), INTENT(INOUT)                   :: blacs_env
+
+#if defined(__CUSOLVERMP)
+      CALL cp_fm_cusolver_context_destroy(blacs_env%cusolver_context)
+#endif
 
       CALL blacs_env%gridexit()
       CALL mp_para_env_release(blacs_env%para_env)

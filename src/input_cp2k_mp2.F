@@ -14,7 +14,8 @@
 MODULE input_cp2k_mp2
    USE bibliography, ONLY: &
       Bates2013, DelBen2012, DelBen2013, DelBen2015, DelBen2015b, Rybkin2016, Wilhelm2016a, &
-      Wilhelm2016b, Wilhelm2017, Wilhelm2018, Stein2022, Stein2024, Bussy2023
+      Wilhelm2016b, Wilhelm2017, Wilhelm2018, Wilhelm2021, Stein2022, Stein2024, Bussy2023, Hedin1965, &
+      Hybertsen1986, Tyagi2024, Tyagi2026, Graml2026
    USE cp_eri_mme_interface, ONLY: create_eri_mme_section
    USE cp_output_handling, ONLY: add_last_numeric, &
                                  cp_print_key_section_create, &
@@ -27,10 +28,12 @@ MODULE input_cp2k_mp2
    USE input_constants, ONLY: &
       bse_fulldiag, bse_iterdiag, bse_tda, bse_abba, bse_both, &
       bse_screening_w0, bse_screening_tdhf, bse_screening_rpa, bse_screening_alpha, &
-      bse_iter_both_cond, bse_iter_en_cond, bse_iter_res_cond, bse_singlet, &
+      cohsex_diagonal, cohsex_off, cohsex_qp_update, &
+      bse_abba_mk_davidson, bse_abba_olsen_stratmann, bse_iter_and_cond, bse_iter_en_cond, &
+      bse_iter_or_cond, bse_iter_res_cond, bse_precond_full_diag, bse_precond_qp_diff, bse_singlet, &
       bse_triplet, do_eri_gpw, do_eri_mme, do_eri_os, do_potential_coulomb, do_potential_id, &
       do_potential_long, do_potential_mix_cl, do_potential_short, do_potential_truncated, &
-      do_potential_tshpsc, eri_default, gaussian, gw_no_print_exx, gw_pade_approx, gw_print_exx, &
+      eri_default, gaussian, gw_no_print_exx, gw_pade_approx, gw_print_exx, &
       gw_read_exx, gw_skip_for_regtest, gw_two_pole_model, kp_weights_W_auto, &
       kp_weights_W_tailored, kp_weights_W_uniform, mp2_method_direct, mp2_method_gpw, &
       mp2_method_none, numerical, ot_precond_full_all, ot_precond_full_kinetic, &
@@ -42,6 +45,7 @@ MODULE input_cp2k_mp2
       sigma_none, sigma_PBE0_S1, sigma_PBE0_S2, sigma_PBE_S1, sigma_PBE_S2
    USE input_cp2k_hfx, ONLY: create_hfx_section
    USE input_cp2k_kpoints, ONLY: create_kpoint_set_section
+   USE input_cp2k_ri_rs, ONLY: create_ri_rs_rpa_section
    USE input_keyword_types, ONLY: keyword_create, &
                                   keyword_release, &
                                   keyword_type
@@ -65,7 +69,7 @@ MODULE input_cp2k_mp2
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'input_cp2k_mp2'
 
-   PUBLIC :: create_mp2_section
+   PUBLIC :: create_mp2_section, create_bse_section
 
 CONTAINS
 
@@ -190,6 +194,10 @@ CONTAINS
       CALL section_release(subsection)
 
       CALL create_canonical_gradients(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+      CALL create_ri_rs_rpa_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
@@ -703,9 +711,8 @@ CONTAINS
 
       CPASSERT(.NOT. ASSOCIATED(section))
       CALL section_create(section, __LOCATION__, name="GW", &
-                          description="Parameters influencing GW calculations on molecules, "// &
-                          "see also 'Electronic band structure from GW', "// &
-                          "https://manual.cp2k.org/trunk/methods/properties/bandstructure_gw.html.", &
+                          description="GW quasiparticle calculations. Use EXACT_RPA_DIAG for direct full-RPA "// &
+                          "diagonalization, or ANALYTIC_CONTINUATION for continuation from imaginary frequencies.", &
                           n_keywords=24, n_subsections=1, repeats=.FALSE.)
 
       NULLIFY (keyword, subsection)
@@ -730,6 +737,56 @@ CONTAINS
                                         "Update DFT eigenvalues in G, not in W.", &
                                         "Update DFT eigenvalues in G and W."), &
                           default_i_val=G0W0)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COHSEX", &
+                          description="Static Coulomb-hole screened-exchange (COHSEX) approximation to "// &
+                          "$G_0W_0$. Only the static screened Coulomb interaction $W(\omega=0)$ is computed; "// &
+                          "its correlation part $W^\text{c}(0) = W(0) - v$ gives the static correlation "// &
+                          "self-energy $\Sigma^\text{c}_{mn} = \frac{1}{2}\sum_p \text{sgn}(\varepsilon_p - "// &
+                          "\varepsilon_\text{F})\, W^\text{c}_{mp,pn}(\omega=0)$. The quasiparticle Hamiltonian "// &
+                          "$H^\text{QP}_{mn} = \varepsilon_n^\text{DFT}\delta_{mn} + \Sigma^\text{x}_{mn} - "// &
+                          "v^\text{xc}_{mn} + \Sigma^\text{c}_{mn}$ is built for the MOs selected by "// &
+                          "CORR_MOS_OCC and CORR_MOS_VIRT; its occupied-virtual blocks are set to zero. "// &
+                          "A subsequent BSE uses $W(\omega=0)$ and the quasiparticle energies (and MOs) "// &
+                          "selected here. No RPA correlation energy is computed.", &
+                          usage="COHSEX QP_UPDATE", &
+                          enum_c_vals=s2a("OFF", "DIAGONAL", "QP_UPDATE"), &
+                          enum_i_vals=[cohsex_off, cohsex_diagonal, cohsex_qp_update], &
+                          enum_desc=s2a("No static COHSEX (default without the keyword).", &
+                                        "Diagonal static COHSEX (Hedin 1965; Hybertsen and Louie 1986): the "// &
+                                        "quasiparticle energies are the diagonal elements "// &
+                                        "$\varepsilon_n^\text{DG} = H^\text{QP}_{nn}$. "// &
+                                        "A subsequent BSE uses $\varepsilon_n^\text{DG}$ with the Kohn-Sham MOs. "// &
+                                        "Default of the lone keyword.", &
+                                        "Static COHSEX with quasiparticle update (Tyagi and Voora 2024): the "// &
+                                        "occupied-occupied and virtual-virtual blocks of $H^\text{QP}$ are "// &
+                                        "diagonalized separately, giving the canonical static COHSEX energies "// &
+                                        "$\varepsilon_n^\text{CN}$ and MOs. Both $\varepsilon_n^\text{DG}$ and "// &
+                                        "MOs are printed  with DFT%PRINT%MO and "// &
+                                        "DFT%PRINT%MO_CUBES. A subsequent BSE uses $\varepsilon_n^\text{CN}$ "// &
+                                        "with the canonical MOs."), &
+                          citations=[Hedin1965, Hybertsen1986, Tyagi2024], &
+                          default_i_val=cohsex_off, lone_keyword_i_val=cohsex_diagonal)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COHSEX_SCALE_OCC", &
+                          description="Scaling factor of the static COHSEX correlation self-energy in the "// &
+                          "occupied-occupied block of $H^\text{QP}$.", &
+                          usage="COHSEX_SCALE_OCC 0.6", &
+                          citations=[Tyagi2026], &
+                          default_r_val=1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="COHSEX_SCALE_VIRT", &
+                          description="Scaling factor of the static COHSEX correlation self-energy in the "// &
+                          "virtual-virtual block of $H^\text{QP}$.", &
+                          usage="COHSEX_SCALE_VIRT 0.6", &
+                          citations=[Tyagi2026], &
+                          default_r_val=1.0_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -878,9 +935,10 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="PRINT_SELF_ENERGY", &
-                          description="If true, print the self-energy for all levels for real energy "// &
-                          "together with the straight line to see the quasiparticle energy as intersection. "// &
-                          "In addition, prints the self-energy for imaginary frequencies together with the Pade fit.", &
+                          description="Write the correlation self-energy and spectral function "// &
+                          "to GW_level_N_self_energy.dat. Set the frequency grid with PRINT/GW_DOS/LOWER_BOUND, "// &
+                          "UPPER_BOUND and a positive STEP. Orbital selection uses MIN_LEVEL_SELF_ENERGY "// &
+                          "and MAX_LEVEL_SELF_ENERGY (zero maximum includes all corrected orbitals).", &
                           usage="PRINT_SELF_ENERGY", &
                           default_l_val=.FALSE., &
                           lone_keyword_l_val=.TRUE.)
@@ -1021,13 +1079,17 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL create_exact_rpa_diag_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
       ! here we generate a subsection for the periodic GW correction
       CALL create_periodic_gw_correction_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
       ! here we generate a subsection for Bethe-Salpeter
-      CALL create_bse_section(subsection)
+      CALL create_bse_section(subsection, run_bse_from_band_structure_section=.FALSE.)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
@@ -1047,6 +1109,60 @@ CONTAINS
       CALL section_release(subsection)
 
    END SUBROUTINE create_ri_g0w0
+
+! **************************************************************************************************
+!> \brief Input for GW from direct diagonalization of the full singlet RPA problem.
+! **************************************************************************************************
+   SUBROUTINE create_exact_rpa_diag_section(section)
+      TYPE(section_type), POINTER :: section
+      TYPE(keyword_type), POINTER :: keyword
+
+      NULLIFY (keyword)
+      CALL section_create(section, __LOCATION__, name="EXACT_RPA_DIAG", &
+                          description="Compute GW self-energies by full RPA diagonalization, without analytic continuation. "// &
+                          "Available for closed-shell molecular, conventional one-shot GW."//CHAR(10)//CHAR(10)// &
+                          "**RPA excitations.** Indices $i,j$ denote occupied orbitals, $a,b$ virtual orbitals, "// &
+                          "$P$ an auxiliary RI index, and $\varepsilon_p$ an SCF orbital energy. "// &
+                          "Coulomb factors satisfy $(pq|rt)\approx\sum_P B_{P,pq}B_{P,rt}$. "// &
+                          "With $\Delta_{ia}=\varepsilon_a-\varepsilon_i$ and "// &
+                          "$K_{ia,jb}=\sum_P B_{P,ia}B_{P,jb}$, the singlet RPA matrices are"//CHAR(10)//CHAR(10)// &
+                          "$$A_{ia,jb}=\Delta_{ia}\delta_{ij}\delta_{ab}+2K_{ia,jb}, "// &
+                          "\qquad B^{\mathrm{RPA}}_{ia,jb}=2K_{ia,jb}.$$"//CHAR(10)//CHAR(10)// &
+                          "The symmetric squared RPA matrix is diagonalized:"// &
+                          CHAR(10)//CHAR(10)// &
+                          "$$C_{ia,jb}=\sqrt{\Delta_{ia}}(A+B^{\mathrm{RPA}})_{ia,jb}\sqrt{\Delta_{jb}}, "// &
+                          "\qquad \sum_{jb}C_{ia,jb}U_{jb,s}=\Omega_s^2U_{ia,s}.$$"//CHAR(10)//CHAR(10)// &
+                          "Here $s$ labels excitations, $\Omega_s>0$, and $U$ has orthonormal columns."//CHAR(10)//CHAR(10)// &
+                          "**Self-energy.** For output orbital $n$ and intermediate orbital $m$, define "// &
+                          "$g_{nm,s}=\sqrt{2/\Omega_s}\sum_{P,ia}B_{P,nm}B_{P,ia}\sqrt{\Delta_{ia}}U_{ia,s}$. "// &
+                          "The retarded correlation self-energy and orbital spectrum are"//CHAR(10)//CHAR(10)// &
+                          "$$\Sigma_n^{c,R}(\omega)=\sum_{m,s}\frac{g_{nm,s}^2} "// &
+                          "{\omega-\varepsilon_m+\tau_m\Omega_s+i\eta}, "// &
+                          "\qquad A_n(\omega)=-\frac1\pi\mathrm{Im} "// &
+                          "[\omega+i\eta_G-\varepsilon_n-\Delta_n^x-\Sigma_n^{c,R}(\omega)]^{-1}.$$"// &
+                          CHAR(10)//CHAR(10)// &
+                          "Here $\tau_m=+1$ for occupied and $-1$ for virtual orbitals, "// &
+                          "$\Delta_n^x=\langle n|\Sigma_x-v_{xc}|n\rangle$, "// &
+                          "$\eta$ is BROADENING_ETA and $\eta_G$ is PRINT/GW_DOS/BROADENING. "// &
+                          "Frequencies are energies ($\hbar=1$). Use PRINT_SELF_ENERGY for orbital files and "// &
+                          "PRINT/GW_DOS for the frequency grid and summed spectrum. CROSSING_SEARCH selects "// &
+                          "Z_SHOT or NEWTON for quasiparticle energies.", &
+                          n_keywords=2, n_subsections=0, repeats=.FALSE.)
+      CALL keyword_create(keyword, __LOCATION__, name="_SECTION_PARAMETERS_", &
+                          description="Use direct full-RPA diagonalization for the GW self-energy.", &
+                          usage="&EXACT_RPA_DIAG", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="BROADENING_ETA", &
+                          description="Positive $\eta$ in the retarded self-energy denominators shown above. "// &
+                          "Smaller values resolve narrower poles and require a finer frequency grid. "// &
+                          "The Green-function broadening is set separately by PRINT/GW_DOS/BROADENING.", &
+                          usage="BROADENING_ETA [eV] 0.1", &
+                          default_r_val=cp_unit_to_cp2k(value=0.1_dp, unit_str="eV"), unit_str="eV")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+   END SUBROUTINE create_exact_rpa_diag_section
 
 ! **************************************************************************************************
 !> \brief ...
@@ -1107,11 +1223,12 @@ CONTAINS
       CALL section_release(print_key)
 
       CALL section_create(gw_dos_section, __LOCATION__, name="GW_DOS", &
-                          description="Section for printing the spectral function.", &
+                          description="Real-frequency grid and orbital selection for GW self-energy and spectral output. "// &
+                          "A positive STEP writes the summed spectral function to spectral.dat.", &
                           n_keywords=6, n_subsections=0, repeats=.FALSE.)
 
       CALL keyword_create(keyword, __LOCATION__, name="LOWER_BOUND", &
-                          description="Lower bound for GW-DOS in eV.", &
+                          description="Lower real-frequency bound for self-energy and spectral output, in eV.", &
                           usage="LOWER_BOUND -20.0", &
                           default_r_val=cp_unit_to_cp2k(value=-20.0_dp, unit_str="eV"), &
                           unit_str="eV")
@@ -1119,7 +1236,8 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="UPPER_BOUND", &
-                          description="Upper bound for GW-DOS in eV.", &
+                          description="Upper real-frequency bound for self-energy and spectral output, in eV. "// &
+                          "The upper endpoint is excluded.", &
                           usage="UPPER_BOUND 5.0", &
                           default_r_val=cp_unit_to_cp2k(value=0.0_dp, unit_str="eV"), &
                           unit_str="eV")
@@ -1127,7 +1245,8 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="STEP", &
-                          description="Difference of two consecutive energy levels for GW-DOS.", &
+                          description="Spacing of the real-frequency grid. Zero disables the grid; use a positive "// &
+                          "value for PRINT_SELF_ENERGY or spectral output. Resolve the chosen broadening.", &
                           usage="STEP 0.1", &
                           default_r_val=cp_unit_to_cp2k(value=0.0_dp, unit_str="eV"), &
                           unit_str="eV")
@@ -1135,35 +1254,40 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="MIN_LEVEL_SPECTRAL", &
-                          description="Lowest energy level to print the self energy to files.", &
+                          description="Lowest corrected molecular orbital included in the summed spectral function.", &
                           usage="MIN_LEVEL_SPECTRAL 3", &
                           default_i_val=1)
       CALL section_add_keyword(gw_dos_section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="MAX_LEVEL_SPECTRAL", &
-                          description="Highest energy level to print the self energy to files.", &
+                          description="Highest corrected molecular orbital included in the summed spectral function. "// &
+                          "Zero includes all corrected orbitals.", &
                           usage="MAX_LEVEL_SPECTRAL 6", &
                           default_i_val=0)
       CALL section_add_keyword(gw_dos_section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="MIN_LEVEL_SELF_ENERGY", &
-                          description="Lowest energy level to print the self energy to files.", &
+                          description="Lowest corrected molecular orbital selected for self-energy files.", &
                           usage="MIN_LEVEL_SELF_ENERGY 3", &
                           default_i_val=1)
       CALL section_add_keyword(gw_dos_section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="MAX_LEVEL_SELF_ENERGY", &
-                          description="Highest energy level to print the self energy to files.", &
+                          description="Highest corrected molecular orbital selected for self-energy files. A positive "// &
+                          "value also enables these files without PRINT_SELF_ENERGY. Zero selects all "// &
+                          "corrected orbitals when PRINT_SELF_ENERGY is enabled.", &
                           usage="MAX_LEVEL_SELF_ENERGY 6", &
                           default_i_val=0)
       CALL section_add_keyword(gw_dos_section, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="BROADENING", &
-                          description="Broadening parameter for spectral function.", &
+                          description="Nonnegative Green-function broadening $\eta_G$ for the spectral function. "// &
+                          "For EXACT_RPA_DIAG the total width is $\eta_G-\mathrm{Im}\Sigma_n^{c,R}$. "// &
+                          "PADE uses $\eta_G+|\mathrm{Im}\Sigma_n^c|$, following the GW_DOS convention.", &
                           usage="BROADENING 0.001", &
                           default_r_val=cp_unit_to_cp2k(value=0.0_dp, unit_str="eV"), &
                           unit_str="eV")
@@ -1284,16 +1408,37 @@ CONTAINS
    END SUBROUTINE create_periodic_gw_correction_section
 
 ! **************************************************************************************************
-!> \brief ...
-!> \param section ...
+!> \brief The &BSE section, built once under RI_RPA%GW and once under PROPERTIES
+!> \param section the section, created here
+!> \param run_bse_from_band_structure_section .TRUE. for the copy under PROPERTIES, .FALSE. for the one under RI_RPA%GW;
+!>        selects the sentence of the description that names the GW behind the section
 ! **************************************************************************************************
-   SUBROUTINE create_bse_section(section)
+   SUBROUTINE create_bse_section(section, run_bse_from_band_structure_section)
       TYPE(section_type), POINTER                        :: section
+      LOGICAL, INTENT(IN)                                :: run_bse_from_band_structure_section
 
+      CHARACTER(LEN=:), ALLOCATABLE                      :: where_from
       TYPE(keyword_type), POINTER                        :: keyword
       TYPE(section_type), POINTER                        :: subsection
 
       CPASSERT(.NOT. ASSOCIATED(section))
+      IF (run_bse_from_band_structure_section) THEN
+         where_from = "This section runs the BSE on the quasiparticle energies, the static screened "// &
+                      "interaction and the RI integrals of the low-scaling GW of PROPERTIES%BANDSTRUCTURE%GW "// &
+                      "(three-center RI integrals in the atomic-orbital basis; \[Wilhelm2021\]), which must be "// &
+                      "present in the same input and must not use RI_RS; its CUTOFF_RADIUS_RI and RI basis set "// &
+                      "are convergence parameters of PROPERTIES%BSE as well. "// &
+                      "The same section under XC%WF_CORRELATION%RI_RPA%GW "// &
+                      "runs the BSE on the $O(N^4)$-scaling GW of RI_RPA%GW (molecular-orbital basis; "// &
+                      "\[Wilhelm2016a\]) instead. Both sections treat non-periodic systems only."
+      ELSE
+         where_from = "This section runs the BSE on the $O(N^4)$-scaling GW of RI_RPA%GW (molecular-orbital "// &
+                      "basis; \[Wilhelm2016a\]), which provides the quasiparticle energies and the screening. "// &
+                      "The same section under PROPERTIES runs the BSE on the "// &
+                      "low-scaling GW of PROPERTIES%BANDSTRUCTURE%GW (three-center RI integrals in the "// &
+                      "atomic-orbital basis; \[Wilhelm2021\]) instead. Both sections treat non-periodic "// &
+                      "systems only."
+      END IF
       CALL section_create(section, __LOCATION__, name="BSE", &
                           description="Parameters for a calculation solving the Bethe-Salpeter equation "// &
                           "(BSE) for electronic excitations. The full BSE "// &
@@ -1304,8 +1449,10 @@ CONTAINS
                           "enables, for example, the computation of electronic excitation energies $\Omega^{(n)}$ "// &
                           "as well as optical properties. The BSE can be solved by diagonalizing "// &
                           "the full ABBA-matrix or by setting B=0, i.e. within the Tamm-Dancoff approximation (TDA). "// &
-                         "Preliminary reference: Eq. (35) in PRB 92, 045209 (2015); http://dx.doi.org/10.1103/PhysRevB.92.045209", &
-                          n_keywords=8, n_subsections=3, repeats=.FALSE.)
+                          "Reference: Eq. (8) (the full BSE), Eq. (10) (the matrix elements A and B with the "// &
+                          "singlet and triplet prefactors) and Eq. (18) (TDA) in \[Graml2026\]."// &
+                          newline//newline//where_from, citations=[Wilhelm2016a, Wilhelm2021, Graml2026], &
+                          n_keywords=9, n_subsections=4, repeats=.FALSE.)
 
       NULLIFY (keyword)
 
@@ -1334,7 +1481,8 @@ CONTAINS
                           enum_c_vals=s2a("FULLDIAG", "ITERDIAG"), &
                           enum_i_vals=[bse_fulldiag, bse_iterdiag], &
                           enum_desc=s2a("Fully diagonalizes the BSE matrices within the chosen level of approximation.", &
-                                        "Iterative diagonalization has not been implemented yet."), &
+                                        "Block Davidson iteration for the lowest NUM_EXC_EN excitations, "// &
+                                        "applying the BSE matrices without forming them; settings in BSE_ITERAT."), &
                           default_i_val=bse_fulldiag)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -1355,7 +1503,9 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="ENERGY_CUTOFF_OCC", &
                           description="Remove all orbitals with indices i,j from A_ia,jb and B_ia,jb with energy difference "// &
                           "to HOMO level larger than the given energy cutoff, i.e. "// &
-               "$\varepsilon_i\in[\varepsilon_{i=\text{HOMO}}^{GW}-E_\text{cut}^\text{occ},\varepsilon_{i=\text{HOMO}}^{GW}]$. "// &
+             "$\varepsilon_i\in[\varepsilon_{i=\text{HOMO}}^{DFT}-E_\text{cut}^\text{occ},\varepsilon_{i=\text{HOMO}}^{DFT}]$. "// &
+                          "The cutoff is applied to the DFT eigenvalues, also when the BSE takes quasiparticle "// &
+                          "energies from the GW. "// &
                           "Can be used to accelerate runtime and reduce memory consumption.", &
                           usage="ENERGY_CUTOFF_OCC 10.0", unit_str="eV", &
                           type_of_var=real_t, default_r_val=-1.0_dp)
@@ -1365,10 +1515,27 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="ENERGY_CUTOFF_EMPTY", &
                           description="Remove all orbitals with indices a,b from A_ia,jb and B_ia,jb with energy difference "// &
                           "to LUMO level larger than the given energy cutoff, i.e. "// &
-             "$\varepsilon_a\in[\varepsilon_{a=\text{LUMO}}^{GW},\varepsilon_{a=\text{LUMO}}^{GW}+E_\text{cut}^\text{empty}]$. "// &
+           "$\varepsilon_a\in[\varepsilon_{a=\text{LUMO}}^{DFT},\varepsilon_{a=\text{LUMO}}^{DFT}+E_\text{cut}^\text{empty}]$. "// &
+                          "The cutoff is applied to the DFT eigenvalues, also when the BSE takes quasiparticle "// &
+                          "energies from the GW. "// &
                           "Can be used to accelerate runtime and reduce memory consumption.", &
                           usage="ENERGY_CUTOFF_EMPTY 10.0", unit_str="eV", &
                           type_of_var=real_t, default_r_val=-1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MEMORY_PER_PROC", &
+                          description="Memory per MPI rank in GB available to the BSE, the counterpart of "// &
+                          "MEMORY_PER_PROC in the GW section. -1: detected when the BSE first needs it, as the "// &
+                          "memory the rank holds plus 80 percent of the free memory of the node divided by its "// &
+                          "ranks. Every memory-heavy step takes what is left after the memory the rank holds "// &
+                          "at that moment: under PROPERTIES the three-center integrals are transformed in "// &
+                          "batches of RI atoms that fit, down to one atom per batch; with ITERDIAG the "// &
+                          "subspace ceiling and the matvec blocks are lowered to fit; with FULLDIAG the "// &
+                          "memory of the BSE matrices is fixed by the active window, and the run stops before "// &
+                          "the GW when it does not fit.", &
+                          usage="MEMORY_PER_PROC 8.0", &
+                          default_r_val=-1.0_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -1400,6 +1567,15 @@ CONTAINS
                           description="Activates printing of exciton descriptors per direction.", &
                           usage="PRINT_DIRECTIONAL_EXC_DESCR .TRUE.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PRINT_DIRECTIONAL_CROSSCORRELATION", &
+                          description="Prints the electron-hole crosscorrelation matrix as part of the "// &
+                          "exciton descriptors per direction. Only active together with "// &
+                          "PRINT_DIRECTIONAL_EXC_DESCR.", &
+                          usage="PRINT_DIRECTIONAL_CROSSCORRELATION .FALSE.", &
+                          default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -1639,85 +1815,135 @@ CONTAINS
 
       CPASSERT(.NOT. ASSOCIATED(section))
       CALL section_create(section, __LOCATION__, name="BSE_ITERAT", &
-                          description="Parameters influencing the iterative Bethe-Salpeter calculation. "// &
-                          "The iterative solver has not been fully implemented yet.", &
-                          n_keywords=9, n_subsections=0, repeats=.FALSE.)
+                          description="Parameters of the iterative (block Davidson) solution of the "// &
+                          "Bethe-Salpeter equation for the lowest excitations, which is invoked by "// &
+                          "BSE_DIAG_METHOD ITERDIAG.", &
+                          n_keywords=8, n_subsections=0, repeats=.FALSE.)
 
       NULLIFY (keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="DAVIDSON_ABORT_COND", &
-                          description="Desired abortion condition for Davidson solver", &
-                          usage="DAVIDSON_ABORT_COND OR", &
-                          enum_c_vals=s2a("EN", "RES", "OR"), &
-                          enum_i_vals=[bse_iter_en_cond, bse_iter_res_cond, bse_iter_both_cond], &
-                          enum_desc=s2a("Uses energy threshold for successfully exiting solver.", &
-                                        "Uses residual threshold for successfully exiting solver.", &
-                                        "Uses either energy or residual threshold for successfully exiting solver."), &
-                          default_i_val=bse_iter_en_cond)
-      CALL section_add_keyword(section, keyword)
-      CALL keyword_release(keyword)
-
       CALL keyword_create(keyword, __LOCATION__, name="NUM_EXC_EN", &
-                          description="Number of lowest excitation energies to be computed.", &
-                          usage="NUM_EXC_EN 3", &
-                          default_i_val=3)
+                          description="Number of lowest excitation energies computed and printed. "// &
+                          "The absorption spectrum of BSE_SPECTRUM sums over these states only.", &
+                          usage="NUM_EXC_EN 10", &
+                          default_i_val=10)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="NUM_ADD_START_Z_SPACE", &
-                          description="Determines the initial dimension of the subspace as "// &
-                          "dim = (NUM_EXC_EN+NUM_ADD_START_Z_SPACE)", &
-                          usage="NUM_ADD_START_Z_SPACE 1", &
-                          default_i_val=0)
+      CALL keyword_create(keyword, __LOCATION__, name="NUM_BUFFER_STATES", &
+                          description="States carried above NUM_EXC_EN so that a degenerate group at the "// &
+                          "upper boundary converges as a whole. They are not printed and need not converge.", &
+                          usage="NUM_BUFFER_STATES 4", &
+                          default_i_val=4)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="FAC_MAX_Z_SPACE", &
-                          description="Factor to determine maximum dimension of the Davidson subspace. "// &
-                          "dimension = (NUM_EXC_EN+NUM_ADD_START_Z_SPACE)*FAC_MAX_Z_SPACE", &
-                          usage="FAC_MAX_Z_SPACE 5", &
-                          default_i_val=5)
+      CALL keyword_create(keyword, __LOCATION__, name="NUM_GUESS_TRANSITIONS", &
+                          description="Number of transitions with the lowest diagonal on which A (and B) "// &
+                          "are built exactly and diagonalized for the initial guess. Its eigenvalues bound "// &
+                          "the true energies from above and are checked against the converged ones. "// &
+                          "0: unit vectors on the lowest diagonal entries. The default is large because "// &
+                          "the block is cheap against the solver's iterations and a large block also seeds "// &
+                          "excitations built from transitions far up the diagonal ordering. Memory: the "// &
+                          "square of this number in doubles per MPI rank.", &
+                          usage="NUM_GUESS_TRANSITIONS 512", &
+                          default_i_val=512)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="NUM_NEW_T", &
-                          description="Number of new t vectors added. "// &
-                          "Must be smaller/equals (NUM_EXC_EN+NUM_ADD_START_Z_SPACE)", &
-                          usage="NUM_NEW_T 4", &
-                          default_i_val=1)
+      CALL keyword_create(keyword, __LOCATION__, name="BLOCK_SIZE", &
+                          description="Maximum number of correction vectors (and kernel applications) "// &
+                          "added to the subspace per iteration. -1: 32, or the number of tracked states "// &
+                          "if fewer. Measured on a 200-state nanographene: 32 within 5 % of the best "// &
+                          "width, 8 twice as slow.", &
+                          usage="BLOCK_SIZE 8", &
+                          default_i_val=-1)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="EPS_RES", &
-                          description="Threshold for stopping the iteration for computing the transition energies. "// &
-                          "If the residuals inside the Davidson space change by less than EPS_RES (in eV), the iteration "// &
-                          "stops.", &
-                          usage="EPS_RES 0.001", unit_str="eV", &
-                          type_of_var=real_t, default_r_val=0.001_dp)
+      CALL keyword_create(keyword, __LOCATION__, name="MAX_SUBSPACE_FACTOR", &
+                          description="Subspace ceiling in units of (NUM_EXC_EN+NUM_BUFFER_STATES) before a "// &
+                          "thick restart, lowered to what MEMORY_PER_PROC of the BSE section leaves; -1 starts "// &
+                          "from 20.", &
+                          usage="MAX_SUBSPACE_FACTOR 5", &
+                          default_i_val=10)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="EPS_EXC_EN", &
-                          description="Threshold for stopping the iteration for computing the transition energies. "// &
-                          "If the desired excitation energies change by less than EPS_EXC_EN (in eV), the iteration "// &
-                          "stops.", &
-                          usage="EPS_EXC_EN 0.001", unit_str="eV", &
-                          type_of_var=real_t, default_r_val=0.001_dp)
+      CALL keyword_create(keyword, __LOCATION__, name="MATVEC_BLOCK_COLUMNS", &
+                          description="Trial vectors the kernel applies per pass. The replicated work "// &
+                          "arrays of one pass are n_arrays*N_ov*MATVEC_BLOCK_COLUMNS doubles, n_arrays 3 for "// &
+                          "the TDA and 4 otherwise. Never more than the columns of the call. Measured: flat "// &
+                          "from 8 to 64, up to 28x slower in the gather at 128 and above. -1: as many as "// &
+                          "the memory MEMORY_PER_PROC of the BSE section leaves allows.", &
+                          usage="MATVEC_BLOCK_COLUMNS 32", &
+                          default_i_val=32)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="NUM_DAVIDSON_ITER", &
-                          description="Maximum number of iterations for determining the transition energies.", &
-                          usage="NUM_DAVIDSON_ITER 100", &
+      CALL keyword_create(keyword, __LOCATION__, name="MAX_ITER", &
+                          description="Maximum number of Davidson iterations. The calculation aborts if it "// &
+                          "is reached before convergence.", &
+                          usage="MAX_ITER 100", &
                           default_i_val=100)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
-      CALL keyword_create(keyword, __LOCATION__, name="Z_SPACE_ENERGY_CUTOFF", &
-                          description="Cutoff (in eV) for maximal energy difference entering the A matrix. "// &
-                          "Per default and for negative values, there is no cutoff applied.", &
-                          usage="Z_SPACE_ENERGY_CUTOFF 60", unit_str="eV", &
-                          type_of_var=real_t, default_r_val=-1.0_dp)
+      CALL keyword_create(keyword, __LOCATION__, name="CONVERGENCE_CRITERION", &
+                          description="Which of EPS_ENERGY (change of each excitation energy between "// &
+                          "iterations) and EPS_RES (residual norm of each state) must hold.", &
+                          usage="CONVERGENCE_CRITERION AND", &
+                          enum_c_vals=s2a("EN", "RES", "OR", "AND"), &
+                          enum_i_vals=[bse_iter_en_cond, bse_iter_res_cond, bse_iter_or_cond, &
+                                       bse_iter_and_cond], &
+                          enum_desc=s2a("The energy criterion EPS_ENERGY has to hold.", &
+                                        "The residual criterion EPS_RES has to hold.", &
+                                        "One of the two criteria has to hold.", &
+                                        "Both criteria have to hold."), &
+                          default_i_val=bse_iter_and_cond)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="EPS_RES", &
+                          description="Threshold on the Euclidean residual norm of every requested state "// &
+                          "(atomic units). Controls the eigenvector accuracy and thereby oscillator "// &
+                          "strengths and descriptors.", &
+                          usage="EPS_RES 1.0E-6", &
+                          type_of_var=real_t, default_r_val=1.0E-6_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="EPS_ENERGY", &
+                          description="Threshold on the change of every requested excitation energy "// &
+                          "between two iterations.", &
+                          usage="EPS_ENERGY 1.0E-6", unit_str="eV", &
+                          type_of_var=real_t, &
+                          default_r_val=cp_unit_to_cp2k(value=1.0E-6_dp, unit_str="eV"))
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PRECONDITIONER", &
+                          description="Diagonal used in the Davidson correction: the diagonal of A "// &
+                          "including the kernel, or the bare quasiparticle energy differences.", &
+                          usage="PRECONDITIONER FULL_DIAGONAL", &
+                          enum_c_vals=s2a("FULL_DIAGONAL", "QP_DIFFERENCE"), &
+                          enum_i_vals=[bse_precond_full_diag, bse_precond_qp_diff], &
+                          enum_desc=s2a("Diagonal of A including the exchange and the screened term.", &
+                                        "Quasiparticle energy differences."), &
+                          default_i_val=bse_precond_full_diag)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ABBA_SOLVER", &
+                          description="Paired solver beyond the TDA: block Davidson on (A+B)(A-B) in the "// &
+                          "(A-B) inner product, or the paired-subspace Davidson of Olsen and Stratmann. "// &
+                          "No automatic fallback between the two.", &
+                          usage="ABBA_SOLVER MK_DAVIDSON", &
+                          enum_c_vals=s2a("MK_DAVIDSON", "OLSEN_STRATMANN"), &
+                          enum_i_vals=[bse_abba_mk_davidson, bse_abba_olsen_stratmann], &
+                          enum_desc=s2a("Block Davidson on (A+B)(A-B) in the (A-B) inner product.", &
+                                        "Paired-subspace Davidson of Olsen and Stratmann."), &
+                          default_i_val=bse_abba_mk_davidson)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
    END SUBROUTINE create_bse_iterat_section
@@ -2266,27 +2492,16 @@ CONTAINS
       CALL keyword_create( &
          keyword, __LOCATION__, &
          name="POTENTIAL_TYPE", &
-         description="Which interaction potential should be used "// &
-         "(Coulomb, TShPSC operator).", &
-         usage="POTENTIAL_TYPE TSHPSC", &
-         enum_c_vals=s2a("COULOMB", "TShPSC", "LONGRANGE", "SHORTRANGE", "TRUNCATED", "MIX_CL", "IDENTITY"), &
+         description="Which interaction potential should be used for the electron-repulsion integrals.", &
+         usage="POTENTIAL_TYPE COULOMB", &
+         enum_c_vals=s2a("COULOMB", "LONGRANGE", "SHORTRANGE", "TRUNCATED", "MIX_CL", "IDENTITY"), &
          enum_i_vals=[do_potential_coulomb, &
-                      do_potential_TShPSC, &
                       do_potential_long, &
                       do_potential_short, &
                       do_potential_truncated, &
                       do_potential_mix_cl, &
                       do_potential_id], &
          enum_desc=s2a("Coulomb potential: 1/r", &
-                       "| Range | TShPSC |"//newline// &
-                       "| ----- | ------ |"//newline// &
-                       "| $ x \leq R_c $ | $ 1/x - s/R_c $ |"//newline// &
-                       "| $ R_c < x \leq nR_c $ | "// &
-                       "$ (1 - s)/R_c - (x - R_c)/R_c^2 + (x - R_c)^2/R_c^3 - "// &
-                       "(2n^2 - 7n + 9 - 4s)(x - R_c)^3/(R_c^4(n^2 - 2n + 1)(n - 1)) + "// &
-                       "(6-3s - 4n + n^2)(x - R_c)^4/(R_c^5(n^4 - 4n^3 + 6n^2 - 4n + 1)) $ "// &
-                       "(4th order polynomial) | "//newline// &
-                       "| $ x > nR_c $ | $ 0 $ | "//newline, &
                        "Longrange Coulomb potential: $ \operatorname{erf}(wr)/r $", &
                        "Shortrange Coulomb potential: $ \operatorname{erfc}(wr)/r $", &
                        "Truncated Coulomb potential", &
@@ -2309,11 +2524,10 @@ CONTAINS
       CALL keyword_create( &
          keyword, __LOCATION__, &
          name="POTENTIAL_DATA", &
-         variants=s2a("TShPSC_DATA", "T_C_G_DATA"), &
-         description="Location of the file TShPSC.dat or t_c_g.dat that contains the data for the "// &
-         "evaluation of the evaluation of the truncated potentials", &
-         usage="TShPSC_DATA t_sh_p_s_c.dat", &
-         default_c_val="t_sh_p_s_c.dat")
+         variants=["T_C_G_DATA"], &
+         description="Location of the data file for evaluating the truncated Coulomb potential.", &
+         usage="POTENTIAL_DATA t_c_g.dat", &
+         default_c_val="t_c_g.dat")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

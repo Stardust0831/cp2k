@@ -20,16 +20,64 @@ Examples are the sequential or thread variant of the Intel MKL, the Cray libsci,
 variant and the reference BLAS/LAPACK packages. Usually the CMake step of CP2K will auto-detect the
 type of BLAS and SCALAPACK and then use the right configuration to ensure the code is thread-safe;
 however, if detection is ambiguous, `-DCP2K_BLAS_VENDOR=MKL` and `-DCP2K_SCALAPACK_VENDOR=MKL` can
-be used for a oneMKL installation
+be used for a oneMKL installation.
 
 On the Mac, BLAS and LAPACK can be provided by either OpenBLAS or Apple's Accelerate framework.
 
+## FFTW (required, FFT implementation)
+
+FFTW is required for performing FFTs. The current version of CP2K works with FFTW 3.X. It can be
+downloaded from <http://www.fftw.org>.
+
+FFTW is also provided by MKL. If you have MKL but still want to use standalone FFTW3, pass
+`-DCP2K_USE_FFTW3_WITH_MKL=ON` to CMake.
+
+```{warning}
+Note that FFTW must know the Fortran compiler you will use in order to install properly
+(e.g., `export F77=gfortran` before configure if you intend to use gfortran).
+```
+
+Since CP2K is OpenMP parallelized, CP2K enables the FFTW3 OpenMP interface by default
+(`-DCP2K_ENABLE_FFTW3_OPENMP_SUPPORT=ON`); the FFTW installation must therefore provide
+`libfftw3_omp`. The alternative threads interface can be selected with
+`-DCP2K_ENABLE_FFTW3_THREADS_SUPPORT=ON`, which requires `libfftw3_threads`.
+
 ## DBCSR (required, block-sparse matrix operations)
 
-CP2K requires [DBCSR](https://github.com/cp2k/dbcsr/) for block-sparse matrix operations. It is
-found automatically by CMake. For MPI builds, DBCSR must also have been built with MPI support. The
-CP2K toolchain, Spack, and a compatible external DBCSR installation are supported ways to provide
-it.
+DBCSR is a standalone library for block-sparse matrix operations. It is maintained at the
+[cp2k/dbcsr](https://github.com/cp2k/dbcsr/) repository, with links to reference materials on
+<https://www.cp2k.org/dbcsr> and documentation on <https://cp2k.github.io/dbcsr/develop/index.html>.
+
+CP2K requires DBCSR as a hard dependency, which can be prepared with the CP2K toolchain or Spack
+build, and will be found automatically by CMake during configuration.
+
+The MPI configuration should be consistent between CP2K and DBCSR. For a MPI build (`psmp`/`pdbg`)
+of CP2K, DBCSR must also have been built with MPI support using the CMake flag `-DUSE_MPI=ON`, and
+`-DUSE_MPI_F08=ON` if `mpi_f08` is available. Likewise, a serial build (`ssmp`/`sdbg`) of CP2K must
+use a DBCSR configured with `-DUSE_MPI=OFF`.
+
+## libwignernj (required, angular momentum algebra)
+
+[libwignernj](https://github.com/susilehtola/libwignernj) evaluates the Wigner 3j, 6j and 9j
+symbols, the Clebsch-Gordan coefficients and the Gaunt coefficients of the complex and real
+spherical harmonics. All intermediate arithmetic is carried out exactly, in a prime factorization
+representation, and the result is rounded only once at the end, so the returned coefficients are
+correct to the last bit.
+
+CP2K uses the Gaunt coefficients of the real spherical harmonics to expand products of two spherical
+harmonics, which is needed by the GAPW atomic densities and potentials, the LRI and SHG integrals,
+the spin-orbit coupling in TDDFPT, the XAS_TDP module and the CNEO nuclear basis.
+
+CP2K requires an external installation of libwignernj 0.8 or newer, including its upstream CMake
+package. The CP2K toolchain installs it by default (`--with-libwignernj=install`); the Spack
+dependency environments also include it. The toolchain accepts `--with-libwignernj=system` or an
+installation prefix to use an existing copy. There is no bundled fallback or configure-time
+download.
+
+Only the C library is used: CP2K binds to it through `ISO_C_BINDING`, so libwignernj can be built
+with `-DWIGNERNJ_BUILD_FORTRAN=OFF`. Use `-Dwignernj_ROOT=/path/to/install` or add the installation
+prefix to `CMAKE_PREFIX_PATH` when configuring CP2K. An installed CP2K also discovers this
+dependency when a downstream project calls `find_package(cp2k)`.
 
 ## MPI and ScaLAPACK (required for MPI parallel builds)
 
@@ -42,9 +90,12 @@ Note that the MPI installation must match the used Fortran compiler.
 
 If your computing platform does not provide MPI, there are several freely available implementations:
 
-- MPICH: <https://www.mpich.org/> (may require `-fallow-argument-mismatch` when building with GCC
-  10\)
+- MPICH: <https://www.mpich.org/>
 - OpenMPI: <http://www.open-mpi.org/>
+
+```{hint}
+When building MPICH with GCC 10, the `-fallow-argument-mismatch` compiler flag may be needed.
+```
 
 ```{note}
 Open MPI applies process binding by default. This can affect hybrid MPI+OpenMP runs because the
@@ -62,34 +113,15 @@ CP2K assumes that the MPI library implements MPI version 3; older versions of MP
 are not supported. CP2K can make use of the `mpi_f08` module; pass `-DCP2K_USE_MPI_F08=ON` to CMake
 to enable it.
 
+From version 2027.1, CP2K also requires the MPI implementation to provide `MPI_THREAD_MULTIPLE`. The
+standalone executables request this level when initializing MPI and stop if it is unavailable. When
+CP2K is used as a library in an application that initializes MPI externally, the application must
+call `MPI_Init_thread` requesting `MPI_THREAD_MULTIPLE`; initialization through `MPI_Init` or with a
+lower thread-support level is insufficient.
+
 For more information of ScaLAPACK, see <http://www.netlib.org/scalapack/>. ScaLAPACK can be part of
 AOCL (AMD) or oneMKL (Intel); these libraries are recommended on the corresponding machines if
 available.
-
-## FFTW (improved performance of FFTs)
-
-FFTW can be used to improve FFT speed on a wide range of architectures. It is strongly recommended
-to install and use FFTW3. The current version of CP2K works with FFTW 3.X (pass
-`-DCP2K_USE_FFTW3=ON` to CMake). It can be downloaded from <http://www.fftw.org>.
-
-FFTW is also provided by MKL. If you have MKL but still want to use standalone FFTW3, pass
-`-DCP2K_USE_FFTW3_WITH_MKL=ON` to CMake.
-
-```{warning}
-Note that FFTW must know the Fortran compiler you will use in order to install properly
-(e.g., `export F77=gfortran` before configure if you intend to use gfortran).
-```
-
-Since CP2K is OpenMP parallelized, CP2K enables the FFTW3 OpenMP interface by default
-(`-DCP2K_ENABLE_FFTW3_OPENMP_SUPPORT=ON`); the FFTW installation must therefore provide
-`libfftw3_omp`. The alternative threads interface can be selected with
-`-DCP2K_ENABLE_FFTW3_THREADS_SUPPORT=ON`, which requires `libfftw3_threads`.
-
-```{important}
-Support for FFTW is required for some features, especially systems with very large block sizes/grid
-sizes. A future release of CP2K may make FFTW a hard dependency. Please consider CP2K to be compiled
-with support for FFTW.
-```
 
 ## LIBINT (ERI calculation for HFX)
 
@@ -111,15 +143,21 @@ Hartree--Fock exchange and related methods.
 
 ## LIBXS (improved performance for matrix multiplication)
 
-- A library for matrix operations and deep learning primitives: <https://github.com/hfp/libxs/>.
-- [LIBXS](https://github.com/hfp/libxs/) provides optimized matrix operations used by CP2K and is
-  required when using CP2K's OpenCL backend.
+LIBXS is a C library for memory operations, numerics, synchronization, and more. It is originally
+developed as part of [LIBXSMM](#libxsmm-jit-kernel-provider-of-libxs). For more information, refer
+to <https://libxs.readthedocs.io/>. The source code is available at <https://github.com/hfp/libxs>.
+
+- LIBXS provides optimized matrix operations used by CP2K and is required when using CP2K's OpenCL
+  backend.
 - Pass `-DCP2K_USE_LIBXS=ON` to CMake to enable it.
 
 ## LIBXSTREAM (OpenCL offload runtime)
 
-- [LIBXSTREAM](https://github.com/hfp/libxstream) provides the stream and memory-management layer
-  used by CP2K's OpenCL offload backend.
+LIBXSTREAM is an accelerator backend library for GPU offloading. For more information, refer to
+<https://libxstream.readthedocs.io/>. The source code is available at
+<https://github.com/hfp/libxstream>.
+
+- LIBXSTREAM provides the stream and memory-management layer used by CP2K's OpenCL offload backend.
 - It is required automatically when configuring OpenCL acceleration with `-DCP2K_USE_ACCEL=OPENCL`;
   there is no separate `CP2K_USE_LIBXSTREAM` option.
 - OpenCL builds also require LIBXS. For a manual build, make both LIBXSTREAM and the OpenCL
@@ -128,7 +166,10 @@ Hartree--Fock exchange and related methods.
 
 ## LIBXSMM (JIT-kernel provider of libXS)
 
-- A library that provide a JIT-kernel for LibXS: <https://github.com/libxsmm/libxsmm/>.
+LIBXSMM is a library for specialized dense and sparse matrix operations that provides just-in-time
+kernels (JIT-kernels) for LibXS. For more information, refer to <https://libxsmm.readthedocs.io/>.
+The source code is available at <https://github.com/libxsmm/libxsmm/>.
+
 - Pass `-DCP2K_USE_LIBXSMM=ON` to CMake to enable it; this is only valid when `-DCP2K_USE_LIBXS=ON`
   is passed.
 - The integration of LIBXS and LIBXSMM is done through `libxs_jit.F` that is provided by LIBXS but
@@ -137,27 +178,44 @@ Hartree--Fock exchange and related methods.
 
 ## LIBXC (wider choice of xc functionals)
 
-LIBXC is a library that provides wider choice of XC functionals.
+LIBXC is a library that provides wider choice of XC functionals. For more information, refer to
+<https://libxc.gitlab.io>.
 
-- The latest version of LIBXC can be downloaded from <https://gitlab.com/libxc/libxc/-/releases>
+- The latest version of LIBXC can be downloaded from <https://gitlab.com/libxc/libxc/-/releases>.
+- CP2K input reference for the [DFT/XC/XC_FUNCTIONAL](#CP2K_INPUT.FORCE_EVAL.DFT.XC.XC_FUNCTIONAL)
+  section lists the LIBXC functionals as well as built-in ones.
 - CP2K makes use of third derivates but does not use fourth derivates, so LIBXC may be configured
   with `cmake .. -DDISABLE_KXC=OFF <other LIBXC configuration flags>`.
 - Pass `-DCP2K_USE_LIBXC=ON` to CMake.
-- [LIBXSMM](https://github.com/libxsmm/libxsmm/) provides just-in-time kernels for LIBXS.
 
 ## GauXC (xc integration library)
 
 GauXC can be used to evaluate selected exchange-correlation functionals through an external
 integrator.
 
-- Libtorch is required for Skala support.
+- Libtorch is required for Skala support. See the [Torch section](#torch-pytorch-c-library) for how
+  to provide a matching libtorch; the libtorch installed automatically by the toolchain is a
+  prebuilt package for a specific GPU and CUDA version and is not guaranteed to be optimal.
 - Pass `-DCP2K_USE_GAUXC=ON` to CMake to enable GauXC. An MPI-enabled CP2K build requires a GauXC
   installation built with MPI support.
+- The toolchain marks its pinned GauXC as containing the OneDFT gradient correction from PR #222.
+  Unmarked external builds retain the older gradient safeguards; GauXC's version alone is
+  insufficient to identify the correction.
 - TorchScript-based GauXC models require a libtorch installation compatible with CP2K's BLAS and
-  OpenMP runtime. Pre-built libtorch bundles can conflict with a CP2K build using oneMKL; use a
-  compatible generic BLAS stack or rebuild libtorch against the selected dynamic stack when this
-  occurs.
+  OpenMP runtime. Pre-built libtorch bundles commonly include oneMKL. CP2K's LP64 OpenBLAS build
+  provides a compatibility path for the conflicting grouped SGEMM/DGEMM symbols; other mixed BLAS
+  interfaces require a consistently built numerical stack.
 - See [](../methods/dft/gauxc) for input, supported calculation types, and current limitations.
+
+## Skala/FTorch (machine learning for quantum chemistry)
+
+Skala/FTorch provides the machine learning based density functional Skala.
+
+- Pass `-DCP2K_USE_SKALA_FTORCH=ON` to CMake to enable Skala/FTorch support.
+- Requires FTorch, Skala, and libtorch libraries to be installed and available. See the
+  [Torch section](#torch-pytorch-c-library) for how to provide a matching libtorch; the libtorch
+  installed automatically by the toolchain is a prebuilt package for a specific GPU and CUDA version
+  and is not guaranteed to be optimal.
 
 ## PEXSI (low scaling SCF method)
 
@@ -172,15 +230,47 @@ typically SuperLU_DIST together with ParMETIS or PT-Scotch.
 
 ## PLUMED (enables various enhanced sampling methods)
 
+PLUMED is a plugin library for enhanced sampling and free energy algorithms in molecular dynamics.
+For more information, refer to <https://www.plumed.org/>. The source code and release tarballs are
+available at <https://github.com/plumed/plumed2>.
+
 CP2K can be compiled with PLUMED 2.x by passing `-DCP2K_USE_PLUMED=ON` to CMake.
 
 See <https://cp2k.org/howto:install_with_plumed> for full instructions.
 
+Activate the native interface with `MOTION/FREE_ENERGY/METADYN/USE_PLUMED` and `PLUMED_INPUT_FILE`.
+CP2K supplies positions, the cell, masses, physical potential energy/forces and the potential
+virial. PLUMED's bias energy is included in MD energies; its force and virial contributions are
+included in integration and pressure, including `ENERGY`-dependent biases. The potential virial must
+be enabled in the force evaluation for variable-cell simulations. CP2K supplies the MD target
+temperature as `kBT` for PLUMED actions that need it.
+
+The initial biased forces are evaluated before the first MD half-step. Continuing MD with a nonzero
+step counter sets PLUMED's restart flag. Keep PLUMED's history files (for example `HILLS`) alongside
+the CP2K restart: the CP2K restart alone does not contain PLUMED's bias history. Use consistent
+PLUMED input and files when restarting. Time-dependent biases do not in general conserve the
+physical-plus-bias energy; the appropriate work/reweighting depends on the method.
+
+The executable-based coupling tests compare biased and unbiased native MD output, so they do not
+require the optional libcp2k stress API or MD adapters. With a PLUMED-enabled executable:
+
+```sh
+python -m pip install './python[test]'
+CP2K_TEST_PLUMED=1 CP2K_TEST_EXECUTABLE=/absolute/path/to/cp2k.psmp \
+  python -m pytest python/tests/test_plumed.py -q
+```
+
+`python/tests/plumed_mpi_smoke.py` separately exercises variable-cell MD through the existing Python
+binding with one or two MPI ranks. Run it in separate scratch directories with `CP2K_LIBRARY` set to
+the matching PLUMED-enabled shared library. Compare `.cell`, `.stress` and the physical columns of
+`.ener`; the last energy-file column is wall time.
+
 ## spglib (crystal symmetries tools)
 
-Spglib is a library for finding and handling crystal symmetries.
+Spglib is a library for finding and handling crystal symmetries. For more information, refer to
+<https://spglib.readthedocs.io/>.
 
-- The library can be downloaded from <https://github.com/atztogo/spglib>
+- The library can be downloaded from <https://github.com/spglib/spglib>
 - For building CP2K with the spglib pass `-DCP2K_USE_SPGLIB=ON` to CMake.
 
 ## SIRIUS (plane wave calculations)
@@ -190,7 +280,9 @@ SIRIUS is a domain specific library for electronic structure calculations with p
 - The code is available at <https://github.com/electronic-structure/SIRIUS>.
 - SIRIUS support requires an MPI build. Pass `-DCP2K_USE_SIRIUS=ON` to CMake to enable it.
 - SIRIUS has its own dependency stack, commonly including HDF5, SpFFT, SPLA, and eigensolver
-  libraries. It's recommended to build SIRIUS through Spack to get all features enabled.
+  libraries. It is recommended to build SIRIUS through Spack to get all features enabled.
+- The CP2K input reference for the [PW_DFT](#CP2K_INPUT.FORCE_EVAL.PW_DFT) section is composed by
+  SIRIUS itself, and thus is absent from the `.xml` dumped by a CP2K binary not built with SIRIUS.
 - Pass `-DCP2K_USE_LIBVDWXC=ON` when the selected SIRIUS build provides libvdwxc support.
 - Pass `-DCP2K_USE_SIRIUS_DFTD3=ON` when SIRIUS was built with DFT-D3 support.
 - Pass `-DCP2K_USE_SIRIUS_DFTD4=ON` when SIRIUS was built with DFT-D4 support.
@@ -204,6 +296,13 @@ COSMA is an alternative for the pdgemm routine included in ScaLAPACK. The librar
 and GPUs.
 
 - Pass `-DCP2K_USE_COSMA=ON` to CMake to enable support for COSMA.
+- COSMA (as of version 2.8.4) keeps a memory pool sized for its largest multiplication until the run
+  ends. In runs with large dense matrix products, such as the full (non-TDA) BSE or RPA and SOS-MP2
+  gradients of large systems, this pool can set the peak memory. The environment variable
+  [`COSMA_CPU_MAX_MEMORY`](https://github.com/eth-cscs/COSMA#tunable-parameters) caps it per MPI
+  rank (in MB), at some cost in runtime; see
+  [COSMA#118](https://github.com/eth-cscs/COSMA/issues/118) and
+  [COSMA#174](https://github.com/eth-cscs/COSMA/pull/174) for the state upstream.
 - See <https://github.com/eth-cscs/COSMA> for more information.
 
 ## LibVori (Voronoi Integration for Electrostatic Properties from Electron Density)
@@ -220,8 +319,8 @@ of each atom.
 
 ## Torch (PyTorch C++ library)
 
-LibTorch is the C++ distribution of PyTorch. CP2K uses it for the NequIP interface and for GauXC
-Skala models.
+LibTorch is the C++ distribution of PyTorch. CP2K uses it for the NequIP and MACE interfaces and for
+GauXC Skala models.
 
 - LibTorch can be downloaded from the
   [PyTorch installation page](https://pytorch.org/get-started/locally/).
@@ -229,6 +328,15 @@ Skala models.
 - For GPU acceleration, choose a LibTorch distribution compatible with the available backend and
   hardware, such as CUDA for an NVIDIA GPU or ROCm for a supported AMD GPU. Refer to the PyTorch
   installation page for current platform, driver, and runtime requirements.
+- The toolchain installs a prebuilt libtorch when `--with-libtorch=install` (or simply
+  `--with-libtorch`) is used. This package is selected for a specific platform, and for a specific
+  GPU and CUDA version, so it is highly recommended to provide your own matching libtorch instead:
+  `--with-libtorch=system` searches for an existing libtorch in the system paths (it does **not**
+  install libtorch), while `--with-libtorch=<path-to-libtorch>` uses a libtorch that you installed
+  or built yourself. Otherwise poor performance is expected and the calculation may even fail.
+- This only applies to the toolchain-based build. The Spack-based build via `make_cp2k.sh` installs
+  a matching libtorch (with CUDA support when `--gpu_model` is set) itself, so no manual libtorch
+  installation is needed there.
 
 ```{caution}
 Note that currently pre-built libtorch bundle (up to 2.12.1) is not compatible with CP2K's external
@@ -254,7 +362,7 @@ DeePMD-kit provides Deep Potential models. Support for its C interface can be en
 
 - DeePMD-kit C interface can be downloaded from
   <https://docs.deepmodeling.com/projects/deepmd/en/master/install/install-from-c-library.html>
-- For more information see <https://github.com/deepmodeling/deepmd-kit.git>.
+- For more information see <https://github.com/deepmodeling/deepmd-kit>.
 
 ## ACE (atomic cluster expansion ML potentials)
 
@@ -269,10 +377,16 @@ potentials support can be enabled by passing `-DCP2K_USE_ACE=ON` to CMake.
 
 ## DFTD4 (dispersion correction)
 
-DFTD4 provides the Generally Applicable Atomic-Charge Dependent London Dispersion Correction.
+DFTD4 provides the Generally Applicable Atomic-Charge Dependent London Dispersion Correction. For
+more information, see <https://www.chemie.uni-bonn.de/grimme/de/software/dft-d4>. The source code
+and release tarballs are available at <https://github.com/dftd4/dftd4>.
 
-- Please use the CMake-built dftd4 package rather than the Meson-built one for CP2K.
-- For more information, see <https://github.com/dftd4/dftd4>
+- Please use the CMake-built dftd4 package rather than the Meson-built one for CP2K at the moment;
+  the ability to export CMake configurations from Meson build has yet to be included in a release.
+- The CP2K 2026.2 release would be the last one to have interfaces to legacy versions of the DFTD4
+  code down to version 3; due to compatibility issues in development, these have since been dropped
+  in [pull request #5641](https://github.com/cp2k/cp2k/pull/5641).
+- DFTD4 is also part of the [TBLITE](#tblite-semiempirical-method) package as noted below.
 - Pass `-DCP2K_USE_DFTD4=ON` to CMake.
 
 ## libsmeagol (electron transport calculation with current-induced forces)
@@ -313,11 +427,13 @@ enabled by passing `-DCP2K_USE_GREENX=ON` to CMake.
 
 TBLITE is a lightweight tight-binding framework that provides the GFN2-xTB method.
 
-- Please always use the CMake-built tblite package rather than the Meson-built one for CP2K.
+- Please always use the CMake-built tblite package rather than the Meson-built one for CP2K at the
+  moment; the ability to export CMake configurations from Meson build has yet to be validated.
 - A CMake build of tblite from source also installs DFT-D4 and s-dftd3. Therefore, no separate DFTD4
   installation is needed when tblite is enabled; s-dftd3 also provides parameters for additional XC
   functionals.
-- For more information see <https://github.com/tblite/tblite>
+- The source code and release tarballs are available at <https://github.com/tblite/tblite>.
+- For more information see <https://tblite.readthedocs.io>.
 - Pass `-DCP2K_USE_TBLITE=ON` to CMake.
 
 ## openPMD (structured output)
@@ -343,7 +459,7 @@ as part of DFLAGS may or may not work.
 MiMiC - Multiscale simulation framework
 
 - Its interface is realized through the MCL library, which can be downloaded from
-  <https://https://mimic-project.org>
+  <https://gitlab.com/mimic-project/>
 - For more information about the framework and supported programs see <https://mimic-project.org>
 - Pass `-DCP2K_USE_MIMIC=ON` to CMake
 
@@ -354,4 +470,4 @@ libGint - A library for the calculation of the Hartree Fock exchange on GPUs
 - Compared to a regular XF calculation, the changes needed in the input file are :
 - &FORCE_EVAL &DFT &XC &HF HFX_LIBRARY libGint
 - &FORCE_EVAL &DFT &XC &HF &MEMORY MAX_MEMORY X
-- pass -DCP2K_USE_LIBGINT=ON\` to CMake.
+- pass `-DCP2K_USE_LIBGINT=ON` to CMake.

@@ -42,7 +42,7 @@ MODULE qs_loc_methods
    USE cp_fm_basic_linalg,              ONLY: cp_fm_rot_cols,&
                                               cp_fm_rot_rows,&
                                               cp_fm_schur_product
-   USE cp_fm_pool_types,                ONLY: cp_fm_pool_p_type,&
+   USE cp_fm_pool_types,                ONLY: cp_fm_pool_type,&
                                               fm_pool_create_fm
    USE cp_fm_struct,                    ONLY: cp_fm_struct_create,&
                                               cp_fm_struct_release,&
@@ -102,6 +102,7 @@ MODULE qs_loc_methods
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE qs_loc_types,                    ONLY: get_qs_loc_env,&
+                                              loc_coeff_index,&
                                               qs_loc_env_type
    USE qs_localization_methods,         ONLY: &
         approx_l1_norm_sd, cardoso_souloumiac, cardoso_souloumiac_pipek, crazy_rotations, &
@@ -368,7 +369,7 @@ CONTAINS
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: first_sgf, last_sgf, nsgf
       REAL(dp)                                           :: eps
       TYPE(cp_cfm_type), POINTER                         :: complex_vectors, my_zij_cfm_set(:, :)
-      TYPE(cp_fm_pool_p_type), DIMENSION(:), POINTER     :: ao_ao_fm_pools
+      TYPE(cp_fm_pool_type), POINTER                     :: ao_ao_fm_pool
       TYPE(cp_fm_type)                                   :: opvec
       TYPE(cp_fm_type), POINTER                          :: ov_fm
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -410,9 +411,9 @@ CONTAINS
                             first_sgf=first_sgf, last_sgf=last_sgf, nsgf=nsgf)
 
       !   Copy the overlap sparse matrix in a full matrix
-      CALL mpools_get(qs_env%mpools, ao_ao_fm_pools=ao_ao_fm_pools)
+      CALL mpools_get(qs_env%mpools, ao_ao_fm_pool=ao_ao_fm_pool)
       ALLOCATE (ov_fm)
-      CALL fm_pool_create_fm(ao_ao_fm_pools(1)%pool, ov_fm, name=" ")
+      CALL fm_pool_create_fm(ao_ao_fm_pool, ov_fm, name=" ")
       CALL copy_dbcsr_to_fm(matrix_s(1)%matrix, ov_fm)
 
       !   Compute zij here
@@ -1025,7 +1026,7 @@ CONTAINS
       IF (PRESENT(mo_coeff)) THEN
          CPASSERT(.NOT. PRESENT(complex_mo_coeff))
          CALL cp_fm_create(squaredmat, mo_coeff%matrix_struct)
-         squaredmat%local_data = mo_coeff%local_data**2.0
+         squaredmat%local_data = mo_coeff%local_data**2
       ELSE
          CPASSERT(PRESENT(complex_mo_coeff))
          CALL cp_fm_create(squaredmat, complex_mo_coeff%matrix_struct)
@@ -1196,8 +1197,8 @@ CONTAINS
       LOGICAL, PARAMETER :: debug_this_subroutine = .FALSE.
 
       CHARACTER(len=default_path_length)                 :: file_tmp
-      INTEGER                                            :: imoment, istate, ncol_global, nm, &
-                                                            nmoloc, nrow_global, output_unit, &
+      INTEGER                                            :: icoeff, imoment, istate, ncol_global, &
+                                                            nm, nmoloc, nrow_global, output_unit, &
                                                             output_unit_sm
       REAL(dp), DIMENSION(:, :), POINTER                 :: centers
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: moment_set
@@ -1209,6 +1210,7 @@ CONTAINS
       TYPE(cp_fm_type), POINTER                          :: mo_localized
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s, moments
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
       logger => cp_get_default_logger()
@@ -1231,7 +1233,9 @@ CONTAINS
       CALL get_qs_loc_env(qs_loc_env=qs_loc_env, moloc_coeff=moloc_coeff)
       centers => qs_loc_env%localized_wfn_control%centers_set(ispin)%array
 
-      CALL get_qs_env(qs_env, matrix_s=matrix_s)
+      CALL get_qs_env(qs_env, dft_control=dft_control, matrix_s=matrix_s)
+      ! in RTP moloc_coeff holds the real and imaginary parts of each spin
+      icoeff = loc_coeff_index(SIZE(moloc_coeff), dft_control%nspins, ispin)
 
       nm = ncoset(norder) - 1
 
@@ -1239,11 +1243,11 @@ CONTAINS
       !particle_set => qs_loc_env%particle_set
       para_env => qs_loc_env%para_env
 
-      CALL cp_fm_get_info(moloc_coeff(ispin), ncol_global=nmoloc)
+      CALL cp_fm_get_info(moloc_coeff(icoeff), ncol_global=nmoloc)
       ALLOCATE (moment_set(nm, nmoloc))
       moment_set = 0.0_dp
 
-      mo_localized => moloc_coeff(ispin)
+      mo_localized => moloc_coeff(icoeff)
 
       DO istate = 1, nmoloc
          rcc = centers(1:3, istate)
@@ -1340,9 +1344,10 @@ CONTAINS
 
       CHARACTER(len=default_path_length)                 :: file_tmp
       COMPLEX(KIND=dp)                                   :: z
-      INTEGER                                            :: icov, imoment, istate, ncol_global, nm, &
-                                                            nmoloc, norder, nrow_global, &
-                                                            output_unit, output_unit_sm
+      INTEGER                                            :: icoeff, icov, imoment, istate, &
+                                                            ncol_global, nm, nmoloc, norder, &
+                                                            nrow_global, output_unit, &
+                                                            output_unit_sm
       REAL(dp), DIMENSION(:, :), POINTER                 :: centers
       REAL(KIND=dp)                                      :: imagpart, Lx, Ly, Lz, realpart
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: moment_set
@@ -1355,6 +1360,7 @@ CONTAINS
       TYPE(cp_fm_type), POINTER                          :: mo_localized
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s, moments
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
 ! two pointers, one to each spin channel's coeff. matrix (nao x nmoloc)
@@ -1389,14 +1395,16 @@ CONTAINS
 
       para_env => qs_loc_env%para_env
 
-      CALL get_qs_env(qs_env, matrix_s=matrix_s)
+      CALL get_qs_env(qs_env, dft_control=dft_control, matrix_s=matrix_s)
+      ! in RTP moloc_coeff holds the real and imaginary parts of each spin
+      icoeff = loc_coeff_index(SIZE(moloc_coeff), dft_control%nspins, ispin)
 
-      CALL cp_fm_get_info(moloc_coeff(ispin), ncol_global=nmoloc)
+      CALL cp_fm_get_info(moloc_coeff(icoeff), ncol_global=nmoloc)
 
       ALLOCATE (moment_set(nm, nmoloc))
       moment_set = 0.0_dp
 
-      mo_localized => moloc_coeff(ispin)
+      mo_localized => moloc_coeff(icoeff)
 
       DO istate = 1, nmoloc
          rcc = centers(1:3, istate)
@@ -1456,13 +1464,13 @@ CONTAINS
 
                  !! XX
                CASE (1)
-                  realpart = 1.0 - 0.5*twopi*twopi/Lx/Lx/Lx/Lx &
+                  realpart = 1.0_dp - 0.5_dp*twopi*twopi/Lx/Lx/Lx/Lx &
                      *moment_set(20, istate)
                   imagpart = twopi/Lx/Lx*moment_set(4, istate) &
-                             - twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lx/Lx/6.0*moment_set(56, istate)
+                             - twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lx/Lx/6.0_dp*moment_set(56, istate)
 
                   ! third order
-                  !realpart = realpart + twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lx/Lx/Lx/Lx/24.0 * moment_set(120, istate)
+                  !realpart = realpart + twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lx/Lx/Lx/Lx/24.0_dp * moment_set(120, istate)
                   !imagpart = imagpart + twopi*twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lx/Lx/Lx/Lx/Lx/Lx/120 &
                   !     * moment_set(220, istate)
 
@@ -1471,13 +1479,13 @@ CONTAINS
 
                  !! XY
                CASE (2)
-                  realpart = 1.0 - 0.5*twopi*twopi/Lx/Ly/Lx/Ly &
+                  realpart = 1.0_dp - 0.5_dp*twopi*twopi/Lx/Ly/Lx/Ly &
                      *moment_set(23, istate)
                   imagpart = twopi/Lx/Ly*moment_set(5, istate) &
-                             - twopi*twopi*twopi/Lx/Lx/Lx/Ly/Ly/Ly/6.0*moment_set(62, istate)
+                             - twopi*twopi*twopi/Lx/Lx/Lx/Ly/Ly/Ly/6.0_dp*moment_set(62, istate)
 
                   ! third order
-                  !realpart = realpart + twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Ly/Ly/Ly/Ly/24.0 * moment_set(130, istate)
+                  !realpart = realpart + twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Ly/Ly/Ly/Ly/24.0_dp * moment_set(130, istate)
                   !imagpart = imagpart + twopi*twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lx/Ly/Ly/Ly/Ly/Ly/120 &
                   !     * moment_set(235, istate)
 
@@ -1486,13 +1494,13 @@ CONTAINS
 
                  !! XZ
                CASE (3)
-                  realpart = 1.0 - 0.5*twopi*twopi/Lx/Lz/Lx/Lz &
+                  realpart = 1.0_dp - 0.5_dp*twopi*twopi/Lx/Lz/Lx/Lz &
                      *moment_set(25, istate)
                   imagpart = twopi/Lx/Lz*moment_set(6, istate) &
-                             - twopi*twopi*twopi/Lx/Lx/Lx/Lz/Lz/Lz/6.0*moment_set(65, istate)
+                             - twopi*twopi*twopi/Lx/Lx/Lx/Lz/Lz/Lz/6.0_dp*moment_set(65, istate)
 
                   ! third order
-                  !realpart = realpart + twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lz/Lz/Lz/Lz/24.0 * moment_set(134, istate)
+                  !realpart = realpart + twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lz/Lz/Lz/Lz/24.0_dp * moment_set(134, istate)
                   !imagpart = imagpart + twopi*twopi*twopi*twopi*twopi/Lx/Lx/Lx/Lx/Lx/Ly/Ly/Ly/Ly/Ly/120 &
                   !     * moment_set(240, istate)
 
@@ -1501,13 +1509,13 @@ CONTAINS
 
                  !! YY
                CASE (4)
-                  realpart = 1.0 - 0.5*twopi*twopi/Ly/Ly/Ly/Ly &
+                  realpart = 1.0_dp - 0.5_dp*twopi*twopi/Ly/Ly/Ly/Ly &
                      *moment_set(30, istate)
                   imagpart = twopi/Ly/Ly*moment_set(7, istate) &
-                             - twopi*twopi*twopi/Ly/Ly/Ly/Ly/Ly/Ly/6.0*moment_set(77, istate)
+                             - twopi*twopi*twopi/Ly/Ly/Ly/Ly/Ly/Ly/6.0_dp*moment_set(77, istate)
 
                   ! third order
-                  !realpart = realpart + twopi*twopi*twopi*twopi/Ly/Ly/Ly/Ly/Ly/Ly/Ly/Ly/24.0 * moment_set(156, istate)
+                  !realpart = realpart + twopi*twopi*twopi*twopi/Ly/Ly/Ly/Ly/Ly/Ly/Ly/Ly/24.0_dp * moment_set(156, istate)
                   !imagpart = imagpart + twopi*twopi*twopi*twopi*twopi/Ly/Ly/Ly/Ly/Ly/Ly/Ly/Ly/Ly/Ly/120 &
                   !     * moment_set(275, istate)
 
@@ -1516,13 +1524,13 @@ CONTAINS
 
                  !! YZ
                CASE (5)
-                  realpart = 1.0 - 0.5*twopi*twopi/Ly/Lz/Ly/Lz &
+                  realpart = 1.0_dp - 0.5_dp*twopi*twopi/Ly/Lz/Ly/Lz &
                      *moment_set(32, istate)
                   imagpart = twopi/Ly/Lz*moment_set(8, istate) &
-                             - twopi*twopi*twopi/Ly/Ly/Ly/Lz/Lz/Lz/6.0*moment_set(80, istate)
+                             - twopi*twopi*twopi/Ly/Ly/Ly/Lz/Lz/Lz/6.0_dp*moment_set(80, istate)
 
                   ! third order
-                  !realpart = realpart + twopi*twopi*twopi*twopi/Lz/Lz/Lz/Lz/Ly/Ly/Ly/Ly/24.0 * moment_set(160, istate)
+                  !realpart = realpart + twopi*twopi*twopi*twopi/Lz/Lz/Lz/Lz/Ly/Ly/Ly/Ly/24.0_dp * moment_set(160, istate)
                   !imagpart = imagpart + twopi*twopi*twopi*twopi*twopi/Lz/Lz/Lz/Lz/Lz/Ly/Ly/Ly/Ly/Ly/120 &
                   !     * moment_set(280, istate)
 
@@ -1531,13 +1539,13 @@ CONTAINS
 
                  !! ZZ
                CASE (6)
-                  realpart = 1.0 - 0.5*twopi*twopi/Lz/Lz/Lz/Lz &
+                  realpart = 1.0_dp - 0.5_dp*twopi*twopi/Lz/Lz/Lz/Lz &
                      *moment_set(34, istate)
                   imagpart = twopi/Lz/Lz*moment_set(9, istate) &
-                             - twopi*twopi*twopi/Lz/Lz/Lz/Lz/Lz/Lz/6.0*moment_set(83, istate)
+                             - twopi*twopi*twopi/Lz/Lz/Lz/Lz/Lz/Lz/6.0_dp*moment_set(83, istate)
 
                   ! third order
-                  !realpart = realpart + twopi*twopi*twopi*twopi/Lz/Lz/Lz/Lz/Lz/Lz/Lz/Lz/24.0 * moment_set(164, istate)
+                  !realpart = realpart + twopi*twopi*twopi*twopi/Lz/Lz/Lz/Lz/Lz/Lz/Lz/Lz/24.0_dp * moment_set(164, istate)
                   !imagpart = imagpart + twopi*twopi*twopi*twopi*twopi/Lz/Lz/Lz/Lz/Lz/Lz/Lz/Lz/Lz/Lz/120 &
                   !     * moment_set(285, istate)
 

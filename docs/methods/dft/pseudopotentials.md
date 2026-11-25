@@ -27,9 +27,45 @@ selected for each atomic [KIND](#CP2K_INPUT.FORCE_EVAL.SUBSYS.KIND) with
 &END FORCE_EVAL
 ```
 
+Do not confuse the [POTENTIAL](#CP2K_INPUT.FORCE_EVAL.SUBSYS.KIND.POTENTIAL) *keyword* with the
+identically-named [POTENTIAL](#CP2K_INPUT.FORCE_EVAL.SUBSYS.KIND.POTENTIAL_SECTION) *section* that
+also defines a pseudopotential. Their distinction is that the *keyword* takes the type and name of
+the potential, while the *section* takes the complete specification and data in an internal format.
+Specifying only the *keyword* as is done above suffices for most practical usage. For those curious,
+CP2K will resolve user-provided inputs and compose restart files with more verbose but otherwise
+equivalent syntax as a new input (see [MOTION/PRINT/RESTART](#CP2K_INPUT.MOTION.PRINT.RESTART)), and
+such a restart file gives a glimpse of the usage of both the *keyword* and the *section*:
+
+```
+     &KIND "O"
+       POTENTIAL "GTH-PBE-q6"
+       &POTENTIAL
+         2 4
+           2.4455430000000000E-001 2 -1.6667214800000000E+001  2.4873113199999999E+000
+         2
+           2.2095592000000000E-001 1  1.8337458110000000E+001
+           2.1133246999999999E-001 0
+         # Potential name: GTH-PBE-Q6 for element symbol: O
+         # Potential read from the potential filename: GTH_POTENTIALS
+       &END POTENTIAL
+     &END KIND
+     &KIND "H"
+       POTENTIAL "GTH-PBE-q1"
+       &POTENTIAL
+         1
+           2.0000000000000001E-001 2 -4.1789004399999996E+000  7.2446330999999997E-001
+         0
+         # Potential name: GTH-PBE-Q1 for element symbol: H
+         # Potential read from the potential filename: GTH_POTENTIALS
+       &END POTENTIAL
+     &END KIND
+```
+
 The suffix `q6` in `GTH-PBE-q6`, for example, means that six valence electrons are treated
-explicitly. The chosen basis set should match this valence configuration; for oxygen, a common
-matching basis is `DZVP-MOLOPT-GTH`.
+explicitly. The chosen basis set should match this valence configuration; for oxygen, the common
+basis sets with the same suffix in the full name like `DZVP-MOLOPT-GTH-q6` can be used. If some
+pseudopotentials without corresponding basis sets, or vice versa, are spotted in the built-in data
+files, consult developers for help.
 
 ## Choosing a Pseudopotential
 
@@ -61,6 +97,27 @@ GAPW method:
 &END KIND
 ```
 
+## UPF Collections and Regression Data
+
+SSSP is a curated selection from several pseudopotential families, not a pseudopotential type. Its
+collections contain norm-conserving, ultrasoft and PAW datasets. The UPF format stores these
+different types, whose calculation support depends on the CP2K implementation and Gaussian basis.
+
+`tests/QS/regtest-upf/` contains a supplemented PBE H USPP for offline regressions of the inverse
+orbital representations. It originates from PSLibrary 1.0.0 and was selected by SSSP v2.0 PBE
+Precision. The adjacent `SOURCE` file records its preparation, checksums, attribution and license.
+The file is regression data and is not installed in the standard CP2K data directory.
+
+The optional installer under `tools/pseudopotentials/` combines original SSSP NC/PAW files with
+prepared USPPs from a checksum-pinned external release. The original UPF hash identifies the
+matching USPP, preserving the SSSP selection. A selection index records the installed file
+locations. Additional non-SSSP USPPs and complete original collections remain separately selectable.
+The external catalog distinguishes compatible generator replays from auxiliary reconstructions and
+records their atomic checks. Calculation support still depends on the method and Gaussian basis.
+Choose a writable external destination. Downloads do not run automatically. See the
+[download and preparation instructions](https://github.com/cp2k/cp2k/blob/master/tools/pseudopotentials/README.md).
+SSSP plane-wave cutoffs are not Gaussian-basis or Quickstep multigrid recommendations.
+
 ## Consistency Checks
 
 Useful checks when setting up a calculation are:
@@ -83,3 +140,4 @@ For a tested minimal GPW input using GTH pseudopotentials, see
 - [](#Hartwigsen1998)
 - [](#Krack2005)
 - [](#Iannuzzi2026)
+- [](#Mirhosseini2026)

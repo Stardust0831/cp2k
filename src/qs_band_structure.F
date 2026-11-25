@@ -20,12 +20,14 @@ MODULE qs_band_structure
                                               open_file
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
    USE cp_parser_methods,               ONLY: read_float_object
+   USE dft_plus_u,                      ONLY: lowdin_kp_prepare
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
    USE kinds,                           ONLY: default_string_length,&
                                               dp,&
+                                              int_8,&
                                               max_line_length
    USE kpoint_methods,                  ONLY: kpoint_env_initialize,&
                                               kpoint_init_cell_index,&
@@ -37,6 +39,12 @@ MODULE qs_band_structure
                                               kpoint_release,&
                                               kpoint_sym_create,&
                                               kpoint_type
+   USE kpoint_unfolding,                ONLY: unfolding_env_release,&
+                                              unfolding_env_type,&
+                                              unfolding_finish_set,&
+                                              unfolding_fold_kpath,&
+                                              unfolding_process_batch,&
+                                              unfolding_setup
    USE machine,                         ONLY: m_walltime
    USE mathconstants,                   ONLY: twopi
    USE message_passing,                 ONLY: mp_para_env_type
@@ -48,10 +56,13 @@ MODULE qs_band_structure
    USE qs_gamma2kp,                     ONLY: create_kp_from_gamma
    USE qs_mo_types,                     ONLY: get_mo_set
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
-   USE qs_scf_diagonalization,          ONLY: do_general_diag_kp
+   USE qs_scf_diagonalization,          ONLY: diag_kp_smat,&
+                                              do_general_diag_kp
    USE qs_scf_types,                    ONLY: qs_scf_env_type
    USE scf_control_types,               ONLY: scf_control_type
    USE string_utilities,                ONLY: uppercase
+
+!$ USE omp_lib, ONLY: omp_get_max_threads
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -59,6 +70,12 @@ MODULE qs_band_structure
    PRIVATE
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_band_structure'
+   ! Target per-rank working-set budget for band-structure k-point batches:
+   ! covers per-group diagonalization workspaces plus batch-resident MOs (and S^{1/2}).
+   INTEGER(KIND=int_8), PARAMETER :: bs_batch_mem_bytes = 384_int_8*1024_int_8**2
+   ! Approximate number of complex nao x nao solver work matrices per k-point group worker.
+   INTEGER(KIND=int_8), PARAMETER :: bs_solver_work_matrices = 5_int_8
+   INTEGER(KIND=int_8), PARAMETER :: complex_dp_bytes = 16_int_8
 
    PUBLIC :: calculate_band_structure, calculate_kp_orbitals, calculate_kpoints_for_bs
 
@@ -104,192 +121,476 @@ CONTAINS
    SUBROUTINE do_calculate_band_structure(qs_env)
       TYPE(qs_environment_type), POINTER                 :: qs_env
 
-      CHARACTER(LEN=default_string_length)               :: filename, ustr
+      CHARACTER(LEN=default_string_length)               :: filename
       CHARACTER(LEN=default_string_length), &
-         DIMENSION(:), POINTER                           :: spname, strptr
-      CHARACTER(LEN=max_line_length)                     :: error_message
-      INTEGER                                            :: bs_data_unit, i, i_rep, ik, ikk, ikpgr, &
-                                                            imo, ip, ispin, n_ptr, n_rep, nadd, &
-                                                            nkp, nmo, npline, npoints, nspins, &
-                                                            unit_nr
-      INTEGER, DIMENSION(2)                              :: kp_range
-      LOGICAL                                            :: explicit, io_default, my_kpgrp
-      REAL(KIND=dp)                                      :: t1, t2
-      REAL(KIND=dp), DIMENSION(3)                        :: kpptr
+         ALLOCATABLE, DIMENSION(:)                       :: spname
+      INTEGER                                            :: batch_size, bs_data_unit, i_rep, ib1, &
+                                                            ib2, min_ngr, n_rep, nadd, ngr_b, &
+                                                            npoints, unit_nr
+      LOGICAL                                            :: do_unfold, need_shalf
+      REAL(KIND=dp)                                      :: path_weight, t1, t2
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: kpgeneral, kspecial
       REAL(KIND=dp), DIMENSION(3, 3)                     :: cart_hmat
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, eigval, occnum, &
-                                                            occupation_numbers, wkp
-      REAL(kind=dp), DIMENSION(:, :), POINTER            :: kpgeneral, kspecial, xkp
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(kpoint_env_type), POINTER                     :: kp
-      TYPE(kpoint_type), POINTER                         :: kpoint
+      TYPE(kpoint_type), POINTER                         :: kpoint, scf_kpoints
       TYPE(mp_para_env_type), POINTER                    :: para_env
-      TYPE(section_vals_type), POINTER                   :: bs_input, kpset
+      TYPE(section_vals_type), POINTER                   :: bs_input, kpset, u_input
 
       bs_input => section_vals_get_subs_vals(qs_env%input, "DFT%PRINT%BAND_STRUCTURE")
-      CALL section_vals_get(bs_input, explicit=explicit)
-      IF (explicit) THEN
-         CALL section_vals_val_get(bs_input, "FILE_NAME", c_val=filename)
-         CALL section_vals_val_get(bs_input, "ADDED_MOS", i_val=nadd)
-         unit_nr = cp_logger_get_default_io_unit()
-         CALL get_qs_env(qs_env=qs_env, para_env=para_env)
-         CALL get_qs_env(qs_env, cell=cell)
+      CALL section_vals_val_get(bs_input, "FILE_NAME", c_val=filename)
+      CALL section_vals_val_get(bs_input, "ADDED_MOS", i_val=nadd)
+      kpset => section_vals_get_subs_vals(bs_input, "KPOINT_SET")
+      CALL section_vals_get(kpset, n_repetition=n_rep)
+      u_input => section_vals_get_subs_vals(bs_input, "UNFOLDING")
+      CALL section_vals_get(u_input, explicit=do_unfold)
+      unit_nr = cp_logger_get_default_io_unit()
+      NULLIFY (scf_kpoints)
+      CALL get_qs_env(qs_env, para_env=para_env, cell=cell, kpoints=scf_kpoints)
+
+      IF (unit_nr > 0) THEN
+         WRITE (unit_nr, FMT="(/,T2,A)") "KPOINTS| Band Structure Calculation"
+         WRITE (unit_nr, FMT="(T2,A,T71,I10)") "KPOINTS| Number of k-point sets", n_rep
+         IF (nadd /= 0) THEN
+            WRITE (unit_nr, FMT="(T2,A,T71,I10)") "KPOINTS| Number of added MOs/bands", nadd
+         END IF
+      END IF
+      IF (filename == "") THEN
+         bs_data_unit = unit_nr
+      ELSE IF (para_env%is_source()) THEN
+         CALL open_file(filename, unit_number=bs_data_unit, file_status="UNKNOWN", file_action="WRITE", &
+                        file_position="APPEND")
+      ELSE
+         bs_data_unit = -1
+      END IF
+
+      IF (do_unfold) THEN
+         CALL band_unfolding(qs_env, kpset, u_input, n_rep, nadd, unit_nr, bs_data_unit)
+      ELSE
+         need_shalf = .FALSE.
+         IF (ASSOCIATED(scf_kpoints)) THEN
+            IF (ALLOCATED(scf_kpoints%lowdin_v)) need_shalf = ANY(scf_kpoints%lowdin_v /= 0.0_dp)
+         END IF
          cart_hmat(:, :) = cell%hmat(:, :)
          IF (cell%input_cell_canonicalized) cart_hmat(:, :) = cell%input_hmat(:, :)
-         kpset => section_vals_get_subs_vals(bs_input, "KPOINT_SET")
-         CALL section_vals_get(kpset, n_repetition=n_rep)
-         IF (unit_nr > 0) THEN
-            WRITE (unit_nr, FMT="(/,T2,A)") "KPOINTS| Band Structure Calculation"
-            WRITE (unit_nr, FMT="(T2,A,T71,I10)") "KPOINTS| Number of k-point sets", n_rep
-            IF (nadd /= 0) THEN
-               WRITE (unit_nr, FMT="(T2,A,T71,I10)") "KPOINTS| Number of added MOs/bands", nadd
-            END IF
-         END IF
-         IF (filename == "") THEN
-            ! use standard output file
-            bs_data_unit = unit_nr
-            io_default = .TRUE.
-         ELSE
-            io_default = .FALSE.
-            IF (para_env%is_source()) THEN
-               CALL open_file(filename, unit_number=bs_data_unit, file_status="UNKNOWN", file_action="WRITE", &
-                              file_position="APPEND")
-            ELSE
-               bs_data_unit = -1
-            END IF
-         END IF
          DO i_rep = 1, n_rep
             t1 = m_walltime()
-            CALL section_vals_val_get(kpset, "NPOINTS", i_rep_section=i_rep, i_val=npline)
-            CALL section_vals_val_get(kpset, "UNITS", i_rep_section=i_rep, c_val=ustr)
-            CALL uppercase(ustr)
-            CALL section_vals_val_get(kpset, "SPECIAL_POINT", i_rep_section=i_rep, n_rep_val=n_ptr)
-            ALLOCATE (kspecial(3, n_ptr))
-            ALLOCATE (spname(n_ptr))
-            DO ip = 1, n_ptr
-               CALL section_vals_val_get(kpset, "SPECIAL_POINT", i_rep_section=i_rep, i_rep_val=ip, c_vals=strptr)
-               IF (SIZE(strptr(:), 1) == 4) THEN
-                  spname(ip) = strptr(1)
-                  DO i = 1, 3
-                     CALL read_float_object(strptr(i + 1), kpptr(i), error_message)
-                     IF (LEN_TRIM(error_message) > 0) CPABORT(TRIM(error_message))
-                  END DO
-               ELSE IF (SIZE(strptr(:), 1) == 3) THEN
-                  spname(ip) = "not specified"
-                  DO i = 1, 3
-                     CALL read_float_object(strptr(i), kpptr(i), error_message)
-                     IF (LEN_TRIM(error_message) > 0) CPABORT(TRIM(error_message))
-                  END DO
-               ELSE
-                  CPABORT("Input SPECIAL_POINT invalid")
+            CALL bs_build_kpath(kpset, i_rep, cart_hmat, unit_nr, kspecial, spname, kpgeneral)
+            npoints = SIZE(kpgeneral, 2)
+            path_weight = 1.0_dp/REAL(npoints, KIND=dp)
+            CALL bs_choose_batch_layout(qs_env, nadd, npoints, need_shalf, batch_size, min_ngr)
+            IF (batch_size < npoints .AND. unit_nr > 0) THEN
+               WRITE (unit_nr, FMT="(T2,A,I0,A,I0,A,I0,A,I0,A)") &
+                  "KPOINTS| Set ", i_rep, ": batching ", npoints, " k-points in chunks of <= ", &
+                  batch_size, " (min group size ", min_ngr, ")"
+            END IF
+            DO ib1 = 1, npoints, batch_size
+               ib2 = MIN(npoints, ib1 + batch_size - 1)
+               ngr_b = bs_batch_group_size(para_env%num_pe, min_ngr, ib2 - ib1 + 1)
+               NULLIFY (kpoint)
+               CALL calculate_kp_orbitals(qs_env, kpoint, "GENERAL", nadd, &
+                                          kpgeneral=kpgeneral(1:3, ib1:ib2), &
+                                          group_size_ext=ngr_b, alloc_dm=.FALSE.)
+               IF (ib1 == 1) THEN
+                  CALL bs_write_set_header(kpoint, i_rep, kspecial, spname, npoints, unit_nr, bs_data_unit)
                END IF
-               SELECT CASE (ustr)
-               CASE ("B_VECTOR")
-                  kspecial(1:3, ip) = kpptr(1:3)
-               CASE ("CART_ANGSTROM")
-                  kspecial(1:3, ip) = (kpptr(1)*cart_hmat(1, 1:3) + &
-                                       kpptr(2)*cart_hmat(2, 1:3) + &
-                                       kpptr(3)*cart_hmat(3, 1:3))/twopi*angstrom
-               CASE ("CART_BOHR")
-                  kspecial(1:3, ip) = (kpptr(1)*cart_hmat(1, 1:3) + &
-                                       kpptr(2)*cart_hmat(2, 1:3) + &
-                                       kpptr(3)*cart_hmat(3, 1:3))/twopi
-               CASE DEFAULT
-                  CPABORT("Unknown unit <"//TRIM(ustr)//"> specified for k-point definition")
-               END SELECT
+               CALL bs_write_standard_set(qs_env, kpoint, bs_data_unit, ib1 - 1, path_weight)
+               CALL kpoint_release(kpoint)
             END DO
-            npoints = (n_ptr - 1)*npline + 1
-            CPASSERT(npoints >= 1)
-
-            ! Initialize environment and calculate MOs
-            ALLOCATE (kpgeneral(3, npoints))
-            kpgeneral(1:3, 1) = kspecial(1:3, 1)
-            ikk = 1
-            DO ik = 2, n_ptr
-               DO ip = 1, npline
-                  ikk = ikk + 1
-                  kpgeneral(1:3, ikk) = kspecial(1:3, ik - 1) + &
-                                        REAL(ip, KIND=dp)/REAL(npline, KIND=dp)* &
-                                        (kspecial(1:3, ik) - kspecial(1:3, ik - 1))
-               END DO
-            END DO
-            NULLIFY (kpoint)
-            CALL calculate_kp_orbitals(qs_env, kpoint, "GENERAL", nadd, kpgeneral=kpgeneral)
-            DEALLOCATE (kpgeneral)
-
-            CALL get_qs_env(qs_env, dft_control=dft_control)
-            nspins = dft_control%nspins
-            kp => kpoint%kp_env(1)%kpoint_env
-            CALL get_mo_set(kp%mos(1, 1), nmo=nmo)
-            ALLOCATE (eigval(nmo), occnum(nmo))
-            CALL get_kpoint_info(kpoint, nkp=nkp, kp_range=kp_range, xkp=xkp, wkp=wkp)
-
-            IF (unit_nr > 0) THEN
-               WRITE (UNIT=unit_nr, FMT="(T2,A,I4,T71,I10)") &
-                  "KPOINTS| Number of k-points in set ", i_rep, npoints
-               WRITE (UNIT=unit_nr, FMT="(T2,A)") &
-                  "KPOINTS| In units of b-vector [2pi/Bohr]"
-               DO ip = 1, n_ptr
-                  WRITE (UNIT=unit_nr, FMT="(T2,A,I5,1X,A11,3(1X,F12.6))") &
-                     "KPOINTS| Special point ", ip, ADJUSTL(TRIM(spname(ip))), kspecial(1:3, ip)
-               END DO
-            END IF
-            IF (bs_data_unit > 0 .AND. (bs_data_unit /= unit_nr)) THEN
-               WRITE (UNIT=bs_data_unit, FMT="(4(A,I0),A)") &
-                  "# Set ", i_rep, ": ", n_ptr, " special points, ", npoints, " k-points, ", nmo, " bands"
-               DO ip = 1, n_ptr
-                  WRITE (UNIT=bs_data_unit, FMT="(A,I0,T20,T24,3(1X,F14.8),2X,A)") &
-                     "#  Special point ", ip, kspecial(1:3, ip), ADJUSTL(TRIM(spname(ip)))
-               END DO
-            END IF
-
-            DO ik = 1, nkp
-               my_kpgrp = (ik >= kp_range(1) .AND. ik <= kp_range(2))
-               DO ispin = 1, nspins
-                  IF (my_kpgrp) THEN
-                     ikpgr = ik - kp_range(1) + 1
-                     kp => kpoint%kp_env(ikpgr)%kpoint_env
-                     CALL get_mo_set(kp%mos(1, ispin), eigenvalues=eigenvalues, occupation_numbers=occupation_numbers)
-                     eigval(1:nmo) = eigenvalues(1:nmo)
-                     occnum(1:nmo) = occupation_numbers(1:nmo)
-                  ELSE
-                     eigval(1:nmo) = 0.0_dp
-                     occnum(1:nmo) = 0.0_dp
-                  END IF
-                  CALL kpoint%para_env_inter_kp%sum(eigval)
-                  CALL kpoint%para_env_inter_kp%sum(occnum)
-                  IF (bs_data_unit > 0) THEN
-                     WRITE (UNIT=bs_data_unit, FMT="(A,I0,T15,A,I0,A,T24,3(1X,F14.8),3X,F14.8)") &
-                        "#  Point ", ik, "  Spin ", ispin, ":", xkp(1:3, ik), wkp(ik)
-                     WRITE (UNIT=bs_data_unit, FMT="(A)") &
-                        "#   Band    Energy [eV]     Occupation"
-                     DO imo = 1, nmo
-                        WRITE (UNIT=bs_data_unit, FMT="(T2,I7,2(1X,F14.8))") &
-                           imo, eigval(imo)*evolt, occnum(imo)
-                     END DO
-                  END IF
-               END DO
-            END DO
-
-            DEALLOCATE (kspecial, spname)
-            DEALLOCATE (eigval, occnum)
-            CALL kpoint_release(kpoint)
+            DEALLOCATE (kspecial, spname, kpgeneral)
             t2 = m_walltime()
             IF (unit_nr > 0) THEN
                WRITE (UNIT=unit_nr, FMT="(T2,A,T67,F14.3)") "KPOINTS| Time for k-point line ", t2 - t1
             END IF
-
          END DO
-
-         ! Close output files
-         IF (.NOT. io_default) THEN
-            IF (para_env%is_source()) CALL close_file(bs_data_unit)
-         END IF
-
       END IF
 
+      IF (filename /= "" .AND. para_env%is_source()) CALL close_file(bs_data_unit)
+
    END SUBROUTINE do_calculate_band_structure
+
+! **************************************************************************************************
+!> \brief Read one KPOINT_SET, convert its special points to b-vector units and interpolate
+!>        the k-point line between them
+!> \param kpset KPOINT_SET section
+!> \param i_rep repetition of the KPOINT_SET section
+!> \param cart_hmat lattice of the CART_* units (columns are the lattice vectors, Bohr)
+!> \param unit_nr output unit for the k-point set summary
+!> \param kspecial (3, n_ptr) special points in b-vector units
+!> \param spname (n_ptr) special point names
+!> \param kpgeneral (3, npoints) k-points of the line in b-vector units
+! **************************************************************************************************
+   SUBROUTINE bs_build_kpath(kpset, i_rep, cart_hmat, unit_nr, kspecial, spname, kpgeneral)
+      TYPE(section_vals_type), POINTER                   :: kpset
+      INTEGER, INTENT(IN)                                :: i_rep
+      REAL(KIND=dp), DIMENSION(3, 3), INTENT(IN)         :: cart_hmat
+      INTEGER, INTENT(IN)                                :: unit_nr
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: kspecial
+      CHARACTER(LEN=default_string_length), &
+         ALLOCATABLE, DIMENSION(:), INTENT(OUT)          :: spname
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :), &
+         INTENT(OUT)                                     :: kpgeneral
+
+      CHARACTER(LEN=default_string_length)               :: ustr
+      CHARACTER(LEN=default_string_length), &
+         DIMENSION(:), POINTER                           :: strptr
+      CHARACTER(LEN=max_line_length)                     :: error_message
+      INTEGER                                            :: i, ik, ikk, ip, n_ptr, npline, npoints
+      REAL(KIND=dp), DIMENSION(3)                        :: kpptr
+
+      CALL section_vals_val_get(kpset, "NPOINTS", i_rep_section=i_rep, i_val=npline)
+      CALL section_vals_val_get(kpset, "UNITS", i_rep_section=i_rep, c_val=ustr)
+      CALL uppercase(ustr)
+      CALL section_vals_val_get(kpset, "SPECIAL_POINT", i_rep_section=i_rep, n_rep_val=n_ptr)
+      ALLOCATE (kspecial(3, n_ptr))
+      ALLOCATE (spname(n_ptr))
+      DO ip = 1, n_ptr
+         CALL section_vals_val_get(kpset, "SPECIAL_POINT", i_rep_section=i_rep, i_rep_val=ip, c_vals=strptr)
+         IF (SIZE(strptr(:), 1) == 4) THEN
+            spname(ip) = strptr(1)
+            DO i = 1, 3
+               CALL read_float_object(strptr(i + 1), kpptr(i), error_message)
+               IF (LEN_TRIM(error_message) > 0) CPABORT(TRIM(error_message))
+            END DO
+         ELSE IF (SIZE(strptr(:), 1) == 3) THEN
+            spname(ip) = "not specified"
+            DO i = 1, 3
+               CALL read_float_object(strptr(i), kpptr(i), error_message)
+               IF (LEN_TRIM(error_message) > 0) CPABORT(TRIM(error_message))
+            END DO
+         ELSE
+            CPABORT("Input SPECIAL_POINT invalid")
+         END IF
+         SELECT CASE (ustr)
+         CASE ("B_VECTOR")
+            kspecial(1:3, ip) = kpptr(1:3)
+         CASE ("CART_ANGSTROM")
+            kspecial(1:3, ip) = (kpptr(1)*cart_hmat(1, 1:3) + &
+                                 kpptr(2)*cart_hmat(2, 1:3) + &
+                                 kpptr(3)*cart_hmat(3, 1:3))/twopi*angstrom
+         CASE ("CART_BOHR")
+            kspecial(1:3, ip) = (kpptr(1)*cart_hmat(1, 1:3) + &
+                                 kpptr(2)*cart_hmat(2, 1:3) + &
+                                 kpptr(3)*cart_hmat(3, 1:3))/twopi
+         CASE DEFAULT
+            CPABORT("Unknown unit <"//TRIM(ustr)//"> specified for k-point definition")
+         END SELECT
+      END DO
+      npoints = (n_ptr - 1)*npline + 1
+      CPASSERT(npoints >= 1)
+
+      ALLOCATE (kpgeneral(3, npoints))
+      kpgeneral(1:3, 1) = kspecial(1:3, 1)
+      ikk = 1
+      DO ik = 2, n_ptr
+         DO ip = 1, npline
+            ikk = ikk + 1
+            kpgeneral(1:3, ikk) = kspecial(1:3, ik - 1) + &
+                                  REAL(ip, KIND=dp)/REAL(npline, KIND=dp)* &
+                                  (kspecial(1:3, ik) - kspecial(1:3, ik - 1))
+         END DO
+      END DO
+
+      IF (unit_nr > 0) THEN
+         WRITE (UNIT=unit_nr, FMT="(T2,A,I4,T71,I10)") &
+            "KPOINTS| Number of k-points in set ", i_rep, npoints
+         WRITE (UNIT=unit_nr, FMT="(T2,A)") &
+            "KPOINTS| In units of b-vector [2pi/Bohr]"
+         DO ip = 1, n_ptr
+            WRITE (UNIT=unit_nr, FMT="(T2,A,I5,1X,A11,3(1X,F12.6))") &
+               "KPOINTS| Special point ", ip, ADJUSTL(TRIM(spname(ip))), kspecial(1:3, ip)
+         END DO
+      END IF
+
+   END SUBROUTINE bs_build_kpath
+
+! **************************************************************************************************
+!> \brief Write the header of one k-point set (its special points) to the band structure file
+!> \param kpoint k-points of the set with their MOs
+!> \param i_rep index of the k-point set
+!> \param kspecial (3, n_ptr) special points in b-vector units
+!> \param spname (n_ptr) special point names
+!> \param npoints number of k-points of the set
+!> \param unit_nr default output unit
+!> \param bs_data_unit band structure data unit
+! **************************************************************************************************
+   SUBROUTINE bs_write_set_header(kpoint, i_rep, kspecial, spname, npoints, unit_nr, bs_data_unit)
+      TYPE(kpoint_type), POINTER                         :: kpoint
+      INTEGER, INTENT(IN)                                :: i_rep
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: kspecial
+      CHARACTER(LEN=default_string_length), &
+         DIMENSION(:), INTENT(IN)                        :: spname
+      INTEGER, INTENT(IN)                                :: npoints, unit_nr, bs_data_unit
+
+      INTEGER                                            :: ip, nmo
+      TYPE(kpoint_env_type), POINTER                     :: kp
+
+      ! on the default output unit the special points are already listed by bs_build_kpath
+      IF (bs_data_unit > 0 .AND. (bs_data_unit /= unit_nr)) THEN
+         kp => kpoint%kp_env(1)%kpoint_env
+         CALL get_mo_set(kp%mos(1), nmo=nmo)
+         WRITE (UNIT=bs_data_unit, FMT="(4(A,I0),A)") &
+            "# Set ", i_rep, ": ", SIZE(kspecial, 2), " special points, ", npoints, " k-points, ", nmo, " bands"
+         DO ip = 1, SIZE(kspecial, 2)
+            WRITE (UNIT=bs_data_unit, FMT="(A,I0,T20,T24,3(1X,F14.8),2X,A)") &
+               "#  Special point ", ip, kspecial(1:3, ip), ADJUSTL(TRIM(spname(ip)))
+         END DO
+      END IF
+
+   END SUBROUTINE bs_write_set_header
+
+! **************************************************************************************************
+!> \brief Collect the band energies and occupations of one k-point batch from the k-point
+!>        groups and write their blocks to the band structure data unit
+!> \param qs_env ...
+!> \param kpoint k-points of the batch with their MOs
+!> \param bs_data_unit band structure data unit
+!> \param ik_offset global k-point index offset preceding this batch
+!> \param path_weight uniform path weight (1 / total number of path points)
+! **************************************************************************************************
+   SUBROUTINE bs_write_standard_set(qs_env, kpoint, bs_data_unit, ik_offset, path_weight)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(kpoint_type), POINTER                         :: kpoint
+      INTEGER, INTENT(IN)                                :: bs_data_unit, ik_offset
+      REAL(KIND=dp), INTENT(IN)                          :: path_weight
+
+      INTEGER                                            :: ik, ikpgr, imo, ispin, nkp, nmo, nspins
+      INTEGER, DIMENSION(2)                              :: kp_range
+      LOGICAL                                            :: my_kpgrp
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: eigval, occnum
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, occupation_numbers
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(kpoint_env_type), POINTER                     :: kp
+
+      CALL get_qs_env(qs_env, dft_control=dft_control)
+      nspins = dft_control%nspins
+      kp => kpoint%kp_env(1)%kpoint_env
+      CALL get_mo_set(kp%mos(1), nmo=nmo)
+      CALL get_kpoint_info(kpoint, nkp=nkp, kp_range=kp_range, xkp=xkp)
+
+      ALLOCATE (eigval(nmo), occnum(nmo))
+      DO ik = 1, nkp
+         my_kpgrp = (ik >= kp_range(1) .AND. ik <= kp_range(2))
+         DO ispin = 1, nspins
+            IF (my_kpgrp) THEN
+               ikpgr = ik - kp_range(1) + 1
+               kp => kpoint%kp_env(ikpgr)%kpoint_env
+               CALL get_mo_set(kp%mos(ispin), eigenvalues=eigenvalues, occupation_numbers=occupation_numbers)
+               eigval(1:nmo) = eigenvalues(1:nmo)
+               occnum(1:nmo) = occupation_numbers(1:nmo)
+            ELSE
+               eigval(1:nmo) = 0.0_dp
+               occnum(1:nmo) = 0.0_dp
+            END IF
+            CALL kpoint%para_env_inter_kp%sum(eigval)
+            CALL kpoint%para_env_inter_kp%sum(occnum)
+            IF (bs_data_unit > 0) THEN
+               WRITE (UNIT=bs_data_unit, FMT="(A,I0,T15,A,I0,A,T24,3(1X,F14.8),3X,F14.8)") &
+                  "#  Point ", ik_offset + ik, "  Spin ", ispin, ":", xkp(1:3, ik), path_weight
+               WRITE (UNIT=bs_data_unit, FMT="(A)") &
+                  "#   Band    Energy [eV]     Occupation"
+               DO imo = 1, nmo
+                  WRITE (UNIT=bs_data_unit, FMT="(T2,I7,2(1X,F14.8))") &
+                     imo, eigval(imo)*evolt, occnum(imo)
+               END DO
+            END IF
+         END DO
+      END DO
+      DEALLOCATE (eigval, occnum)
+
+   END SUBROUTINE bs_write_standard_set
+
+! **************************************************************************************************
+!> \brief Band structure unfolding onto the primitive cell of TRANSFORMATION_MATRIX: the
+!>        primitive-cell path of every KPOINT_SET is folded onto unique supercell K-points,
+!>        which are diagonalized and unfolded in memory-bounded batches (module kpoint_unfolding)
+!> \param qs_env ...
+!> \param kpset KPOINT_SET section
+!> \param u_input UNFOLDING section
+!> \param n_rep number of k-point sets
+!> \param nadd number of added MOs/bands
+!> \param unit_nr default output unit
+!> \param bs_data_unit band structure data unit
+! **************************************************************************************************
+   SUBROUTINE band_unfolding(qs_env, kpset, u_input, n_rep, nadd, unit_nr, bs_data_unit)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(section_vals_type), POINTER                   :: kpset, u_input
+      INTEGER, INTENT(IN)                                :: n_rep, nadd, unit_nr, bs_data_unit
+
+      CHARACTER(LEN=default_string_length), &
+         ALLOCATABLE, DIMENSION(:)                       :: spname
+      INTEGER                                            :: batch_size, i_rep, ib1, ib2, min_ngr, &
+                                                            nfold, ngr_b, nmo, npoints, nspins
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: path2K
+      REAL(KIND=dp)                                      :: sumdev, t1, t2
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: kpfolded, kpgeneral, kspecial
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: eigval_all, occnum_all
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: wall
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(kpoint_env_type), POINTER                     :: kp
+      TYPE(kpoint_type), POINTER                         :: kpoint
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(unfolding_env_type)                           :: uf
+
+      CALL get_qs_env(qs_env, dft_control=dft_control, para_env=para_env)
+      nspins = dft_control%nspins
+      CALL unfolding_setup(uf, qs_env, u_input, unit_nr, bs_data_unit)
+      DO i_rep = 1, n_rep
+         t1 = m_walltime()
+         ! CART_* KPOINT_SET units must convert with the primitive lattice: the
+         ! unfolding path points are primitive-cell k-points (avoids double folding)
+         CALL bs_build_kpath(kpset, i_rep, uf%h_pc, unit_nr, kspecial, spname, kpgeneral)
+         npoints = SIZE(kpgeneral, 2)
+         CALL unfolding_fold_kpath(uf, kpgeneral, kpfolded, path2K, nfold)
+         IF (unit_nr > 0) THEN
+            WRITE (unit_nr, FMT="(T2,A,I0,A,I0,A,I0,A)") "UNFOLD_BAND| Set ", i_rep, ": ", &
+               npoints, " path points -> ", nfold, " unique supercell K-points"
+         END IF
+         CALL bs_choose_batch_layout(qs_env, nadd, nfold, .TRUE., batch_size, min_ngr)
+         IF (batch_size < nfold .AND. unit_nr > 0) THEN
+            WRITE (unit_nr, FMT="(T2,A,I0,A,I0,A,I0,A,I0,A)") &
+               "UNFOLD_BAND| Set ", i_rep, ": batching ", nfold, " K-points in chunks of <= ", &
+               batch_size, " (min group size ", min_ngr, ")"
+         END IF
+         sumdev = 0.0_dp
+         DO ib1 = 1, nfold, batch_size
+            ib2 = MIN(nfold, ib1 + batch_size - 1)
+            ngr_b = bs_batch_group_size(para_env%num_pe, min_ngr, ib2 - ib1 + 1)
+            NULLIFY (kpoint)
+            CALL calculate_kp_orbitals(qs_env, kpoint, "GENERAL", nadd, &
+                                       kpgeneral=kpfolded(1:3, ib1:ib2), &
+                                       group_size_ext=ngr_b, alloc_dm=.FALSE.)
+            IF (ib1 == 1) THEN
+               kp => kpoint%kp_env(1)%kpoint_env
+               CALL get_mo_set(kp%mos(1), nmo=nmo)
+               CALL bs_write_set_header(kpoint, i_rep, kspecial, spname, npoints, unit_nr, bs_data_unit)
+               ALLOCATE (wall(npoints, nmo, 0:uf%n_groups, nspins))
+               ALLOCATE (eigval_all(nmo, nfold, nspins), occnum_all(nmo, nfold, nspins))
+               wall = 0.0_dp
+               eigval_all = 0.0_dp
+               occnum_all = 0.0_dp
+            END IF
+            CALL unfolding_process_batch(uf, qs_env, kpoint, kpgeneral, path2K, ib1 - 1, &
+                                         wall, eigval_all, occnum_all, sumdev)
+            CALL kpoint_release(kpoint)
+         END DO
+         CALL unfolding_finish_set(para_env, kpfolded, kpgeneral, path2K, eigval_all, occnum_all, &
+                                   wall, sumdev, unit_nr, bs_data_unit)
+         DEALLOCATE (kpfolded, kspecial, spname, kpgeneral, path2K, wall, eigval_all, occnum_all)
+         t2 = m_walltime()
+         IF (unit_nr > 0) THEN
+            WRITE (UNIT=unit_nr, FMT="(T2,A,T67,F14.3)") "KPOINTS| Time for k-point line ", t2 - t1
+         END IF
+      END DO
+      CALL unfolding_env_release(uf)
+
+   END SUBROUTINE band_unfolding
+
+! **************************************************************************************************
+!> \brief Choose k-point batch size and minimum k-point group size so band-structure diagonalization
+!>        and unfolding stay within bs_batch_mem_bytes per rank while respecting any explicit
+!>        &DFT%KPOINTS%PARALLEL_GROUP_SIZE setting
+!> \param qs_env ...
+!> \param nadd number of added MOs/bands
+!> \param nkp_total total number of k-points in the set
+!> \param need_shalf whether S(K)^{1/2} is stored per k-point (unfolding or Loewdin DFT+U)
+!> \param batch_size maximum number of k-points processed in one batch
+!> \param min_ngr minimum MPI ranks per k-point group
+! **************************************************************************************************
+   SUBROUTINE bs_choose_batch_layout(qs_env, nadd, nkp_total, need_shalf, batch_size, min_ngr)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER, INTENT(IN)                                :: nadd, nkp_total
+      LOGICAL, INTENT(IN)                                :: need_shalf
+      INTEGER, INTENT(OUT)                               :: batch_size, min_ngr
+
+      INTEGER :: igr, kplocal_max, max_batch, nao, nbatches, ngr, nkp_grp, nmo, nmo_eff, npe, &
+         nspins, omp_threads, scf_group_size, user_min_ngr
+      INTEGER(KIND=int_8)                                :: budget_group, min_group_bytes, nao8, &
+                                                            nmo8, per_k_bytes, work_bytes
+      LOGICAL                                            :: pgs_explicit
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+
+      CALL get_qs_env(qs_env, dft_control=dft_control, para_env=para_env)
+      npe = para_env%num_pe
+      nspins = dft_control%nspins
+      CALL get_mo_set(qs_env%mos(1), nao=nao, nmo=nmo)
+      nmo_eff = MAX(1, MIN(nao, nmo + nadd))
+
+      CALL section_vals_val_get(qs_env%input, "DFT%KPOINTS%PARALLEL_GROUP_SIZE", &
+                                i_val=scf_group_size, explicit=pgs_explicit)
+      IF (.NOT. pgs_explicit) scf_group_size = -1
+      IF (scf_group_size == 0) THEN
+         user_min_ngr = npe
+      ELSE IF (scf_group_size > 0) THEN
+         user_min_ngr = MIN(scf_group_size, npe)
+      ELSE
+         user_min_ngr = 1
+      END IF
+
+      omp_threads = 1
+!$    omp_threads = omp_get_max_threads()
+
+      nao8 = INT(nao, KIND=int_8)
+      nmo8 = INT(nmo_eff, KIND=int_8)
+      work_bytes = bs_solver_work_matrices*nao8*nao8*complex_dp_bytes
+      per_k_bytes = (INT(nspins, KIND=int_8)*nao8*nmo8 + &
+                     MERGE(nao8*nao8, 0_int_8, need_shalf))*complex_dp_bytes
+      min_group_bytes = work_bytes + per_k_bytes
+
+      ngr = npe
+      DO igr = npe, user_min_ngr, -1
+         IF (MOD(npe, igr) /= 0) CYCLE
+         IF (npe/igr > nkp_total) CYCLE
+         IF (min_group_bytes <= bs_batch_mem_bytes*INT(igr, KIND=int_8)) ngr = igr
+      END DO
+      min_ngr = ngr
+      nkp_grp = npe/ngr
+
+      budget_group = bs_batch_mem_bytes*INT(ngr, KIND=int_8)
+      kplocal_max = 1
+      IF (per_k_bytes > 0_int_8) THEN
+         IF (ngr == 1 .AND. omp_threads > 1) THEN
+            ! For 1-rank groups kp_diag_local_phase spawns MIN(omp_threads, kplocal) OpenMP
+            ! workers; stay at kplocal = 1 unless multi-worker workspaces also fit in budget.
+            IF (work_bytes*INT(omp_threads, KIND=int_8) + per_k_bytes <= budget_group) THEN
+               kplocal_max = INT(MIN(INT(nkp_total, KIND=int_8), &
+                                     MAX(1_int_8, (budget_group - work_bytes*INT(omp_threads, KIND=int_8))/per_k_bytes)))
+            END IF
+         ELSE IF (work_bytes + per_k_bytes <= budget_group) THEN
+            kplocal_max = INT(MIN(INT(nkp_total, KIND=int_8), &
+                                  MAX(1_int_8, (budget_group - work_bytes)/per_k_bytes)))
+         END IF
+      END IF
+
+      max_batch = MIN(nkp_total, MAX(1, nkp_grp*kplocal_max))
+      nbatches = (nkp_total + max_batch - 1)/max_batch
+      batch_size = (nkp_total + nbatches - 1)/nbatches
+
+   END SUBROUTINE bs_choose_batch_layout
+
+! **************************************************************************************************
+!> \brief Smallest valid k-point group size (>= min_ngr, dividing npe) with npe/ngr <= nkp_b
+!> \param npe total MPI ranks
+!> \param min_ngr minimum MPI ranks per k-point group
+!> \param nkp_b number of k-points in the current batch
+!> \return valid parallel_group_size for kpoint_env_initialize
+! **************************************************************************************************
+   PURE FUNCTION bs_batch_group_size(npe, min_ngr, nkp_b) RESULT(ngr_b)
+      INTEGER, INTENT(IN)                                :: npe, min_ngr, nkp_b
+      INTEGER                                            :: ngr_b
+
+      INTEGER                                            :: igr
+
+      ngr_b = npe
+      DO igr = npe, min_ngr, -1
+         IF (MOD(npe, igr) /= 0) CYCLE
+         IF (npe/igr > nkp_b) CYCLE
+         ngr_b = igr
+      END DO
+
+   END FUNCTION bs_batch_group_size
 
 ! **************************************************************************************************
 !> \brief diagonalize KS matrices at a set of kpoints
@@ -302,10 +603,11 @@ CONTAINS
 !> \param group_size_ext ...
 !> \param kp_shift ...
 !> \param gamma_centered ...
+!> \param alloc_dm Allocate per-kpoint density matrices (default .TRUE.)
 !> \author JGH
 ! **************************************************************************************************
    SUBROUTINE calculate_kp_orbitals(qs_env, kpoint, scheme, nadd, mp_grid, kpgeneral, group_size_ext, &
-                                    kp_shift, gamma_centered)
+                                    kp_shift, gamma_centered, alloc_dm)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(kpoint_type), POINTER                         :: kpoint
       CHARACTER(LEN=*), INTENT(IN)                       :: scheme
@@ -315,12 +617,15 @@ CONTAINS
          OPTIONAL                                        :: kpgeneral
       INTEGER, INTENT(IN), OPTIONAL                      :: group_size_ext
       REAL(KIND=dp), DIMENSION(3), INTENT(IN), OPTIONAL  :: kp_shift
-      LOGICAL, INTENT(IN), OPTIONAL                      :: gamma_centered
+      LOGICAL, INTENT(IN), OPTIONAL                      :: gamma_centered, alloc_dm
 
+      INTEGER                                            :: ik
       LOGICAL                                            :: diis_step
+      REAL(dp), POINTER                                  :: potential(:, :)
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, matrix_s
       TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(kpoint_type), POINTER                         :: scf_kpoints
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_nl
@@ -333,15 +638,28 @@ CONTAINS
       CALL get_qs_env(qs_env=qs_env, para_env=para_env, blacs_env=blacs_env)
       CALL kpoint_env_initialize(kpoint, para_env, blacs_env)
 
-      CALL kpoint_initialize_mos(kpoint, qs_env%mos, nadd)
+      CALL kpoint_initialize_mos(kpoint, qs_env%mos, nadd, alloc_dm=alloc_dm)
       CALL kpoint_initialize_mo_set(kpoint)
 
       CALL get_qs_env(qs_env, sab_kp=sab_nl, dft_control=dft_control)
       CALL kpoint_init_cell_index(kpoint, sab_nl, para_env, dft_control%nimages)
 
       CALL get_qs_env(qs_env, matrix_ks_kp=matrix_ks, matrix_s_kp=matrix_s, &
-                      scf_env=scf_env, scf_control=scf_control)
-      CALL do_general_diag_kp(matrix_ks, matrix_s, kpoint, scf_env, scf_control, .FALSE., diis_step)
+                      scf_env=scf_env, scf_control=scf_control, kpoints=scf_kpoints)
+      NULLIFY (potential)
+      IF (ASSOCIATED(scf_kpoints)) THEN
+         IF (ALLOCATED(scf_kpoints%lowdin_v)) THEN
+            IF (ANY(scf_kpoints%lowdin_v /= 0.0_dp)) potential => scf_kpoints%lowdin_v
+         END IF
+      END IF
+      IF (ASSOCIATED(potential)) THEN
+         CALL diag_kp_smat(matrix_s, kpoint, scf_env%scf_work1)
+         DO ik = 1, SIZE(kpoint%kp_env)
+            CALL lowdin_kp_prepare(kpoint%kp_env(ik)%kpoint_env, scf_kpoints%lowdin_orbitals, .FALSE.)
+         END DO
+      END IF
+      CALL do_general_diag_kp(matrix_ks, matrix_s, kpoint, scf_env, scf_control, .FALSE., diis_step, &
+                              potential=potential)
 
    END SUBROUTINE calculate_kp_orbitals
 

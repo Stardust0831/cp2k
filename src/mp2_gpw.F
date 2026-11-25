@@ -22,6 +22,7 @@ MODULE mp2_gpw
                                               cp_blacs_env_create,&
                                               cp_blacs_env_release,&
                                               cp_blacs_env_type
+   USE cp_cfm_types,                    ONLY: cp_cfm_type
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_clear_mempools, dbcsr_copy, dbcsr_create, dbcsr_distribution_release, &
@@ -39,7 +40,8 @@ MODULE mp2_gpw
         cp_add_default_logger, cp_get_default_logger, cp_logger_create, &
         cp_logger_get_default_unit_nr, cp_logger_release, cp_logger_set, cp_logger_type, &
         cp_rm_default_logger, cp_to_string
-   USE dbt_api,                         ONLY: dbt_type
+   USE dbt_api,                         ONLY: dbt_clear_mempools,&
+                                              dbt_type
    USE distribution_1d_types,           ONLY: distribution_1d_release,&
                                               distribution_1d_type
    USE distribution_2d_types,           ONLY: distribution_2d_release,&
@@ -58,8 +60,6 @@ MODULE mp2_gpw
    USE input_section_types,             ONLY: section_vals_val_get
    USE kinds,                           ONLY: dp
    USE kpoint_types,                    ONLY: kpoint_type
-   USE libint_wrapper,                  ONLY: cp_libint_static_cleanup,&
-                                              cp_libint_static_init
    USE machine,                         ONLY: default_output_unit,&
                                               m_flush
    USE message_passing,                 ONLY: mp_para_env_release,&
@@ -139,11 +139,11 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'mp2_gpw_main'
 
-      INTEGER :: blacs_grid_layout, bse_lev_virt, color_sub, dimen_RI, dimen_RI_red, eri_method, &
-         handle, ispin, local_unit_nr, my_group_L_end, my_group_L_size, my_group_L_start, nmo, &
-         nspins, potential_type, ri_metric_type
-      INTEGER, ALLOCATABLE, DIMENSION(:) :: ends_array_mc, ends_array_mc_block, gw_corr_lev_occ, &
-         gw_corr_lev_virt, homo, starts_array_mc, starts_array_mc_block
+      INTEGER :: blacs_grid_layout, color_sub, dimen_RI, dimen_RI_red, eri_method, handle, ispin, &
+         local_unit_nr, my_group_L_end, my_group_L_size, my_group_L_start, nmo, nspins, &
+         potential_type, ri_metric_type
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: bse_lev_virt, ends_array_mc, ends_array_mc_block, &
+         gw_corr_lev_occ, gw_corr_lev_virt, homo, starts_array_mc, starts_array_mc_block
       INTEGER, DIMENSION(3)                              :: periodic
       LOGICAL :: blacs_repeatable, do_bse, do_im_time, do_kpoints_cubic_RPA, my_do_gw, &
          my_do_ri_mp2, my_do_ri_rpa, my_do_ri_sos_laplace_mp2
@@ -151,17 +151,17 @@ CONTAINS
                                                             Emp2_EX_BB, eps_gvg_rspace_old, &
                                                             eps_pgf_orb_old, eps_rho_rspace_old
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: Eigenval
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: BIb_C_bse_ab, BIb_C_bse_ij
       REAL(KIND=dp), DIMENSION(:), POINTER               :: mo_eigenvalues
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(block_ind_type), ALLOCATABLE, &
          DIMENSION(:, :, :)                              :: t_3c_O_ind
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env_sub, blacs_env_sub_mat_munu
+      TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: cfm_matrix_L_kpoints, &
+                                                            cfm_matrix_Minv_L_kpoints
       TYPE(cp_fm_type)                                   :: fm_matrix_PQ
       TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:)        :: mo_coeff
-      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_matrix_L_kpoints, fm_matrix_Minv, &
-                                                            fm_matrix_Minv_L_kpoints, &
+      TYPE(cp_fm_type), ALLOCATABLE, DIMENSION(:, :)     :: fm_matrix_Minv, fm_matrix_Minv_L_gamma, &
                                                             fm_matrix_Minv_Vtrunc_Minv
       TYPE(cp_fm_type), POINTER                          :: mo_coeff_ptr
       TYPE(cp_logger_type), POINTER                      :: logger, logger_sub
@@ -174,14 +174,12 @@ CONTAINS
       TYPE(dbt_type)                                     :: t_3c_M
       TYPE(dbt_type), ALLOCATABLE, DIMENSION(:, :)       :: t_3c_O
       TYPE(dft_control_type), POINTER                    :: dft_control
-      TYPE(group_dist_d1_type)                           :: gd_array, gd_B_all, gd_B_occ_bse, &
-                                                            gd_B_virt_bse
+      TYPE(group_dist_d1_type)                           :: gd_array, gd_B_all
       TYPE(group_dist_d1_type), ALLOCATABLE, &
-         DIMENSION(:)                                    :: gd_B_virtual
+         DIMENSION(:)                                    :: gd_B_occ_bse, gd_B_virt_bse, gd_B_virtual
       TYPE(hfx_compression_type), ALLOCATABLE, &
          DIMENSION(:, :, :)                              :: t_3c_O_compressed
       TYPE(kpoint_type), POINTER                         :: kpoints, kpoints_from_DFT
-      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
       TYPE(mp_para_env_type), POINTER                    :: para_env_sub
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_orb_sub
@@ -189,7 +187,8 @@ CONTAINS
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
       TYPE(three_dim_real_array), ALLOCATABLE, &
-         DIMENSION(:)                                    :: BIb_C, BIb_C_gw
+         DIMENSION(:)                                    :: BIb_C, BIb_C_bse_ab, BIb_C_bse_ij, &
+                                                            BIb_C_gw
 
       CALL timeset(routineN, handle)
 
@@ -225,9 +224,8 @@ CONTAINS
       ! ... setup needed to be able to qs_integrate in a subgroup.
       IF (do_kpoints_cubic_RPA) THEN
          CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, kpoints=kpoints_from_DFT)
-         mos(1:nspins) => kpoints_from_DFT%kp_env(1)%kpoint_env%mos(1:nspins, 1)
       ELSE
-         CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, mos=mos)
+         CALL get_qs_env(qs_env=qs_env, dft_control=dft_control)
       END IF
       CALL get_mo_set(mo_set=mos_mp2(1), nmo=nmo)
       ALLOCATE (homo(nspins), Eigenval(nmo, nspins), mo_coeff(nspins))
@@ -273,9 +271,6 @@ CONTAINS
             END IF
          END IF
 
-         ! statically initialize libint
-         CALL cp_libint_static_init()
-
       END IF
 
       IF (mp2_env%ri_metric%potential_type == ri_default) THEN
@@ -301,8 +296,10 @@ CONTAINS
          CALL m_flush(unit_nr)
       END IF
 
-      ! MG: Disable logger layer for BSE, misses some key information to print cube files properly
-      IF (.NOT. (mp2_env%ri_g0w0%print_local_bandgap .OR. mp2_env%bse%do_nto_analysis)) THEN
+      ! MG: Disable logger layer for BSE, misses some key information to print cube files properly;
+      ! the same holds for the static COHSEX MOs (DFT%PRINT%MO, DFT%PRINT%MO_CUBES)
+      IF (.NOT. (mp2_env%ri_g0w0%print_local_bandgap .OR. mp2_env%bse%do_nto_analysis .OR. &
+                 mp2_env%ri_g0w0%do_static_cohsex)) THEN
          ! a logger
          NULLIFY (logger_sub)
          CALL cp_logger_create(logger_sub, para_env=para_env_sub, &
@@ -341,7 +338,7 @@ CONTAINS
 
       ! check if we want to do ri-g0w0 on top of ri-rpa
       my_do_gw = mp2_env%ri_rpa%do_ri_g0w0
-      ALLOCATE (gw_corr_lev_occ(nspins), gw_corr_lev_virt(nspins))
+      ALLOCATE (gw_corr_lev_occ(nspins), gw_corr_lev_virt(nspins), bse_lev_virt(nspins))
       gw_corr_lev_occ(1) = mp2_env%ri_g0w0%corr_mos_occ
       gw_corr_lev_virt(1) = mp2_env%ri_g0w0%corr_mos_virt
       IF (nspins == 2) THEN
@@ -350,20 +347,18 @@ CONTAINS
       END IF
 
       IF (do_bse) THEN
-         IF (nspins > 1) THEN
-            CPABORT("BSE not implemented for open shell calculations")
-         END IF
          !Keep default behavior for occupied
          ! We do not implement an explicit bse_lev_occ here, because the small number of occupied levels
          ! does not critically influence the memory
-         bse_lev_virt = gw_corr_lev_virt(1)
+         ! bse_lev_virt is per-spin (= the per-spin GW-corrected virtual count): the (ab|K) block is sized per spin
+         bse_lev_virt(:) = gw_corr_lev_virt(:)
       END IF
 
       ! After the components are inside of the routines, we can move this line insight the branch
       ALLOCATE (mo_coeff_o(nspins), mo_coeff_v(nspins), mo_coeff_all(nspins), mo_coeff_gw(nspins))
 
       ! Always allocate for usage in call of replicate_mat_to_subgroup
-      ALLOCATE (mo_coeff_o_bse(1), mo_coeff_v_bse(1))
+      ALLOCATE (mo_coeff_o_bse(nspins), mo_coeff_v_bse(nspins))
 
       ! for imag. time, we do not need this
       IF (.NOT. do_im_time) THEN
@@ -377,7 +372,7 @@ CONTAINS
                                            mo_coeff_o(ispin)%matrix, mo_coeff_v(ispin)%matrix, &
                                            mo_coeff_all(ispin)%matrix, mo_coeff_gw(ispin)%matrix, &
                                            my_do_gw, gw_corr_lev_occ(ispin), gw_corr_lev_virt(ispin), do_bse, &
-                                           bse_lev_virt, mo_coeff_o_bse(1)%matrix, mo_coeff_v_bse(1)%matrix, &
+                                           bse_lev_virt(ispin), mo_coeff_o_bse(ispin)%matrix, mo_coeff_v_bse(ispin)%matrix, &
                                            mp2_env%mp2_gpw%eps_filter)
 
          END DO
@@ -394,7 +389,8 @@ CONTAINS
             CALL mp2_ri_gpw_compute_in( &
                BIb_C, BIb_C_gw, BIb_C_bse_ij, BIb_C_bse_ab, gd_array, gd_B_virtual, dimen_RI, dimen_RI_red, qs_env, &
                para_env, para_env_sub, color_sub, cell, particle_set, &
-               atomic_kind_set, qs_kind_set, fm_matrix_PQ, fm_matrix_L_kpoints, fm_matrix_Minv_L_kpoints, &
+               atomic_kind_set, qs_kind_set, fm_matrix_PQ, cfm_matrix_L_kpoints, cfm_matrix_Minv_L_kpoints, &
+               fm_matrix_Minv_L_gamma, &
                fm_matrix_Minv, fm_matrix_Minv_Vtrunc_Minv, nmo, homo, mat_munu, sab_orb_sub, &
                mo_coeff_o, mo_coeff_v, mo_coeff_all, mo_coeff_gw, mo_coeff_o_bse, mo_coeff_v_bse, &
                mp2_env%mp2_gpw%eps_filter, unit_nr, &
@@ -412,7 +408,8 @@ CONTAINS
                                        dimen_RI, dimen_RI_red, qs_env, para_env, para_env_sub, &
                                        color_sub, cell, particle_set, &
                                        atomic_kind_set, qs_kind_set, fm_matrix_PQ, &
-                                       fm_matrix_L_kpoints, fm_matrix_Minv_L_kpoints, &
+                                       cfm_matrix_L_kpoints, cfm_matrix_Minv_L_kpoints, &
+                                       fm_matrix_Minv_L_gamma, &
                                        fm_matrix_Minv, fm_matrix_Minv_Vtrunc_Minv, nmo, homo, &
                                        mat_munu, sab_orb_sub, &
                                        mo_coeff_o, mo_coeff_v, mo_coeff_all, mo_coeff_gw, mo_coeff_o_bse, mo_coeff_v_bse, &
@@ -477,6 +474,7 @@ CONTAINS
       ! Free possibly large buffers allocated by dbcsr on the GPU,
       ! large hybrid dgemm/pdgemm's coming later will need the space.
       CALL dbcsr_clear_mempools()
+      CALL dbt_clear_mempools()
 
       IF (calc_forces .AND. .NOT. do_im_time) THEN
          ! make a copy of mo_coeff_o and mo_coeff_v
@@ -519,10 +517,12 @@ CONTAINS
 
       END IF
       IF (do_bse) THEN
-         CALL dbcsr_release(mo_coeff_o_bse(1)%matrix)
-         CALL dbcsr_release(mo_coeff_v_bse(1)%matrix)
-         DEALLOCATE (mo_coeff_o_bse(1)%matrix)
-         DEALLOCATE (mo_coeff_v_bse(1)%matrix)
+         DO ispin = 1, nspins
+            CALL dbcsr_release(mo_coeff_o_bse(ispin)%matrix)
+            CALL dbcsr_release(mo_coeff_v_bse(ispin)%matrix)
+            DEALLOCATE (mo_coeff_o_bse(ispin)%matrix)
+            DEALLOCATE (mo_coeff_v_bse(ispin)%matrix)
+         END DO
       END IF
       DEALLOCATE (mo_coeff_o_bse, mo_coeff_v_bse)
 
@@ -550,7 +550,8 @@ CONTAINS
          CALL rpa_ri_compute_en(qs_env, Emp2, mp2_env, BIb_C, BIb_C_gw, BIb_C_bse_ij, BIb_C_bse_ab, &
                                 para_env, para_env_sub, color_sub, &
                                 gd_array, gd_B_virtual, gd_B_all, gd_B_occ_bse, gd_B_virt_bse, &
-                                mo_coeff, fm_matrix_PQ, fm_matrix_L_kpoints, fm_matrix_Minv_L_kpoints, &
+                                mo_coeff, fm_matrix_PQ, cfm_matrix_L_kpoints, cfm_matrix_Minv_L_kpoints, &
+                                fm_matrix_Minv_L_gamma, &
                                 fm_matrix_Minv, fm_matrix_Minv_Vtrunc_Minv, kpoints, &
                                 Eigenval, nmo, homo, dimen_RI, dimen_RI_red, gw_corr_lev_occ, gw_corr_lev_virt, &
                                 bse_lev_virt, &
@@ -559,8 +560,9 @@ CONTAINS
                                 starts_array_mc, ends_array_mc, &
                                 starts_array_mc_block, ends_array_mc_block, calc_forces)
 
-         IF (mp2_env%ri_rpa%do_rse) &
+         IF (mp2_env%ri_rpa%do_rse) THEN
             CALL rse_energy(qs_env, mp2_env, para_env, dft_control, mo_coeff, homo, Eigenval)
+         END IF
 
          IF (do_im_time) THEN
             IF (ASSOCIATED(mat_P_global%matrix)) THEN
@@ -568,7 +570,6 @@ CONTAINS
                DEALLOCATE (mat_P_global%matrix)
             END IF
 
-            CALL cp_libint_static_cleanup()
             IF (calc_forces) CALL cp_fm_release(fm_matrix_PQ)
          END IF
 
@@ -641,7 +642,8 @@ CONTAINS
 
       CALL cp_blacs_env_release(blacs_env_sub)
 
-      IF (.NOT. (mp2_env%ri_g0w0%print_local_bandgap .OR. mp2_env%bse%do_nto_analysis)) THEN
+      IF (.NOT. (mp2_env%ri_g0w0%print_local_bandgap .OR. mp2_env%bse%do_nto_analysis .OR. &
+                 mp2_env%ri_g0w0%do_static_cohsex)) THEN
          CALL cp_rm_default_logger()
          CALL cp_logger_release(logger_sub)
       END IF
@@ -655,6 +657,9 @@ CONTAINS
       END IF
 
       DEALLOCATE (Eigenval, mo_coeff)
+
+      ! buffers of the tensor operations (e.g., low-scaling RPA/GW) are not kept beyond this point
+      CALL dbt_clear_mempools()
 
       CALL timestop(handle)
 
@@ -981,11 +986,13 @@ CONTAINS
 !> \param do_kpoints ...
 !> \param sab_orb_sub ...
 !> \param dbcsr_sym_type ...
+!> \param custom_row_blk_sizes ...
 !> \author Jan Wilhelm, code by Mauro Del Ben
 ! **************************************************************************************************
    SUBROUTINE create_mat_munu(mat_munu, qs_env, eps_grid, blacs_env_sub, &
                               do_ri_aux_basis, do_mixed_basis, group_size_prim, &
-                              do_alloc_blocks_from_nbl, do_kpoints, sab_orb_sub, dbcsr_sym_type)
+                              do_alloc_blocks_from_nbl, do_kpoints, sab_orb_sub, dbcsr_sym_type, &
+                              custom_row_blk_sizes)
 
       TYPE(dbcsr_p_type), INTENT(OUT)                    :: mat_munu
       TYPE(qs_environment_type), POINTER                 :: qs_env
@@ -997,12 +1004,13 @@ CONTAINS
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          OPTIONAL, POINTER                               :: sab_orb_sub
       CHARACTER, OPTIONAL                                :: dbcsr_sym_type
+      INTEGER, DIMENSION(:), INTENT(IN), OPTIONAL        :: custom_row_blk_sizes
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'create_mat_munu'
 
       CHARACTER                                          :: my_dbcsr_sym_type
       INTEGER                                            :: handle, ikind, natom, nkind
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_sizes, row_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_sizes, row_blk_sizes
       LOGICAL                                            :: my_do_alloc_blocks_from_nbl, &
                                                             my_do_kpoints, my_do_mixed_basis, &
                                                             my_do_ri_aux_basis
@@ -1160,11 +1168,15 @@ CONTAINS
       natom = SIZE(particle_set)
       ALLOCATE (row_blk_sizes(natom))
       IF (my_do_ri_aux_basis) THEN
-
-         ALLOCATE (basis_set_ri_aux(nkind))
-         CALL basis_set_list_setup(basis_set_ri_aux, "RI_AUX", qs_kind_set)
-         CALL get_particle_set(particle_set, qs_kind_set, nsgf=row_blk_sizes, basis=basis_set_ri_aux)
-         DEALLOCATE (basis_set_ri_aux)
+         IF (PRESENT(custom_row_blk_sizes)) THEN
+            CPASSERT(SIZE(custom_row_blk_sizes) == natom)
+            row_blk_sizes(:) = custom_row_blk_sizes
+         ELSE
+            ALLOCATE (basis_set_ri_aux(nkind))
+            CALL basis_set_list_setup(basis_set_ri_aux, "RI_AUX", qs_kind_set)
+            CALL get_particle_set(particle_set, qs_kind_set, nsgf=row_blk_sizes, basis=basis_set_ri_aux)
+            DEALLOCATE (basis_set_ri_aux)
+         END IF
 
       ELSE IF (my_do_mixed_basis) THEN
 

@@ -80,7 +80,6 @@ MODULE qs_fb_env_methods
    USE qs_fb_trial_fns_types,           ONLY: fb_trial_fns_create,&
                                               fb_trial_fns_nullify,&
                                               fb_trial_fns_obj,&
-                                              fb_trial_fns_release,&
                                               fb_trial_fns_set
    USE qs_integral_utils,               ONLY: basis_set_list_setup
    USE qs_kind_types,                   ONLY: get_qs_kind,&
@@ -140,7 +139,7 @@ CONTAINS
       CHARACTER(len=default_string_length)               :: name
       INTEGER :: filtered_nfullrowsORcols_total, handle, homo_filtered, ispin, lfomo_filtered, &
          my_nmo, nao, ndep, nelectron, nmo, nmo_filtered, nspin, original_nfullrowsORcols_total
-      INTEGER, DIMENSION(:), POINTER                     :: filtered_rowORcol_block_sizes, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: filtered_rowORcol_block_sizes, &
                                                             original_rowORcol_block_sizes
       LOGICAL                                            :: collective_com
       REAL(kind=dp) :: diis_error, eps_default, eps_diis, eps_eigval, fermi_level, filter_temp, &
@@ -1098,7 +1097,6 @@ CONTAINS
       ! set fb_env
       CALL fb_env_set(fb_env=fb_env, &
                       trial_fns=trial_fns)
-      CALL fb_trial_fns_release(trial_fns)
 
       ! cleanup
       DEALLOCATE (basis_set_list)

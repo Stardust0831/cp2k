@@ -15,12 +15,13 @@ MODULE dbt_block
    #:set maxdim = maxrank
    #:set ndims = range(2,maxdim+1)
 
-   USE OMP_LIB, ONLY: omp_get_thread_num, omp_get_num_threads
+   USE OMP_LIB, ONLY: omp_get_thread_num, omp_get_num_threads, omp_get_level
+   USE util, ONLY: get_limit
    USE cp_dbcsr_api, ONLY: &
       dbcsr_type, dbcsr_release, &
-      dbcsr_iterator_type, dbcsr_iterator_start, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
-      dbcsr_has_symmetry, dbcsr_desymmetrize, dbcsr_get_num_blocks, dbcsr_iterator_stop, &
-      dbcsr_reserve_blocks, dbcsr_finalize
+      dbcsr_iterator_type, dbcsr_iterator_readonly_start, dbcsr_iterator_blocks_left, &
+      dbcsr_iterator_next_block, dbcsr_has_symmetry, dbcsr_desymmetrize, dbcsr_get_num_blocks, &
+      dbcsr_iterator_stop, dbcsr_reserve_blocks, dbcsr_finalize
    USE dbt_allocate_wrap, ONLY: &
       allocate_any
    USE dbt_tas_types, ONLY: &
@@ -37,7 +38,7 @@ MODULE dbt_block
       array_list, get_array_elements, destroy_array_list, sizes_of_arrays, create_array_list, &
       get_arrays
    USE dbt_types, ONLY: &
-      dbt_type, ndims_tensor, dbt_blk_sizes, dbt_get_num_blocks, &
+      dbt_type, ndims_tensor, dbt_blk_sizes, dbt_get_num_blocks, dbt_get_info, &
       dbt_finalize, ndims_matrix_row, ndims_matrix_column
 
 #include "../base/base_uses.f90"
@@ -47,6 +48,7 @@ MODULE dbt_block
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'dbt_block'
 
    PUBLIC :: &
+      dbt_get_block_pattern, &
       block_nd, &
       create_block, &
       dbt_get_block, &
@@ -60,6 +62,9 @@ MODULE dbt_block
       dbt_reserve_blocks, &
       destroy_block, &
       checker_tr, &
+      dbt_copy_block, &
+      dbt_get_block_data, &
+      dbt_put_block_data, &
       ndims_iterator
 
    TYPE dbt_iterator_type
@@ -203,23 +208,68 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief reserve blocks from indices as array object
+!>        A serial caller starts an OpenMP team internally. An existing team calls collectively,
+!>        with each thread providing its own part of the block list.
 !> \author Patrick Seewald
 ! **************************************************************************************************
-   SUBROUTINE dbt_reserve_blocks_index_array(tensor, blk_ind)
+   RECURSIVE SUBROUTINE dbt_reserve_blocks_index_array(tensor, blk_ind)
       TYPE(dbt_type), INTENT(INOUT)   :: tensor
       INTEGER, DIMENSION(:, :), INTENT(IN) :: blk_ind
-      INTEGER                             :: handle
+      INTEGER                             :: handle, block_range(2)
+      LOGICAL                             :: inside_team
       CHARACTER(LEN=*), PARAMETER :: routineN = 'dbt_reserve_blocks_index_array'
 
       CALL timeset(routineN, handle)
-      #:for ndim in ndims
-         IF (ndims_tensor(tensor) == ${ndim}$) THEN
-            CALL dbt_reserve_blocks(tensor, ${arrlist("blk_ind", nmax=ndim, ndim_pre=1)}$)
-         END IF
-      #:endfor
+      ! The array interface accepts a serial caller and keeps collective team calls intact.
+      inside_team = .TRUE.
+!$    inside_team = omp_get_level() > 0
+      IF (.NOT. inside_team) THEN
+!$OMP PARALLEL DEFAULT(NONE) SHARED(tensor,blk_ind) PRIVATE(block_range)
+         block_range = get_limit(SIZE(blk_ind, 1), omp_get_num_threads(), omp_get_thread_num())
+         CALL dbt_reserve_blocks_index_array(tensor, blk_ind(block_range(1):block_range(2), :))
+!$OMP END PARALLEL
+      ELSE
+         #:for ndim in ndims
+            IF (ndims_tensor(tensor) == ${ndim}$) THEN
+               CALL dbt_reserve_blocks(tensor, ${arrlist("blk_ind", nmax=ndim, ndim_pre=1)}$)
+            END IF
+         #:endfor
+      END IF
       CALL timestop(handle)
 
    END SUBROUTINE dbt_reserve_blocks_index_array
+
+! **************************************************************************************************
+!> \brief Collect the global stored-block pattern projected onto two tensor dimensions.
+!>        Called outside an OpenMP team; iteration and reduction are internal.
+!> \param tensor source tensor
+!> \param dimensions tensor dimensions retained in the projection
+!> \param pattern output pattern, one for present entries and zero otherwise
+! **************************************************************************************************
+   SUBROUTINE dbt_get_block_pattern(tensor, dimensions, pattern)
+      TYPE(dbt_type), INTENT(IN) :: tensor
+      INTEGER, INTENT(IN) :: dimensions(2)
+      INTEGER, INTENT(OUT) :: pattern(:, :)
+
+      INTEGER :: ind(ndims_tensor(tensor)), nblks(ndims_tensor(tensor))
+      TYPE(dbt_iterator_type) :: iter
+
+      CPASSERT(omp_get_level() == 0)
+      CPASSERT(ALL(dimensions >= 1) .AND. ALL(dimensions <= SIZE(ind)))
+      CALL dbt_get_info(tensor, nblks_total=nblks)
+      CPASSERT(ALL(SHAPE(pattern) == nblks(dimensions)))
+      pattern = 0
+!$OMP PARALLEL DEFAULT(NONE) SHARED(tensor,dimensions,pattern) PRIVATE(iter,ind)
+      CALL dbt_iterator_start(iter, tensor)
+      DO WHILE (dbt_iterator_blocks_left(iter))
+         CALL dbt_iterator_next_block(iter, ind)
+!$OMP ATOMIC WRITE
+         pattern(ind(dimensions(1)), ind(dimensions(2))) = 1
+      END DO
+      CALL dbt_iterator_stop(iter)
+!$OMP END PARALLEL
+      CALL tensor%pgrid%mp_comm_2d%max(pattern)
+   END SUBROUTINE dbt_get_block_pattern
 
 ! **************************************************************************************************
 !> \brief reserve tensor blocks using block indices
@@ -300,7 +350,7 @@ CONTAINS
       TYPE(dbt_type), INTENT(INOUT)  :: tensor_out
       TYPE(dbcsr_type), POINTER               :: matrix_in_desym
 
-      INTEGER                            :: iblk, nblk, nblk_per_thread, a, b
+      INTEGER                            :: iblk, my_iblk, nblk, nblk_per_thread, a, b
       INTEGER, ALLOCATABLE, DIMENSION(:) :: blk_ind_1, blk_ind_2
       INTEGER, DIMENSION(2)              :: ind_2d
       TYPE(dbcsr_iterator_type)          :: iter
@@ -318,16 +368,24 @@ CONTAINS
 
       nblk = dbcsr_get_num_blocks(matrix_in_desym)
       ALLOCATE (blk_ind_1(nblk), blk_ind_2(nblk))
-      CALL dbcsr_iterator_start(iter, matrix_in_desym)
-      DO iblk = 1, nblk
+      iblk = 0
+
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix_in_desym,tensor_out,nblk,iblk,blk_ind_1,blk_ind_2) &
+!$OMP PRIVATE(iter,ind_2d,my_iblk,nblk_per_thread,a,b)
+      CALL dbcsr_iterator_readonly_start(iter, matrix_in_desym)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, ind_2d(1), ind_2d(2))
-         blk_ind_1(iblk) = ind_2d(1); blk_ind_2(iblk) = ind_2d(2)
+!$OMP ATOMIC CAPTURE
+         iblk = iblk + 1
+         my_iblk = iblk
+!$OMP END ATOMIC
+         blk_ind_1(my_iblk) = ind_2d(1)
+         blk_ind_2(my_iblk) = ind_2d(2)
       END DO
       CALL dbcsr_iterator_stop(iter)
+!$OMP BARRIER
+      CPASSERT(iblk == nblk)
 
-!TODO: Parallelize creation of block list.
-!$OMP PARALLEL DEFAULT(NONE) SHARED(tensor_out,nblk,blk_ind_1,blk_ind_2) &
-!$OMP PRIVATE(nblk_per_thread,a,b)
       nblk_per_thread = nblk/omp_get_num_threads() + 1
       a = omp_get_thread_num()*nblk_per_thread + 1
       b = MIN(a + nblk_per_thread, nblk)
@@ -472,12 +530,7 @@ CONTAINS
       INTEGER, DIMENSION(ndims_tensor(tensor)), &
          INTENT(IN)                                :: ind
 
-      SELECT CASE (ndims_tensor(tensor))
-         #:for ndim in ndims
-            CASE (${ndim}$)
-            CALL dbt_put_${ndim}$d_block(tensor, ind, block%sizes, block%blk, summation=summation)
-         #:endfor
-      END SELECT
+      CALL dbt_put_block_data(tensor, ind, block%sizes, block%blk, summation=summation)
    END SUBROUTINE dbt_put_anyd_block
 
 ! **************************************************************************************************
@@ -499,19 +552,90 @@ CONTAINS
       INTEGER, DIMENSION(ndims_tensor(tensor)), &
          INTENT(IN)                                :: ind
       INTEGER, DIMENSION(ndims_tensor(tensor))    :: blk_size
-      REAL(dp), DIMENSION(:), ALLOCATABLE         :: block_arr
 
       CALL dbt_blk_sizes(tensor, ind, blk_size)
-      ALLOCATE (block_arr(PRODUCT(blk_size)))
+      CALL create_block(block, blk_size)
+      CALL dbt_get_block_data(tensor, ind, blk_size, block%blk, found)
+   END SUBROUTINE dbt_get_anyd_block
+
+! **************************************************************************************************
+!> \brief Get a block into the given contiguous data (arbitrary tensor rank), without allocating
+!>        any intermediate block.
+!> \param ind block index
+!> \param sizes block size
+!> \param data block data
+!> \param found whether block was found
+!> \author Hans Pabst
+! **************************************************************************************************
+   SUBROUTINE dbt_get_block_data(tensor, ind, sizes, data, found)
+      TYPE(dbt_type), INTENT(INOUT)                        :: tensor
+      INTEGER, DIMENSION(ndims_tensor(tensor)), INTENT(IN) :: ind, sizes
+      REAL(dp), DIMENSION(PRODUCT(sizes)), INTENT(OUT)     :: data
+      LOGICAL, INTENT(OUT)                                 :: found
+
+      found = .FALSE.
+      SELECT CASE (ndims_tensor(tensor))
+         #:for ndim in ndims
+            CASE (${ndim}$)
+            CALL dbt_get_${ndim}$d_block(tensor, ind, sizes, data, found)
+         #:endfor
+      END SELECT
+   END SUBROUTINE dbt_get_block_data
+
+! **************************************************************************************************
+!> \brief Put a block from the given contiguous data (arbitrary tensor rank), without allocating
+!>        any intermediate block.
+!> \param ind block index
+!> \param sizes block size
+!> \param data block data
+!> \param summation whether block should be summed to existing block
+!> \author Hans Pabst
+! **************************************************************************************************
+   SUBROUTINE dbt_put_block_data(tensor, ind, sizes, data, summation)
+      TYPE(dbt_type), INTENT(INOUT)                        :: tensor
+      INTEGER, DIMENSION(ndims_tensor(tensor)), INTENT(IN) :: ind, sizes
+      REAL(dp), DIMENSION(PRODUCT(sizes)), INTENT(IN)      :: data
+      LOGICAL, INTENT(IN), OPTIONAL                        :: summation
 
       SELECT CASE (ndims_tensor(tensor))
          #:for ndim in ndims
             CASE (${ndim}$)
-            CALL dbt_get_${ndim}$d_block(tensor, ind, blk_size, block_arr, found)
+            CALL dbt_put_${ndim}$d_block(tensor, ind, sizes, data, summation=summation)
          #:endfor
       END SELECT
-      CALL create_block(block, blk_size, block_arr)
-   END SUBROUTINE dbt_get_anyd_block
+   END SUBROUTINE dbt_put_block_data
+
+! **************************************************************************************************
+!> \brief Copy a local block between tensors with the same index mapping and matching block sizes,
+!>        without an intermediate copy or reshape. Both blocks must belong to the calling rank,
+!>        and the tensors must have separate block storage.
+!> \param ind block index
+!> \param summation whether block should be summed to existing block
+!> \param ind_out destination block index, defaults to ind
+!> \author Hans Pabst
+! **************************************************************************************************
+   SUBROUTINE dbt_copy_block(tensor_in, tensor_out, ind, summation, ind_out)
+      TYPE(dbt_type), INTENT(INOUT)                           :: tensor_in, tensor_out
+      INTEGER, DIMENSION(ndims_tensor(tensor_in)), INTENT(IN) :: ind
+      LOGICAL, INTENT(IN), OPTIONAL                           :: summation
+      INTEGER, DIMENSION(ndims_tensor(tensor_out)), &
+         INTENT(IN), OPTIONAL                               :: ind_out
+
+      INTEGER(KIND=int_8), DIMENSION(2)                       :: ind_2d
+      REAL(dp), DIMENSION(:, :), POINTER, CONTIGUOUS          :: block_2d
+
+      NULLIFY (block_2d)
+      ind_2d(:) = get_2d_indices_tensor(tensor_in%nd_index_blk, ind)
+      CALL dbt_tas_get_block_p(tensor_in%matrix_rep, ind_2d(1), ind_2d(2), block_2d)
+      IF (ASSOCIATED(block_2d)) THEN
+         IF (PRESENT(ind_out)) THEN
+            ind_2d(:) = get_2d_indices_tensor(tensor_out%nd_index_blk, ind_out)
+         ELSE
+            ind_2d(:) = get_2d_indices_tensor(tensor_out%nd_index_blk, ind)
+         END IF
+         CALL dbt_tas_put_block(tensor_out%matrix_rep, ind_2d(1), ind_2d(2), block_2d, summation=summation)
+      END IF
+   END SUBROUTINE dbt_copy_block
 
    #:for ndim in ndims
 ! **************************************************************************************************

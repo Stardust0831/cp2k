@@ -18,6 +18,7 @@ MODULE qs_energy
    USE dm_ls_scf,                       ONLY: ls_scf
    USE energy_corrections,              ONLY: energy_correction
    USE excited_states,                  ONLY: excited_state_energy
+   USE fde_main,                        ONLY: fde_run
    USE input_constants,                 ONLY: smeagol_runtype_emtransport
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
@@ -32,7 +33,8 @@ MODULE qs_energy
    USE qs_environment_methods,          ONLY: qs_env_rebuild_pw_env
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
-   USE qs_harris_utils,                 ONLY: harris_energy_correction
+   USE qs_harris_methods,               ONLY: harris_energy_correction
+   USE qs_harris_types,                 ONLY: harris_type
    USE qs_ks_methods,                   ONLY: qs_ks_update_qs_env
    USE qs_matrix_w,                     ONLY: compute_matrix_w
    USE qs_nonscf,                       ONLY: nonscf
@@ -77,11 +79,16 @@ CONTAINS
                                                             do_excited_state, loverlap_deltat, &
                                                             my_calc_forces, run_rtp
       TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(harris_type), POINTER                         :: harris_env
       TYPE(qs_energy_type), POINTER                      :: energy
       TYPE(scf_control_type), POINTER                    :: scf_control
       TYPE(section_vals_type), POINTER                   :: excited_state_section
 
       CALL timeset(routineN, handle)
+
+      ! Alternative electronic solvers must not inherit a previous SCF status.
+      qs_env%scf_convergence_available = .FALSE.
+      qs_env%scf_converged = .FALSE.
 
       my_calc_forces = .FALSE.
       IF (PRESENT(calc_forces)) my_calc_forces = calc_forces
@@ -94,9 +101,15 @@ CONTAINS
       CALL get_qs_env(qs_env=qs_env, run_rtp=run_rtp)
       IF (.NOT. run_rtp) THEN
 
-         NULLIFY (dft_control, energy)
+         NULLIFY (dft_control, energy, harris_env)
          CALL qs_energies_init(qs_env, my_calc_forces)
-         CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, scf_control=scf_control, energy=energy)
+         CALL get_qs_env(qs_env=qs_env, dft_control=dft_control, scf_control=scf_control, energy=energy, &
+                         harris_env=harris_env)
+         IF (ASSOCIATED(harris_env)) THEN
+            IF (harris_env%direct_density_matrix_energy .AND. my_calc_forces) THEN
+               CPABORT("Forces are not available for the direct fitted-density-matrix energy")
+            END IF
+         END IF
 
          ! *** check if only overlap matrix is needed for couplings
          loverlap_deltat = .FALSE.
@@ -140,7 +153,7 @@ CONTAINS
                IF (.NOT. (dft_control%smeagol_control%smeagol_enabled .AND. &
                           dft_control%smeagol_control%run_type == smeagol_runtype_emtransport)) THEN
                   ! if calculate forces, time to compute the w matrix
-                  CALL compute_matrix_w(qs_env, my_calc_forces)
+                  CALL compute_matrix_w(qs_env, my_calc_forces, include_lowdin_forces=my_calc_forces)
                END IF
             END IF
          END IF
@@ -152,6 +165,9 @@ CONTAINS
 
          ! Do active space calculation
          CALL active_space_main(qs_env)
+
+         ! frozen-density embedding driver (spawns a subsystem solver)
+         IF (dft_control%do_fde) CALL fde_run(qs_env)
 
          ! Check for energy correction
          IF (qs_env%energy_correction) THEN
@@ -167,8 +183,9 @@ CONTAINS
          END IF
 
          IF (dft_control%tddfpt2_control%do_smearing) THEN
-            IF (.NOT. ASSOCIATED(dft_control%tddfpt2_control%smeared_occup)) &
+            IF (.NOT. ASSOCIATED(dft_control%tddfpt2_control%smeared_occup)) THEN
                CPABORT("Smearing occupation not associated.")
+            END IF
             CALL deallocate_fermi_params(dft_control%tddfpt2_control%smeared_occup)
          END IF
          IF (dft_control%qs_control%lrigpw) THEN

@@ -109,7 +109,7 @@ CONTAINS
             index = INT(r/pot%set(j)%eam%drar) + 1
             IF (index > pot%set(j)%eam%npoints) THEN
                index = pot%set(j)%eam%npoints
-            ELSEIF (index < 1) THEN
+            ELSE IF (index < 1) THEN
                index = 1
             END IF
             qq = r - pot%set(j)%eam%rval(index)
@@ -119,17 +119,17 @@ CONTAINS
          ELSE IF (pot%type(j) == b4_type) THEN
             IF (r <= pot%set(j)%buck4r%r1) THEN
                pp = pot%set(j)%buck4r%a*EXP(-pot%set(j)%buck4r%b*r)
-            ELSEIF (r > pot%set(j)%buck4r%r1 .AND. r <= pot%set(j)%buck4r%r2) THEN
+            ELSE IF (r > pot%set(j)%buck4r%r1 .AND. r <= pot%set(j)%buck4r%r2) THEN
                pp = 0.0_dp
                DO n = 0, pot%set(j)%buck4r%npoly1
                   pp = pp + pot%set(j)%buck4r%poly1(n)*r**n
                END DO
-            ELSEIF (r > pot%set(j)%buck4r%r2 .AND. r <= pot%set(j)%buck4r%r3) THEN
+            ELSE IF (r > pot%set(j)%buck4r%r2 .AND. r <= pot%set(j)%buck4r%r3) THEN
                pp = 0.0_dp
                DO n = 0, pot%set(j)%buck4r%npoly2
                   pp = pp + pot%set(j)%buck4r%poly2(n)*r**n
                END DO
-            ELSEIF (r > pot%set(j)%buck4r%r3) THEN
+            ELSE IF (r > pot%set(j)%buck4r%r3) THEN
                pp = -pot%set(j)%buck4r%c/r**6
             END IF
             lvalue = pp
@@ -139,7 +139,7 @@ CONTAINS
             IF (index2 > pot%set(j)%tab%npoints) THEN
                index2 = pot%set(j)%tab%npoints
                index1 = index2 - 1
-            ELSEIF (index1 < 1) THEN
+            ELSE IF (index1 < 1) THEN
                index1 = 1
                index2 = 2
             END IF
@@ -156,8 +156,9 @@ CONTAINS
          ELSE IF (pot%type(j) == gp_type) THEN
             pot%set(j)%gp%values(1) = r
             lvalue = evalf(pot%set(j)%gp%myid, pot%set(j)%gp%values)
-            IF (EvalErrType > 0) &
+            IF (EvalErrType > 0) THEN
                CPABORT("Error evaluating generic potential energy function")
+            END IF
          ELSE
             lvalue = 0.0_dp
          END IF
@@ -189,7 +190,7 @@ CONTAINS
          fac = pot%z1*pot%z2/evolt
          ener_zbl = fac/r*(0.1818_dp*EXP(-3.2_dp*x) + 0.5099_dp*EXP(-0.9423_dp*x) + &
                            0.2802_dp*EXP(-0.4029_dp*x) + 0.02817_dp*EXP(-0.2016_dp*x))
-      ELSEIF (r > pot%zbl_rcut(1) .AND. r <= pot%zbl_rcut(2)) THEN
+      ELSE IF (r > pot%zbl_rcut(1) .AND. r <= pot%zbl_rcut(2)) THEN
          ener_zbl = pot%zbl_poly(0) + pot%zbl_poly(1)*r + pot%zbl_poly(2)*r*r + pot%zbl_poly(3)*r*r*r + &
                     pot%zbl_poly(4)*r*r*r*r + pot%zbl_poly(5)*r*r*r*r*r
       ELSE
@@ -276,7 +277,7 @@ CONTAINS
                   r1**4*r2**3*dd1 + 20._dp*r1**3*r2**2*v2 + 2._dp*r1**3*r2**4*dd1 + r1**3*r2**4*dd2 - 8._dp*r1**3*r2**3*d2 - &
                   2._dp*r1**4*r2**3*dd2 + 10._dp*r1**4*r2**2*d2 - 10._dp*r1**4*r2*v2 + 2._dp*r1*d1*r2**5 - 10._dp*r1**2*d1*r2**4 + &
                   8._dp*r1**3*d1*r2**3 - 2._dp*r1**5*r2*d2 + r1**5*r2**2*dd2)/ &
-           (10.*r2**2*r1**3 - 5._dp*r2*r1**4 - 10._dp*r1**2*r2**3 + 5._dp*r2**4*r1 - r2**5 + r1**5)
+           (10._dp*r2**2*r1**3 - 5._dp*r2*r1**4 - 10._dp*r1**2*r2**3 + 5._dp*r2**4*r1 - r2**5 + r1**5)
 
       a1 = -.5_dp*(-4._dp*r2**3*r1**3*dd2 + 24._dp*r2**2*r1**3*d1 + 4._dp*r2**3*r1**3*dd1 + 3._dp*r2**4*r1**2*dd2 + &
                    r2**4*r1**2*dd1 - 2._dp*r2**5*r1*dd1 - 10._dp*r2**4*r1*d1 + 10._dp*r1**4*r2*d2 - &
@@ -292,7 +293,7 @@ CONTAINS
                   60._dp*r1**2*v1*r2 + r1**5*dd2 - r2**5*dd1)/ &
            (10._dp*r2**2*r1**3 - 5._dp*r2*r1**4 - 10._dp*r1**2*r2**3 + 5._dp*r2**4*r1 - r2**5 + r1**5)
 
-      a3 = -.5_dp*(3._dp*r1**4*dd2 - r1**4*dd1 + 8.*r1**3*d1 - 4.*r1**3*r2*dd1 + &
+      a3 = -.5_dp*(3._dp*r1**4*dd2 - r1**4*dd1 + 8._dp*r1**3*d1 - 4._dp*r1**3*r2*dd1 + &
                    12._dp*r1**3*d2 + 32._dp*r1**2*r2*d1 - 8._dp*r1**2*r2**2*dd2 - &
                    20._dp*r1**2*v1 + 8._dp*r1**2*r2**2*dd1 + 28._dp*r1**2*r2*d2 + &
                    20._dp*r1**2*v2 + 80._dp*r1*r2*v2 - 28._dp*r2**2*r1*d1 - 80._dp*r1*v1*r2 - &
@@ -300,15 +301,15 @@ CONTAINS
                    r2**4*dd2 - 3._dp*r2**4*dd1 + 20._dp*r2**2*v2 - 20._dp*r2**2*v1)/ &
            (10._dp*r2**2*r1**3 - 5._dp*r2*r1**4 - 10._dp*r1**2*r2**3 + 5._dp*r2**4*r1 - r2**5 + r1**5)
 
-      a4 = .5_dp*(3._dp*r1**3*dd2 - 2._dp*r1**3*dd1 + r1**2*r2*dd1 + 14.*r1**2*d1 - 4._dp*r1**2*r2*dd2 + &
+      a4 = .5_dp*(3._dp*r1**3*dd2 - 2._dp*r1**3*dd1 + r1**2*r2*dd1 + 14._dp*r1**2*d1 - 4._dp*r1**2*r2*dd2 + &
                   16._dp*r1**2*d2 - 2._dp*r1*r2*d2 - r1*r2**2*dd2 - &
-                  30._dp*r1*v1 + 30.*r1*v2 + 2._dp*r1*r2*d1 + 4._dp*r1*r2**2*dd1 - 16._dp*r2**2*d1 + &
+                  30._dp*r1*v1 + 30._dp*r1*v2 + 2._dp*r1*r2*d1 + 4._dp*r1*r2**2*dd1 - 16._dp*r2**2*d1 + &
                   2._dp*r2**3*dd2 - 14._dp*r2**2*d2 + 30._dp*r2*v2 - 30._dp*v1*r2 - &
                   3._dp*r2**3*dd1)/(10._dp*r2**2*r1**3 - 5._dp*r2*r1**4 - &
                                     10._dp*r1**2*r2**3 + 5._dp*r2**4*r1 - r2**5 + r1**5)
 
-      a5 = -.5_dp*(6._dp*r1*d1 + 2._dp*r2*r1*dd1 + 6._dp*r1*d2 - 2.*r2*r1*dd2 - &
-                   r2**2*dd1 - r1**2*dd1 - 12.*v1 + 12._dp*v2 + r1**2*dd2 - &
+      a5 = -.5_dp*(6._dp*r1*d1 + 2._dp*r2*r1*dd1 + 6._dp*r1*d2 - 2._dp*r2*r1*dd2 - &
+                   r2**2*dd1 - r1**2*dd1 - 12._dp*v1 + 12._dp*v2 + r1**2*dd2 - &
                    6._dp*r2*d1 + r2**2*dd2 - 6._dp*r2*d2)/ &
            (10._dp*r2**2*r1**3 - 5._dp*r2*r1**4 - 10._dp*r1**2*r2**3 + 5._dp*r2**4*r1 - r2**5 + r1**5)
 

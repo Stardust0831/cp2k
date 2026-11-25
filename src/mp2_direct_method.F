@@ -15,7 +15,7 @@ MODULE mp2_direct_method
    USE cell_types,                      ONLY: cell_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_type
-   USE hfx_energy_potential,            ONLY: coulomb4
+   USE four_center_integral_methods,    ONLY: coulomb4
    USE hfx_load_balance_methods,        ONLY: cost_model,&
                                               p1_energy,&
                                               p2_energy,&
@@ -23,28 +23,23 @@ MODULE mp2_direct_method
    USE hfx_pair_list_methods,           ONLY: build_pair_list_mp2
    USE hfx_types,                       ONLY: hfx_basis_type,&
                                               hfx_pgf_list,&
-                                              hfx_pgf_product_list,&
                                               hfx_potential_type,&
                                               hfx_screen_coeff_type,&
                                               hfx_type,&
                                               pair_set_list_type
-   USE input_constants,                 ONLY: do_potential_TShPSC
    USE kinds,                           ONLY: dp,&
                                               int_8
-   USE libint_wrapper,                  ONLY: cp_libint_t
    USE machine,                         ONLY: m_flush
    USE mathconstants,                   ONLY: zero
    USE message_passing,                 ONLY: mp_para_env_release,&
                                               mp_para_env_type
    USE mp2_ri_libint,                   ONLY: prepare_integral_calc
-   USE mp2_types,                       ONLY: init_TShPSC_lmax,&
-                                              mp2_biel_type,&
+   USE mp2_types,                       ONLY: mp2_biel_type,&
                                               mp2_type,&
                                               pair_list_type_mp2
    USE orbital_pointers,                ONLY: ncoset
    USE particle_types,                  ONLY: particle_type
    USE qs_environment_types,            ONLY: qs_environment_type
-   USE t_sh_p_s_c,                      ONLY: free_C0
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -112,11 +107,6 @@ CONTAINS
 
       alpha_beta_case = .FALSE.
       IF (PRESENT(C_j) .AND. PRESENT(Auto_j)) alpha_beta_case = .TRUE.
-
-      IF (unit_nr > 0 .AND. mp2_env%potential_parameter%potential_type == do_potential_TShPSC) THEN
-         IF (unit_nr > 0) WRITE (unit_nr, '(T3,A,T64,F12.6,A5)') 'Truncated MP2 method, Rt=', &
-            mp2_env%potential_parameter%cutoff_radius, ' Bohr'
-      END IF
 
       ! create the local para env
       ! each para_env_sub corresponds to a group that is going to compute
@@ -416,9 +406,7 @@ CONTAINS
          llB, lset, max_num_call_sec_transf, max_pgf, max_set, multiple
       INTEGER :: my_num_call_sec_transf, natom, ncob, nints, nseta, nsetb, nsgf_max, nspins, &
          primitive_counter, proc_num, proc_receive, proc_send, R_offset_rec, Rsize_rec, &
-         S_offset_rec, same_size_kl_index, sphi_a_u1, sphi_a_u2, sphi_a_u3, sphi_b_u1, sphi_b_u2, &
-         sphi_b_u3, sphi_c_u1, sphi_c_u2, sphi_c_u3, sphi_d_u1, sphi_d_u2, sphi_d_u3, Ssize_rec, &
-         step_size, total_num_RS_task
+         S_offset_rec, same_size_kl_index, Ssize_rec, step_size, total_num_RS_task
       INTEGER(int_8)                                     :: estimate_to_store_int, neris_tmp, &
                                                             neris_total, nprim_ints
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: kind_of, nimages, proc_num_task, &
@@ -431,7 +419,6 @@ CONTAINS
                                                             lc_min, ld_max, ld_min, npgfa, npgfb, &
                                                             npgfc, npgfd, nsgfa, nsgfb, nsgfc, &
                                                             nsgfd
-      INTEGER, DIMENSION(:, :), POINTER                  :: nsgfl_a, nsgfl_b, nsgfl_c, nsgfl_d
       LOGICAL                                            :: alpha_beta_case, case_send_receive, &
                                                             copy_integrals, do_periodic
       LOGICAL, DIMENSION(:, :), POINTER                  :: shm_atomic_pair_list
@@ -440,26 +427,18 @@ CONTAINS
          pmax_atom, pmax_entry, ra(3), rab2, rb(3), rc(3), rcd2, rd(3), screen_kind_ij, &
          screen_kind_kl
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cost_RS, cost_RS_temp, ee_buffer1, &
-                                                            ee_buffer2, ee_primitives_tmp, &
-                                                            ee_work, ee_work2, primitive_integrals
+                                                            ee_buffer2, ee_work2, &
+                                                            primitive_integrals
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: BIb_RS_mat_rec, C_beta_T, max_contraction
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: BIb, BIb_RS_mat_rec_big, zero_mat_big
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: BI1, MNRS
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: p_work
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: shm_pmax_block, zeta, zetb, zetc, zetd
-      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: sphi_a_ext_set, sphi_b_ext_set, &
-                                                            sphi_c_ext_set, sphi_d_ext_set
-      REAL(KIND=dp), DIMENSION(:, :, :, :), POINTER      :: sphi_a_ext, sphi_b_ext, sphi_c_ext, &
-                                                            sphi_d_ext
       REAL(KIND=dp), DIMENSION(dimen, 2)                 :: zero_mat
       REAL(KIND=dp), DIMENSION(dimen, dimen)             :: C_T
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(cp_libint_t)                                  :: private_lib
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(hfx_basis_type), DIMENSION(:), POINTER        :: basis_parameter
       TYPE(hfx_pgf_list), ALLOCATABLE, DIMENSION(:)      :: pgf_list_ij, pgf_list_kl
-      TYPE(hfx_pgf_product_list), ALLOCATABLE, &
-         DIMENSION(:)                                    :: pgf_product_list
       TYPE(hfx_potential_type)                           :: mp2_potential_parameter
       TYPE(hfx_screen_coeff_type), DIMENSION(:, :), &
          POINTER                                         :: screen_coeffs_kind, tmp_R_1, tmp_R_2, &
@@ -487,10 +466,10 @@ CONTAINS
 
       CALL prepare_integral_calc(cell, qs_env, mp2_env, para_env, mp2_potential_parameter, actual_x_data, &
                                  do_periodic, basis_parameter, max_set, particle_set, natom, kind_of, &
-                                 nsgf_max, primitive_integrals, ee_work, ee_work2, ee_buffer1, ee_buffer2, &
-                                 ee_primitives_tmp, nspins, max_contraction, max_pgf, pgf_list_ij, &
-                                 pgf_list_kl, pgf_product_list, nimages, eps_schwarz, log10_eps_schwarz, &
-                                 private_lib, p_work, screen_coeffs_set, screen_coeffs_kind, screen_coeffs_pgf, &
+                                 nsgf_max, primitive_integrals, ee_work2, ee_buffer1, ee_buffer2, &
+                                 nspins, max_contraction, max_pgf, pgf_list_ij, &
+                                 pgf_list_kl, nimages, eps_schwarz, log10_eps_schwarz, &
+                                 screen_coeffs_set, screen_coeffs_kind, screen_coeffs_pgf, &
                                  radii_pgf)
 
       ln_10 = LOG(10.0_dp)
@@ -661,11 +640,6 @@ CONTAINS
             nseta = basis_parameter(ikind)%nset
             zeta => basis_parameter(ikind)%zet
             nsgfa => basis_parameter(ikind)%nsgf
-            sphi_a_ext => basis_parameter(ikind)%sphi_ext(:, :, :, :)
-            nsgfl_a => basis_parameter(ikind)%nsgfl
-            sphi_a_u1 = UBOUND(sphi_a_ext, 1)
-            sphi_a_u2 = UBOUND(sphi_a_ext, 2)
-            sphi_a_u3 = UBOUND(sphi_a_ext, 3)
 
             lb_max => basis_parameter(jkind)%lmax
             lb_min => basis_parameter(jkind)%lmin
@@ -673,11 +647,6 @@ CONTAINS
             nsetb = basis_parameter(jkind)%nset
             zetb => basis_parameter(jkind)%zet
             nsgfb => basis_parameter(jkind)%nsgf
-            sphi_b_ext => basis_parameter(jkind)%sphi_ext(:, :, :, :)
-            nsgfl_b => basis_parameter(jkind)%nsgfl
-            sphi_b_u1 = UBOUND(sphi_b_ext, 1)
-            sphi_b_u2 = UBOUND(sphi_b_ext, 2)
-            sphi_b_u3 = UBOUND(sphi_b_ext, 3)
 
             iset = set_list_ij(i_set_list_ij)%pair(1)
             jset = set_list_ij(i_set_list_ij)%pair(2)
@@ -685,9 +654,6 @@ CONTAINS
             ncob = npgfb(jset)*ncoset(lb_max(jset))
             max_val1 = screen_coeffs_set(jset, iset, jkind, ikind)%x(1)*rab2 + &
                        screen_coeffs_set(jset, iset, jkind, ikind)%x(2)
-
-            sphi_a_ext_set => sphi_a_ext(:, :, :, iset)
-            sphi_b_ext_set => sphi_b_ext(:, :, :, jset)
 
             IF (case_index == 1) THEN
                global_counter = kl_list_proc(index_kl, 3)
@@ -731,22 +697,12 @@ CONTAINS
                npgfc => basis_parameter(kkind)%npgf
                zetc => basis_parameter(kkind)%zet
                nsgfc => basis_parameter(kkind)%nsgf
-               sphi_c_ext => basis_parameter(kkind)%sphi_ext(:, :, :, :)
-               nsgfl_c => basis_parameter(kkind)%nsgfl
-               sphi_c_u1 = UBOUND(sphi_c_ext, 1)
-               sphi_c_u2 = UBOUND(sphi_c_ext, 2)
-               sphi_c_u3 = UBOUND(sphi_c_ext, 3)
 
                ld_max => basis_parameter(lkind)%lmax
                ld_min => basis_parameter(lkind)%lmin
                npgfd => basis_parameter(lkind)%npgf
                zetd => basis_parameter(lkind)%zet
                nsgfd => basis_parameter(lkind)%nsgf
-               sphi_d_ext => basis_parameter(lkind)%sphi_ext(:, :, :, :)
-               nsgfl_d => basis_parameter(lkind)%nsgfl
-               sphi_d_u1 = UBOUND(sphi_d_ext, 1)
-               sphi_d_u2 = UBOUND(sphi_d_ext, 2)
-               sphi_d_u3 = UBOUND(sphi_d_ext, 3)
 
                DO i_set_list_kl = i_set_list_kl_start, i_set_list_kl_stop
                   kset = set_list_kl(i_set_list_kl)%pair(1)
@@ -760,8 +716,6 @@ CONTAINS
 
                   !! Near field screening
                   IF (max_val2 + pmax_atom < log10_eps_schwarz) CYCLE
-                  sphi_c_ext_set => sphi_c_ext(:, :, :, kset)
-                  sphi_d_ext_set => sphi_d_ext(:, :, :, lset)
                   !! get max_vals if we screen on initial density
                   pmax_entry = 0.0_dp
 
@@ -785,14 +739,10 @@ CONTAINS
                      tmp_screen_pgf1 => screen_coeffs_pgf(:, :, jset, iset, jkind, ikind)
                      tmp_screen_pgf2 => screen_coeffs_pgf(:, :, lset, kset, lkind, kkind)
 
-                     CALL coulomb4(private_lib, ra, rb, rc, rd, npgfa(iset), npgfb(jset), npgfc(kset), npgfd(lset), &
+                     CALL coulomb4(actual_x_data%eri4_context, ra, rb, rc, rd, npgfa(iset), npgfb(jset), npgfc(kset), npgfd(lset), &
                                    la_min(iset), la_max(iset), lb_min(jset), lb_max(jset), &
                                    lc_min(kset), lc_max(kset), ld_min(lset), ld_max(lset), &
                                    nsgfa(iset), nsgfb(jset), nsgfc(kset), nsgfd(lset), &
-                                   sphi_a_u1, sphi_a_u2, sphi_a_u3, &
-                                   sphi_b_u1, sphi_b_u2, sphi_b_u3, &
-                                   sphi_c_u1, sphi_c_u2, sphi_c_u3, &
-                                   sphi_d_u1, sphi_d_u2, sphi_d_u3, &
                                    zeta(1:npgfa(iset), iset), zetb(1:npgfb(jset), jset), &
                                    zetc(1:npgfc(kset), kset), zetd(1:npgfd(lset), lset), &
                                    primitive_integrals, &
@@ -802,15 +752,11 @@ CONTAINS
                                    max_contraction_val, cartesian_estimate, cell, neris_tmp, &
                                    log10_pmax, log10_eps_schwarz, &
                                    tmp_R_1, tmp_R_2, tmp_screen_pgf1, tmp_screen_pgf2, &
-                                   pgf_list_ij, pgf_list_kl, pgf_product_list, &
-                                   nsgfl_a(:, iset), nsgfl_b(:, jset), &
-                                   nsgfl_c(:, kset), nsgfl_d(:, lset), &
-                                   sphi_a_ext_set, &
-                                   sphi_b_ext_set, &
-                                   sphi_c_ext_set, &
-                                   sphi_d_ext_set, &
-                                   ee_work, ee_work2, ee_buffer1, ee_buffer2, ee_primitives_tmp, &
-                                   nimages, do_periodic, p_work)
+                                   pgf_list_ij, pgf_list_kl, &
+                                   basis_parameter(ikind)%contraction(:, iset), basis_parameter(jkind)%contraction(:, jset), &
+                                   basis_parameter(kkind)%contraction(:, kset), basis_parameter(lkind)%contraction(:, lset), &
+                                   ee_work2, ee_buffer1, ee_buffer2, &
+                                   nimages, do_periodic)
 
                      nints = nsgfa(iset)*nsgfb(jset)*nsgfc(kset)*nsgfd(lset)
                      neris_total = neris_total + nints
@@ -1104,18 +1050,12 @@ CONTAINS
 
       DEALLOCATE (pgf_list_ij)
       DEALLOCATE (pgf_list_kl)
-      DEALLOCATE (pgf_product_list)
 
       DEALLOCATE (max_contraction, kind_of)
 
-      DEALLOCATE (ee_work, ee_work2, ee_buffer1, ee_buffer2, ee_primitives_tmp)
+      DEALLOCATE (ee_work2, ee_buffer1, ee_buffer2)
 
       DEALLOCATE (nimages)
-
-      IF (mp2_env%potential_parameter%potential_type == do_potential_TShPSC) THEN
-         init_TShPSC_lmax = -1
-         CALL free_C0()
-      END IF
 
       CALL timestop(handle)
 

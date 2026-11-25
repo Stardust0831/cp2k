@@ -19,7 +19,7 @@
 !> \note
 !>      One design choice was not to use dynamically allocated elements to
 !>      reduce the possibility of leaks.
-!>      Needs to be extended (for example charge, dipole,...)
+!>      Needs to be extended (for example charge,...)
 !>      I just added the units and kinds that I needed.
 !>      Used by the parser
 !>      Should keep an unsorted/uncompressed version for nicer labels?
@@ -34,8 +34,8 @@ MODULE cp_units
    USE mathconstants,                   ONLY: radians,&
                                               twopi
    USE physcon,                         ONLY: &
-        atm, bar, bohr, e_mass, evolt, femtoseconds, joule, kcalmol, kelvin, kjmol, massunit, &
-        newton, pascal, picoseconds, seconds, wavenumbers
+        a_bohr, atm, bar, bohr, debye, e_charge, e_mass, evolt, femtoseconds, joule, kcalmol, &
+        kelvin, kjmol, massunit, newton, pascal, picoseconds, seconds, wavenumbers
    USE string_utilities,                ONLY: compress,&
                                               s2a,&
                                               uppercase
@@ -59,7 +59,8 @@ MODULE cp_units
                                  cp_ukind_potential = 9, &
                                  cp_ukind_force = 10, &
                                  cp_ukind_efield = 11, &
-                                 cp_ukind_max = 11
+                                 cp_ukind_dipole = 12, &
+                                 cp_ukind_max = 12
 
    ! General
    INTEGER, PARAMETER, PUBLIC :: cp_units_none = 100, &
@@ -118,6 +119,11 @@ MODULE cp_units
    INTEGER, PARAMETER, PUBLIC :: cp_units_volt_per_m = 202, &
                                  cp_units_volt_per_nm = 203, &
                                  cp_units_volt_per_angstrom = 204
+
+   ! Dipole moment
+   INTEGER, PARAMETER, PUBLIC :: cp_units_debye = 210, &
+                                 cp_units_e_angstrom = 211, &
+                                 cp_units_c_m = 212
 
    INTEGER, PARAMETER, PUBLIC :: cp_unit_max_kinds = 8, cp_unit_basic_desc_length = 15, &
                                  cp_unit_desc_length = cp_unit_max_kinds*cp_unit_basic_desc_length
@@ -375,11 +381,26 @@ CONTAINS
          CASE ("EFIELD")
             unit_id(i_unit) = cp_units_none
             kind_id(i_unit) = cp_ukind_efield
+         CASE ("DEBYE")
+            unit_id(i_unit) = cp_units_debye
+            kind_id(i_unit) = cp_ukind_dipole
+         CASE ("E_ANGSTROM")
+            unit_id(i_unit) = cp_units_e_angstrom
+            kind_id(i_unit) = cp_ukind_dipole
+         CASE ("C_M")
+            unit_id(i_unit) = cp_units_c_m
+            kind_id(i_unit) = cp_ukind_dipole
+         CASE ("AU_DIP")
+            unit_id(i_unit) = cp_units_au
+            kind_id(i_unit) = cp_ukind_dipole
+         CASE ("DIPOLE")
+            unit_id(i_unit) = cp_units_none
+            kind_id(i_unit) = cp_ukind_dipole
          CASE ("AU")
             CALL cp_abort(__LOCATION__, &
                           "au unit without specifying its kind not accepted, use "// &
                           "(au_e, au_f, au_t, au_temp, au_l, au_m, au_p, au_pot, "// &
-                          "au_efield)")
+                          "au_efield, au_dip)")
          CASE default
             CPABORT("Unknown unit: "//string(i_low:i_high - 1))
          END SELECT
@@ -649,11 +670,18 @@ CONTAINS
          CASE default
             CPABORT("unknown electric field unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
+      CASE (cp_ukind_dipole)
+         SELECT CASE (basic_unit)
+         CASE (cp_units_debye, cp_units_e_angstrom, cp_units_c_m, cp_units_au, cp_units_none)
+         CASE default
+            CPABORT("unknown dipole unit:"//TRIM(cp_to_string(basic_unit)))
+         END SELECT
       CASE (cp_ukind_none)
-         IF (basic_unit /= cp_units_none) &
+         IF (basic_unit /= cp_units_none) THEN
             CALL cp_abort(__LOCATION__, &
                           "if the kind of the unit is none also unit must be undefined,not:" &
                           //TRIM(cp_to_string(basic_unit)))
+         END IF
       CASE default
          CPABORT("unknown kind of unit:"//TRIM(cp_to_string(basic_kind)))
       END SELECT
@@ -679,10 +707,11 @@ CONTAINS
       my_power = 1
       IF (PRESENT(power)) my_power = power
       IF (basic_unit == cp_units_none .AND. basic_kind /= cp_ukind_undef) THEN
-         IF (basic_kind /= cp_units_none) &
+         IF (basic_kind /= cp_units_none) THEN
             CALL cp_abort(__LOCATION__, &
                           "unit not yet fully specified, unit of kind "// &
                           TRIM(cp_to_string(basic_unit)))
+         END IF
       END IF
       SELECT CASE (basic_kind)
       CASE (cp_ukind_undef)
@@ -809,7 +838,7 @@ CONTAINS
          CASE (cp_units_Newton)
             res = value*newton**(-my_power)
          CASE (cp_units_mNewton)
-            res = value*(1.0E+3*newton)**(-my_power)
+            res = value*(1.0E+3_dp*newton)**(-my_power)
          CASE (cp_units_au)
             res = value
          CASE default
@@ -827,6 +856,19 @@ CONTAINS
             res = value
          CASE default
             CPABORT("unknown electric field unit:"//TRIM(cp_to_string(basic_unit)))
+         END SELECT
+      CASE (cp_ukind_dipole)
+         SELECT CASE (basic_unit)
+         CASE (cp_units_debye)
+            res = debye**(-my_power)*value
+         CASE (cp_units_e_angstrom)
+            res = value*bohr**my_power
+         CASE (cp_units_c_m)
+            res = (e_charge*a_bohr)**(-my_power)*value
+         CASE (cp_units_au)
+            res = value
+         CASE default
+            CPABORT("unknown dipole unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
       CASE (cp_ukind_none)
          CALL cp_abort(__LOCATION__, &
@@ -862,9 +904,10 @@ CONTAINS
       IF (accept_undefined) my_accept_undefined = accept_undefined
       IF (PRESENT(power)) my_power = power
       IF (basic_unit == cp_units_none) THEN
-         IF (.NOT. my_accept_undefined .AND. basic_kind == cp_units_none) &
+         IF (.NOT. my_accept_undefined .AND. basic_kind == cp_units_none) THEN
             CALL cp_abort(__LOCATION__, "unit not yet fully specified, unit of kind "// &
                           TRIM(cp_to_string(basic_kind)))
+         END IF
       END IF
       SELECT CASE (basic_kind)
       CASE (cp_ukind_undef)
@@ -900,10 +943,11 @@ CONTAINS
             res = "K_e"
          CASE (cp_units_none)
             res = "energy"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown energy unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
@@ -931,10 +975,11 @@ CONTAINS
             res = "au_temp"
          CASE (cp_units_none)
             res = "temperature"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown temperature unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
@@ -956,10 +1001,11 @@ CONTAINS
             res = "au_p"
          CASE (cp_units_none)
             res = "pressure"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown pressure unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
@@ -971,10 +1017,11 @@ CONTAINS
             res = "deg"
          CASE (cp_units_none)
             res = "angle"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown angle unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
@@ -992,10 +1039,11 @@ CONTAINS
             res = "wavenumber_t"
          CASE (cp_units_none)
             res = "time"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown time unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
@@ -1009,10 +1057,11 @@ CONTAINS
             res = "m_e"
          CASE (cp_units_none)
             res = "mass"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown mass unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
@@ -1024,10 +1073,11 @@ CONTAINS
             res = "au_pot"
          CASE (cp_units_none)
             res = "potential"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown potential unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
@@ -1041,10 +1091,11 @@ CONTAINS
             res = "au_f"
          CASE (cp_units_none)
             res = "force"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown potential unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
@@ -1060,12 +1111,33 @@ CONTAINS
             res = "au_efield"
          CASE (cp_units_none)
             res = "electric field"
-            IF (.NOT. my_accept_undefined) &
+            IF (.NOT. my_accept_undefined) THEN
                CALL cp_abort(__LOCATION__, &
                              "unit not yet fully specified, unit of kind "// &
                              TRIM(res))
+            END IF
          CASE default
             CPABORT("unknown efield unit:"//TRIM(cp_to_string(basic_unit)))
+         END SELECT
+      CASE (cp_ukind_dipole)
+         SELECT CASE (basic_unit)
+         CASE (cp_units_debye)
+            res = "debye"
+         CASE (cp_units_e_angstrom)
+            res = "e_angstrom"
+         CASE (cp_units_c_m)
+            res = "C_m"
+         CASE (cp_units_au)
+            res = "au_dip"
+         CASE (cp_units_none)
+            res = "dipole"
+            IF (.NOT. my_accept_undefined) THEN
+               CALL cp_abort(__LOCATION__, &
+                             "unit not yet fully specified, unit of kind "// &
+                             TRIM(res))
+            END IF
+         CASE default
+            CPABORT("unknown dipole unit:"//TRIM(cp_to_string(basic_unit)))
          END SELECT
       CASE (cp_ukind_none)
          CALL cp_abort(__LOCATION__, &
@@ -1343,6 +1415,9 @@ CONTAINS
             CASE (cp_ukind_efield)
                CALL cp_unit_create2(unit_set%units(i)%unit, kind_id=[i], unit_id=[cp_units_volt_per_m], &
                                     power=[1])
+            CASE (cp_ukind_dipole)
+               CALL cp_unit_create2(unit_set%units(i)%unit, kind_id=[i], unit_id=[cp_units_debye], &
+                                    power=[1])
             CASE default
                CPABORT("unhandled unit type "//TRIM(cp_to_string(i)))
                EXIT
@@ -1390,6 +1465,7 @@ CONTAINS
       CALL format_units_as_xml("force", s2a("N", "Newton", "mN", "mNewton", "au_f"), iw)
       CALL format_units_as_xml("efield", s2a("Vm-1", "Vnm-1", "VA-1", "volt_per_m", "volt_per_nm", &
                                              "volt_per_angstrom", "au_efield"), iw)
+      CALL format_units_as_xml("dipole", s2a("debye", "e_angstrom", "C_m", "au_dip"), iw)
 
    END SUBROUTINE export_units_as_xml
 

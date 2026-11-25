@@ -49,16 +49,17 @@ MODULE almo_scf
    USE cp_blacs_env,                    ONLY: cp_blacs_env_release
    USE cp_control_types,                ONLY: dft_control_type
    USE cp_dbcsr_api,                    ONLY: &
-        dbcsr_add, dbcsr_binary_read, dbcsr_copy, dbcsr_create, dbcsr_distribution_type, &
-        dbcsr_filter, dbcsr_finalize, dbcsr_get_info, dbcsr_iterator_blocks_left, &
-        dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
-        dbcsr_multiply, dbcsr_p_type, dbcsr_release, dbcsr_scale, dbcsr_set, dbcsr_type, &
-        dbcsr_type_no_symmetry, dbcsr_type_symmetric, dbcsr_work_create
+        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_distribution_type, dbcsr_filter, &
+        dbcsr_finalize, dbcsr_get_info, dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
+        dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_multiply, &
+        dbcsr_p_type, dbcsr_release, dbcsr_scale, dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry, &
+        dbcsr_type_symmetric, dbcsr_work_create
    USE cp_dbcsr_contrib,                ONLY: dbcsr_add_on_diag,&
                                               dbcsr_checksum,&
                                               dbcsr_init_random,&
                                               dbcsr_reserve_all_blocks
    USE cp_dbcsr_diag,                   ONLY: cp_dbcsr_syevd
+   USE cp_dbcsr_io,                     ONLY: dbcsr_binary_read
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm
    USE cp_fm_types,                     ONLY: cp_fm_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
@@ -263,8 +264,10 @@ CONTAINS
          almo_scf_env%ndomains = almo_scf_env%natoms
       END IF
 
-      IF (ALLOCATED(almo_scf_env%activate) .AND. almo_scf_env%activate(1) > 1) THEN
-         DEALLOCATE (almo_scf_env%activate)
+      IF (ALLOCATED(almo_scf_env%activate)) THEN
+         IF (almo_scf_env%activate(1) > 1) THEN
+            DEALLOCATE (almo_scf_env%activate)
+         END IF
       END IF
 
       IF (.NOT. ALLOCATED(almo_scf_env%activate)) THEN
@@ -1400,7 +1403,6 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'almo_scf_delocalization'
 
       INTEGER                                            :: handle, ispin, unit_nr
-      LOGICAL                                            :: almo_experimental
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:)        :: no_quench
       TYPE(optimizer_options_type)                       :: arbitrary_optimizer
@@ -1461,25 +1463,6 @@ CONTAINS
          !!!! RZK-warning a whole class of delocalization methods
          !!!! are commented out at the moment because some of their
          !!!! routines have not been thoroughly tested.
-
-         !!!! if we have virtuals pre-optimize and truncate them
-         !!!IF (almo_scf_env%need_virtuals) THEN
-         !!!   SELECT CASE (almo_scf_env%deloc_truncate_virt)
-         !!!   CASE (virt_full)
-         !!!      ! simply copy virtual orbitals from matrix_v_full_blk to matrix_v_blk
-         !!!      DO ispin=1,almo_scf_env%nspins
-         !!!         CALL dbcsr_copy(almo_scf_env%matrix_v_blk(ispin),&
-         !!!                 almo_scf_env%matrix_v_full_blk(ispin))
-         !!!      ENDDO
-         !!!   CASE (virt_number,virt_occ_size)
-         !!!      CALL split_v_blk(almo_scf_env)
-         !!!      !CALL truncate_subspace_v_blk(qs_env,almo_scf_env)
-         !!!   CASE DEFAULT
-         !!!      CPErrorMessage(cp_failure_level,routineP,"illegal method for virtual space truncation")
-         !!!      CPPrecondition(.FALSE.,cp_failure_level,routineP,failure)
-         !!!   END SELECT
-         !!!ENDIF
-         !!!CALL harris_foulkes_correction(qs_env,almo_scf_env)
 
          IF (almo_scf_env%xalmo_update_algorithm == almo_scf_pcg) THEN
 
@@ -1584,18 +1567,6 @@ CONTAINS
                                     assume_t0_q0x=(almo_scf_env%xalmo_trial_wf == xalmo_trial_r0_out), &
                                     perturbation_only=.FALSE., &
                                     special_case=xalmo_case_normal)
-
-            ! RZK-warning THIS IS A HACK TO GET ORBITAL ENERGIES
-            almo_experimental = .FALSE.
-            IF (almo_experimental) THEN
-               almo_scf_env%perturbative_delocalization = .TRUE.
-               !DO ispin=1,almo_scf_env%nspins
-               !   CALL dbcsr_copy(almo_scf_env%matrix_t(ispin),&
-               !           almo_scf_env%matrix_t_blk(ispin))
-               !ENDDO
-               CALL almo_scf_xalmo_eigensolver(qs_env, almo_scf_env, &
-                                               arbitrary_optimizer)
-            END IF ! experimental
 
          ELSE IF (almo_scf_env%xalmo_update_algorithm == almo_scf_trustr) THEN
 
@@ -1734,7 +1705,7 @@ CONTAINS
 
       REAL(KIND=dp)                                      :: det_diff, prev_determinant
 
-      almo_scf_env%overlap_determinant = 1.0
+      almo_scf_env%overlap_determinant = 1.0_dp
       ! KEEP: initial_vol_coeff = almo_scf_env%opt_nlmo_pcg%opt_penalty%penalty_strength
       almo_scf_env%opt_nlmo_pcg%opt_penalty%penalty_strength = &
          -1.0_dp*almo_scf_env%opt_nlmo_pcg%opt_penalty%penalty_strength !NEW1
@@ -2622,8 +2593,9 @@ CONTAINS
       ALLOCATE (almo_scf_env%matrix_p_blk(nspins))
       ALLOCATE (almo_scf_env%matrix_ks(nspins))
       ALLOCATE (almo_scf_env%matrix_ks_blk(nspins))
-      IF (almo_scf_env%need_previous_ks) &
+      IF (almo_scf_env%need_previous_ks) THEN
          ALLOCATE (almo_scf_env%matrix_ks_0deloc(nspins))
+      END IF
       DO ispin = 1, nspins
          ! RZK-warning copy with symmery but remember that this might cause problems
          CALL dbcsr_create(almo_scf_env%matrix_p(ispin), &

@@ -68,11 +68,11 @@ MODULE qs_tddfpt2_fhxc_forces
                                               no_sf_tddfpt,&
                                               tddfpt_kernel_full,&
                                               tddfpt_sf_col,&
-                                              xc_kernel_method_analytic,&
-                                              xc_kernel_method_best,&
-                                              xc_kernel_method_numeric,&
                                               xc_none
-   USE input_section_types,             ONLY: section_vals_get,&
+   USE input_section_types,             ONLY: section_get_ival,&
+                                              section_get_lval,&
+                                              section_get_rval,&
+                                              section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
                                               section_vals_val_get
@@ -98,13 +98,12 @@ MODULE qs_tddfpt2_fhxc_forces
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type,&
                                               set_qs_env
-   USE qs_force_types,                  ONLY: qs_force_type
-   USE qs_fxc,                          ONLY: qs_fgxc_analytic,&
-                                              qs_fgxc_create,&
-                                              qs_fgxc_gdiff,&
+   USE qs_fgxc,                         ONLY: qs_fgxc_create,&
                                               qs_fgxc_release
+   USE qs_force_types,                  ONLY: qs_force_type
    USE qs_gapw_densities,               ONLY: prepare_gapw_den
-   USE qs_integrate_potential,          ONLY: integrate_v_rspace
+   USE qs_integrate_potential,          ONLY: integrate_rho_nlcc,&
+                                              integrate_v_rspace
    USE qs_kernel_types,                 ONLY: full_kernel_env_type
    USE qs_kind_types,                   ONLY: qs_kind_type
    USE qs_ks_atom,                      ONLY: update_ks_atom
@@ -134,8 +133,6 @@ MODULE qs_tddfpt2_fhxc_forces
    USE qs_tddfpt2_subgroups,            ONLY: tddfpt_subgroup_env_type
    USE qs_tddfpt2_types,                ONLY: tddfpt_ground_state_mos,&
                                               tddfpt_work_matrices
-   USE qs_vxc_atom,                     ONLY: calculate_gfxc_atom,&
-                                              gfxc_atom_diff
    USE task_list_types,                 ONLY: task_list_type
    USE util,                            ONLY: get_limit
    USE virial_types,                    ONLY: virial_type
@@ -179,13 +176,11 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'fhxc_force'
 
       CHARACTER(LEN=default_string_length)               :: basis_type
-      INTEGER                                            :: handle, ia, ib, iounit, ispin, mspin, &
-                                                            myfun, n_rep_hf, nactive(2), nao, &
-                                                            nao_aux, natom, nkind, norb(2), nsev, &
-                                                            nspins, order, spin
-      LOGICAL :: distribute_fock_matrix, do_admm, do_analytic, do_hfx, do_hfxlr, do_hfxsr, &
-         do_numeric, do_res, do_sf, gapw, gapw_xc, hfx_treat_lsd_in_core, is_rks_triplets, &
-         needs_tau_response, needs_tau_response_aux, s_mstruct_changed, use_virial
+      INTEGER :: handle, ia, ib, iounit, ispin, mspin, myfun, n_rep_hf, nactive(2), nao, nao_aux, &
+         natom, nkind, norb(2), nsev, nspins, nsteps, order, spin
+      LOGICAL :: analytic_2nd_deriv, analytic_3rd_deriv, distribute_fock_matrix, do_admm, do_hfx, &
+         do_hfxlr, do_hfxsr, do_onecenter, do_res, do_sf, gapw, gapw_xc, hfx_treat_lsd_in_core, &
+         is_rks_triplets, needs_tau_response, needs_tau_response_aux, s_mstruct_changed, use_virial
       REAL(KIND=dp)                                      :: eh1, eh1c, eps_delta, eps_fit, focc, &
                                                             fscal, fval, kval, xehartree
       REAL(KIND=dp), DIMENSION(3)                        :: fodeb
@@ -225,7 +220,7 @@ CONTAINS
                                                             rho_r_aux, rhox_r, rhox_r_aux, &
                                                             rhox_tau_r, rhox_tau_r_aux, rhoxx_r, &
                                                             rhoxx_tau_r
-      TYPE(pw_r3d_rs_type), POINTER                      :: weights
+      TYPE(pw_r3d_rs_type), POINTER                      :: rho_nlcc, weights
       TYPE(qs_force_type), DIMENSION(:), POINTER         :: force
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
@@ -297,6 +292,8 @@ CONTAINS
       !
       CALL get_qs_env(qs_env, ks_env=ks_env, pw_env=pw_env, para_env=para_env)
       CALL get_qs_env(qs_env, xcint_weights=weights)
+      NULLIFY (rho_nlcc)
+      CALL get_qs_env(qs_env, rho_nlcc=rho_nlcc)
       !
       NULLIFY (hartree_local, local_rho_set, local_rho_set_admm)
       IF (gapw .OR. gapw_xc) THEN
@@ -554,21 +551,11 @@ CONTAINS
       CALL section_vals_val_get(xc_section, "XC_FUNCTIONAL%_SECTION_PARAMETERS_", &
                                 i_val=myfun)
       IF (.NOT. ((myfun == xc_none) .OR. (tddfpt_control%spinflip == tddfpt_sf_col))) THEN
-         SELECT CASE (ex_env%xc_kernel_method)
-         CASE (xc_kernel_method_best)
-            do_analytic = .TRUE.
-            do_numeric = .TRUE.
-         CASE (xc_kernel_method_analytic)
-            do_analytic = .TRUE.
-            do_numeric = .FALSE.
-         CASE (xc_kernel_method_numeric)
-            do_analytic = .FALSE.
-            do_numeric = .TRUE.
-         CASE DEFAULT
-            CPABORT("invalid xc_kernel_method")
-         END SELECT
-         order = ex_env%diff_order
-         eps_delta = ex_env%eps_delta_rho
+         nsteps = section_get_ival(xc_section, "NSTEPS")
+         order = 2*nsteps
+         eps_delta = section_get_rval(xc_section, "STEP_SIZE")
+         analytic_2nd_deriv = section_get_lval(xc_section, "2ND_DERIV_ANALYTICAL")
+         analytic_3rd_deriv = section_get_lval(xc_section, "3RD_DERIV_ANALYTICAL")
 
          IF (gapw_xc) THEN
             CALL get_qs_env(qs_env=qs_env, ks_env=ks_env, rho_xc=rho)
@@ -604,25 +591,20 @@ CONTAINS
          END IF
          ! Calculate the exchange-correlation kernel derivative contribution, notice that for open-shell
          ! rhox_r contains a factor of 2!
-         IF (do_analytic .AND. .NOT. do_numeric) THEN
-            IF (.NOT. do_sf) THEN
-               CPABORT("Analytic 3rd EXC derivatives not available")
-            ELSE !TODO
-               CALL get_qs_env(qs_env, xcint_weights=weights)
-               CALL qs_fgxc_analytic(rho, rhox, xc_section, weights, auxbas_pw_pool, &
-                                     fxc_rho, fxc_tau, gxc_rho, gxc_tau, spinflip=do_sf)
-            END IF
-         ELSEIF (do_numeric) THEN
-            IF (do_analytic) THEN
-               CALL qs_fgxc_gdiff(ks_env, rho, rhox, xc_section, order, eps_delta, is_rks_triplets, &
-                                  weights, fxc_rho, fxc_tau, gxc_rho, gxc_tau, spinflip=do_sf)
-            ELSE
-               CALL qs_fgxc_create(ks_env, rho, rhox, xc_section, order, is_rks_triplets, &
-                                   fxc_rho, fxc_tau, gxc_rho, gxc_tau)
-            END IF
+         IF (gapw .OR. gapw_xc) THEN
+            do_onecenter = .TRUE.
+            rho_atom_set => ex_env%local_rho_set%rho_atom_set
+            rho_atom_set_f => local_rho_set_f%rho_atom_set
+            rho_atom_set_g => local_rho_set_g%rho_atom_set
+            CALL get_qs_env(qs_env=qs_env, qs_kind_set=qs_kind_set)
          ELSE
-            CPABORT("FHXC forces analytic/numeric")
+            do_onecenter = .FALSE.
+            NULLIFY (rho_atom_set, rho_atom_set_f, rho_atom_set_g, qs_kind_set)
          END IF
+         CALL qs_fgxc_create(qs_env, rho, rhox, rho_atom_set, &
+                             xc_section, do_onecenter, is_rks_triplets, do_sf, &
+                             fxc_rho, fxc_tau, gxc_rho, gxc_tau, &
+                             rho_atom_set_f, rho_atom_set_g, qs_kind_set)
 
          IF (nspins == 2) THEN
             DO ispin = 1, nspins
@@ -630,22 +612,12 @@ CONTAINS
                IF (ASSOCIATED(gxc_tau)) CALL pw_scale(gxc_tau(ispin), 0.5_dp)
             END DO
          END IF
-         IF (gapw .OR. gapw_xc) THEN
-            IF (do_analytic .AND. .NOT. do_numeric) THEN
-               CPABORT("Analytic 3rd EXC derivatives not available")
-            ELSEIF (do_numeric) THEN
-               IF (do_analytic) THEN
-                  CALL gfxc_atom_diff(qs_env, ex_env%local_rho_set%rho_atom_set, &
-                                      local_rho_set_f%rho_atom_set, local_rho_set_g%rho_atom_set, &
-                                      qs_kind_set, xc_section, is_rks_triplets, order, eps_delta)
-               ELSE
-                  CALL calculate_gfxc_atom(qs_env, ex_env%local_rho_set%rho_atom_set, &
-                                           local_rho_set_f%rho_atom_set, local_rho_set_g%rho_atom_set, &
-                                           qs_kind_set, xc_section, is_rks_triplets, order)
-               END IF
-            ELSE
-               CPABORT("FHXC forces analytic/numeric")
-            END IF
+
+         IF (ASSOCIATED(rho_nlcc)) THEN
+            DO ispin = 1, nspins
+               CALL integrate_rho_nlcc(gxc_rho(ispin), qs_env, &
+                                       debug_forces, .FALSE., "dnlcc*dFxc")
+            END DO
          END IF
 
          IF (debug_forces) fodeb(1:3) = force(1)%rho_elec(1:3, 1)
@@ -662,6 +634,13 @@ CONTAINS
             CALL integrate_v_rspace(qs_env=qs_env, v_rspace=fxc_rho(ispin), &
                                     pmat=matrix_px1(ispin), hmat=matrix_fx(ispin), &
                                     gapw=(gapw .OR. gapw_xc), calculate_forces=.TRUE.)
+            IF (ASSOCIATED(fxc_tau)) THEN
+               ! The grid backend includes the factor 1/2 in the tau gradient-product integral.
+               CALL pw_scale(fxc_tau(ispin), fxc_tau(ispin)%pw_grid%dvol)
+               CALL integrate_v_rspace(qs_env=qs_env, v_rspace=fxc_tau(ispin), &
+                                       pmat=matrix_px1(ispin), hmat=matrix_fx(ispin), &
+                                       gapw=(gapw .OR. gapw_xc), calculate_forces=.TRUE., compute_tau=.TRUE.)
+            END IF
          END DO
          IF (debug_forces) THEN
             fodeb(1:3) = force(1)%rho_elec(1:3, 1) - fodeb(1:3)
@@ -679,11 +658,16 @@ CONTAINS
             CALL dbcsr_create(matrix_gx(ispin)%matrix, template=matrix_s(1)%matrix)
             CALL dbcsr_copy(matrix_gx(ispin)%matrix, matrix_s(1)%matrix)
             CALL dbcsr_set(matrix_gx(ispin)%matrix, 0.0_dp)
-            CALL pw_scale(gxc_rho(ispin), gxc_rho(ispin)%pw_grid%dvol)
-            CALL pw_scale(gxc_rho(ispin), 0.5_dp)
+            CALL pw_scale(gxc_rho(ispin), 0.5_dp*gxc_rho(ispin)%pw_grid%dvol)
             CALL integrate_v_rspace(qs_env=qs_env, v_rspace=gxc_rho(ispin), &
                                     pmat=matrix_p(ispin), hmat=matrix_gx(ispin), &
                                     gapw=(gapw .OR. gapw_xc), calculate_forces=.TRUE.)
+            IF (ASSOCIATED(gxc_tau)) THEN
+               CALL pw_scale(gxc_tau(ispin), 0.5_dp*gxc_tau(ispin)%pw_grid%dvol)
+               CALL integrate_v_rspace(qs_env=qs_env, v_rspace=gxc_tau(ispin), &
+                                       pmat=matrix_p(ispin), hmat=matrix_gx(ispin), &
+                                       gapw=(gapw .OR. gapw_xc), calculate_forces=.TRUE., compute_tau=.TRUE.)
+            END IF
             CALL dbcsr_scale(matrix_gx(ispin)%matrix, 2.0_dp)
          END DO
          IF (debug_forces) THEN
@@ -691,7 +675,7 @@ CONTAINS
             CALL para_env%sum(fodeb)
             IF (iounit > 0) WRITE (iounit, "(T3,A,T33,3F16.8)") "DEBUG:: Dx*dgxc[Dx]", fodeb
          END IF
-         CALL qs_fgxc_release(ks_env, fxc_rho, fxc_tau, gxc_rho, gxc_tau)
+         CALL qs_fgxc_release(fxc_rho, fxc_tau, gxc_rho, gxc_tau, auxbas_pw_pool)
 
          ! grid weight contribution to forces
          IF (debug_forces) fodeb(1:3) = force(1)%rho_elec(1:3, 1)
@@ -818,18 +802,27 @@ CONTAINS
                                rho_r=rhox_r_aux, rho_g=rhox_g_aux, &
                                rho_r_valid=.TRUE., rho_g_valid=.TRUE.)
             END IF
-            IF (do_analytic .AND. .NOT. do_numeric) THEN
-               CPABORT("Analytic 3rd derivatives of EXC not available")
-            ELSEIF (do_numeric) THEN
-               IF (do_analytic) THEN
-                  CALL qs_fgxc_gdiff(ks_env, rho_aux_fit, rhox_aux, xc_section, order, eps_delta, &
-                                     is_rks_triplets, weights, fxc_rho, fxc_tau, gxc_rho, gxc_tau)
-               ELSE
-                  CALL qs_fgxc_create(ks_env, rho_aux_fit, rhox_aux, xc_section, &
-                                      order, is_rks_triplets, fxc_rho, fxc_tau, gxc_rho, gxc_tau)
-               END IF
+
+            IF (admm_env%do_gapw) THEN
+               do_onecenter = .TRUE.
+               rho_atom_set => admm_env%admm_gapw_env%local_rho_set%rho_atom_set
+               rho_atom_set_f => local_rho_set_f_admm%rho_atom_set
+               rho_atom_set_g => local_rho_set_g_admm%rho_atom_set
+               qs_kind_set => admm_env%admm_gapw_env%admm_kind_set
             ELSE
-               CPABORT("FHXC forces analytic/numeric")
+               do_onecenter = .FALSE.
+               NULLIFY (rho_atom_set, rho_atom_set_f, rho_atom_set_g, qs_kind_set)
+            END IF
+            CALL qs_fgxc_create(qs_env, rho_aux_fit, rhox_aux, rho_atom_set, &
+                                xc_section, do_onecenter, is_rks_triplets, do_sf, &
+                                fxc_rho, fxc_tau, gxc_rho, gxc_tau, &
+                                rho_atom_set_f, rho_atom_set_g, qs_kind_set)
+
+            IF (ASSOCIATED(rho_nlcc)) THEN
+               DO ispin = 1, nspins
+                  CALL integrate_rho_nlcc(gxc_rho(ispin), qs_env, &
+                                          debug_forces, .FALSE., "dnlcc*dFxc(ADMM)")
+               END DO
             END IF
 
             ! grid weight contribution to forces ADMM XC correction term
@@ -899,32 +892,10 @@ CONTAINS
                CALL para_env%sum(fodeb)
                IF (iounit > 0) WRITE (iounit, "(T3,A,T33,3F16.8)") "DEBUG:: Dx*dgxc[Dx]ADMM", fodeb
             END IF
-            CALL qs_fgxc_release(ks_env, fxc_rho, fxc_tau, gxc_rho, gxc_tau)
+            CALL qs_fgxc_release(fxc_rho, fxc_tau, gxc_rho, gxc_tau, auxbas_pw_pool)
             !
             IF (admm_env%do_gapw) THEN
                CALL get_admm_env(admm_env, sab_aux_fit=sab_aux_fit)
-               rho_atom_set => admm_env%admm_gapw_env%local_rho_set%rho_atom_set
-               rho_atom_set_f => local_rho_set_f_admm%rho_atom_set
-               rho_atom_set_g => local_rho_set_g_admm%rho_atom_set
-
-               IF (do_analytic .AND. .NOT. do_numeric) THEN
-                  CPABORT("Analytic 3rd EXC derivatives not available")
-               ELSEIF (do_numeric) THEN
-                  IF (do_analytic) THEN
-                     CALL gfxc_atom_diff(qs_env, rho_atom_set, &
-                                         rho_atom_set_f, rho_atom_set_g, &
-                                         admm_env%admm_gapw_env%admm_kind_set, xc_section, &
-                                         is_rks_triplets, order, eps_delta)
-                  ELSE
-                     CALL calculate_gfxc_atom(qs_env, rho_atom_set, &
-                                              rho_atom_set_f, rho_atom_set_g, &
-                                              admm_env%admm_gapw_env%admm_kind_set, xc_section, &
-                                              is_rks_triplets, order)
-                  END IF
-               ELSE
-                  CPABORT("FHXC forces analytic/numeric")
-               END IF
-
                IF (debug_forces) fodeb(1:3) = force(1)%Vhxc_atom(1:3, 1)
                IF (nspins == 1) THEN
                   CALL update_ks_atom(qs_env, mfx, matrix_px1_admm, forces=.TRUE., &
@@ -1111,7 +1082,7 @@ CONTAINS
                                      hf_fraction=x_data(1, 1)%general_parameter%fraction)
             ELSE
                DO ispin = 1, mspin
-                  eh1 = 0.0
+                  eh1 = 0.0_dp
                   CALL integrate_four_center(qs_env, x_data, mhe, eh1, mpe, hfx_section, &
                                              para_env, s_mstruct_changed, 1, distribute_fock_matrix, &
                                              ispin=ispin, nspins=nsev)
@@ -1129,7 +1100,7 @@ CONTAINS
                                      hf_fraction=x_data(1, 1)%general_parameter%fraction)
             ELSE
                DO ispin = 1, mspin
-                  eh1 = 0.0
+                  eh1 = 0.0_dp
                   CALL integrate_four_center(qs_env, x_data, mhe, eh1, mpe, hfx_section, &
                                              para_env, s_mstruct_changed, 1, distribute_fock_matrix, &
                                              ispin=ispin, nspins=nsev)
@@ -1231,7 +1202,7 @@ CONTAINS
                                      hf_fraction=x_data(1, 1)%general_parameter%fraction)
             ELSE
                DO ispin = 1, mspin
-                  eh1 = 0.0
+                  eh1 = 0.0_dp
                   CALL integrate_four_center(qs_env, x_data, mhe, eh1, mpe, hfx_section, &
                                              para_env, s_mstruct_changed, 1, distribute_fock_matrix, &
                                              ispin=ispin, nspins=SIZE(mpe, 1))
@@ -1250,7 +1221,7 @@ CONTAINS
                                      hf_fraction=x_data(1, 1)%general_parameter%fraction)
             ELSE
                DO ispin = 1, mspin
-                  eh1 = 0.0
+                  eh1 = 0.0_dp
                   CALL integrate_four_center(qs_env, x_data, mhe, eh1, mpe, hfx_section, &
                                              para_env, s_mstruct_changed, 1, distribute_fock_matrix, &
                                              ispin=ispin, nspins=SIZE(mpe, 1))
@@ -1562,7 +1533,7 @@ CONTAINS
                                                             hfx, rbeta, spinfac, xfac
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: tcharge, tv
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: gtcharge
-      REAL(KIND=dp), DIMENSION(3)                        :: fij, fodeb, rij
+      REAL(KIND=dp), DIMENSION(3)                        :: fij, focoul, fodeb, foexch, rij
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: gab, pblock
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
@@ -1653,6 +1624,9 @@ CONTAINS
       ALLOCATE (tcharge(natom), gtcharge(natom, 4))
 
       cpmos => ex_env%cpmos
+
+      focoul = 0.0_dp
+      foexch = 0.0_dp
 
       DO ispin = 1, nspins
          ct => work%ctransformed(ispin)
@@ -1781,7 +1755,7 @@ CONTAINS
             IF (debug_forces) THEN
                fodeb(1:3) = force(1)%rho_elec(1:3, 1) - fodeb(1:3)
                CALL para_env%sum(fodeb)
-               IF (iounit > 0) WRITE (iounit, "(T3,A,T33,3F16.8)") "DEBUG:: Coul[X]   ", fodeb
+               focoul(1:3) = focoul(1:3) + fodeb(1:3)
             END IF
             norb = nactive(ispin)
             ! forces from Lowdin charge derivative
@@ -1990,7 +1964,7 @@ CONTAINS
             IF (debug_forces) THEN
                fodeb(1:3) = force(1)%rho_elec(1:3, 1) - fodeb(1:3)
                CALL para_env%sum(fodeb)
-               IF (iounit > 0) WRITE (iounit, "(T3,A,T33,3F16.8)") "DEBUG:: Exch[X]   ", fodeb
+               foexch(1:3) = foexch(1:3) + fodeb(1:3)
             END IF
          END IF
          !
@@ -1998,6 +1972,11 @@ CONTAINS
          CALL cp_fm_release(xvec)
          DEALLOCATE (tv)
       END DO
+
+      IF (debug_forces) THEN
+         IF (iounit > 0) WRITE (iounit, "(T3,A,T33,3F16.8)") "DEBUG:: Coul[X]   ", focoul
+         IF (iounit > 0) WRITE (iounit, "(T3,A,T33,3F16.8)") "DEBUG:: Exch[X]   ", foexch
+      END IF
 
       CALL cp_fm_release(xtransformed)
       DEALLOCATE (tcharge, gtcharge)

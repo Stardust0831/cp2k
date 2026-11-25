@@ -99,7 +99,7 @@ CONTAINS
       CHARACTER(len=2)                                   :: element_symbol, esa, esb, esc
       INTEGER :: fall, handle, ia, iab, iabc, iatom, ib, ic, icol, ikind, irow, ispin, jatom, &
          mao_basis, max_iter, me, na, nab, nabc, natom, nb, nc, nimages, nspin, ssize
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_sizes, mao_blk, mao_blk_sizes, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_sizes, mao_blk, mao_blk_sizes, &
                                                             orb_blk, row_blk_sizes
       LOGICAL                                            :: analyze_ua, explicit, fo, for, fos, &
                                                             found, neglect_abc, print_basis, &
@@ -243,8 +243,9 @@ CONTAINS
       CALL get_particle_set(particle_set, qs_kind_set, nmao=col_blk_sizes)
       ! check if MAOs have been specified
       DO iab = 1, natom
-         IF (col_blk_sizes(iab) < 0) &
+         IF (col_blk_sizes(iab) < 0) THEN
             CPABORT("Number of MAOs has to be specified in KIND section for all elements")
+         END IF
       END DO
       DO ispin = 1, nspin
          ! coeficients

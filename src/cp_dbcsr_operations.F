@@ -40,7 +40,8 @@ MODULE cp_dbcsr_operations
    USE distribution_2d_types,           ONLY: distribution_2d_get,&
                                               distribution_2d_type
    USE kinds,                           ONLY: default_string_length,&
-                                              dp
+                                              dp,&
+                                              int_8
    USE mathlib,                         ONLY: gcd,&
                                               lcm
    USE message_passing,                 ONLY: mp_para_env_type
@@ -56,7 +57,25 @@ MODULE cp_dbcsr_operations
 
    INTEGER, SAVE, PUBLIC :: max_elements_per_block = 32
 
-   PUBLIC :: dbcsr_multiply_local
+   ! A plan caches S/A routing for a source block layout and FM distribution.
+   ! Use check_plan for sources whose layout can change. The owner must release
+   ! the plan before releasing the FM structure. All owned storage is allocatable;
+   ! no matrix data pointers or MPI requests are retained. Calls must be serialized.
+   TYPE dbcsr_fm_thread_plan_type
+      INTEGER, ALLOCATABLE :: blocks(:, :), slots(:)
+   END TYPE dbcsr_fm_thread_plan_type
+
+   TYPE, PUBLIC :: dbcsr_fm_copy_plan_type
+      PRIVATE
+      TYPE(cp_fm_struct_type), POINTER :: matrix_struct => NULL()
+      CHARACTER :: matrix_type = " "
+      TYPE(dbcsr_fm_thread_plan_type), ALLOCATABLE :: thread(:)
+      INTEGER, ALLOCATABLE :: send_count(:), send_disp(:), recv_count(:), recv_disp(:), recv_index(:, :)
+      REAL(KIND=dp), ALLOCATABLE :: send_values(:), recv_values(:)
+   END TYPE dbcsr_fm_copy_plan_type
+
+   PUBLIC :: copy_dbcsr_to_local, copy_local_to_dbcsr
+   PUBLIC :: dbcsr_multiply_local, dbcsr_sum_many
 
    ! CP2K API emulation
    PUBLIC :: copy_fm_to_dbcsr, copy_dbcsr_to_fm, &
@@ -91,6 +110,116 @@ MODULE cp_dbcsr_operations
    END INTERFACE
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Sum local, nonsymmetric matrices in history order, using bounded per-worker storage.
+!>        Pack and store outside OpenMP, including missing or transposed input blocks.
+!> \param matrix_c independent output matrices
+!> \param matrix_a input matrices, indexed by output and history entry; must not alias outputs
+!> \param alpha coefficients of the history entries
+! **************************************************************************************************
+   SUBROUTINE dbcsr_sum_many(matrix_c, matrix_a, alpha)
+      TYPE(dbcsr_p_type), INTENT(IN)                     :: matrix_c(:), matrix_a(:, :)
+      REAL(dp), INTENT(IN)                               :: alpha(:)
+
+      TYPE local_sum_type
+         REAL(dp), ALLOCATABLE :: value(:, :), buffer(:, :)
+      END TYPE local_sum_type
+
+      INTEGER                                            :: first, i, j, k, n, nbatch, nworkers
+      TYPE(local_sum_type), ALLOCATABLE                  :: work(:)
+
+      CPASSERT(SIZE(matrix_c) == SIZE(matrix_a, 1))
+      CPASSERT(SIZE(alpha) == SIZE(matrix_a, 2))
+      IF (SIZE(matrix_c) == 0) RETURN
+      nworkers = 1
+!$    nworkers = MIN(SIZE(matrix_c), omp_get_max_threads())
+      ALLOCATE (work(nworkers))
+      DO first = 1, SIZE(matrix_c), nworkers
+         nbatch = MIN(nworkers, SIZE(matrix_c) - first + 1)
+         DO j = 1, nbatch
+            CALL dbcsr_get_info(matrix_c(first + j - 1)%matrix, nfullrows_total=n, nfullcols_total=k)
+            IF (ALLOCATED(work(j)%value)) THEN
+               IF (SIZE(work(j)%value, 1) /= n .OR. SIZE(work(j)%value, 2) /= k) THEN
+                  DEALLOCATE (work(j)%value, work(j)%buffer)
+               END IF
+            END IF
+            IF (.NOT. ALLOCATED(work(j)%value)) ALLOCATE (work(j)%value(n, k), work(j)%buffer(n, k))
+            work(j)%value(:, :) = 0.0_dp
+         END DO
+         DO i = 1, SIZE(alpha)
+            DO j = 1, nbatch
+               CALL copy_dbcsr_to_local(matrix_a(first + j - 1, i)%matrix, work(j)%buffer)
+            END DO
+!$OMP PARALLEL DO DEFAULT(NONE) SCHEDULE(STATIC) NUM_THREADS(nbatch) IF(nbatch > 1) SHARED(work,alpha,i,nbatch)
+            DO j = 1, nbatch
+               work(j)%value(:, :) = work(j)%value(:, :) + alpha(i)*work(j)%buffer(:, :)
+            END DO
+!$OMP END PARALLEL DO
+         END DO
+         DO j = 1, nbatch
+            CALL copy_local_to_dbcsr(matrix_c(first + j - 1)%matrix, work(j)%value)
+         END DO
+      END DO
+   END SUBROUTINE dbcsr_sum_many
+
+! **************************************************************************************************
+!> \brief Load a single-rank, nonsymmetric matrix without redistribution.
+!> \param matrix DBCSR matrix
+!> \param dense full local matrix
+! **************************************************************************************************
+   SUBROUTINE copy_dbcsr_to_local(matrix, dense)
+      TYPE(dbcsr_type), INTENT(IN)                       :: matrix
+      REAL(dp), INTENT(OUT)                              :: dense(:, :)
+
+      INTEGER                                            :: col, nc, nr, row
+      LOGICAL                                            :: transposed
+      REAL(dp), POINTER                                  :: block(:, :)
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      CPASSERT(dbcsr_get_matrix_type(matrix) == dbcsr_type_no_symmetry)
+      dense(:, :) = 0.0_dp
+      CALL dbcsr_iterator_readonly_start(iter, matrix)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, block=block, transposed=transposed, &
+                                        row_size=nr, col_size=nc, row_offset=row, col_offset=col)
+         IF (transposed) THEN
+            dense(row:row + nr - 1, col:col + nc - 1) = TRANSPOSE(block)
+         ELSE
+            dense(row:row + nr - 1, col:col + nc - 1) = block
+         END IF
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+   END SUBROUTINE copy_dbcsr_to_local
+
+! **************************************************************************************************
+!> \brief Store a single-rank, nonsymmetric matrix without redistribution.
+!> \param matrix DBCSR matrix
+!> \param dense full local matrix
+! **************************************************************************************************
+   SUBROUTINE copy_local_to_dbcsr(matrix, dense)
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: matrix
+      REAL(dp), INTENT(IN)                               :: dense(:, :)
+
+      INTEGER                                            :: col, nc, nr, row
+      LOGICAL                                            :: transposed
+      REAL(dp), POINTER                                  :: block(:, :)
+      TYPE(dbcsr_iterator_type)                          :: iter
+
+      CPASSERT(dbcsr_get_matrix_type(matrix) == dbcsr_type_no_symmetry)
+      CALL dbcsr_reserve_all_blocks(matrix)
+      CALL dbcsr_iterator_start(iter, matrix)
+      DO WHILE (dbcsr_iterator_blocks_left(iter))
+         CALL dbcsr_iterator_next_block(iter, block=block, transposed=transposed, &
+                                        row_size=nr, col_size=nc, row_offset=row, col_offset=col)
+         IF (transposed) THEN
+            block(:, :) = TRANSPOSE(dense(row:row + nr - 1, col:col + nc - 1))
+         ELSE
+            block(:, :) = dense(row:row + nr - 1, col:col + nc - 1)
+         END IF
+      END DO
+      CALL dbcsr_iterator_stop(iter)
+   END SUBROUTINE copy_local_to_dbcsr
 
 ! **************************************************************************************************
 !> \brief   Copy a BLACS matrix to a dbcsr matrix.
@@ -154,7 +283,7 @@ CONTAINS
       INTEGER                                            :: col, handle, ncol_block, ncol_global, &
                                                             nrow_block, nrow_global, row
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: first_col, first_row, last_col, last_row
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, row_blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_size, row_blk_size
       INTEGER, DIMENSION(:, :), POINTER                  :: pgrid
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: dbcsr_block, fm_block
       TYPE(dbcsr_distribution_type)                      :: bc_dist
@@ -207,10 +336,16 @@ CONTAINS
 !> \brief Copy a DBCSR matrix to a BLACS matrix
 !> \param[in] matrix          DBCSR matrix
 !> \param[out] fm             full matrix
+!> \param plan optional S/A routing plan; discard before releasing the FM structure
+!> \param check_plan check for layout changes and collectively rebuild the plan;
+!>        defaults to false for callers that guarantee fixed layouts and threads
 ! **************************************************************************************************
-   SUBROUTINE copy_dbcsr_to_fm(matrix, fm)
+   SUBROUTINE copy_dbcsr_to_fm(matrix, fm, plan, check_plan)
       TYPE(dbcsr_type), INTENT(IN)                       :: matrix
       TYPE(cp_fm_type), INTENT(INOUT)                    :: fm
+      TYPE(dbcsr_fm_copy_plan_type), INTENT(INOUT), &
+         OPTIONAL                                        :: plan
+      LOGICAL, INTENT(IN), OPTIONAL                      :: check_plan
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'copy_dbcsr_to_fm'
 
@@ -218,12 +353,16 @@ CONTAINS
       INTEGER                                            :: group_handle, handle, ncol_block, &
                                                             nfullcols_total, nfullrows_total, &
                                                             nrow_block
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, row_blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_size, row_blk_size
       INTEGER, DIMENSION(:, :), POINTER                  :: pgrid
+      LOGICAL                                            :: validate_plan
       TYPE(dbcsr_distribution_type)                      :: bc_dist, dist
+      TYPE(dbcsr_fm_copy_plan_type)                      :: local_plan
       TYPE(dbcsr_type)                                   :: bc_mat, matrix_nosym
 
       CALL timeset(routineN, handle)
+      validate_plan = .FALSE.
+      IF (PRESENT(check_plan)) validate_plan = check_plan
 
       ! check compatibility
       CALL dbcsr_get_info(matrix, &
@@ -234,6 +373,20 @@ CONTAINS
 
       CPASSERT(fm%matrix_struct%nrow_global == nfullrows_total)
       CPASSERT(fm%matrix_struct%ncol_global == nfullcols_total)
+
+      SELECT CASE (dbcsr_get_matrix_type(matrix))
+      CASE (dbcsr_type_symmetric, dbcsr_type_antisymmetric)
+         IF (PRESENT(plan)) THEN
+            CALL copy_dbcsr_to_fm_sym(matrix, fm, plan, validate_plan)
+         ELSE
+            CALL copy_dbcsr_to_fm_sym(matrix, fm, local_plan, .FALSE.)
+         END IF
+         CALL timestop(handle)
+         RETURN
+      END SELECT
+
+      ! Other matrix types use the uncached redistribution path.
+      IF (PRESENT(plan)) plan = dbcsr_fm_copy_plan_type()
 
       ! info about the full matrix
       nrow_block = fm%matrix_struct%nrow_block
@@ -252,10 +405,14 @@ CONTAINS
                         dbcsr_type_no_symmetry, row_blk_size, col_blk_size, reuse_arrays=.TRUE.)
       CALL dbcsr_distribution_release(bc_dist)
 
-      CALL dbcsr_create(matrix_nosym, template=matrix, matrix_type="N")
-      CALL dbcsr_desymmetrize(matrix, matrix_nosym)
-      CALL dbcsr_complete_redistribute(matrix_nosym, bc_mat)
-      CALL dbcsr_release(matrix_nosym)
+      IF (dbcsr_get_matrix_type(matrix) == dbcsr_type_no_symmetry) THEN
+         CALL dbcsr_complete_redistribute(matrix, bc_mat)
+      ELSE
+         CALL dbcsr_create(matrix_nosym, template=matrix, matrix_type=dbcsr_type_no_symmetry)
+         CALL dbcsr_desymmetrize(matrix, matrix_nosym)
+         CALL dbcsr_complete_redistribute(matrix_nosym, bc_mat)
+         CALL dbcsr_release(matrix_nosym)
+      END IF
 
       CALL copy_dbcsr_to_fm_bc(bc_mat, fm)
 
@@ -263,6 +420,241 @@ CONTAINS
 
       CALL timestop(handle)
    END SUBROUTINE copy_dbcsr_to_fm
+
+! **************************************************************************************************
+!> \brief Send S/A values using a routing plan, checking the block sequence while packing.
+!>        Mutable sources require a collective check before using the cached routing.
+!> \param matrix symmetric or antisymmetric DBCSR workspace
+!> \param fm full matrix on the source communicator
+!> \param plan reusable routing and buffers; no outstanding communication on return
+!> \param check_plan rebuild collectively if the source layout, FM structure or threads change
+! **************************************************************************************************
+   SUBROUTINE copy_dbcsr_to_fm_sym(matrix, fm, plan, check_plan)
+      TYPE(dbcsr_type), INTENT(IN)                       :: matrix
+      TYPE(cp_fm_type), INTENT(INOUT)                    :: fm
+      TYPE(dbcsr_fm_copy_plan_type), INTENT(INOUT)       :: plan
+      LOGICAL, INTENT(IN)                                :: check_plan
+
+      INTEGER                                            :: attempt, col, col_offset, i, iblock, j, &
+                                                            k, mirror, ncol, nrecv, nrow, &
+                                                            nthreads, pos, rebuild, row, &
+                                                            row_offset, thread
+      LOGICAL                                            :: block_matches, layout_matches, transposed
+      REAL(KIND=dp)                                      :: symmetry_sign, value
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: block
+      TYPE(dbcsr_iterator_type)                          :: iter
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+
+      IF (.NOT. ALLOCATED(plan%thread)) CALL dbcsr_to_fm_plan_create(matrix, fm, plan)
+      para_env => fm%matrix_struct%context%para_env
+      symmetry_sign = 1.0_dp
+      IF (dbcsr_get_matrix_type(matrix) == dbcsr_type_antisymmetric) symmetry_sign = -1.0_dp
+
+      DO attempt = 1, 2
+         layout_matches = ASSOCIATED(plan%matrix_struct, fm%matrix_struct) .AND. &
+                          plan%matrix_type == dbcsr_get_matrix_type(matrix)
+         rebuild = 0
+!$OMP PARALLEL DEFAULT(NONE) SHARED(matrix, plan, symmetry_sign, layout_matches) &
+!$OMP PRIVATE(iter, row, col, block, transposed, row_offset, col_offset, nrow, ncol, &
+!$OMP thread, nthreads, iblock, pos, mirror, i, j, k, value, block_matches) REDUCTION(MAX:rebuild)
+         thread = 0
+         nthreads = 1
+!$       thread = omp_get_thread_num()
+!$       nthreads = omp_get_num_threads()
+         IF (.NOT. layout_matches .OR. nthreads /= SIZE(plan%thread)) THEN
+            rebuild = 1
+         ELSE
+            iblock = 0
+            pos = 0
+            CALL dbcsr_iterator_readonly_start(iter, matrix)
+            DO WHILE (dbcsr_iterator_blocks_left(iter))
+               CALL dbcsr_iterator_next_block(iter, row, col, block, transposed=transposed, &
+                                              row_size=nrow, col_size=ncol, row_offset=row_offset, col_offset=col_offset)
+               iblock = iblock + 1
+               block_matches = iblock <= SIZE(plan%thread(thread)%blocks, 2)
+               IF (block_matches) block_matches = ALL(plan%thread(thread)%blocks(:, iblock) == &
+                                                      [row, col, nrow, ncol, row_offset, col_offset])
+               IF (.NOT. block_matches) THEN
+                  rebuild = 1
+                  EXIT
+               END IF
+               DO j = 1, ncol
+                  DO i = 1, nrow
+                     IF (transposed) THEN
+                        value = symmetry_sign*block(j, i)
+                     ELSE
+                        value = block(i, j)
+                     END IF
+                     DO mirror = 1, 2
+                        IF (mirror == 2 .AND. row == col) CYCLE
+                        pos = pos + 1
+                        k = plan%thread(thread)%slots(pos)
+                        plan%send_values(k) = value
+                        value = symmetry_sign*value
+                     END DO
+                  END DO
+               END DO
+            END DO
+            CALL dbcsr_iterator_stop(iter)
+            IF (iblock /= SIZE(plan%thread(thread)%blocks, 2) .OR. &
+                pos /= SIZE(plan%thread(thread)%slots)) rebuild = 1
+         END IF
+!$OMP END PARALLEL
+         IF (check_plan) CALL para_env%max(rebuild)
+         IF (rebuild == 0) EXIT
+         CPASSERT(check_plan .AND. attempt == 1)
+         CALL dbcsr_to_fm_plan_create(matrix, fm, plan)
+      END DO
+
+      ! Counts and destination indices were exchanged once when the plan was built.
+      CALL para_env%alltoall(plan%send_values, plan%send_count, plan%send_disp, &
+                             plan%recv_values, plan%recv_count, plan%recv_disp)
+      nrecv = SUM(plan%recv_count)
+      fm%local_data = 0.0_dp
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(fm, plan, nrecv) PRIVATE(k)
+      DO k = 1, nrecv
+         fm%local_data(plan%recv_index(1, k), plan%recv_index(2, k)) = plan%recv_values(k)
+      END DO
+!$OMP END PARALLEL DO
+
+   END SUBROUTINE copy_dbcsr_to_fm_sym
+
+! **************************************************************************************************
+!> \brief Cache source-to-packet slots and destination FM indices, not source pointers.
+!>        Counting and indexing use the same static DBCSR thread assignment. The
+!>        plan is valid only while that assignment and both matrix layouts are fixed.
+!> \param matrix symmetric or antisymmetric DBCSR workspace
+!> \param fm destination full matrix
+!> \param plan new routing plan
+! **************************************************************************************************
+   SUBROUTINE dbcsr_to_fm_plan_create(matrix, fm, plan)
+      TYPE(dbcsr_type), INTENT(IN)                       :: matrix
+      TYPE(cp_fm_type), INTENT(IN)                       :: fm
+      TYPE(dbcsr_fm_copy_plan_type), INTENT(OUT)         :: plan
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'dbcsr_to_fm_plan_create'
+
+      INTEGER                                            :: col, col_offset, dest, handle, i, &
+                                                            iblock, j, k, mirror, ncol, nproc, &
+                                                            nrow, nthreads, pass, pos, row, &
+                                                            row_offset, thread, x, y
+      INTEGER(KIND=int_8)                                :: count, offset
+      INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:)     :: local_pos
+      INTEGER(KIND=int_8), ALLOCATABLE, DIMENSION(:, :)  :: thread_pos
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: nblocks
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: send_index
+      LOGICAL                                            :: transposed
+      TYPE(cp_fm_struct_type), POINTER                   :: fms
+      TYPE(dbcsr_iterator_type)                          :: iter
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+
+      CALL timeset(routineN, handle)
+      fms => fm%matrix_struct
+      plan%matrix_struct => fms
+      plan%matrix_type = dbcsr_get_matrix_type(matrix)
+      para_env => fms%context%para_env
+      nproc = para_env%num_pe
+      nthreads = 1
+!$    nthreads = omp_get_max_threads()
+      ALLOCATE (thread_pos(0:nproc - 1, 0:nthreads - 1), nblocks(0:nthreads - 1))
+      ALLOCATE (plan%send_count(0:nproc - 1), plan%send_disp(0:nproc - 1), &
+                plan%recv_count(0:nproc - 1), plan%recv_disp(0:nproc - 1))
+      thread_pos(:, :) = 0
+      nblocks(:) = 0
+
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(matrix, fms, nproc, nthreads, &
+!$OMP thread_pos, nblocks, send_index, plan) &
+!$OMP PRIVATE(iter, row, col, row_offset, col_offset, nrow, ncol, &
+!$OMP thread, iblock, pos, pass, mirror, i, j, x, y, dest, k, offset, count, local_pos, transposed)
+      thread = 0
+!$    thread = omp_get_thread_num()
+      ALLOCATE (local_pos(0:nproc - 1))
+      local_pos(:) = 0
+      DO pass = 1, 2
+         iblock = 0
+         pos = 0
+         IF (pass == 2) THEN
+!$OMP SINGLE
+            CPASSERT(SUM(thread_pos) <= INT(HUGE(0), int_8)/2)
+            plan%send_count(:) = INT(SUM(thread_pos, DIM=2))
+!$          nthreads = omp_get_num_threads()
+            ALLOCATE (plan%thread(0:nthreads - 1))
+            DO k = 0, nthreads - 1
+               ALLOCATE (plan%thread(k)%blocks(6, nblocks(k)), &
+                         plan%thread(k)%slots(INT(SUM(thread_pos(:, k)))))
+            END DO
+            offset = 0
+            DO dest = 0, nproc - 1
+               plan%send_disp(dest) = INT(offset)
+               DO k = 0, nthreads - 1
+                  count = thread_pos(dest, k)
+                  thread_pos(dest, k) = offset
+                  offset = offset + count
+               END DO
+            END DO
+            ALLOCATE (send_index(2, MAX(1, SUM(plan%send_count))), &
+                      plan%send_values(MAX(1, SUM(plan%send_count))))
+            send_index(:, :) = 0
+            plan%send_values(:) = 0.0_dp
+!$OMP END SINGLE
+            local_pos(:) = thread_pos(:, thread)
+         END IF
+         CALL dbcsr_iterator_readonly_start(iter, matrix)
+         DO WHILE (dbcsr_iterator_blocks_left(iter))
+            CALL dbcsr_iterator_next_block(iter, row, col, row_size=nrow, col_size=ncol, &
+                                           row_offset=row_offset, col_offset=col_offset, transposed=transposed)
+            iblock = iblock + 1
+            IF (pass == 2) THEN
+               plan%thread(thread)%blocks(:, iblock) = [row, col, nrow, ncol, row_offset, col_offset]
+            END IF
+            DO j = 1, ncol
+               DO i = 1, nrow
+                  DO mirror = 1, 2
+                     IF (mirror == 2 .AND. row == col) CYCLE
+                     x = row_offset + i - 1
+                     y = col_offset + j - 1
+                     IF (mirror == 2) THEN
+                        x = col_offset + j - 1
+                        y = row_offset + i - 1
+                     END IF
+                     dest = fms%context%blacs2mpi(fms%g2p_row(x), fms%g2p_col(y))
+                     local_pos(dest) = local_pos(dest) + 1
+                     IF (pass == 1) CYCLE
+                     k = INT(local_pos(dest))
+                     send_index(:, k) = [fms%g2l_row(x), fms%g2l_col(y)]
+                     pos = pos + 1
+                     plan%thread(thread)%slots(pos) = k
+                  END DO
+               END DO
+            END DO
+         END DO
+         CALL dbcsr_iterator_stop(iter)
+         IF (pass == 1) THEN
+            thread_pos(:, thread) = local_pos(:)
+            nblocks(thread) = iblock
+         END IF
+!$OMP BARRIER
+      END DO
+      DEALLOCATE (local_pos)
+!$OMP END PARALLEL
+      DEALLOCATE (thread_pos, nblocks)
+
+      CALL para_env%alltoall(plan%send_count, plan%recv_count, 1)
+      CPASSERT(SUM(INT(plan%recv_count, int_8)) <= INT(HUGE(0), int_8)/2)
+      plan%recv_disp(0) = 0
+      DO dest = 1, nproc - 1
+         plan%recv_disp(dest) = plan%recv_disp(dest - 1) + plan%recv_count(dest - 1)
+      END DO
+      ALLOCATE (plan%recv_index(2, MAX(1, SUM(plan%recv_count))), &
+                plan%recv_values(MAX(1, SUM(plan%recv_count))))
+      plan%recv_index(:, :) = 0
+      plan%recv_values(:) = 0.0_dp
+      CALL para_env%alltoall(send_index, 2*plan%send_count, 2*plan%send_disp, &
+                             plan%recv_index, 2*plan%recv_count, 2*plan%recv_disp)
+      CALL timestop(handle)
+
+   END SUBROUTINE dbcsr_to_fm_plan_create
 
 ! **************************************************************************************************
 !> \brief Copy a DBCSR_BLACS matrix to a BLACS matrix
@@ -415,8 +807,8 @@ CONTAINS
       TYPE(distribution_2d_type), INTENT(IN), TARGET     :: dist2d
       TYPE(dbcsr_distribution_type), INTENT(OUT)         :: dist
 
-      INTEGER, DIMENSION(:), POINTER                     :: col_dist, row_dist
-      INTEGER, DIMENSION(:, :), POINTER                  :: col_dist_data, pgrid, row_dist_data
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_dist, row_dist
+      INTEGER, CONTIGUOUS, DIMENSION(:, :), POINTER      :: col_dist_data, pgrid, row_dist_data
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
       TYPE(distribution_2d_type), POINTER                :: dist2d_p
       TYPE(mp_para_env_type), POINTER                    :: para_env
@@ -460,10 +852,11 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'dbcsr_multiply_local'
 
-      INTEGER                                            :: col, coloff, my_ncol, row, rowoff, &
-                                                            timing_handle
+      INTEGER                                            :: col, coloff, my_ncol, nrows, row, &
+                                                            rowoff, timing_handle
       LOGICAL                                            :: has_symm
       REAL(dp)                                           :: my_alpha, my_alpha2
+      REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: vec_c_priv
       REAL(dp), DIMENSION(:, :), POINTER                 :: data_d
       TYPE(dbcsr_iterator_type)                          :: iter
 
@@ -474,6 +867,7 @@ CONTAINS
 
       my_ncol = SIZE(vec_b, 2)
       IF (PRESENT(ncol)) my_ncol = ncol
+      nrows = SIZE(vec_c, 1)
 
       my_alpha2 = 0.0_dp
       IF (dbcsr_get_matrix_type(matrix_a) == dbcsr_type_symmetric) my_alpha2 = my_alpha
@@ -482,9 +876,12 @@ CONTAINS
       has_symm = (dbcsr_get_matrix_type(matrix_a) == dbcsr_type_symmetric .OR. &
                   dbcsr_get_matrix_type(matrix_a) == dbcsr_type_antisymmetric)
 
-!$OMP     PARALLEL DEFAULT(NONE) SHARED(matrix_a,vec_b,vec_c,ncol,my_alpha2,my_alpha,my_ncol,has_symm) &
-!$OMP              PRIVATE(iter,row,col,data_d,rowoff,coloff)
-      CALL dbcsr_iterator_readonly_start(iter, matrix_a, dynamic=.TRUE., dynamic_byrows=.TRUE.)
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(matrix_a, vec_b, vec_c, my_alpha2, my_alpha, my_ncol, nrows, has_symm) &
+!$OMP PRIVATE(iter, row, col, data_d, rowoff, coloff, vec_c_priv)
+      ALLOCATE (vec_c_priv(nrows, my_ncol))
+      vec_c_priv(:, :) = 0.0_dp
+      CALL dbcsr_iterator_readonly_start(iter, matrix_a)
       DO WHILE (dbcsr_iterator_blocks_left(iter))
          CALL dbcsr_iterator_next_block(iter, row, col, data_d, row_offset=rowoff, col_offset=coloff)
          IF (my_ncol /= 1) THEN
@@ -492,40 +889,34 @@ CONTAINS
                        SIZE(data_d, 1), my_ncol, SIZE(data_d, 2), &
                        my_alpha, data_d(1, 1), SIZE(data_d, 1), &
                        vec_b(coloff, 1), SIZE(vec_b, 1), &
-                       1.0_dp, vec_c(rowoff, 1), SIZE(vec_c, 1))
+                       1.0_dp, vec_c_priv(rowoff, 1), nrows)
          ELSE
             CALL dgemv('N', SIZE(data_d, 1), SIZE(data_d, 2), &
                        my_alpha, data_d(1, 1), SIZE(data_d, 1), &
                        vec_b(coloff, 1), 1, &
-                       1.0_dp, vec_c(rowoff, 1), 1)
+                       1.0_dp, vec_c_priv(rowoff, 1), 1)
+         END IF
+         IF (has_symm .AND. row /= col) THEN
+            IF (my_ncol /= 1) THEN
+               CALL dgemm('T', 'N', &
+                          SIZE(data_d, 2), my_ncol, SIZE(data_d, 1), &
+                          my_alpha2, data_d(1, 1), SIZE(data_d, 1), &
+                          vec_b(rowoff, 1), SIZE(vec_b, 1), &
+                          1.0_dp, vec_c_priv(coloff, 1), nrows)
+            ELSE
+               CALL dgemv('T', SIZE(data_d, 1), SIZE(data_d, 2), &
+                          my_alpha2, data_d(1, 1), SIZE(data_d, 1), &
+                          vec_b(rowoff, 1), 1, &
+                          1.0_dp, vec_c_priv(coloff, 1), 1)
+            END IF
          END IF
       END DO
       CALL dbcsr_iterator_stop(iter)
-!$OMP     END PARALLEL
-
-      ! FIXME ... in the symmetric case, the writes to vec_c depend on the column, not the row. This makes OMP-ing more difficult
-      ! needs e.g. a buffer for vec_c and a reduction of that buffer.
-      IF (has_symm) THEN
-         CALL dbcsr_iterator_readonly_start(iter, matrix_a)
-         DO WHILE (dbcsr_iterator_blocks_left(iter))
-            CALL dbcsr_iterator_next_block(iter, row, col, data_d, row_offset=rowoff, col_offset=coloff)
-            IF (row /= col) THEN
-               IF (my_ncol /= 1) THEN
-                  CALL dgemm('T', 'N', &
-                             SIZE(data_d, 2), my_ncol, SIZE(data_d, 1), &
-                             my_alpha2, data_d(1, 1), SIZE(data_d, 1), &
-                             vec_b(rowoff, 1), SIZE(vec_b, 1), &
-                             1.0_dp, vec_c(coloff, 1), SIZE(vec_c, 1))
-               ELSE
-                  CALL dgemv('T', SIZE(data_d, 1), SIZE(data_d, 2), &
-                             my_alpha2, data_d(1, 1), SIZE(data_d, 1), &
-                             vec_b(rowoff, 1), 1, &
-                             1.0_dp, vec_c(coloff, 1), 1)
-               END IF
-            END IF
-         END DO
-         CALL dbcsr_iterator_stop(iter)
-      END IF
+!$OMP CRITICAL(dbcsr_multiply_local_crit)
+      vec_c(:, 1:my_ncol) = vec_c(:, 1:my_ncol) + vec_c_priv(:, 1:my_ncol)
+!$OMP END CRITICAL(dbcsr_multiply_local_crit)
+      DEALLOCATE (vec_c_priv)
+!$OMP END PARALLEL
 
       CALL timestop(timing_handle)
    END SUBROUTINE dbcsr_multiply_local
@@ -554,11 +945,13 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'cp_dbcsr_sm_fm_multiply'
 
       INTEGER                                            :: a_ncol, a_nrow, b_ncol, b_nrow, c_ncol, &
-                                                            c_nrow, k_in, k_out, timing_handle, &
+                                                            c_nrow, icol_local, k_in, k_out, &
+                                                            ncol_local, timing_handle, &
                                                             timing_handle_mult
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, col_blk_size_right_in, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_size, col_blk_size_right_in, &
                                                             col_blk_size_right_out, col_dist, &
                                                             row_blk_size, row_dist
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices
       TYPE(dbcsr_type)                                   :: in, out
       TYPE(dbcsr_distribution_type)                      :: dist, dist_right_in, product_dist
       REAL(dp)                                           :: my_alpha, my_beta
@@ -611,8 +1004,15 @@ CONTAINS
                            row_blk_size, col_blk_size_right_out)
 
          CALL copy_fm_to_dbcsr(fm_in, in)
-         IF (ncol /= k_out .OR. my_beta /= 0.0_dp) &
+         IF (ncol /= k_out .OR. my_beta /= 0.0_dp) THEN
+            IF (my_beta == 0.0_dp) THEN
+               CALL cp_fm_get_info(fm_out, ncol_local=ncol_local, col_indices=col_indices)
+               DO icol_local = 1, ncol_local
+                  IF (col_indices(icol_local) <= ncol) fm_out%local_data(:, icol_local) = 0.0_dp
+               END DO
+            END IF
             CALL copy_fm_to_dbcsr(fm_out, out)
+         END IF
 
          CALL timeset(routineN//'_core', timing_handle_mult)
          CALL dbcsr_multiply("N", "N", my_alpha, matrix, in, my_beta, out, &
@@ -648,8 +1048,9 @@ CONTAINS
 
       n1 = SIZE(sizes1)
       n2 = SIZE(sizes2)
-      IF (n1 /= n2) &
+      IF (n1 /= n2) THEN
          CPABORT("distributions must be equal!")
+      END IF
       sizes1(1:n1) = sizes2(1:n1)
       used = SUM(sizes1(1:n1))
       ! If sizes1 does not cover everything, then we increase the
@@ -700,7 +1101,7 @@ CONTAINS
 
       INTEGER                                            :: k, my_symmetry_mode, nao, npcols, &
                                                             timing_handle
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size_left, col_dist_left, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_size_left, col_dist_left, &
                                                             row_blk_size, row_dist
       LOGICAL                                            :: check_product, my_keep_sparsity
       REAL(KIND=dp)                                      :: my_alpha, norm
@@ -723,8 +1124,9 @@ CONTAINS
       NULLIFY (col_dist_left)
 
       IF (ncol > 0) THEN
-         IF (.NOT. dbcsr_valid_index(sparse_matrix)) &
+         IF (.NOT. dbcsr_valid_index(sparse_matrix)) THEN
             CPABORT("sparse_matrix must pre-exist")
+         END IF
          !
          ! Setup matrix_v
          CALL cp_fm_get_info(matrix_v, ncol_global=k)
@@ -830,25 +1232,6 @@ CONTAINS
             WRITE (*, *) 'PRESENT (matrix_g)', PRESENT(matrix_g)
             WRITE (*, *) 'matrix_type=', dbcsr_get_matrix_type(sparse_matrix)
             WRITE (*, *) 'norm(sm+alpha*v*g^t - fm+alpha*v*g^t)/n=', norm/REAL(nao, dp)
-            IF (norm/REAL(nao, dp) > 1e-12_dp) THEN
-               !WRITE(*,*) 'fm_matrix'
-               !DO j=1,SIZE(fm_matrix%local_data,2)
-               !   DO i=1,SIZE(fm_matrix%local_data,1)
-               !      WRITE(*,'(A,I3,A,I3,A,E26.16,A)') 'a(',i,',',j,')=',fm_matrix%local_data(i,j),';'
-               !   ENDDO
-               !ENDDO
-               !WRITE(*,*) 'mat_v'
-               !CALL dbcsr_print(mat_v)
-               !WRITE(*,*) 'mat_g'
-               !CALL dbcsr_print(mat_g)
-               !WRITE(*,*) 'sparse_matrix'
-               !CALL dbcsr_print(sparse_matrix)
-               !WRITE(*,*) 'sparse_matrix2 (-sm + sparse(fm))'
-               !CALL dbcsr_print(sparse_matrix2)
-               !WRITE(*,*) 'sparse_matrix3 (copy of sm input)'
-               !CALL dbcsr_print(sparse_matrix3)
-               !stop
-            END IF
             CALL dbcsr_release(sparse_matrix2)
             CALL dbcsr_release(sparse_matrix3)
             CALL cp_fm_release(fm_matrix)
@@ -876,7 +1259,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(IN)                       :: template
 
       INTEGER                                            :: k_in
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size_right_in, row_blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_size_right_in, row_blk_size
       TYPE(dbcsr_distribution_type)                      :: dist_right_in, tmpl_dist
 
       CALL cp_fm_get_info(fm_in, ncol_global=k_in)
@@ -911,7 +1294,7 @@ CONTAINS
 
       CHARACTER                                          :: mysym
       INTEGER                                            :: npcols, nprows
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, col_dist, row_blk_size, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_size, col_dist, row_blk_size, &
                                                             row_dist
       TYPE(dbcsr_distribution_type)                      :: dist_m_n, tmpl_dist
 
@@ -954,7 +1337,7 @@ CONTAINS
 
       CHARACTER                                          :: mysym
       INTEGER                                            :: npcols
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_size, col_dist, row_blk_size, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_size, col_dist, row_blk_size, &
                                                             row_dist
       TYPE(dbcsr_distribution_type)                      :: dist_m_n, tmpl_dist
 
@@ -1025,11 +1408,13 @@ CONTAINS
 
          estimated_blocks = max_blocks_per_bin*nbins
          ALLOCATE (blk_dist(estimated_blocks), stat=stat)
-         IF (stat /= 0) &
+         IF (stat /= 0) THEN
             CPABORT("blk_dist")
+         END IF
          ALLOCATE (blk_sizes(estimated_blocks), stat=stat)
-         IF (stat /= 0) &
+         IF (stat /= 0) THEN
             CPABORT("blk_sizes")
+         END IF
          element_stack = 0
          nblks = 0
          DO blk_layer = 1, max_blocks_per_bin
@@ -1051,23 +1436,27 @@ CONTAINS
             block_size => blk_sizes
          ELSE
             ALLOCATE (block_distribution(nblks), stat=stat)
-            IF (stat /= 0) &
+            IF (stat /= 0) THEN
                CPABORT("blk_dist")
+            END IF
             block_distribution(:) = blk_dist(1:nblks)
             DEALLOCATE (blk_dist)
             ALLOCATE (block_size(nblks), stat=stat)
-            IF (stat /= 0) &
+            IF (stat /= 0) THEN
                CPABORT("blk_sizes")
+            END IF
             block_size(:) = blk_sizes(1:nblks)
             DEALLOCATE (blk_sizes)
          END IF
       ELSE
          ALLOCATE (block_distribution(0), stat=stat)
-         IF (stat /= 0) &
+         IF (stat /= 0) THEN
             CPABORT("blk_dist")
+         END IF
          ALLOCATE (block_size(0), stat=stat)
-         IF (stat /= 0) &
+         IF (stat /= 0) THEN
             CPABORT("blk_sizes")
+         END IF
       END IF
 1579  FORMAT(I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5, 1X, I5)
       IF (debug_mod) THEN
@@ -1099,8 +1488,8 @@ CONTAINS
       INTEGER                                            :: multiplicity, ncols, nimages, npcols, &
                                                             nprows
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: tmp_images
-      INTEGER, DIMENSION(:), POINTER                     :: old_col_dist, right_col_dist, &
-                                                            right_row_dist
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: right_col_dist, right_row_dist
+      INTEGER, DIMENSION(:), POINTER                     :: old_col_dist
 
       CALL dbcsr_distribution_get(dist_left, &
                                   ncols=ncols, &
@@ -1220,7 +1609,7 @@ CONTAINS
 
       INTEGER                                            :: nblkcols, nblkrows, npcols, nprows, &
                                                             pdim, sz
-      INTEGER, DIMENSION(:), POINTER                     :: cd_data, rd_data
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: cd_data, rd_data
 
       ! Row sizes
       IF (nrow_block == 0) THEN
@@ -1426,7 +1815,7 @@ CONTAINS
       INTEGER                                            :: imatrix
 
       IF (ASSOCIATED(matrix_set)) THEN
-         DO imatrix = 1, SIZE(matrix_set)
+         DO imatrix = LBOUND(matrix_set, 1), UBOUND(matrix_set, 1)
             CALL dbcsr_deallocate_matrix(matrix_set(imatrix)%matrix)
          END DO
          DEALLOCATE (matrix_set)
@@ -1447,8 +1836,8 @@ CONTAINS
       INTEGER                                            :: imatrix, jmatrix
 
       IF (ASSOCIATED(matrix_set)) THEN
-         DO jmatrix = 1, SIZE(matrix_set, 2)
-            DO imatrix = 1, SIZE(matrix_set, 1)
+         DO jmatrix = LBOUND(matrix_set, 2), UBOUND(matrix_set, 2)
+            DO imatrix = LBOUND(matrix_set, 1), UBOUND(matrix_set, 1)
                CALL dbcsr_deallocate_matrix(matrix_set(imatrix, jmatrix)%matrix)
             END DO
          END DO
@@ -1469,9 +1858,9 @@ CONTAINS
       INTEGER                                            :: imatrix, jmatrix, kmatrix
 
       IF (ASSOCIATED(matrix_set)) THEN
-         DO kmatrix = 1, SIZE(matrix_set, 3)
-            DO jmatrix = 1, SIZE(matrix_set, 2)
-               DO imatrix = 1, SIZE(matrix_set, 1)
+         DO kmatrix = LBOUND(matrix_set, 3), UBOUND(matrix_set, 3)
+            DO jmatrix = LBOUND(matrix_set, 2), UBOUND(matrix_set, 2)
+               DO imatrix = LBOUND(matrix_set, 1), UBOUND(matrix_set, 1)
                   CALL dbcsr_deallocate_matrix(matrix_set(imatrix, jmatrix, kmatrix)%matrix)
                END DO
             END DO
@@ -1493,10 +1882,10 @@ CONTAINS
       INTEGER                                            :: imatrix, jmatrix, kmatrix, lmatrix
 
       IF (ASSOCIATED(matrix_set)) THEN
-         DO lmatrix = 1, SIZE(matrix_set, 4)
-         DO kmatrix = 1, SIZE(matrix_set, 3)
-            DO jmatrix = 1, SIZE(matrix_set, 2)
-               DO imatrix = 1, SIZE(matrix_set, 1)
+         DO lmatrix = LBOUND(matrix_set, 4), UBOUND(matrix_set, 4)
+         DO kmatrix = LBOUND(matrix_set, 3), UBOUND(matrix_set, 3)
+            DO jmatrix = LBOUND(matrix_set, 2), UBOUND(matrix_set, 2)
+               DO imatrix = LBOUND(matrix_set, 1), UBOUND(matrix_set, 1)
                   CALL dbcsr_deallocate_matrix(matrix_set(imatrix, jmatrix, kmatrix, lmatrix)%matrix)
                END DO
             END DO
@@ -1521,11 +1910,11 @@ CONTAINS
                                                             lmatrix
 
       IF (ASSOCIATED(matrix_set)) THEN
-         DO hmatrix = 1, SIZE(matrix_set, 5)
-            DO lmatrix = 1, SIZE(matrix_set, 4)
-            DO kmatrix = 1, SIZE(matrix_set, 3)
-               DO jmatrix = 1, SIZE(matrix_set, 2)
-                  DO imatrix = 1, SIZE(matrix_set, 1)
+         DO hmatrix = LBOUND(matrix_set, 5), UBOUND(matrix_set, 5)
+            DO lmatrix = LBOUND(matrix_set, 4), UBOUND(matrix_set, 4)
+            DO kmatrix = LBOUND(matrix_set, 3), UBOUND(matrix_set, 3)
+               DO jmatrix = LBOUND(matrix_set, 2), UBOUND(matrix_set, 2)
+                  DO imatrix = LBOUND(matrix_set, 1), UBOUND(matrix_set, 1)
                      CALL dbcsr_deallocate_matrix(matrix_set(imatrix, jmatrix, kmatrix, lmatrix, hmatrix)%matrix)
                   END DO
                END DO

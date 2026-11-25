@@ -18,6 +18,7 @@ MODULE dbt_split
    USE dbt_allocate_wrap, ONLY: allocate_any
    USE dbt_array_list_methods, ONLY: get_ith_array
    USE dbt_block, ONLY: dbt_iterator_type, &
+                        dbt_copy_block, &
                         dbt_get_block, &
                         dbt_put_block, &
                         dbt_iterator_start, &
@@ -272,7 +273,7 @@ CONTAINS
 
                         CALL timestop(handle)
 
-                     END SUBROUTINE
+                     END SUBROUTINE dbt_split_blocks_generic
 
 ! **************************************************************************************************
 !> \brief Split tensor blocks into smaller blocks of maximum size PRODUCT(block_sizes).
@@ -331,7 +332,7 @@ CONTAINS
                                                                                                   nodata=nodata)
                         #:endfor
 
-                     END SUBROUTINE
+                     END SUBROUTINE dbt_split_blocks
 
 ! **************************************************************************************************
 !> \brief Copy tensor with split blocks to tensor with original block sizes.
@@ -480,7 +481,7 @@ CONTAINS
 
                               CALL timestop(handle)
 
-                           END SUBROUTINE
+                           END SUBROUTINE dbt_split_copyback
 
 ! **************************************************************************************************
 !> \brief split two tensors with same total sizes but different block sizes such that they have
@@ -503,7 +504,8 @@ CONTAINS
                               INTEGER, DIMENSION(ndims_tensor(tensor1)), &
                                  INTENT(IN), OPTIONAL                        :: order
                               LOGICAL, INTENT(IN), OPTIONAL     :: nodata1, nodata2, move_data
-                          INTEGER, DIMENSION(:), ALLOCATABLE  :: ${varlist("blk_size_split_1")}$, ${varlist("blk_size_split_2")}$, &
+                              INTEGER, DIMENSION(:), ALLOCATABLE  :: ${varlist("blk_size_split_1")}$, &
+                                                                     ${varlist("blk_size_split_2")}$, &
                                                                      blk_size_d_1, blk_size_d_2, blk_size_d_split
                               INTEGER :: size_sum_1, size_sum_2, size_sum, bind_1, bind_2, isplit, bs, idim, i
                               LOGICAL :: move_prv, nodata1_prv, nodata2_prv
@@ -529,7 +531,7 @@ CONTAINS
                               IF (PRESENT(order)) THEN
                                  order_prv(:) = dbt_inverse_order(order)
                               ELSE
-                                 order_prv(:) = (/(i, i=1, ndims_tensor(tensor1))/)
+                                 order_prv(:) = [(i, i=1, ndims_tensor(tensor1))]
                               END IF
 
                               DO idim = 1, ndims_tensor(tensor2)
@@ -551,7 +553,7 @@ CONTAINS
                                        size_sum = size_sum + bs
                                        isplit = isplit + 1
                                        blk_size_d_split(isplit) = bs
-                                    ELSEIF (blk_size_d_1(bind_1 + 1) > blk_size_d_2(bind_2 + 1)) THEN
+                                    ELSE IF (blk_size_d_1(bind_1 + 1) > blk_size_d_2(bind_2 + 1)) THEN
                                        bind_2 = bind_2 + 1
                                        bs = blk_size_d_2(bind_2)
                                        blk_size_d_1(bind_1 + 1) = blk_size_d_1(bind_1 + 1) - bs
@@ -608,7 +610,7 @@ CONTAINS
                                  END IF
                               #:endfor
 
-                           END SUBROUTINE
+                           END SUBROUTINE dbt_make_compatible_blocks
 
 ! **************************************************************************************************
 !> \author Patrick Seewald
@@ -674,6 +676,12 @@ CONTAINS
                                     blk_bounds(2, idim) = MIN(bounds(2, idim) - blk_offset(idim) + 1, blk_size(idim))
                                  END DO
 
+                                 ! tensor_out was created from tensor_in, hence uncropped blocks copy as is
+                                 IF (ALL(blk_bounds(1, :) == 1) .AND. ALL(blk_bounds(2, :) == blk_size)) THEN
+                                    CALL dbt_copy_block(tensor_in, tensor_out, blk_index)
+                                    CYCLE iter_loop
+                                 END IF
+
                                  #:for ndim in ndims
                                     IF (ndims_tensor(tensor_in) == ${ndim}$) THEN
                                        CALL dbt_get_block(tensor_in, blk_index, block_${ndim}$d, found)
@@ -698,6 +706,6 @@ CONTAINS
                               CALL dbt_copy_contraction_storage(tensor_in, tensor_out)
 
                               CALL timestop(handle)
-                           END SUBROUTINE
+                           END SUBROUTINE dbt_crop
 
-                        END MODULE
+                        END MODULE dbt_split

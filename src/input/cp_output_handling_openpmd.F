@@ -16,6 +16,7 @@
 !>      handling: @see cp_log_handling
 ! **************************************************************************************************
 MODULE cp_output_handling_openpmd
+
    USE cp_output_handling, only: cp_print_key_should_output, cp_p_file
    USE cp_files, ONLY: close_file, &
                        open_file
@@ -659,7 +660,7 @@ CONTAINS
          openpmd_file_index = cp_openpmd_get_openpmd_file_entry( &
                               openpmd_basename, filename, openpmd_config, logger, my_mpi_io)
 
-         OPEN (newunit=res, status='scratch', action='write')
+         CALL open_file(unit_number=res, file_status="SCRATCH", file_action="WRITE")
          BLOCK
             TYPE(cp_openpmd_per_call_value_type) :: output_info
 
@@ -747,7 +748,7 @@ CONTAINS
                                   my_mpi_io)) THEN
          CALL section_vals_val_get(print_key, "FILENAME", c_val=outPath)
          IF (cp_openpmd_remove_unit_nr(unit_nr)) THEN
-            CLOSE (unit_nr)
+            CALL close_file(unit_number=unit_nr)
          END IF
 
          unit_nr = -1

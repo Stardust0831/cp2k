@@ -46,8 +46,7 @@ MODULE response_solver
                                               cp_logger_get_default_unit_nr,&
                                               cp_logger_type
    USE ec_env_types,                    ONLY: energy_correction_type
-   USE ec_methods,                      ONLY: create_kernel,&
-                                              ec_mos_init
+   USE ec_methods,                      ONLY: ec_mos_init
    USE ec_orth_solver,                  ONLY: ec_response_ao
    USE exstates_types,                  ONLY: excited_energy_type
    USE hartree_local_methods,           ONLY: Vh_1c_gg_integrals,&
@@ -106,8 +105,10 @@ MODULE response_solver
                                               set_qs_env
    USE qs_force_types,                  ONLY: qs_force_type,&
                                               total_qs_force
+   USE qs_fxc,                          ONLY: qs_fxc_create
    USE qs_gapw_densities,               ONLY: prepare_gapw_den
-   USE qs_integrate_potential,          ONLY: integrate_v_core_rspace,&
+   USE qs_integrate_potential,          ONLY: integrate_rho_nlcc,&
+                                              integrate_v_core_rspace,&
                                               integrate_v_rspace
    USE qs_kind_types,                   ONLY: get_qs_kind,&
                                               get_qs_kind_set,&
@@ -137,12 +138,12 @@ MODULE response_solver
    USE qs_rho0_methods,                 ONLY: init_rho0
    USE qs_rho_atom_methods,             ONLY: allocate_rho_atom_internals,&
                                               calculate_rho_atom_coeff
+   USE qs_rho_atom_types,               ONLY: rho_atom_type
    USE qs_rho_types,                    ONLY: qs_rho_create,&
                                               qs_rho_get,&
                                               qs_rho_set,&
                                               qs_rho_type
-   USE qs_vxc_atom,                     ONLY: calculate_vxc_atom,&
-                                              calculate_xc_2nd_deriv_atom
+   USE qs_vxc_atom,                     ONLY: calculate_vxc_atom
    USE task_list_types,                 ONLY: task_list_type
    USE virial_methods,                  ONLY: one_third_sum_diag
    USE virial_types,                    ONLY: virial_type
@@ -869,9 +870,9 @@ CONTAINS
       INTEGER                                            :: handle, iounit, ispin, mspin, myfun, &
                                                             n_rep_hf, nao, nao_aux, natom, nder, &
                                                             nocc, nspins
-      LOGICAL :: debug_forces, debug_stress, distribute_fock_matrix, do_ex, do_hfx, gapw, gapw_xc, &
-         hfx_treat_lsd_in_core, needs_tau_response, needs_tau_response_aux, resp_only, &
-         s_mstruct_changed, use_virial
+      LOGICAL :: debug_forces, debug_stress, distribute_fock_matrix, do_ex, do_hfx, do_onecenter, &
+         gapw, gapw_xc, hfx_treat_lsd_in_core, needs_tau_response, needs_tau_response_aux, &
+         resp_only, s_mstruct_changed, use_virial
       REAL(KIND=dp)                                      :: eh1, ehartree, ekin_mol, eps_filter, &
                                                             exc, exc_aux_fit, fconv, focc, &
                                                             hartree_gs, hartree_t
@@ -915,10 +916,12 @@ CONTAINS
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho_r_gs, rho_r_t, rhoz_r, rhoz_r_aux, &
                                                             rhoz_r_xc, rhoz_tau_r_aux, tauz_r, &
                                                             tauz_r_xc, v_xc, v_xc_tau
+      TYPE(pw_r3d_rs_type), POINTER                      :: rho_nlcc
       TYPE(qs_force_type), DIMENSION(:), POINTER         :: force
-      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
+      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: kind_set, qs_kind_set
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
       TYPE(qs_rho_type), POINTER                         :: rho, rho0, rho1, rho_aux_fit, rho_xc
+      TYPE(rho_atom_type), DIMENSION(:), POINTER         :: rho0_atom_set, rho1_atom_set
       TYPE(section_vals_type), POINTER                   :: hfx_section, xc_fun_section, xc_section
       TYPE(task_list_type), POINTER                      :: task_list, task_list_aux_fit
       TYPE(virial_type), POINTER                         :: virial
@@ -959,6 +962,10 @@ CONTAINS
       nspins = dft_control%nspins
       gapw = dft_control%qs_control%gapw
       gapw_xc = dft_control%qs_control%gapw_xc
+
+      ! NLCC
+      NULLIFY (rho_nlcc)
+      CALL get_qs_env(qs_env=qs_env, rho_nlcc=rho_nlcc)
 
       IF (debug_forces) THEN
          CALL get_qs_env(qs_env, natom=natom, atomic_kind_set=atomic_kind_set)
@@ -1244,7 +1251,7 @@ CONTAINS
             CALL pw_zero(vhxc_rspace)
             IF (gapw) THEN
                CALL pw_transfer(v_hartree_rspace_gs, vhxc_rspace)
-            ELSEIF (gapw_xc) THEN
+            ELSE IF (gapw_xc) THEN
                CALL pw_transfer(vh_rspace, vhxc_rspace)
             END IF
             CALL integrate_v_rspace(v_rspace=vhxc_rspace, &
@@ -1468,37 +1475,37 @@ CONTAINS
          END DO
       END IF
 
+      ALLOCATE (rho1)
+      CALL qs_rho_create(rho1)
       IF (gapw_xc) THEN
          CALL get_qs_env(qs_env=qs_env, rho_xc=rho_xc)
+         rho0 => rho_xc
+         IF (ASSOCIATED(tauz_r_xc)) THEN
+            CALL qs_rho_set(rho1, rho_r=rhoz_r_xc, rho_g=rhoz_g_xc, tau_r=tauz_r_xc, &
+                            rho_r_valid=.TRUE., rho_g_valid=.TRUE., tau_r_valid=.TRUE.)
+         ELSE
+            CALL qs_rho_set(rho1, rho_r=rhoz_r_xc, rho_g=rhoz_g_xc, &
+                            rho_r_valid=.TRUE., rho_g_valid=.TRUE.)
+         END IF
       ELSE
          CALL get_qs_env(qs_env=qs_env, rho=rho)
+         rho0 => rho
+         IF (ASSOCIATED(tauz_r)) THEN
+            CALL qs_rho_set(rho1, rho_r=rhoz_r, rho_g=rhoz_g, tau_r=tauz_r, &
+                            rho_r_valid=.TRUE., rho_g_valid=.TRUE., tau_r_valid=.TRUE.)
+         ELSE
+            CALL qs_rho_set(rho1, rho_r=rhoz_r, rho_g=rhoz_g, &
+                            rho_r_valid=.TRUE., rho_g_valid=.TRUE.)
+         END IF
       END IF
 
       IF (dft_control%qs_control%gapw_control%accurate_xcint) THEN
          ! GAPW Accurate integration
          IF (debug_forces) fodeb(1:3) = force(1)%rho_elec(1:3, 1)
          IF (debug_stress .AND. use_virial) stdeb = virial%pv_virial
-         ALLOCATE (rho1)
-         CALL qs_rho_create(rho1)
-         IF (gapw_xc) THEN
-            CALL get_qs_env(qs_env=qs_env, rho_xc=rho0)
-            IF (ASSOCIATED(tauz_r_xc)) THEN
-               CALL qs_rho_set(rho1, rho_r=rhoz_r_xc, rho_g=rhoz_g_xc, tau_r=tauz_r_xc, &
-                               rho_r_valid=.TRUE., rho_g_valid=.TRUE., tau_r_valid=.TRUE.)
-            ELSE
-               CALL qs_rho_set(rho1, rho_r=rhoz_r_xc, rho_g=rhoz_g_xc)
-            END IF
-         ELSE
-            CALL get_qs_env(qs_env=qs_env, rho=rho0)
-            IF (ASSOCIATED(tauz_r)) THEN
-               CALL qs_rho_set(rho1, rho_r=rhoz_r, rho_g=rhoz_g, tau_r=tauz_r, &
-                               rho_r_valid=.TRUE., rho_g_valid=.TRUE., tau_r_valid=.TRUE.)
-            ELSE
-               CALL qs_rho_set(rho1, rho_r=rhoz_r, rho_g=rhoz_g)
-            END IF
-         END IF
+         !
          CALL accint_weight_force(qs_env, rho0, rho1, 1, xc_section)
-         DEALLOCATE (rho1)
+         !
          IF (debug_forces) THEN
             fodeb(1:3) = force(1)%rho_elec(1:3, 1) - fodeb(1:3)
             CALL para_env%sum(fodeb)
@@ -1639,17 +1646,6 @@ CONTAINS
       IF (use_virial) THEN
          virial%pv_xc = 0.0_dp
       END IF
-      !
-      NULLIFY (v_xc, v_xc_tau)
-      IF (gapw_xc) THEN
-         CALL create_kernel(qs_env, vxc=v_xc, vxc_tau=v_xc_tau, &
-                            rho=rho_xc, rho1_r=rhoz_r_xc, rho1_g=rhoz_g_xc, tau1_r=tauz_r_xc, &
-                            xc_section=xc_section, compute_virial=use_virial, virial_xc=virial%pv_xc)
-      ELSE
-         CALL create_kernel(qs_env, vxc=v_xc, vxc_tau=v_xc_tau, &
-                            rho=rho, rho1_r=rhoz_r, rho1_g=rhoz_g, tau1_r=tauz_r, &
-                            xc_section=xc_section, compute_virial=use_virial, virial_xc=virial%pv_xc)
-      END IF
 
       IF (gapw .OR. gapw_xc) THEN
          !get local_rho_set for GS density and response potential / density
@@ -1718,6 +1714,8 @@ CONTAINS
          END IF !gapw
       END IF !gapw
 
+      do_onecenter = .FALSE.
+      NULLIFY (rho0_atom_set, rho1_atom_set)
       IF (gapw .OR. gapw_xc) THEN
          !GAPW compute atomic fxc contributions
          IF (myfun /= xc_none) THEN
@@ -1729,13 +1727,18 @@ CONTAINS
             CALL calculate_rho_atom_coeff(qs_env, mpa, local_rho_set_f%rho_atom_set, &
                                           qs_kind_set, oce, sab_orb, para_env)
             CALL prepare_gapw_den(qs_env, local_rho_set_f, do_rho0=.FALSE.)
-            ! add hard and soft atomic contributions
-            CALL calculate_xc_2nd_deriv_atom(local_rho_set_gs%rho_atom_set, &
-                                             local_rho_set_f%rho_atom_set, &
-                                             qs_env, xc_section, para_env, &
-                                             do_triplet=.FALSE.)
+            rho0_atom_set => local_rho_set_gs%rho_atom_set
+            rho1_atom_set => local_rho_set_f%rho_atom_set
+            do_onecenter = .TRUE.
          END IF ! myfun
       END IF
+
+      NULLIFY (v_xc, v_xc_tau)
+      CALL qs_fxc_create(qs_env, rho0, rho1, rho0_atom_set, xc_section, do_onecenter, &
+                         v_xc, v_xc_tau, rho1_atom_set, &
+                         dispersion_env=qs_env%dispersion_env, &
+                         compute_virial=use_virial, virial_xc=virial%pv_xc)
+      DEALLOCATE (rho1)
 
       ! Stress-tensor XC-kernel GGA contribution
       IF (use_virial) THEN
@@ -1759,9 +1762,17 @@ CONTAINS
       CALL qs_rho_get(rho, rho_ao_kp=matrix_p)
       IF (debug_stress .AND. use_virial) stdeb = virial%pv_virial
 
+      IF (ASSOCIATED(rho_nlcc)) THEN
+         DO ispin = 1, nspins
+            CALL integrate_rho_nlcc(v_xc(ispin), qs_env, &
+                                    debug_forces, debug_stress, "dnlcc*dVxc")
+         END DO
+      END IF
+
       DO ispin = 1, nspins
          CALL pw_scale(v_xc(ispin), v_xc(ispin)%pw_grid%dvol)
       END DO
+
       IF ((.NOT. (gapw)) .AND. (.NOT. gapw_xc)) THEN
          IF (debug_forces) fodeb(1:3) = force(1)%rho_elec(1:3, 1)
          DO ispin = 1, nspins
@@ -1795,7 +1806,7 @@ CONTAINS
             CALL pw_zero(v_xc(ispin))
             IF (gapw) THEN ! Hartree potential of response density
                CALL pw_axpy(v_hartree_rspace_t, v_xc(ispin))
-            ELSEIF (gapw_xc) THEN
+            ELSE IF (gapw_xc) THEN
                CALL pw_axpy(zv_hartree_rspace, v_xc(ispin))
             END IF
             CALL integrate_v_rspace(qs_env=qs_env, &
@@ -2142,16 +2153,35 @@ CONTAINS
 
             IF (use_virial) virial%pv_xc = 0.0_dp
 
-            CALL create_kernel(qs_env=qs_env, &
-                               vxc=v_xc, &
-                               vxc_tau=v_xc_tau, &
-                               rho=rho_aux_fit, &
-                               rho1_r=rhoz_r_aux, &
-                               rho1_g=rhoz_g_aux, &
-                               tau1_r=rhoz_tau_r_aux, &
-                               xc_section=xc_section, &
-                               compute_virial=use_virial, &
-                               virial_xc=virial%pv_xc)
+            NULLIFY (rho0_atom_set, rho1_atom_set)
+            kind_set => qs_kind_set
+            IF (admm_env%do_gapw) THEN
+               kind_set => admm_env%admm_gapw_env%admm_kind_set
+               CALL local_rho_set_create(local_rhoz_set_admm)
+               CALL allocate_rho_atom_internals(local_rhoz_set_admm%rho_atom_set, atomic_kind_set, &
+                                                kind_set, dft_control, para_env)
+               CALL calculate_rho_atom_coeff(qs_env, mpz(:, 1), local_rhoz_set_admm%rho_atom_set, &
+                                             kind_set, admm_env%admm_gapw_env%oce, sab_aux_fit, para_env)
+               CALL prepare_gapw_den(qs_env, local_rho_set=local_rhoz_set_admm, &
+                                     do_rho0=.FALSE., kind_set_external=kind_set)
+               rho0_atom_set => admm_env%admm_gapw_env%local_rho_set%rho_atom_set
+               rho1_atom_set => local_rhoz_set_admm%rho_atom_set
+               do_onecenter = .TRUE.
+            END IF
+
+            ALLOCATE (rho1)
+            CALL qs_rho_create(rho1)
+            IF (ASSOCIATED(rhoz_tau_r_aux)) THEN
+               CALL qs_rho_set(rho1, rho_r=rhoz_r_aux, rho_g=rhoz_g_aux, tau_r=rhoz_tau_r_aux, &
+                               rho_r_valid=.TRUE., rho_g_valid=.TRUE., tau_r_valid=.TRUE.)
+            ELSE
+               CALL qs_rho_set(rho1, rho_r=rhoz_r_aux, rho_g=rhoz_g_aux, &
+                               rho_r_valid=.TRUE., rho_g_valid=.TRUE.)
+            END IF
+            CALL qs_fxc_create(qs_env, rho_aux_fit, rho1, rho0_atom_set, xc_section, do_onecenter, &
+                               v_xc, v_xc_tau, rho1_atom_set, &
+                               kind_set_external=kind_set, &
+                               compute_virial=use_virial, virial_xc=virial%pv_xc)
 
             ! Stress-tensor ADMM-kernel GGA contribution
             IF (use_virial) THEN
@@ -2164,6 +2194,13 @@ CONTAINS
                CALL para_env%sum(stdeb)
                IF (iounit > 0) WRITE (UNIT=iounit, FMT="(T2,A,T41,2(1X,ES19.11))") &
                   'STRESS| GGA 2nd Pin_admm*dK*rhoz_admm', one_third_sum_diag(stdeb), det_3x3(stdeb)
+            END IF
+            !
+            IF (ASSOCIATED(rho_nlcc)) THEN
+               DO ispin = 1, nspins
+                  CALL integrate_rho_nlcc(v_xc(ispin), qs_env, &
+                                          debug_forces, debug_stress, "dnlcc*dVxc(ADMM)")
+               END DO
             END IF
             !
             CALL qs_rho_get(rho_aux_fit, rho_ao_kp=matrix_p)
@@ -2205,23 +2242,14 @@ CONTAINS
             IF (use_virial) THEN
                virial%pv_ehartree = virial%pv_ehartree + (virial%pv_virial - pv_loc)
             END IF
+
             ! GAPW ADMM XC correction integrate weight contribution to force
             IF (admm_env%do_gapw) THEN
                IF (debug_forces) fodeb(1:3) = force(1)%rho_elec(1:3, 1)
                IF (debug_stress .AND. use_virial) stdeb = virial%pv_virial
-
-               ALLOCATE (rho1)
-               CALL qs_rho_create(rho1)
-               IF (ASSOCIATED(rhoz_tau_r_aux)) THEN
-                  CALL qs_rho_set(rho1, rho_r=rhoz_r_aux, rho_g=rhoz_g_aux, &
-                                  tau_r=rhoz_tau_r_aux, tau_r_valid=.TRUE.)
-               ELSE
-                  CALL qs_rho_set(rho1, rho_r=rhoz_r_aux, rho_g=rhoz_g_aux)
-               END IF
                !
                CALL accint_weight_force(qs_env, rho_aux_fit, rho1, 1, xc_section)
                !
-               DEALLOCATE (rho1)
                IF (debug_forces) THEN
                   fodeb(1:3) = force(1)%rho_elec(1:3, 1) - fodeb(1:3)
                   CALL para_env%sum(fodeb)
@@ -2245,22 +2273,9 @@ CONTAINS
             DEALLOCATE (v_xc, rhoz_r_aux, rhoz_g_aux)
             IF (ASSOCIATED(v_xc_tau)) DEALLOCATE (v_xc_tau)
             IF (ASSOCIATED(rhoz_tau_r_aux)) DEALLOCATE (rhoz_tau_r_aux)
+            DEALLOCATE (rho1)
             !
             IF (admm_env%do_gapw) THEN
-               CALL local_rho_set_create(local_rhoz_set_admm)
-               CALL allocate_rho_atom_internals(local_rhoz_set_admm%rho_atom_set, atomic_kind_set, &
-                                                admm_env%admm_gapw_env%admm_kind_set, dft_control, para_env)
-               CALL calculate_rho_atom_coeff(qs_env, mpz(:, 1), local_rhoz_set_admm%rho_atom_set, &
-                                             admm_env%admm_gapw_env%admm_kind_set, &
-                                             admm_env%admm_gapw_env%oce, sab_aux_fit, para_env)
-               CALL prepare_gapw_den(qs_env, local_rho_set=local_rhoz_set_admm, &
-                                     do_rho0=.FALSE., kind_set_external=admm_env%admm_gapw_env%admm_kind_set)
-               !compute the potential due to atomic densities
-               CALL calculate_xc_2nd_deriv_atom(admm_env%admm_gapw_env%local_rho_set%rho_atom_set, &
-                                                local_rhoz_set_admm%rho_atom_set, &
-                                                qs_env, xc_section, para_env, do_triplet=.FALSE., &
-                                                kind_set_external=admm_env%admm_gapw_env%admm_kind_set)
-               !
                IF (debug_forces) fodeb(1:3) = force(1)%Vhxc_atom(1:3, 1)
                CALL update_ks_atom(qs_env, mhy(:, 1), matrix_p(:, 1), forces=.TRUE., tddft=.FALSE., &
                                    rho_atom_external=local_rhoz_set_admm%rho_atom_set, &
@@ -2363,13 +2378,13 @@ CONTAINS
 
             ELSE
                DO ispin = 1, mspin
-                  eh1 = 0.0
+                  eh1 = 0.0_dp
                   CALL integrate_four_center(qs_env, x_data, mhz, eh1, mpz, hfx_section, &
                                              para_env, s_mstruct_changed, 1, distribute_fock_matrix, &
                                              ispin=ispin)
                END DO
                DO ispin = 1, mspin
-                  eh1 = 0.0
+                  eh1 = 0.0_dp
                   CALL integrate_four_center(qs_env, x_data, mhd, eh1, mpd, hfx_section, &
                                              para_env, s_mstruct_changed, 1, distribute_fock_matrix, &
                                              ispin=ispin)
@@ -2438,7 +2453,7 @@ CONTAINS
                                      hf_fraction=x_data(1, 1)%general_parameter%fraction)
             ELSE
                DO ispin = 1, mspin
-                  eh1 = 0.0
+                  eh1 = 0.0_dp
                   CALL integrate_four_center(qs_env, x_data, mhz, eh1, mpz, hfx_section, &
                                              para_env, s_mstruct_changed, 1, distribute_fock_matrix, &
                                              ispin=ispin)
@@ -2771,7 +2786,7 @@ CONTAINS
             mcharge1(iatom) = SUM(charges1(iatom, :))
          END DO
          ! Coulomb Kernel
-         CALL xtb_coulomb_hessian(qs_env, matrix_hz, charges1, mcharge1, mcharge)
+         CALL xtb_coulomb_hessian(qs_env, matrix_hz, charges1, mcharge1, mcharge, mpa)
          CALL calc_xtb_ehess_force(qs_env, p_matrix, mpa, charges, mcharge, charges1, &
                                    mcharge1, debug_forces)
          !

@@ -17,13 +17,15 @@
 #if !defined(__NO_OFFLOAD_GRID)
 #define __NO_OFFLOAD_GRID
 #endif
-#if !defined(__NO_OFFLOAD_PW)
-#define __NO_OFFLOAD_PW
+#if !defined(__NO_OFFLOAD_FFT)
+#define __NO_OFFLOAD_FFT
 #endif
 #endif
 
 #if defined(__OFFLOAD_CUDA) || defined(__OFFLOAD_HIP) ||                       \
     defined(__OFFLOAD_OPENCL)
+#include "../base/cp_assert.h"
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,6 +104,17 @@ static inline offloadError_t offloadGetLastError(void) {
 }
 
 /*******************************************************************************
+ * \brief Wrapper around cudaPeekAtLastError.
+ ******************************************************************************/
+static inline offloadError_t offloadPeekAtLastError(void) {
+#if defined(__OFFLOAD_CUDA)
+  return cudaPeekAtLastError();
+#elif defined(__OFFLOAD_HIP)
+  return hipPeekAtLastError();
+#endif
+}
+
+/*******************************************************************************
  * \brief Wrapper around cudaMemsetAsync.
  ******************************************************************************/
 static inline void offloadMemsetAsync(void *ptr, const int val,
@@ -162,6 +175,23 @@ static inline void offloadMemcpyAsyncDtoH(void *ptr_hst, const void *ptr_dev,
 #elif defined(__OFFLOAD_HIP)
   OFFLOAD_CHECK(
       hipMemcpyAsync(ptr_hst, ptr_dev, size, hipMemcpyDeviceToHost, stream));
+#endif
+}
+
+/*******************************************************************************
+ * \brief Wrapper around cudaMemcpy2DAsync(...,cudaMemcpyDeviceToHost,...).
+ ******************************************************************************/
+static inline void offloadMemcpy2DAsync(void *ptr_hst, const size_t dpitch,
+                                        const void *ptr_dev,
+                                        const size_t spitch, const size_t width,
+                                        const size_t height,
+                                        const offloadStream_t stream) {
+#if defined(__OFFLOAD_CUDA)
+  OFFLOAD_CHECK(cudaMemcpy2DAsync(ptr_hst, dpitch, ptr_dev, spitch, width,
+                                  height, cudaMemcpyDeviceToHost, stream));
+#elif defined(__OFFLOAD_HIP)
+  OFFLOAD_CHECK(hipMemcpy2DAsync(ptr_hst, dpitch, ptr_dev, spitch, width,
+                                 height, hipMemcpyDeviceToHost, stream));
 #endif
 }
 
@@ -315,7 +345,7 @@ static inline void offloadMallocHost(void **ptr, size_t size) {
 #elif defined(__OFFLOAD_HIP)
   OFFLOAD_CHECK(hipHostMalloc(ptr, size, hipHostMallocDefault)); // inconsistent
 #else
-  assert(NULL != ptr);
+  cp_assert(NULL != ptr);
   *ptr = malloc(size);
 #endif
 }
@@ -329,7 +359,7 @@ static inline void offloadMalloc(void **ptr, size_t size) {
 #elif defined(__OFFLOAD_HIP)
   OFFLOAD_CHECK(hipMalloc(ptr, size));
 #else
-  assert(NULL != ptr);
+  cp_assert(NULL != ptr);
   *ptr = NULL;
 #endif
 }
@@ -343,7 +373,7 @@ static inline void offloadFree(void *ptr) {
 #elif defined(__OFFLOAD_HIP)
   OFFLOAD_CHECK(hipFree(ptr));
 #else
-  assert(NULL == ptr);
+  cp_assert(NULL == ptr);
 #endif
 }
 

@@ -3,7 +3,8 @@
 The Bethe-Salpeter equation (BSE) is a method for computing electronic excitation energies and
 optical absorption spectra. We repeat the theory and implementation of BSE from \[[](#Graml2026)\]
 in Sec. [1](#header-theory), in Sec. [2](#header-input) the BSE input keywords and in Sec.
-[3](#header-example) a full CP2K input file of a BSE calculation and the corresponding output. For
+[3](#header-example) a full CP2K input file of a BSE calculation and the corresponding output. Sec.
+[4](#header-properties-bse) describes the BSE section under `PROPERTIES` for large molecules. For
 further references on BSE, see \[[](#Blase2018), [](#Blase2020), [](#Bruneval2015),
 [](#Sander2015)\].
 
@@ -36,14 +37,12 @@ $$
 
 We abbreviate $A$ and $B$ as matrices with index $A_{ia,jb}$, i.e. they have
 $N_\mathrm{occ}N_\mathrm{empty}$ rows and $N_\mathrm{occ}N_\mathrm{empty}$ columns. The entries of
-$A$ and
+$A$ and $B$ are
 
 $$
-\begin{align}
     A_{ia,jb} &= (\varepsilon_a^{GW}-\varepsilon_i^{GW})\delta_{ij}\delta_{ab} + \alpha^\mathrm{S/T}
     v_{ia,jb} - W_{ij,ab}(\omega=0) \quad ,\\
     B_{ia,jb} &= \alpha^\mathrm{(S/T)} v_{ia,bj} - W_{ib,aj}(\omega=0) \quad .
-\end{align}
 $$
 
 where $\delta_{ij}$ is the Kronecker delta. The user sets $\alpha^S=2$ for computing singlet
@@ -56,9 +55,7 @@ $Y_{ia}^{(n)}$ are the eigenvectors of the excitation $n$, which relate to the w
 electronic excitation,
 
 $$
-\begin{align}
 \Psi_\text{excitation}^{(n)}(\mathbf{r}_e,\mathbf{r}_h) = \sum_{ia} X_{ia}^{(n)} \varphi_i(\mathbf{r}_h) \varphi_a(\mathbf{r}_e) + Y_{ia}^{(n)} \varphi_i(\mathbf{r}_e) \varphi_a(\mathbf{r}_h) \quad ,
-\end{align}
 $$
 
 i.e. $X_{ia}^{(n)}$ and $Y_{ia}^{(n)}$ describe the transition amplitude between occupied orbital
@@ -74,7 +71,11 @@ $$
 
 Diagonalizing $A$ in TDA, or the full block-matrix $ABBA$, takes in the order of
 $(N_\mathrm{occ} N_\mathrm{empty})^3$ floating point operations. This translates to a computational
-scaling of $O(N^6)$ in the system size $N$.
+scaling of $O(N^6)$ in the system size $N$. Alternatively, the lowest excitations can be obtained
+iteratively with a block Davidson solver that applies $A$ and $B$ to trial vectors without forming
+them ([BSE_DIAG_METHOD](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.BSE_DIAG_METHOD)
+`ITERDIAG`, settings in
+[BSE_ITERAT](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.BSE_ITERAT)).
 
 ### 1.2 Optical absorption spectrum
 
@@ -83,61 +84,49 @@ spectrum can be computed as the imaginary part of the dynamical dipole polarizab
 $\alpha_{\mu,\mu'}(\omega) $ with $(\mu,\mu'\in\{x,y,z\})$:
 
 $$
-\begin{align}
 \alpha_{\mu,\mu'}(\omega) 
 = - \sum_n \frac{2 \Omega^{(n)} d^{(n)}_{\mu} d^{(n)}_{\mu'}}{(\omega+i\eta)^2-\left(\Omega^{(n)}\right)^2}
 \quad ,
-\end{align}
 $$
 
 where we have introduced an artificial broadening $\eta$. The transition moments $d^{(n)}_{\mu}$ are
 computed in the length gauge $(\mu\in\{x,y,z\})$ as
 
 $$
-\begin{align}
 d^{(n)}_{\mu} = \sqrt{2} \sum_{i,a} \langle \varphi_i|\hat{\mu}| \varphi_a \rangle (X_{ia}^{(n)} + Y_{ia}^{(n)}) 
 \quad .
-\end{align}
 $$
 
 When the molecules are not aligned, e.g. for gas phase and liquids, the spatial average is
 sufficient, i.e. the optical absorption spectrum can be computed as
 
 $$
-\begin{align}
 \mathrm{Im}\left[\bar{\alpha}(\omega)\right] = \frac{1}{3} \sum_{\mu\in\{x,y,z\}} \mathrm{Im}\left[\alpha_{\mu,\mu}(\omega)\right]
 \quad .
-\end{align}
 $$
 
 We can rewrite the last equation as
 
 $$
-\begin{align}
 \mathrm{Im}\left[\bar{\alpha}(\omega)\right] 
 = - \mathrm{Im}\left[
   \sum_n \frac{f^{(n)}}{(\omega+i\eta)^2-\left(\Omega^{(n)}\right)^2}
   \right]
 \quad .
-\end{align}
 $$
 
 where we introduced the oscillator strengths $f^{(n)}$, which are defined by
 
 $$
-\begin{align}
 f^{(n)} = \frac{2}{3} \Omega^{(n)} \sum_{\mu\in\{x,y,z\}} | d^{(n)}_{\mu} |^2
 \quad .
-\end{align}
 $$
 
 Additionally, the photoabsorption cross section tensor
 
 $$
-\begin{align}
 \sigma_{\mu,\mu'}(\omega)  = \frac{4 \pi \omega}{c} \mathrm{Im}\left[\alpha_{\mu,\mu'}(\omega) \right]
 \quad .
-\end{align}
 $$
 
 is printed, where $c$ denotes the speed of light.
@@ -148,11 +137,9 @@ In order to analyse the excitation wave function independent of a specific choic
 orbitals $\varphi_p(\mathbf{r})$, we can rewrite it as
 
 $$
-\begin{align}
 \Psi_\text{excitation}^{(n)}(\mathbf{r}_e,\mathbf{r}_h) = 
 \sum_I {\lambda_I^{(n)}} \phi_I^{(n)}(\mathbf{r}_e) \chi_I^{(n)}(\mathbf{r}_h)
 \quad .
-\end{align}
 $$
 
 in terms of the natural transitions orbitals (NTOs) $\phi_I^{(n)}(\mathbf{r}_e) $ and
@@ -175,11 +162,9 @@ Assuming $\lambda_1^{(n)} = 1$ and $\lambda_{I\neq 1}=0$, the excitation wave fu
 given as a product
 
 $$
-\begin{align}
 \Psi_\text{excitation}^{(n)}(\mathbf{r}_e,\mathbf{r}_h) = 
 \phi_1^{(n)}(\mathbf{r}_e) \chi_1^{(n)}(\mathbf{r}_h)
 \quad .
-\end{align}
 $$
 
 In this case, the electron is excited from the occupied NTO $\chi_1^{(n)}(\mathbf{r}_h)$ to the
@@ -200,7 +185,6 @@ $$
 i.e.:
 
 $$
-\begin{align}
     {T}^{(n)} &=  
     {U}^{(n)} 
     {\Lambda^{(n)}}
@@ -209,7 +193,6 @@ $$
     \phi_I^{(n)}(\mathbf{r}_e) &= \sum_{p=1}^{N_b} \varphi_p(\mathbf{r}_e) V_{p,I}^{(n)} \quad ,
     \\
     \chi_I^{(n)}(\mathbf{r}_h) &= \sum_{q=1}^{N_b} \varphi_q(\mathbf{r}_h) U_{q,I}^{(n)} \quad .
-\end{align}
 $$
 
 ### 1.4 Measures for the size of an excited state
@@ -221,16 +204,13 @@ following Ref. \[[](#Mewes2018)\].
 To that end, we define the exciton expectation value with respect to a generic operator $\hat{O}$ as
 
 $$
-\begin{align}
-\langle \hat{O} \rangle _\text{exc}^{(n)}
-=
+{\langle \hat{O} \rangle}_\text{exc}^{(n)} =
 \frac{ 
  \langle \Psi_\text{excitation}^{(n)} | \hat{O} | \Psi_\text{excitation}^{(n)}\rangle 
 }{
  \langle \Psi_\text{excitation}^{(n)} | \Psi_\text{excitation}^{(n)}\rangle 
 }
 \quad ,
-\end{align}
 $$
 
 where we drop the excitation index $n$ from now on for better readability.
@@ -243,9 +223,7 @@ state, i.e. distinguish between, e.g., valence, Rydberg or charge-transfer state
 First, we define the distance between electron and hole as
 
 $$
-\begin{align}
-d_{h \rightarrow e} = | \langle \mathbf{r}_h - \mathbf{r}_e \rangle_\mathrm{exc} | \quad ,
-\end{align}
+d_{h \rightarrow e} = | {\langle \mathbf{r}_h - \mathbf{r}_e \rangle}_\mathrm{exc} | \quad ,
 $$
 
 which can be used to distinguish different classes of excitations: For example in a charge-transfer
@@ -255,12 +233,10 @@ electron-hole distance $d_{h \rightarrow e}$.
 Further, we can measure the size of electron and hole, respectively, as
 
 $$
-\begin{align}
 \sigma_{e/h} = \sqrt{ 
-  \langle \mathbf{r}_{e/h}^2 \rangle_\mathrm{exc} 
-  - \langle \mathbf{r}_{e/h} \rangle_\mathrm{exc} ^2
+  {\langle \mathbf{r}_{e/h}^2 \rangle}_\mathrm{exc} 
+  - {\langle \mathbf{r}_{e/h} \rangle}_\mathrm{exc} ^2
   } \quad ,
-\end{align}
 $$
 
 which allow us to distinguish between Rydberg states, where $\sigma_h \ll \sigma_e$, and valence
@@ -269,9 +245,7 @@ states, where $\sigma_h \approx \sigma_e$.
 Closely related to these quantities, we can also define the exciton size
 
 $$
-\begin{align}
-d_\mathrm{exc} = \sqrt{ \langle |\mathbf{r}_h - \mathbf{r}_e|^2 \rangle_\mathrm{exc} } \quad .
-\end{align}
+d_\mathrm{exc} = \sqrt{ {\langle |\mathbf{r}_h - \mathbf{r}_e|^2 \rangle}_\mathrm{exc} } \quad .
 $$
 
 which quantifies the spatial extent of the combined electron-hole pair. As one would expect, the
@@ -282,11 +256,9 @@ Finally, we quantify the correlation of electron and hole by the electron-hole c
 coefficient
 
 $$
-\begin{align}
-R_{eh} = \frac{1}{\sigma_e \sigma_h} \left( \langle \mathbf{r}_h \cdot \mathbf{r}_e \rangle_\mathrm{exc}
-- \langle \mathbf{r}_h \rangle_\mathrm{exc} \cdot \langle \mathbf{r}_e \rangle_\mathrm{exc} \right)
+R_{eh} = \frac{1}{\sigma_e \sigma_h} \left( {\langle \mathbf{r}_h \cdot \mathbf{r}_e \rangle}_\mathrm{exc}
+- {\langle \mathbf{r}_h \rangle}_\mathrm{exc} \cdot {\langle \mathbf{r}_e \rangle}_\mathrm{exc} \right)
 \quad ,
-\end{align}
 $$
 
 which allows us to distinguish between correlated ($R_{eh}>0$) motion, i.e. bound excitons, and
@@ -336,6 +308,13 @@ In the upper GW/BSE section, the following keywords have been used:
   - `OFF` generalized diagonalization of $ABBA$,
   - `TDA+ABBA` CP2K diagonalizes $ABBA$ as well as $A$.
 
+- [BSE_DIAG_METHOD](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.BSE_DIAG_METHOD):
+  `FULLDIAG` (default) diagonalizes the matrices; `ITERDIAG` runs a block Davidson solver for the
+  lowest
+  [NUM_EXC_EN](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.BSE_ITERAT.NUM_EXC_EN)
+  excitations without forming $A$ and $B$, with the settings of
+  [BSE_ITERAT](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.BSE_ITERAT).
+
 - [SPIN_CONFIG](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.SPIN_CONFIG): Two options
   available: Choose between `SINGLET` for computing singlet excitation energies $(\alpha^S = 2)$ and
   `TRIPLET` for computing triplet excitation energies $(\alpha^T=0)$. Standard is `SINGLET` as an
@@ -348,16 +327,18 @@ In the upper GW/BSE section, the following keywords have been used:
 - [ENERGY_CUTOFF_OCC](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.ENERGY_CUTOFF_OCC)
   $E_\text{cut}^\text{occ}$: Restrict occupied molecular orbital (MO) indices $i$ and only use
   occupied MOs with
-  $\varepsilon_i\in[\varepsilon_{i=\text{HOMO}}^{GW}-E_\text{cut}^\text{occ},\varepsilon_{i=\text{HOMO}}^{GW}]$.
-  Setting a small `ENERGY_CUTOFF_OCC` drastically reduces the computation time and the memory
-  consumption, but also might affect the computed excitation energies $\Omega^{(n)}$. Recommended to
-  use for large systems with more than 30 atoms, but we recommend a careful convergence test by
-  increasing `ENERGY_CUTOFF_OCC` and observing the effect on $\Omega^{(n)}$ \[[](#Graml2026)\].
+  $\varepsilon_i\in[\varepsilon_{i=\text{HOMO}}^{DFT}-E_\text{cut}^\text{occ},\varepsilon_{i=\text{HOMO}}^{DFT}]$.
+  The cutoff is applied to the DFT eigenvalues, also when the BSE takes quasiparticle energies from
+  the *GW*. Setting a small `ENERGY_CUTOFF_OCC` drastically reduces the computation time and the
+  memory consumption, but also might affect the computed excitation energies $\Omega^{(n)}$.
+  Recommended to use for large systems with more than 30 atoms, but we recommend a careful
+  convergence test by increasing `ENERGY_CUTOFF_OCC` and observing the effect on $\Omega^{(n)}$
+  \[[](#Graml2026)\].
 
 - [ENERGY_CUTOFF_EMPTY](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.ENERGY_CUTOFF_EMPTY)
   $E_\text{cut}^\text{empty}$: Analogous to `ENERGY_CUTOFF_OCC`, but for the empty states, i.e. only
   empty states in the interval
-  $\varepsilon_a\in[\varepsilon_{a=\text{LUMO}}^{GW},\varepsilon_{a=\text{LUMO}}^{GW}+E_\text{cut}^\text{empty}]$.
+  $\varepsilon_a\in[\varepsilon_{a=\text{LUMO}}^{DFT},\varepsilon_{a=\text{LUMO}}^{DFT}+E_\text{cut}^\text{empty}]$.
 
 - [NUM_PRINT_EXC_DESCR](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.NUM_PRINT_EXC_DESCR):
   Number of excitations, for which the exciton descriptors are printed.
@@ -399,16 +380,30 @@ optical properties:
   [SELF_CONSISTENCY](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.SELF_CONSISTENCY)).
 - [BASIS_SET](#CP2K_INPUT.FORCE_EVAL.SUBSYS.KIND.BASIS_SET): Specify the basis set, which affects
   $N_\mathrm{empty}$ and thus the size of the matrices $A_{ia,jb}$ and $B_{ia,jb}$. The
-  <a href="https://www.basissetexchange.org/basis/aug-cc-pvdz/format/cp2k/?version=1&elements=1" target="_blank">`aug-cc-pVDZ`</a>
+  [`aug-cc-pVDZ`](https://www.basissetexchange.org/basis/aug-cc-pvdz/format/cp2k/?version=1&elements=1)
   basis set should be sufficient for most calculations, but needs to be checked regarding
   convergence, e.g. using
-  <a href="https://www.basissetexchange.org/basis/aug-cc-pvtz/format/cp2k/?version=1&elements=1" target="_blank">`aug-cc-pVTZ`</a>
-  .
+  [`aug-cc-pVTZ`](https://www.basissetexchange.org/basis/aug-cc-pvtz/format/cp2k/?version=1&elements=1).
 
 The memory consumption of the BSE algorithm is large, it is approximately
 $100 \cdot N_\mathrm{occ}^2 N_\mathrm{empty}^2$ Bytes. You can see $N_\mathrm{occ}$,
 $N_\mathrm{empty}$ and the estimated memory consumption from the BSE output. The BSE implementation
-is well parallelized, i.e. you can use several nodes that can provide the memory.
+is well parallelized, i.e. you can use several nodes that can provide the memory. With
+`BSE_DIAG_METHOD ITERDIAG` these matrices are never allocated; the memory is then set by the RI
+three-center tensors, and the solver prints its own estimate.
+
+With `BSE_DIAG_METHOD FULLDIAG`, the BSE multiplies matrices of size
+$N_\mathrm{occ} N_\mathrm{empty} \times N_\mathrm{occ} N_\mathrm{empty}$, so the peak memory also
+depends on a global setting:
+
+- [TYPE_OF_MATRIX_MULTIPLICATION](#CP2K_INPUT.GLOBAL.FM.TYPE_OF_MATRIX_MULTIPLICATION): With
+  `COSMA`, the default when CP2K is built with
+  [COSMA](../../../technologies/libraries.md#cosma-distributed-communication-optimal-matrix-matrix-multiplication-algorithm),
+  the library keeps buffers for its largest multiplication until the run ends, and for large systems
+  these buffers can set the peak memory. Especially when a run fails with an out-of-memory error,
+  the environment variable
+  [`COSMA_CPU_MAX_MEMORY`](https://github.com/eth-cscs/COSMA#tunable-parameters) caps them per MPI
+  rank (in MB) at a small cost in runtime; `SCALAPACK` avoids them at a larger one.
 
 We have benchmarked the numerical precision of our BSE implementation in \[[](#Graml2026)\] and
 compared its results to the BSE implementation in FHI aims \[[](#Liu2020)\]. For our recommended
@@ -440,9 +435,9 @@ mpirun -n 1 cp2k.psmp BSE_H2.inp
 which requires 5 GB RAM and takes roughly 45 seconds on 1 core. You can find the input and output
 file [here](https://github.com/cp2k/cp2k-examples/tree/master/bethe-salpeter/H2). We use the basis
 sets `aug-cc-pVDZ` and `aug-cc-pVDZ-RIFIT` from the file `BASIS-aug`. These basis sets can be
-obtained from the Basis Set Exchange Library:
-<a href="https://www.basissetexchange.org/basis/aug-cc-pvdz/format/cp2k/?version=1&elements=1" target="_blank">`aug-cc-pVDZ`</a>,
-<a href="https://www.basissetexchange.org/basis/aug-cc-pvdz-rifit/format/cp2k/?version=1&elements=1" target="_blank">`aug-cc-pVDZ-RIFIT`</a>.
+obtained from the Basis Set Exchange Library as
+[`aug-cc-pVDZ`](https://www.basissetexchange.org/basis/aug-cc-pvdz/format/cp2k/?version=1&elements=1),
+[`aug-cc-pVDZ-RIFIT`](https://www.basissetexchange.org/basis/aug-cc-pvdz-rifit/format/cp2k/?version=1&elements=1).
 The geometry for H<sub>2</sub> was taken from \[[](#vanSetten2015)\].
 
 (header-output)=
@@ -605,7 +600,106 @@ and explicitly setting the keywords
 [ENERGY_CUTOFF_OCC](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.ENERGY_CUTOFF_OCC)
 and
 [ENERGY_CUTOFF_EMPTY](#CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE.ENERGY_CUTOFF_EMPTY),
-see details given above.
+see details given above. If CP2K uses COSMA for the matrix multiplications, also consider capping
+its buffers with `COSMA_CPU_MAX_MEMORY`, especially when a run fails with an out-of-memory error,
+see [TYPE_OF_MATRIX_MULTIPLICATION](#CP2K_INPUT.GLOBAL.FM.TYPE_OF_MATRIX_MULTIPLICATION) above.
+
+(header-properties-bse)=
+
+## 4. BSE on the *GW* of `PROPERTIES%BANDSTRUCTURE%GW` (`PROPERTIES%BSE`)
+
+The BSE section exists in two places. Each runs on the *GW* next to it, the keywords of both are
+identical, and both treat non-periodic systems (molecules) only:
+
+- [RI_RPA%GW%BSE][bse], in full `FORCE_EVAL%DFT%XC%WF_CORRELATION%RI_RPA%GW%BSE`, runs on the
+  $O(N^4)$-scaling *GW* of the [RI_RPA%GW][gw] section, as in the sections above.
+- [PROPERTIES%BSE](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BSE), in full `FORCE_EVAL%PROPERTIES%BSE`, runs
+  on the low-scaling *GW* of
+  [PROPERTIES%BANDSTRUCTURE%GW](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BANDSTRUCTURE.GW), which must be
+  present in the same input and is described in [](../../electronic_structure/band/gw).
+
+The *GW* of `PROPERTIES%BANDSTRUCTURE%GW` is designed for large systems \[[](#Graml2024)\], so
+`PROPERTIES%BSE` is the BSE section to use for large molecules. `PROPERTIES%BSE` has the following
+requirements of its own:
+
+- A non-periodic cell, i.e. [PERIODIC](#CP2K_INPUT.FORCE_EVAL.SUBSYS.CELL.PERIODIC) `NONE`.
+- No [RI_RS](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BANDSTRUCTURE.GW.RI_RS) subsection in
+  `PROPERTIES%BANDSTRUCTURE%GW`. By default, `PROPERTIES%BANDSTRUCTURE%GW` computes the three-center
+  integrals $(\mu\nu|P)$ of the resolution of the identity (RI) between atomic orbitals $\mu, \nu$
+  and RI basis functions $P$ explicitly; `RI_RS` replaces them by a representation on a real-space
+  grid. `PROPERTIES%BSE` builds its kernel from the explicit three-center integrals.
+- The Γ-point only, i.e. no
+  [BANDSTRUCTURE_PATH](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BANDSTRUCTURE.BANDSTRUCTURE_PATH)
+  subsection and no [DOS%KPOINTS](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BANDSTRUCTURE.DOS.KPOINTS) in
+  `PROPERTIES%BANDSTRUCTURE`.
+- No [RTBSE](#CP2K_INPUT.FORCE_EVAL.DFT.REAL_TIME_PROPAGATION.RTBSE) section in the same run.
+- With [NTO_ANALYSIS](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BSE.NTO_ANALYSIS),
+  [CUBE_FILES](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BSE.NTO_ANALYSIS.CUBE_FILES) `F`: `PROPERTIES%BSE`
+  writes no cube files of the natural transition orbitals.
+
+`PROPERTIES%BSE` takes the quasiparticle energies, the three-center integrals and the static
+screened interaction $W(i\omega = 0)$ from `PROPERTIES%BANDSTRUCTURE%GW`; no second RPA calculation
+is run for the screening. $W(i\omega = 0)$ is summed from the screened interaction on the
+imaginary-time grid of `PROPERTIES%BANDSTRUCTURE%GW`. The numerical parameters of
+`PROPERTIES%BANDSTRUCTURE%GW` are therefore convergence parameters of `PROPERTIES%BSE` as well,
+beyond their effect on the quasiparticle energies:
+
+- [NUM_TIME_FREQ_POINTS](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BANDSTRUCTURE.GW.NUM_TIME_FREQ_POINTS)
+  sets the imaginary-time grid from which $W(i\omega = 0)$ is summed.
+- [CUTOFF_RADIUS_RI](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BANDSTRUCTURE.GW.CUTOFF_RADIUS_RI) is the
+  radius of the truncated Coulomb metric of the RI. `PROPERTIES%BSE` builds its kernel in the same
+  metric.
+- [EPS_FILTER](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BANDSTRUCTURE.GW.EPS_FILTER) filters the
+  three-center integrals, which enter the screening and the kernel of `PROPERTIES%BSE`.
+
+A minimal input:
+
+```
+&PROPERTIES
+  &BANDSTRUCTURE
+    &GW
+      NUM_TIME_FREQ_POINTS 30
+      CUTOFF_RADIUS_RI 20.0
+      MEMORY_PER_PROC 2
+    &END GW
+  &END BANDSTRUCTURE
+  &BSE
+    BSE_DIAG_METHOD FULLDIAG
+    ENERGY_CUTOFF_EMPTY 50.0
+    ENERGY_CUTOFF_OCC 60.0
+    TDA OFF
+  &END BSE
+&END PROPERTIES
+```
+
+A `CUTOFF_RADIUS_RI` beyond the extent of the molecule turns the truncated Coulomb metric of
+`PROPERTIES%BANDSTRUCTURE%GW` into the Coulomb metric of `RI_RPA%GW`. With such a radius and enough
+time and frequency points, the two *GW* implementations, and with them `PROPERTIES%BSE` and
+`RI_RPA%GW%BSE`, can be converged to each other. With looser settings, a residual deviation between
+the excitation energies of `PROPERTIES%BSE` and of `RI_RPA%GW%BSE` remains, which stems from the
+*GW* step.
+
+`PROPERTIES%BSE` transforms the three-center integrals to molecular orbitals in batches of RI atoms
+that fit the memory [MEMORY_PER_PROC](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BSE.MEMORY_PER_PROC) leaves
+per MPI rank after what the rank holds; by default the BSE detects that memory as the *GW* does for
+its own [MEMORY_PER_PROC](#CP2K_INPUT.FORCE_EVAL.PROPERTIES.BANDSTRUCTURE.GW.MEMORY_PER_PROC). The
+same remainder bounds the subspace of the iterative solver, and with `FULLDIAG` the memory of the
+diagonalization is estimated before the *GW* starts and the run stops when it does not fit. The
+output reports the memory per rank, what is left for each step, the largest batch and the number of
+batches. The three-center integrals of the BSE stay until the BSE ends and take about
+$8 N_\mathrm{RI} (N_\mathrm{occ}^2 + N_\mathrm{occ} N_\mathrm{virt} + N_\mathrm{virt}^2)$ bytes over
+all ranks and per spin, with $N_\mathrm{RI}$ RI functions and $N_\mathrm{occ}$, $N_\mathrm{virt}$
+levels in the active window; a value set by hand covers them and what SCF and *GW* hold.
+
+The budget holds per step and is no total for the run. The transformation of the integrals and the
+solver run one after the other, and each may take up to the budget on top of what the run holds when
+the step starts. By default, each step takes half of the memory that is free at that moment, so no
+value has to be estimated. A budget set by hand should not exceed the memory per MPI rank minus what
+the run holds already: the memory that SCF and *GW* have not released, and the transformed
+three-center integrals, which stay until the BSE ends and take about
+$8\,N_\text{RI}\,(N_\text{occ}^2 + N_\text{occ} N_\text{virt} + N_\text{virt}^2)$ bytes over all
+ranks and per spin, with $N_\text{RI}$ RI functions and $N_\text{occ}$, $N_\text{virt}$ levels in
+the active window.
 
 [bse]: #CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW.BSE
 [gw]: #CP2K_INPUT.FORCE_EVAL.DFT.XC.WF_CORRELATION.RI_RPA.GW

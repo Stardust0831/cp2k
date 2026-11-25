@@ -3,7 +3,7 @@
 # Usage: podman build --shm-size=1g -f ./Dockerfile.test_conventions ../../
 #
 
-FROM ubuntu:26.04
+FROM docker.io/ubuntu:26.04
 
 # Install requirements for the toolchain.
 WORKDIR /opt/cp2k-toolchain
@@ -16,7 +16,6 @@ COPY ./tools/toolchain/scripts/VERSION \
      ./tools/toolchain/scripts/tool_kit.sh \
      ./tools/toolchain/scripts/common_vars.sh \
      ./tools/toolchain/scripts/signal_trap.sh \
-     ./tools/toolchain/scripts/get_openblas_arch.sh \
      ./scripts/
 COPY ./tools/toolchain/install_cp2k_toolchain.sh .
 RUN ./install_cp2k_toolchain.sh \
@@ -58,6 +57,8 @@ RUN  ./scripts/stage8/install_stage8.sh && rm -rf ./build
 COPY ./tools/toolchain/scripts/stage9/ ./scripts/stage9/
 RUN  ./scripts/stage9/install_stage9.sh && rm -rf ./build
 
+RUN apt-get update -qq && apt-get install -qq clang-tidy libomp-dev
+
 COPY ./tools/conventions/redirect_gfortran_output.py /usr/bin/
 
 # Install CP2K sources.
@@ -67,6 +68,7 @@ COPY ./data ./data
 COPY ./tools/build_utils ./tools/build_utils
 COPY ./cmake ./cmake
 COPY ./CMakeLists.txt .
+COPY ./CMakePresets.json .
 
 # Compile CP2K.
 COPY ./tools/docker/scripts/build_cp2k.sh ./tools/docker/scripts/cmake_cp2k.sh ./
@@ -74,7 +76,7 @@ RUN ./build_cp2k.sh toolchain_conventions psmp
 
 # Run test for conventions.
 COPY ./tools/conventions ./tools/conventions
-RUN /bin/bash -ec "./tools/conventions/test_conventions.sh |& tee report.log"
+RUN /bin/bash -ec "./tools/conventions/test_conventions.sh -j $(nproc) |& tee report.log"
 
 # Output the report if the image is old and was therefore pulled from the build cache.
 CMD cat $(find ./report.log -mmin +10) | sed '/^Summary:/ s/$/ (cached)/'

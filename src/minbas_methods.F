@@ -85,7 +85,7 @@ CONTAINS
       INTEGER                                            :: handle, homo, i, iab, ispin, nao, natom, &
                                                             ndep, nmao, nmo, nmx, np, np1, nspin, &
                                                             nvirt, unit_nr
-      INTEGER, DIMENSION(:), POINTER                     :: col_blk_sizes, row_blk_sizes
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_blk_sizes, row_blk_sizes
       LOGICAL                                            :: do_minbas, my_full_ortho
       REAL(KIND=dp)                                      :: my_eps_filter
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dval, dvalo, dvalv, eigval
@@ -138,8 +138,9 @@ CONTAINS
       nmao = SUM(col_blk_sizes)
       ! check if MAOs have been specified
       DO iab = 1, natom
-         IF (col_blk_sizes(iab) < 0) &
+         IF (col_blk_sizes(iab) < 0) THEN
             CPABORT("Number of MAOs has to be specified in KIND section for all elements")
+         END IF
       END DO
       CALL get_mo_set(mo_set=mos(1), nao=nao, nmo=nmo)
 
@@ -167,7 +168,7 @@ CONTAINS
             WRITE (unit_nr, '(T2,A)') 'Localized Minimal Basis Analysis not possible'
          END IF
          do_minbas = .FALSE.
-      ELSEIF (nmo /= nmx) THEN
+      ELSE IF (nmo /= nmx) THEN
          IF (unit_nr > 0) THEN
             WRITE (unit_nr, '(T2,A)') 'Different Number of Alpha and Beta MOs'
             WRITE (unit_nr, '(T2,A)') 'Localized Minimal Basis Analysis not possible'

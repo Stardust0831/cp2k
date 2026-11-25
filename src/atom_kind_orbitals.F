@@ -21,9 +21,9 @@ MODULE atom_kind_orbitals
    USE atom_set_basis,                  ONLY: set_kind_basis_atomic
    USE atom_types,                      ONLY: &
         CGTO_BASIS, Clementi_geobas, GTO_BASIS, atom_basis_type, atom_ecppot_type, &
-        atom_gthpot_type, atom_integrals, atom_orbitals, atom_potential_type, atom_sgppot_type, &
-        atom_type, create_atom_orbs, create_atom_type, lmat, release_atom_basis, &
-        release_atom_potential, release_atom_type, set_atom
+        atom_gthpot_type, atom_integrals, atom_optimization_type, atom_orbitals, &
+        atom_potential_type, atom_sgppot_type, atom_type, create_atom_orbs, create_atom_type, &
+        lmat, release_atom_basis, release_atom_potential, release_atom_type, set_atom
    USE atom_utils,                      ONLY: atom_density,&
                                               get_maxl_occ,&
                                               get_maxn_occ
@@ -39,10 +39,11 @@ MODULE atom_kind_orbitals
         barrier_conf, do_analytic, do_dkh0_atom, do_dkh1_atom, do_dkh2_atom, do_dkh3_atom, &
         do_gapw_log, do_nonrel_atom, do_numeric, do_rks_atom, do_sczoramp_atom, do_uks_atom, &
         do_zoramp_atom, ecp_pseudo, gth_pseudo, no_pseudo, poly_conf, rel_dkh, rel_none, &
-        rel_sczora_mp, rel_zora, rel_zora_full, rel_zora_mp, sgp_pseudo
+        rel_sczora_mp, rel_zora, rel_zora_full, rel_zora_mp, sgp_pseudo, upf_pseudo
    USE input_section_types,             ONLY: section_vals_type
    USE kinds,                           ONLY: dp
    USE mathconstants,                   ONLY: dfac,&
+                                              fourpi,&
                                               pi
    USE periodic_table,                  ONLY: ptable
    USE physcon,                         ONLY: bohr
@@ -62,8 +63,18 @@ MODULE atom_kind_orbitals
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'atom_kind_orbitals'
 
+   ! Default values for optimization in an atomic guess
+   ! Commented values are the defaults in create_optimization_section
+   ! of input_cp2k_atom.F for the input section ATOM/OPTIMIZATION
+   TYPE(atom_optimization_type), PARAMETER :: atom_optimization = atom_optimization_type( &
+                                              damping=0.2_dp, &    ! 0.4_dp
+                                              eps_scf=1.0E-6_dp, & ! 1.0E-6_dp
+                                              eps_diis=100.0_dp, & ! 10000.0_dp
+                                              max_iter=200, &      ! 200
+                                              n_diis=5)            ! 5
+
    PUBLIC :: calculate_atomic_orbitals, calculate_atomic_density, &
-             calculate_atomic_relkin, gth_potential_conversion
+             calculate_atomic_relkin, gth_potential_conversion, sgp_potential_conversion
 
 ! **************************************************************************************************
 
@@ -83,9 +94,14 @@ CONTAINS
 !> \param confine ...
 !> \param xc_section ...
 !> \param nocc ...
+!> \param which_l ...
+!> \param which_n ...
+!> \param proj_shell_charge ...
+!> \param ao_coef ...
 ! **************************************************************************************************
    SUBROUTINE calculate_atomic_orbitals(atomic_kind, qs_kind, agrid, iunit, pmat, fmat, &
-                                        density, wavefunction, wfninfo, confine, xc_section, nocc)
+                                        density, wavefunction, wfninfo, confine, xc_section, nocc, &
+                                        which_l, which_n, proj_shell_charge, ao_coef)
       TYPE(atomic_kind_type), INTENT(IN)                 :: atomic_kind
       TYPE(qs_kind_type), INTENT(IN)                     :: qs_kind
       TYPE(grid_atom_type), OPTIONAL                     :: agrid
@@ -97,16 +113,22 @@ CONTAINS
       LOGICAL, INTENT(IN), OPTIONAL                      :: confine
       TYPE(section_vals_type), OPTIONAL, POINTER         :: xc_section
       INTEGER, DIMENSION(:), OPTIONAL                    :: nocc
+      INTEGER, INTENT(IN), OPTIONAL                      :: which_l, which_n
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: proj_shell_charge(4)
+      REAL(KIND=dp), DIMENSION(:), INTENT(INOUT), &
+         OPTIONAL, POINTER                               :: ao_coef
 
       INTEGER                                            :: i, ii, j, k, k1, k2, l, ll, m, mb, mo, &
-                                                            nr, nset, nsgf, z
+                                                            nr, nset, nsgf, projector_index, &
+                                                            valence_n, z
       INTEGER, DIMENSION(0:lmat)                         :: nbb
       INTEGER, DIMENSION(0:lmat, 10)                     :: ncalc, ncore, nelem
       INTEGER, DIMENSION(0:lmat, 100)                    :: set_index, shell_index
       INTEGER, DIMENSION(:), POINTER                     :: nshell
       INTEGER, DIMENSION(:, :), POINTER                  :: first_sgf, ls
       LOGICAL                                            :: ecp_semi_local, ghost, has_pp, uks
-      REAL(KIND=dp)                                      :: ok, scal, zeff
+      REAL(KIND=dp)                                      :: ok, qleft, scal, take, zeff
+      REAL(KIND=dp), DIMENSION(0:lmat, 10)               :: occupation_neutral
       REAL(KIND=dp), DIMENSION(0:lmat, 10, 2)            :: edelta
       TYPE(all_potential_type), POINTER                  :: all_potential
       TYPE(atom_basis_type), POINTER                     :: basis
@@ -117,6 +139,14 @@ CONTAINS
       TYPE(gth_potential_type), POINTER                  :: gth_potential
       TYPE(gto_basis_set_type), POINTER                  :: orb_basis_set
       TYPE(sgp_potential_type), POINTER                  :: sgp_potential
+
+      IF (PRESENT(ao_coef) .OR. PRESENT(which_l) .OR. &
+          PRESENT(which_n) .OR. PRESENT(proj_shell_charge)) THEN
+         IF (.NOT. PRESENT(ao_coef) .OR. .NOT. PRESENT(which_l) .OR. &
+             .NOT. PRESENT(which_n) .OR. .NOT. PRESENT(proj_shell_charge)) THEN
+            CPABORT("ao_coef, which_l, which_n, and proj_shell_charge must be provided together")
+         END IF
+      END IF
 
       NULLIFY (atom)
       CALL create_atom_type(atom)
@@ -171,7 +201,10 @@ CONTAINS
          CALL set_atom(atom, zcore=NINT(zeff), potential=potential)
       ELSE IF (ASSOCIATED(sgp_potential)) THEN
          CALL get_potential(sgp_potential, ecp_semi_local=ecp_semi_local)
-         IF (ecp_semi_local) THEN
+         IF (ALLOCATED(sgp_potential%upf_data)) THEN
+            potential%ppot_type = upf_pseudo
+            potential%upf_pot = sgp_potential%upf_data
+         ELSE IF (ecp_semi_local) THEN
             potential%ppot_type = ecp_pseudo
             CALL ecp_potential_conversion(sgp_potential, potential%ecp_pot)
             potential%ecp_pot%symbol = ptable(z)%symbol
@@ -189,16 +222,13 @@ CONTAINS
 
       NULLIFY (basis)
       ALLOCATE (basis)
+
       CALL set_kind_basis_atomic(basis, orb_basis_set, has_pp, agrid)
 
       CALL set_atom(atom, basis=basis)
 
       ! optimization defaults
-      atom%optimization%damping = 0.2_dp
-      atom%optimization%eps_scf = 1.e-6_dp
-      atom%optimization%eps_diis = 100._dp
-      atom%optimization%max_iter = 50
-      atom%optimization%n_diis = 5
+      atom%optimization = atom_optimization
 
       ! set up the electronic state
       CALL init_atom_electronic_state(atomic_kind=atomic_kind, &
@@ -206,7 +236,8 @@ CONTAINS
                                       ncalc=ncalc, &
                                       ncore=ncore, &
                                       nelem=nelem, &
-                                      edelta=edelta)
+                                      edelta=edelta, &
+                                      rks=PRESENT(ao_coef))
 
       ! restricted or unrestricted?
       IF (SUM(ABS(edelta)) > 0.0_dp) THEN
@@ -259,6 +290,47 @@ CONTAINS
             END DO
          END IF
       END DO
+
+      IF (PRESENT(proj_shell_charge)) THEN
+         ! Save the neutral/original calculated shell list.
+         occupation_neutral(0:lmat, 1:10) = atom%state%occupation(0:lmat, 1:10)
+         IF (uks) THEN
+            CALL cp_abort(__LOCATION__, "proj_shell_charge in"// &
+                          " calculate_atomic_orbitals is implemented only for RKS")
+         END IF
+         DO l = 0, MIN(3, lmat)
+            qleft = proj_shell_charge(l + 1)
+            IF (qleft > 0.0_dp) THEN
+               ! Remove electrons from the highest shell in this angular momentum channel.
+               DO k = 7, 1, -1
+                  IF (atom%state%occupation(l, k) > 0.0_dp) THEN
+                     take = MIN(qleft, atom%state%occupation(l, k))
+                     atom%state%occupation(l, k) = atom%state%occupation(l, k) - take
+                     qleft = qleft - take
+                     IF (qleft <= 1.0e-12_dp) EXIT
+                  END IF
+               END DO
+               IF (qleft > 1.0e-10_dp) THEN
+                  CALL cp_abort(__LOCATION__, "proj_shell_charge removes"// &
+                                " more electrons than available in this angular channel")
+               END IF
+               ! Keep atom%state%occ consistent with atom%state%occupation.
+               qleft = proj_shell_charge(l + 1)
+               DO k = 7, 1, -1
+                  IF (atom%state%occ(l, k) > 0.0_dp) THEN
+                     take = MIN(qleft, atom%state%occ(l, k))
+                     atom%state%occ(l, k) = atom%state%occ(l, k) - take
+                     qleft = qleft - take
+                     IF (qleft <= 1.0e-12_dp) EXIT
+                  END IF
+               END DO
+            ELSE IF (qleft < 0.0_dp) THEN
+               CALL cp_abort(__LOCATION__, "Negative proj_shell_charge"// &
+                             " is not supported in this implementation")
+            END IF
+         END DO
+      END IF
+
       IF (uks) THEN
          atom%state%multiplicity = NINT(ABS(SUM(atom%state%occa - atom%state%occb)) + 1)
       ELSE
@@ -267,13 +339,18 @@ CONTAINS
 
       atom%state%maxl_occ = get_maxl_occ(atom%state%occupation)
       atom%state%maxn_occ = get_maxn_occ(atom%state%occupation)
-      atom%state%maxl_calc = atom%state%maxl_occ
-      atom%state%maxn_calc = atom%state%maxn_occ
+      IF (PRESENT(proj_shell_charge)) THEN
+         atom%state%maxl_calc = get_maxl_occ(occupation_neutral)
+         atom%state%maxn_calc = get_maxn_occ(occupation_neutral)
+      ELSE
+         atom%state%maxl_calc = atom%state%maxl_occ
+         atom%state%maxn_calc = atom%state%maxn_occ
+      END IF
 
       ! total number of occupied orbitals
       IF (PRESENT(nocc) .AND. ghost) THEN
          nocc = 0
-      ELSEIF (PRESENT(nocc)) THEN
+      ELSE IF (PRESENT(nocc)) THEN
          nocc = 0
          DO l = 0, lmat
             DO k = 1, 7
@@ -319,7 +396,6 @@ CONTAINS
             CALL calculate_atom(atom, -1)
          END IF
       END IF
-
       IF (PRESENT(pmat)) THEN
          ! recover density matrix in CP2K/GPW order and normalization
          CALL get_gto_basis_set(orb_basis_set, &
@@ -453,6 +529,30 @@ CONTAINS
          END IF
       END IF
 
+      IF (PRESENT(ao_coef)) THEN
+         CPASSERT(PRESENT(which_l))
+         CPASSERT(PRESENT(which_n))
+         CPASSERT(which_l >= 0 .AND. which_l <= lmat)
+         valence_n = COUNT(ncore(which_l, :) > 0) + which_l + 1
+         projector_index = which_n - valence_n + 1
+         IF (projector_index < 1 .OR. projector_index > SIZE(atom%orbitals%wfn, 2)) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "The requested tensorial atomic projector N is outside "// &
+                          "the available orbital range for the selected L.")
+         END IF
+         IF (ASSOCIATED(ao_coef)) DEALLOCATE (ao_coef)
+         ALLOCATE (ao_coef(SIZE(atom%orbitals%wfn(:, 1, which_l))))
+         ao_coef(:) = atom%orbitals%wfn(:, projector_index, which_l)
+         IF (MAXVAL(ABS(ao_coef)) <= 100.0_dp*EPSILON(1.0_dp)) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "The requested atomic projector is zero. Check the "// &
+                          "specified N and L quantum numbers.")
+         END IF
+         DO j = 1, SIZE(ao_coef(:))
+            ao_coef(j) = ao_coef(j)*SQRT(atom%integrals%ovlp(j, j, which_l))
+         END DO
+      END IF
+
       ! clean up
       CALL atom_int_release(integrals)
       CALL atom_ppint_release(integrals)
@@ -575,7 +675,10 @@ CONTAINS
          CALL set_atom(atom, zcore=NINT(zeff), potential=potential)
       ELSE IF (ASSOCIATED(sgp_potential)) THEN
          CALL get_potential(sgp_potential, ecp_semi_local=ecp_semi_local)
-         IF (ecp_semi_local) THEN
+         IF (ALLOCATED(sgp_potential%upf_data)) THEN
+            potential%ppot_type = upf_pseudo
+            potential%upf_pot = sgp_potential%upf_data
+         ELSE IF (ecp_semi_local) THEN
             potential%ppot_type = ecp_pseudo
             CALL ecp_potential_conversion(sgp_potential, potential%ecp_pot)
             potential%ecp_pot%symbol = ptable(z)%symbol
@@ -640,7 +743,7 @@ CONTAINS
                basis%bf(k, i, l) = rk**l*ear
                basis%dbf(k, i, l) = (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear
                basis%ddbf(k, i, l) = (REAL(l*(l - 1), dp)*rk**(l - 2) - &
-                                      2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al*rk**(l + 2))*ear
+                                      2._dp*al*REAL(2*l + 1, dp)*rk**(l) + 4._dp*al**2*rk**(l + 2))*ear
             END DO
          END DO
       END DO
@@ -648,11 +751,7 @@ CONTAINS
       CALL set_atom(atom, basis=basis)
 
       ! optimization defaults
-      atom%optimization%damping = 0.2_dp
-      atom%optimization%eps_scf = 1.e-6_dp
-      atom%optimization%eps_diis = 100._dp
-      atom%optimization%max_iter = 50
-      atom%optimization%n_diis = 5
+      atom%optimization = atom_optimization
 
       nelem = 0
       ncore = 0
@@ -949,7 +1048,7 @@ CONTAINS
                                           + (REAL(l, dp)*rk**(l - 1) - 2._dp*al*rk**(l + 1))*ear*basis%cm(i, j, l)
                      basis%ddbf(k, j, l) = basis%ddbf(k, j, l) + &
                                            (REAL(l*(l - 1), dp)*rk**(l - 2) - 2._dp*al*REAL(2*l + 1, dp)* &
-                                            rk**(l) + 4._dp*al*rk**(l + 2))*ear*basis%cm(i, j, l)
+                                            rk**(l) + 4._dp*al**2*rk**(l + 2))*ear*basis%cm(i, j, l)
                   END DO
                END DO
             END DO
@@ -958,11 +1057,7 @@ CONTAINS
          CALL set_atom(atom, basis=basis)
 
          ! optimization defaults
-         atom%optimization%damping = 0.2_dp
-         atom%optimization%eps_scf = 1.e-6_dp
-         atom%optimization%eps_diis = 100._dp
-         atom%optimization%max_iter = 50
-         atom%optimization%n_diis = 5
+         atom%optimization = atom_optimization
 
          ! electronic state
          nelem = 0
@@ -1240,7 +1335,7 @@ CONTAINS
                          name=sgp_atompot%pname, &
                          zeff=zeff, &
                          elec_conf=ppeconf, &
-                         alpha_core_charge=ac)
+                         core_charge_radius=ac)
       sgp_atompot%zion = zeff
       sgp_atompot%ac_local = ac
       sgp_atompot%econf(0:3) = ppeconf(0:3)
@@ -1255,7 +1350,9 @@ CONTAINS
          sgp_atompot%n_nonlocal = n
          sgp_atompot%a_nonlocal(1:n) = ap(1:n)
          sgp_atompot%h_nonlocal(1:n, 0:lm) = hhp(1:n, 0:lm)
-         sgp_atompot%c_nonlocal(1:n, 1:n, 0:lm) = ccp(1:n, 1:n, 0:lm)
+         ! The atomic solver uses unit-normalized spherical harmonics and
+         ! radial integrals; undo the SGP storage factor 1/sqrt(4*pi).
+         sgp_atompot%c_nonlocal(1:n, 1:n, 0:lm) = SQRT(fourpi)*ccp(1:n, 1:n, 0:lm)
       END IF
       ! local
       CALL get_potential(sgp_potential, n_local=n, a_local=ap, c_local=ce)

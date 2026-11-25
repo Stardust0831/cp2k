@@ -27,7 +27,7 @@ MODULE qs_tddfpt2_properties
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_copy, dbcsr_get_block_p, dbcsr_get_info, dbcsr_init_p, dbcsr_iterator_blocks_left, &
         dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
-        dbcsr_p_type, dbcsr_set, dbcsr_type
+        dbcsr_p_type, dbcsr_type
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr,&
                                               cp_dbcsr_sm_fm_multiply,&
@@ -99,9 +99,10 @@ MODULE qs_tddfpt2_properties
                                               init_mo_set,&
                                               mo_set_type,&
                                               set_mo_set
-   USE qs_moments,                      ONLY: build_berry_moment_matrix
+   USE qs_moments,                      ONLY: build_berry_moment_matrix,&
+                                              build_local_moment_matrix,&
+                                              get_multipoles_ao
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
-   USE qs_operators_ao,                 ONLY: rRc_xyz_ao
    USE qs_overlap,                      ONLY: build_overlap_matrix
    USE qs_subsys_types,                 ONLY: qs_subsys_get,&
                                               qs_subsys_type
@@ -286,9 +287,6 @@ CONTAINS
 
          DO ideriv = 1, nderivs
             kvec(:) = twopi*cell%h_inv(ideriv, :)
-            DO i_cos_sin = 1, 2
-               CALL dbcsr_set(berry_cossin_xyz(i_cos_sin)%matrix, 0.0_dp)
-            END DO
             CALL build_berry_moment_matrix(qs_env, berry_cossin_xyz(1)%matrix, &
                                            berry_cossin_xyz(2)%matrix, kvec)
 
@@ -386,8 +384,8 @@ CONTAINS
                                   reference=tddfpt_control%dipole_reference, &
                                   ref_point=tddfpt_control%dipole_ref_point)
 
-         CALL rRc_xyz_ao(op=rRc_xyz, qs_env=qs_env, rc=reference_point, order=1, &
-                         minimum_image=.FALSE., soft=.FALSE.)
+         CALL build_local_moment_matrix(qs_env, rRc_xyz, 1, ref_point=reference_point, &
+                                        all_images=.TRUE.)
 
          DO ispin = 1, nspins
 
@@ -835,8 +833,9 @@ CONTAINS
                END DO
 
                DO iproc = 1, para_env%num_pe
-                  IF (iproc - 1 /= para_env%mepos) &
+                  IF (iproc - 1 /= para_env%mepos) THEN
                      CALL recv_handlers(iproc)%wait()
+                  END IF
                END DO
 
                ! compute total number of non-negligible excitations
@@ -936,8 +935,9 @@ CONTAINS
             END IF
 
             ! deallocate temporary arrays
-            IF (para_env%is_source()) &
+            IF (para_env%is_source()) THEN
                DEALLOCATE (weights_recv, weights_neg_abs_recv, inds_recv, inds)
+            END IF
          END DO
 
          DEALLOCATE (weights_local, inds_local)
@@ -1226,18 +1226,21 @@ CONTAINS
 !> \param gs_mos                                molecular orbitals optimised for the ground state
 !> \param matrix_s                              overlap matrix
 !> \param do_directional_exciton_descriptors    flag for computing descriptors for each (cartesian) direction
+!> \param do_directional_exciton_crosscorrelation flag for adding the crosscorrelation matrix to the directional descriptors
 !> \param qs_env                                Information on particles/geometry
 !> \par History
 !>    * 12.2024 created as 'tddfpt_print_exciton_descriptors' [Maximilian Graml]
 ! **************************************************************************************************
    SUBROUTINE tddfpt_print_exciton_descriptors(log_unit, evects, gs_mos, matrix_s, &
-                                               do_directional_exciton_descriptors, qs_env)
+                                               do_directional_exciton_descriptors, &
+                                               do_directional_exciton_crosscorrelation, qs_env)
       INTEGER, INTENT(in)                                :: log_unit
       TYPE(cp_fm_type), DIMENSION(:, :), INTENT(in)      :: evects
       TYPE(tddfpt_ground_state_mos), DIMENSION(:), &
          INTENT(in)                                      :: gs_mos
       TYPE(dbcsr_type), POINTER                          :: matrix_s
-      LOGICAL, INTENT(IN) :: do_directional_exciton_descriptors
+      LOGICAL, INTENT(IN) :: do_directional_exciton_descriptors, &
+         do_directional_exciton_crosscorrelation
       TYPE(qs_environment_type), INTENT(IN), POINTER     :: qs_env
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'tddfpt_print_exciton_descriptors'
@@ -1255,8 +1258,11 @@ CONTAINS
                                                             fm_multipole_ai, fm_multipole_ij, &
                                                             S_mos_virt
       TYPE(cp_fm_type), DIMENSION(:), POINTER            :: mo_coeff
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_multipole
       TYPE(exciton_descr_type), ALLOCATABLE, &
          DIMENSION(:)                                    :: exc_descr
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
 
       CALL timeset(routineN, handle)
 
@@ -1308,9 +1314,12 @@ CONTAINS
       ALLOCATE (fm_multipole_ab(n_moments_quad))
       ALLOCATE (fm_multipole_ai(n_moments_quad))
 
+      CALL get_multipoles_ao(qs_env, 2, matrix_multipole, ref_point_multipole)
+      CALL get_qs_env(qs_env, mos=mos)
       CALL get_multipoles_mo(fm_multipole_ai, fm_multipole_ij, fm_multipole_ab, &
-                             qs_env, mo_coeff, ref_point_multipole, 2, &
+                             matrix_multipole, mos, mo_coeff, &
                              nmo_occ(1), nmo_virt(1), blacs_env)
+      CALL dbcsr_deallocate_matrix_set(matrix_multipole)
 
       CALL cp_fm_release(mo_coeff)
 
@@ -1363,9 +1372,10 @@ CONTAINS
       ! Actual printing
       print_checkvalue = .TRUE.
       prefix_output = ' '
+      CALL get_qs_env(qs_env, particle_set=particle_set)
       CALL print_exciton_descriptors(exc_descr, ref_point_multipole, log_unit, &
                                      nstates, print_checkvalue, do_directional_exciton_descriptors, &
-                                     prefix_output, qs_env)
+                                     do_directional_exciton_crosscorrelation, prefix_output, particle_set)
 
       DEALLOCATE (ref_point_multipole)
       DEALLOCATE (exc_descr)
@@ -1525,7 +1535,7 @@ CONTAINS
                                         cell, dft_control, particle_set, pw_env)
             IF (iset == 1) THEN
                WRITE (filename, '(a4,I3.3,I2.2,a11)') "NTO_STATE", istate, i, "_Hole_State"
-            ELSEIF (iset == 2) THEN
+            ELSE IF (iset == 2) THEN
                WRITE (filename, '(a4,I3.3,I2.2,a15)') "NTO_STATE", istate, i, "_Particle_State"
             END IF
             mpi_io = .TRUE.
@@ -1534,7 +1544,7 @@ CONTAINS
                                            log_filename=.FALSE., ignore_should_output=.TRUE., mpi_io=mpi_io)
             IF (iset == 1) THEN
                WRITE (title, *) "Natural Transition Orbital Hole State", i
-            ELSEIF (iset == 2) THEN
+            ELSE IF (iset == 2) THEN
                WRITE (title, *) "Natural Transition Orbital Particle State", i
             END IF
             CALL cp_pw_to_cube(wf_r, unit_nr, title, particles=particles, stride=stride, mpi_io=mpi_io)

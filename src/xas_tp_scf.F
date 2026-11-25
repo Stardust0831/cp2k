@@ -199,7 +199,7 @@ CONTAINS
       CPASSERT(gapw)
       xas_control => dft_control%xas_control
 
-      CALL cp_add_iter_level(logger%iter_info, "XAS_SCF")
+      CALL cp_add_iter_level(logger, "XAS_SCF")
 
       CALL get_qs_env(qs_env, matrix_ks=matrix_ks, rho=rho, mos=mos)
       CALL qs_rho_get(rho, rho_ao_kp=rho_ao_kp)
@@ -378,7 +378,7 @@ CONTAINS
 
       CALL cp_print_key_finished_output(output_unit, logger, xas_section, &
                                         "PRINT%PROGRAM_RUN_INFO")
-      CALL cp_rm_iter_level(logger%iter_info, "XAS_SCF")
+      CALL cp_rm_iter_level(logger, "XAS_SCF")
 
       CALL timestop(handle)
 
@@ -545,8 +545,9 @@ CONTAINS
             END IF
          END DO !  istate
 
-         IF (my_state == 0) &
+         IF (my_state == 0) THEN
             CPABORT("Could not identify the core state to be excited")
+         END IF
          xas_estate = my_state
          CALL get_mo_set(mos(my_spin), mo_coeff=mo_coeff)
          CALL cp_fm_get_submatrix(mo_coeff, vecbuffer, 1, xas_estate, &

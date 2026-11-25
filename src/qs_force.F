@@ -36,7 +36,8 @@ MODULE qs_force
    USE hfx_exx,                         ONLY: calculate_exx
    USE input_constants,                 ONLY: &
         do_method_gapw, do_method_gapw_xc, do_method_gpw, do_method_lrigpw, do_method_ofgpw, &
-        do_method_rigpw, ri_mp2_laplace, ri_mp2_method_gpw, ri_rpa_method_gpw
+        do_method_rigpw, plus_u_lowdin, ri_mp2_laplace, ri_mp2_method_gpw, ri_rpa_method_gpw, &
+        smeagol_runtype_emtransport
    USE input_section_types,             ONLY: section_vals_get,&
                                               section_vals_get_subs_vals,&
                                               section_vals_type,&
@@ -74,12 +75,14 @@ MODULE qs_force
    USE ri_environment_methods,          ONLY: build_ri_matrices
    USE rt_propagation_forces,           ONLY: calc_c_mat_force,&
                                               rt_admm_force
-   USE rt_propagation_velocity_gauge,   ONLY: velocity_gauge_ks_matrix,&
+   USE rt_propagation_velocity_gauge,   ONLY: velocity_gauge_kinetic_force,&
+                                              velocity_gauge_ks_matrix,&
                                               velocity_gauge_nl_force
    USE se_core_core,                    ONLY: se_core_core_interaction
    USE se_core_matrix,                  ONLY: build_se_core_matrix
    USE tblite_interface,                ONLY: build_tblite_matrices,&
-                                              tb_reference_cli_compare
+                                              tb_init_ham
+   USE tblite_reference_cli,            ONLY: tb_reference_cli_compare
    USE virial_types,                    ONLY: project_virial_to_periodic_subspace,&
                                               symmetrize_virial,&
                                               virial_type
@@ -139,8 +142,8 @@ CONTAINS
                                                             output_unit
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: atom_of_kind, kind_of, natom_of_kind
       LOGICAL                                            :: do_admm, do_exx, do_gw, do_im_time, &
-                                                            has_unit_metric, omit_headers, &
-                                                            perform_ec, reuse_hfx
+                                                            do_kpoints, has_unit_metric, &
+                                                            omit_headers, perform_ec, reuse_hfx
       REAL(dp)                                           :: dummy_real, dummy_real2(2)
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cell_type), POINTER                           :: cell
@@ -185,7 +188,15 @@ CONTAINS
       CALL get_qs_env(qs_env, &
                       force=force, &
                       subsys=subsys, &
+                      do_kpoints=do_kpoints, &
                       dft_control=dft_control)
+      IF (do_kpoints .AND. dft_control%dft_plus_u .AND. dft_control%plus_u_method_id == plus_u_lowdin) THEN
+         IF (ASSOCIATED(qs_env%mp2_env) .OR. qs_env%run_rtp .OR. &
+             (dft_control%smeagol_control%smeagol_enabled .AND. &
+              dft_control%smeagol_control%run_type == smeagol_runtype_emtransport)) THEN
+            CPABORT("Lowdin DFT+U forces with k-points require the ground-state DFT W matrix")
+         END IF
+      END IF
       IF (.NOT. ASSOCIATED(force)) THEN
          !   *** Allocate the force data structure ***
          nkind = SIZE(atomic_kind_set)
@@ -227,8 +238,10 @@ CONTAINS
 
          CALL calc_c_mat_force(qs_env)
          IF (dft_control%do_admm) CALL rt_admm_force(qs_env)
-         IF (dft_control%rtp_control%velocity_gauge .AND. dft_control%rtp_control%nl_gauge_transform) &
-            CALL velocity_gauge_nl_force(qs_env, particle_set)
+         IF (dft_control%rtp_control%velocity_gauge) THEN
+            CALL velocity_gauge_kinetic_force(qs_env)
+            IF (dft_control%rtp_control%nl_gauge_transform) CALL velocity_gauge_nl_force(qs_env, particle_set)
+         END IF
       END IF
       ! from an eventual Mulliken restraint
       IF (dft_control%qs_control%mulliken_restraint) THEN
@@ -244,7 +257,8 @@ CONTAINS
       END IF
       ! Add non-Pulay contribution of DFT+U to W matrix, since it has also to be
       ! digested with overlap matrix derivatives
-      IF (dft_control%dft_plus_u) THEN
+      ! Lowdin k-point derivatives were already added before transforming W(k).
+      IF (dft_control%dft_plus_u .AND. .NOT. (do_kpoints .AND. dft_control%plus_u_method_id == plus_u_lowdin)) THEN
          NULLIFY (matrix_w_kp)
          CALL get_qs_env(qs_env, matrix_w_kp=matrix_w_kp)
          CALL plus_u(qs_env=qs_env, matrix_w=matrix_w_kp)
@@ -286,18 +300,23 @@ CONTAINS
          CALL build_se_core_matrix(qs_env=qs_env, para_env=para_env, &
                                    calculate_forces=.TRUE.)
          CALL se_core_core_interaction(qs_env, para_env, calculate_forces=.TRUE.)
-      ELSEIF (dft_control%qs_control%dftb) THEN
+      ELSE IF (dft_control%qs_control%dftb) THEN
          CALL build_dftb_matrices(qs_env=qs_env, para_env=para_env, &
                                   calculate_forces=.TRUE.)
          CALL calculate_dftb_dispersion(qs_env=qs_env, para_env=para_env, &
                                         calculate_forces=.TRUE.)
-      ELSEIF (dft_control%qs_control%xtb) THEN
+      ELSE IF (dft_control%qs_control%xtb) THEN
          IF (dft_control%qs_control%xtb_control%do_tblite) THEN
+            ! RTP skips the Hamiltonian initialization in qs_energies.
+            IF (qs_env%run_rtp) THEN
+               CALL tb_init_ham(qs_env, .TRUE.)
+               CALL build_tblite_matrices(qs_env=qs_env, calculate_forces=.FALSE.)
+            END IF
             CALL build_tblite_matrices(qs_env=qs_env, calculate_forces=.TRUE.)
          ELSE
             CALL build_xtb_matrices(qs_env=qs_env, calculate_forces=.TRUE.)
          END IF
-      ELSEIF (perform_ec) THEN
+      ELSE IF (perform_ec) THEN
          ! Calculates core and grid based forces
          CALL energy_correction(qs_env, ec_init=.FALSE., calculate_forces=.TRUE.)
       ELSE
@@ -305,10 +324,12 @@ CONTAINS
          CALL build_core_hamiltonian_matrix(qs_env=qs_env, calculate_forces=.TRUE.)
          ! The above line reset the core H, which should be re-updated in case a TD field is applied:
          IF (qs_env%run_rtp) THEN
-            IF (dft_control%apply_efield_field) &
-               CALL efield_potential_lengh_gauge(qs_env)
-            IF (dft_control%rtp_control%velocity_gauge) &
+            IF (dft_control%apply_efield_field) THEN
+               CALL efield_potential_lengh_gauge(qs_env, calculate_forces=.TRUE.)
+            END IF
+            IF (dft_control%rtp_control%velocity_gauge) THEN
                CALL velocity_gauge_ks_matrix(qs_env, subtract_nl_term=.FALSE.)
+            END IF
 
          END IF
          CALL calculate_ecore_self(qs_env)
@@ -368,9 +389,9 @@ CONTAINS
                                   t3=dummy_real)
             END IF
          END IF
-      ELSEIF (perform_ec) THEN
+      ELSE IF (perform_ec) THEN
          ! energy correction forces postponed
-      ELSEIF (qs_env%harris_method) THEN
+      ELSE IF (qs_env%harris_method) THEN
          ! Harris method forces already done in harris_energy_correction
       ELSE
          ! Compute grid-based forces
@@ -600,6 +621,7 @@ CONTAINS
                   iatom, ikind, "        efield", qs_force(ikind)%efield(1:3, i), &
                   iatom, ikind, "           eev", qs_force(ikind)%eev(1:3, i), &
                   iatom, ikind, "   mp2_non_sep", qs_force(ikind)%mp2_non_sep(1:3, i), &
+                  iatom, ikind, "   tensorial_u", qs_force(ikind)%tensorial_u(1:3, i), &
                   iatom, ikind, "         total", qs_force(ikind)%total(1:3, i)
                grand_total(1:3) = grand_total(1:3) + qs_force(ikind)%total(1:3, i)
             END DO
@@ -631,6 +653,7 @@ CONTAINS
                   iatom, ikind, "        efield", qs_force(ikind)%efield(1:3, i), &
                   iatom, ikind, "           eev", qs_force(ikind)%eev(1:3, i), &
                   iatom, ikind, "   mp2_non_sep", qs_force(ikind)%mp2_non_sep(1:3, i), &
+                  iatom, ikind, "   tensorial_u", qs_force(ikind)%tensorial_u(1:3, i), &
                   iatom, ikind, "         total", qs_force(ikind)%total(1:3, i)
                grand_total(1:3) = grand_total(1:3) + qs_force(ikind)%total(1:3, i)
             END DO
@@ -661,6 +684,7 @@ CONTAINS
                   iatom, ikind, "       ch_pulay", qs_force(ikind)%ch_pulay(1:3, i), &
                   iatom, ikind, "        fock_4c", qs_force(ikind)%fock_4c(1:3, i), &
                   iatom, ikind, "   mp2_non_sep", qs_force(ikind)%mp2_non_sep(1:3, i), &
+                  iatom, ikind, "   tensorial_u", qs_force(ikind)%tensorial_u(1:3, i), &
                   iatom, ikind, "          total", qs_force(ikind)%total(1:3, i)
                grand_total(1:3) = grand_total(1:3) + qs_force(ikind)%total(1:3, i)
             END DO

@@ -17,7 +17,7 @@ MODULE input_cp2k_dft
    USE bibliography,                    ONLY: &
         Andermatt2016, Andreussi2012, Andreussi2019, Avezac2005, Bengtsson1999, Blochl1995, &
         Brelaz1979, Chai2024a, Chai2025a, Fattebert2002, Guidon2010, Iannuzzi2006, Kunert2003, &
-        Marek2025, Merlot2014, Perdew1981, VandeVondele2005b, Yin2017
+        Marek2025, Mattiat2022, Merlot2014, Perdew1981, VandeVondele2005b, Yin2017
    USE cp_output_handling,              ONLY: add_last_numeric,&
                                               cp_print_key_section_create,&
                                               high_print_level,&
@@ -25,7 +25,6 @@ MODULE input_cp2k_dft
                                               medium_print_level,&
                                               silent_print_level
    USE cp_spline_utils,                 ONLY: pw_interp,&
-                                              spline3_nopbc_interp,&
                                               spline3_pbc_interp
    USE cp_units,                        ONLY: cp_unit_to_cp2k
    USE input_constants,                 ONLY: &
@@ -41,10 +40,11 @@ MODULE input_cp2k_dft
         do_admm_purify_none, do_admm_purify_none_dm, do_arnoldi, do_bch, do_cn, do_em, do_etrs, &
         do_exact, do_pade, do_taylor, ehrenfest, gaussian, kg_color_dsatur, kg_color_greedy, &
         kg_tnadd_atomic, kg_tnadd_embed, kg_tnadd_embed_ri, kg_tnadd_none, no_admm_type, &
-        numerical, plus_u_lowdin, plus_u_mulliken, plus_u_mulliken_charges, real_time_propagation, &
-        rel_dkh, rel_none, rel_pot_erfc, rel_pot_full, rel_sczora_mp, rel_trans_atom, &
-        rel_trans_full, rel_trans_molecule, rel_zora, rel_zora_full, rel_zora_mp, &
-        rtp_bse_ham_g0w0, rtp_bse_ham_ks, rtp_method_bse, rtp_method_tddft, sccs_andreussi, &
+        numerical, plus_u_lowdin, plus_u_mulliken, plus_u_mulliken_charges, plus_u_tensorial, &
+        real_time_propagation, rel_dkh, rel_none, rel_pot_erfc, rel_pot_full, rel_sczora_mp, &
+        rel_trans_atom, rel_trans_full, rel_trans_molecule, rel_zora, rel_zora_full, rel_zora_mp, &
+        rtp_bse_ham_gw, rtp_bse_ham_ks, rtp_bse_kernel_ri_ao, rtp_bse_kernel_ri_default, &
+        rtp_bse_kernel_ri_rs, rtp_method_bse, rtp_method_tddft, sccs_andreussi, &
         sccs_derivative_cd3, sccs_derivative_cd5, sccs_derivative_cd7, sccs_derivative_fft, &
         sccs_fattebert_gygi, sccs_saa_andreussi, sic_ad, sic_eo, sic_list_all, sic_list_unpaired, &
         sic_mauri_spz, sic_mauri_us, sic_none, slater, use_mom_ref_coac, use_mom_ref_com, &
@@ -57,6 +57,7 @@ MODULE input_cp2k_dft
    USE input_cp2k_external,             ONLY: create_ext_den_section,&
                                               create_ext_pot_section,&
                                               create_ext_vxc_section
+   USE input_cp2k_fde,                  ONLY: create_fde_section
    USE input_cp2k_field,                ONLY: create_efield_section,&
                                               create_per_efield_section
    USE input_cp2k_harris,               ONLY: create_harris_section
@@ -142,9 +143,12 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="POTENTIAL_FILE_NAME", &
                           description="Name of the pseudopotential library file, optionally including a path. "// &
+                          "This keyword can be repeated to search several pseudopotential files. "// &
+                          "Files are searched in input order and the first matching potential is used. "// &
                           "The potential selected for each kind is set with KIND%POTENTIAL.", &
                           usage="POTENTIAL_FILE_NAME <FILENAME>", &
-                          default_lc_val="POTENTIAL")
+                          type_of_var=lchar_t, repeats=.TRUE., &
+                          default_lc_val="POTENTIAL", n_var=1)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -201,17 +205,54 @@ CONTAINS
                           name="PLUS_U_METHOD", &
                           description="Method employed for the calculation of the DFT+U contribution", &
                           repeats=.FALSE., &
-                          enum_c_vals=s2a("LOWDIN", "MULLIKEN", "MULLIKEN_CHARGES"), &
-                          enum_i_vals=[plus_u_lowdin, plus_u_mulliken, plus_u_mulliken_charges], &
+                          enum_c_vals=s2a("LOWDIN", "MULLIKEN", "MULLIKEN_CHARGES", "TENSORIAL"), &
+                          enum_i_vals=[plus_u_lowdin, plus_u_mulliken, plus_u_mulliken_charges, &
+                                       plus_u_tensorial], &
                           enum_desc=s2a("Method based on Lowdin population analysis "// &
                                         "(computationally expensive, since the diagonalization of the "// &
                                         "overlap matrix is required, but possibly more robust than Mulliken)", &
                                         "Method based on Mulliken population analysis using the net AO and "// &
                                         "overlap populations (computationally cheap method)", &
-                                        "Method based on Mulliken gross orbital populations (GOP)"), &
+                                        "Method based on Mulliken gross orbital populations (GOP)", &
+                                        "Method based on Tensorial population analysis approach"), &
                           n_var=1, &
                           default_i_val=plus_u_mulliken, &
                           usage="PLUS_U_METHOD Lowdin")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, &
+                          name="EPS_U_J_LOOP", &
+                          description="Convergence threshold for the self-consistent update of U and J parameters "// &
+                          "in the minimum tracking linear response calculation.", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          unit_str="hartree", &
+                          default_r_val=1.0E-2_dp, &
+                          usage="EPS_U_J_LOOP [eV] 0.01")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, &
+                          name="MTLR_REFERENCE_SCF", &
+                          description="Controls the unperturbed reference SCF for minimum tracking linear "// &
+                          "response. With SCF_GUESS ATOMIC, the default is OFF. If enabled, an unperturbed "// &
+                          "reference SCF is first converged and its orbitals initialize every perturbation. "// &
+                          "With SCF_GUESS RESTART, a reference SCF is required and uses the standard "// &
+                          "restart initial guess.", &
+                          repeats=.FALSE., &
+                          type_of_var=logical_t, &
+                          lone_keyword_l_val=.TRUE., &
+                          usage="MTLR_REFERENCE_SCF ON")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, &
+                          name="MAX_MTLR_LOOP", &
+                          description="Max number of iterations for calculated self-consistent linear response U and J.", &
+                          repeats=.FALSE., &
+                          default_i_val=10, &
+                          usage="MAX_MTLR_LOOP 10")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -352,6 +393,10 @@ CONTAINS
       CALL section_release(subsection)
 
       CALL create_kg_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
+
+      CALL create_fde_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
 
@@ -1369,12 +1414,11 @@ CONTAINS
       NULLIFY (keyword, print_key)
 
       CALL keyword_create(keyword, __LOCATION__, name="kind", &
-                          description="the interpolator to use", &
+                          description="The interpolator to use. SPLINE3 automatically enables commensurate grids.", &
                           usage="kind spline3", &
                           default_i_val=pw_interp, &
-                          enum_c_vals=s2a("pw", "spline3_nopbc", "spline3"), &
-                          enum_i_vals=[pw_interp, &
-                                       spline3_nopbc_interp, spline3_pbc_interp])
+                          enum_c_vals=s2a("pw", "spline3"), &
+                          enum_i_vals=[pw_interp, spline3_pbc_interp])
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -1519,7 +1563,11 @@ CONTAINS
       CALL section_create(section, __LOCATION__, name="LOW_SPIN_ROKS", &
                           description="Specify the details of the low spin ROKS method. "// &
                           "In particular, one can specify various terms added to the energy of the high spin roks configuration"// &
-                          " with a energy scaling factor, and a prescription of the spin state.", &
+                          " with an energy scaling factor, and a prescription of the spin state. "// &
+                          "With METHOD GAPW, energies and orbital derivatives are supported for LDA/GGA, "// &
+                          "hybrids (without ADMM), tau-dependent meta-GGAs, and molecular GauXC/Skala. "// &
+                          "Nuclear forces, analytical stress, and native-grid Skala are not supported with GAPW. "// &
+                          "The GauXC path requires isolated all-electron calculations with HOST execution.", &
                           n_keywords=6, n_subsections=0, repeats=.FALSE.)
 
       NULLIFY (keyword)
@@ -1557,7 +1605,7 @@ CONTAINS
                           description="Parameters needed to set up the real time propagation"// &
                           " for the electron dynamics. This currently works only in the NVE ensemble.", &
                           n_keywords=4, n_subsections=4, repeats=.FALSE., &
-                          citations=[Kunert2003, Andermatt2016])
+                          citations=[Kunert2003, Andermatt2016, Mattiat2022])
 
       CALL keyword_create(keyword, __LOCATION__, name="MAX_ITER", &
                           description="Maximal number of iterations for the self consistent propagator loop.", &
@@ -1661,6 +1709,20 @@ CONTAINS
                           "INITIAL_WFN=RESTART_WFN. Note that if INITIAL_WFN=SCF_WFN, this keyword is not needed to "// &
                           "apply the mixing defined in the WFN_MIX section. Default is False.", &
                           usage="APPLY_WFN_MIX_INIT_RESTART", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="LOCALIZE_INITIAL_WFN", &
+                          description="Replace the occupied orbitals of the initial wavefunction by "// &
+                          "localized orbitals, computed as requested in the DFT%LOCALIZE section, "// &
+                          "before the propagation starts. Applies to INITIAL_WFN SCF_WFN and RESTART_WFN; "// &
+                          "with RESTART_WFN the localization is done before APPLY_WFN_MIX_INIT_RESTART, so that "// &
+                          "WFN_MIX acts on the localized orbitals. The rotation is unitary within orbitals "// &
+                          "of equal occupation: the density matrix and all observables are unchanged, "// &
+                          "only the orbital representation of the propagated wavefunction differs. "// &
+                          "Ignored with INITIAL_WFN RT_RESTART and in the linear scaling propagation.", &
+                          usage="LOCALIZE_INITIAL_WFN", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -1823,35 +1885,23 @@ CONTAINS
       CALL section_release(print_key)
 
       CALL cp_print_key_section_create(print_key, __LOCATION__, "RESTART", &
-                                       description="Controls the dumping of the MO restart file during rtp. "// &
-                                       "By default keeps a short history of three restarts. "// &
-                                       "See also RESTART_HISTORY. In density propagation this controls the printing of "// &
-                                       "density matrix.", &
+                                       description="Controls the dumping of the latest wavefunction restart "// &
+                                       "file during rtp. In density propagation this controls the printing "// &
+                                       "of density matrix. See also RESTART_HISTORY.", &
                                        print_level=low_print_level, common_iter_levels=3, &
                                        each_iter_names=s2a("MD"), each_iter_values=[20], &
-                                       add_last=add_last_numeric, filename="RESTART")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       add_last=add_last_numeric, filename="RESTART", do_backup=.TRUE.)
       CALL section_add_subsection(print_section, print_key)
       CALL section_release(print_key)
 
       CALL cp_print_key_section_create(print_key, __LOCATION__, "RESTART_HISTORY", &
-                                       description="Dumps unique MO restart files during the run keeping all of them. "// &
-                                       "In density propagation it dumps the density matrix instead", &
+                                       description="Dumps unique wavefunction restart files during the run, "// &
+                                       "keeping all of them. In density propagation it dumps the density "// &
+                                       "matrix instead. For the latest wavefunction restart file, see RESTART.", &
                                        print_level=low_print_level, common_iter_levels=0, &
                                        each_iter_names=s2a("MD"), &
                                        each_iter_values=[500], &
-                                       filename="RESTART")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       filename="RESTART", do_backup=.TRUE.)
       CALL section_add_subsection(print_section, print_key)
       CALL section_release(print_key)
 
@@ -1871,7 +1921,7 @@ CONTAINS
 
       CALL cp_print_key_section_create(print_key, __LOCATION__, "CURRENT_INT", &
                                        description="Print the integral of the current density (only if the"// &
-                                       " imaginary part of the density is NOT zero.", &
+                                       " imaginary part of the density is NOT zero).", &
                                        print_level=high_print_level, common_iter_levels=1, &
                                        each_iter_names=s2a("MD"), &
                                        each_iter_values=[1], &
@@ -1884,13 +1934,7 @@ CONTAINS
                                        print_level=high_print_level, common_iter_levels=0, &
                                        each_iter_names=s2a("MD"), &
                                        each_iter_values=[20], &
-                                       filename="current")
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+                                       filename="current", do_backup=.TRUE.)
       CALL keyword_create(keyword, __LOCATION__, name="STRIDE", &
                           description="The stride (X,Y,Z) used to write the cube file "// &
                           "(larger values result in smaller cube files). You can provide 3 numbers (for X,Y,Z) or"// &
@@ -1980,6 +2024,21 @@ CONTAINS
       CALL keyword_release(keyword)
       CALL section_add_subsection(print_section, print_key)
       CALL section_release(print_key)
+      ! Liouvillian eigenvalue diagnostic (linearized RT-BSE, TDA only)
+      CALL cp_print_key_section_create(print_key, __LOCATION__, "LIOUVILLIAN_EIG", &
+                                       description="Prints the eigenvalues of the linearized RT-BSE "// &
+                                       "Liouvillian on the OV subspace, computed once at job init from a "// &
+                                       "matrix-free probe of the kernel (no time propagation). In TDA this "// &
+                                       "equals the Casida-A eigenvalue problem and gives a broadening-free, "// &
+                                       "finite-time-free correctness check against bse_full.F. "// &
+                                       "Activated by RTBSE%DIAGNOSE_LIOUVILLIAN_EIG. Output lists "// &
+                                       "eigenvalues in atomic units and eV.", &
+                                       print_level=medium_print_level, common_iter_levels=0, &
+                                       each_iter_names=s2a("MD"), &
+                                       each_iter_values=[1], &
+                                       filename="LIOUVILLIAN_EIG")
+      CALL section_add_subsection(print_section, print_key)
+      CALL section_release(print_key)
 
       CALL cp_print_key_section_create(print_key, __LOCATION__, "E_CONSTITUENTS", &
                                        description="Print the energy constituents (relevant to RTP) which make up "// &
@@ -2046,12 +2105,163 @@ CONTAINS
       CALL keyword_create(keyword, __LOCATION__, name="RTBSE_HAMILTONIAN", &
                           description="Which Hamiltonian to use as the single-particle Hamiltonian"// &
                           " in the Green's propagator.", &
-                          usage="RTBSE_HAMILTONIAN G0W0", &
-                          default_i_val=rtp_bse_ham_g0w0, &
-                          enum_c_vals=s2a("KS", "G0W0"), &
-                          enum_i_vals=[rtp_bse_ham_ks, rtp_bse_ham_g0w0], &
-                          enum_desc=s2a("Use Kohn-Sham Hamiltonian for Green's propagation.", &
-                                        "Use G0W0 Hamiltonian for Green's function propagation"))
+                          usage="RTBSE_HAMILTONIAN GW", &
+                          default_i_val=rtp_bse_ham_gw, &
+                          enum_c_vals=s2a("KS", "GW"), &
+                          enum_i_vals=[rtp_bse_ham_ks, rtp_bse_ham_gw], &
+                          enum_desc=s2a("Use Kohn-Sham Hamiltonian for Green's function propagation.", &
+                                        "Use GW Hamiltonian for Green's function propagation. The GW "// &
+                                        "eigenvalues from the highest-level GW flavor will be picked."))
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! Switch for linearized rtbse propagation
+      CALL keyword_create(keyword, __LOCATION__, name="LINEARIZED_BSE_PROPAGATION", &
+                          variants=s2a("LRRTBSE"), &
+                          description="Linearizes the BSE propagation", &
+                          usage="LINEARIZED_BSE_PROPAGATION .T.", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! Energy cutoff (occupied) for active MO window in linearized RT-BSE
+      CALL keyword_create(keyword, __LOCATION__, name="ENERGY_CUTOFF_OCC", &
+                          description="Energy cutoff (relative to HOMO) defining the lowest "// &
+                          "occupied molecular orbital included in the active MO window of the "// &
+                          "linearized RT-BSE propagation. Only used when "// &
+                          "LINEARIZED_BSE_PROPAGATION=.TRUE.. A non-positive value disables the "// &
+                          "occupied truncation.", &
+                          usage="ENERGY_CUTOFF_OCC 5.0", &
+                          unit_str="eV", &
+                          default_r_val=-1.0_dp/evolt)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! Energy cutoff (empty) for active MO window in linearized RT-BSE
+      CALL keyword_create(keyword, __LOCATION__, name="ENERGY_CUTOFF_EMPTY", &
+                          description="Energy cutoff (relative to LUMO) defining the highest "// &
+                          "virtual molecular orbital included in the active MO window of the "// &
+                          "linearized RT-BSE propagation. Only used when "// &
+                          "LINEARIZED_BSE_PROPAGATION=.TRUE.. A non-positive value disables the "// &
+                          "virtual truncation.", &
+                          usage="ENERGY_CUTOFF_EMPTY 5.0", &
+                          unit_str="eV", &
+                          default_r_val=-1.0_dp/evolt)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ENFORCE_MAX_DT", &
+                          description="For linearized RT-BSE, recompute TIMESTEP and STEPS so the same total "// &
+                          "propagation time is covered with the largest timestep that does not exceed the "// &
+                          "estimated RK4 stability limit.", &
+                          usage="ENFORCE_MAX_DT", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! Tamm-Dancoff approximation for the linearized RT-BSE kernel
+      CALL keyword_create(keyword, __LOCATION__, name="TDA", &
+                          description="Apply the Tamm-Dancoff approximation to the linearized RT-BSE kernel: "// &
+                          "the Hartree and screened-exchange contributions are restricted so that the OV and VO "// &
+                          "blocks of the density response remain decoupled (i.e. only A-block coupling is kept, "// &
+                          "B-block coupling is dropped). Only effective when "// &
+                          "LINEARIZED_BSE_PROPAGATION=.TRUE..", &
+                          usage="TDA", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! First-peak shift for the TDA path
+      CALL keyword_create(keyword, __LOCATION__, name="TDA_SHIFT_TO_FIRST_PEAK", &
+                          description="For the linearized RT-BSE TDA path, shift the active-MO single-particle "// &
+                          "diagonals by +Omega_0/2 (occupied) and -Omega_0/2 (virtual) with "// &
+                          "Omega_0 = eps_min_ai, so the lowest active OV mode oscillates at zero frequency "// &
+                          "in the rotating frame (RK4-exact for peak 1). omega_max becomes the full active "// &
+                          "OV width Delta = eps_max_ai - eps_min_ai. The rotation is undone at I/O so "// &
+                          "observables remain in the lab frame. Only effective when TDA=.TRUE.. "// &
+                          "Use with caution, additional convergence checks w.r.t. dt needed.", &
+                          usage="TDA_SHIFT_TO_FIRST_PEAK", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="DEBUG_DISABLE_HARTREE", &
+                          description="Debug option for linearized RT-BSE: disables the Hartree kernel in both "// &
+                          "the static reference initialization and the propagation. The Coulomb RI setup is "// &
+                          "still built so the run stays internally consistent.", &
+                          usage="DEBUG_DISABLE_HARTREE", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KERNEL_RI", &
+                          description="Select the RI framework used to evaluate the linearized RT-BSE "// &
+                          "Hartree and screened-exchange kernels (propagation and reference). "// &
+                          "DEFAULT infers from the GW flavor: RI-RS if the GW_RI_RS section was active, "// &
+                          "AO-RI otherwise. RS/AO force that framework regardless of how GW was run. The "// &
+                          "RI-RS grid (mat_phi_mu_l, mat_Z_lP) and the V_grid/W0_grid kernels are built on "// &
+                          "demand. RI-RS is implemented for linearized RT-BSE only; for full RT-BSE an "// &
+                          "explicit RS is overridden to AO with a warning.", &
+                          usage="KERNEL_RI RS", &
+                          enum_c_vals=s2a("DEFAULT", "RS", "AO"), &
+                          enum_i_vals=[rtp_bse_kernel_ri_default, rtp_bse_kernel_ri_rs, rtp_bse_kernel_ri_ao], &
+                          enum_desc=s2a("Infer from the GW flavor (GW_RI_RS active -> RS, else AO).", &
+                                        "Real-space RI grid kernels (linearized RT-BSE only).", &
+                                        "AO-RI kernels."), &
+                          default_i_val=rtp_bse_kernel_ri_default, n_var=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="DEBUG_DISABLE_SEX", &
+                          description="Debug option for linearized RT-BSE: disables the screened-exchange kernel "// &
+                          "in both the static reference initialization and the propagation.", &
+                          usage="DEBUG_DISABLE_SEX", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      ! Liouvillian eigenvalue diagnostic (matrix-free probe at init; TDA + ABBA)
+      CALL keyword_create(keyword, __LOCATION__, name="DIAGNOSE_LIOUVILLIAN_EIG", &
+                          description="Diagnostic for linearized RT-BSE: at job initialization, build the "// &
+                          "Liouvillian on the OV subspace by probing the kernel routine with canonical OV basis "// &
+                          "vectors, then diagonalize. In TDA this equals the Casida-A eigenvalue problem, giving a "// &
+                          "broadening-free, finite-time-free correctness check against bse_full.F. "// &
+                          "In ABBA it builds and diagonalizes the full coupled (A, B) Liouvillian via the "// &
+                          "Furche reduction. "// &
+                          "Output is controlled by the LIOUVILLIAN_EIG print key in the parent "// &
+                          "&REAL_TIME_PROPAGATION%&PRINT section.", &
+                          usage="DIAGNOSE_LIOUVILLIAN_EIG", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="EPS_FILTER_RHO", &
+                          description="RI-RS linearized RT-BSE: block-filter threshold on the propagated "// &
+                          "response density Delta-rho (AO). Applied upstream of the projection the "// &
+                          "Hartree shares, so it cuts the SEX kernel and the Hartree response alike. "// &
+                          "Absolute, so its strength is the ratio to the Delta-rho scale.", &
+                          usage="EPS_FILTER_RHO 1.0E-6", &
+                          default_r_val=-1.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="CUTOFF_RADIUS_W0", &
+                          description="RI-RS linearized RT-BSE: real-space truncation radius for the "// &
+                          "grid-basis screened interaction W0. Grid block pairs whose centroids lie "// &
+                          "further apart are dropped at build, and the per-step SEX grid transient is "// &
+                          "built into the same pattern. Affects the BSE kernel only, not the GW "// &
+                          "quasiparticle energies and not the Hartree response. Requires a "// &
+                          "non-periodic cell. Zero or negative disables the truncation.", &
+                          usage="CUTOFF_RADIUS_W0 30.0", &
+                          default_r_val=cp_unit_to_cp2k(value=-1.0_dp, unit_str="angstrom"), &
+                          type_of_var=real_t, unit_str="angstrom")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -2197,8 +2407,8 @@ CONTAINS
                           name="SCCS", &
                           description="Define the parameters for self-consistent continuum solvation (SCCS) model", &
                           citations=[Fattebert2002, Andreussi2012, Yin2017], &
-                          n_keywords=8, &
-                          n_subsections=3, &
+                          n_keywords=10, &
+                          n_subsections=4, &
                           repeats=.FALSE.)
 
       NULLIFY (keyword)
@@ -2356,7 +2566,56 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, &
+                          name="CORE_FILL", &
+                          description="Add a normalised Gaussian fill density $Z_{val}/(\sqrt{\pi}\sigma)^3 "// &
+                          "\exp(-r^2/\sigma^2)$ on each atom to the electronic density used for the "// &
+                          "definition of the dielectric function. This fills the low valence density "// &
+                          "region at the nuclei of pseudopotential atoms, which otherwise may be treated "// &
+                          "as solvent if a grid point is close to a nucleus (similar to the solvent_mode "// &
+                          "'full' of the Environ library). Kinds without removed core electrons (Z_val = Z, "// &
+                          "e.g. H, He-q2, Li-q3, Be-q4) are not filled by default. "// &
+                          "The resulting ionic forces are included.", &
+                          usage="CORE_FILL", &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, &
+                          name="CORE_FILL_SPREAD", &
+                          description="Default spread $\sigma$ of the Gaussian fill density used with CORE_FILL "// &
+                          "(Environ default 0.5 bohr). Can be overwritten per kind in the CORE_FILL_KIND section.", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          type_of_var=real_t, &
+                          unit_str="bohr", &
+                          default_r_val=0.5_dp, &
+                          usage="CORE_FILL_SPREAD [bohr] 0.5")
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       NULLIFY (subsection)
+
+      CALL section_create(subsection, __LOCATION__, &
+                          name="CORE_FILL_KIND", &
+                          description="Per-kind spread of the CORE_FILL Gaussian fill density. "// &
+                          "Each line contains a kind label (as defined in &KIND) and the spread in bohr. "// &
+                          "A spread <= 0 disables the fill for that kind. Kinds not listed use "// &
+                          "CORE_FILL_SPREAD, except kinds without removed core electrons (Z_val = Z) which are "// &
+                          "not filled.", &
+                          n_keywords=1, &
+                          n_subsections=0, &
+                          repeats=.FALSE.)
+      CALL keyword_create(keyword, __LOCATION__, name="_DEFAULT_KEYWORD_", &
+                          description="Kind label and spread in bohr", &
+                          repeats=.TRUE., &
+                          usage="{kind label} {spread in bohr}", &
+                          type_of_var=lchar_t)
+      CALL section_add_keyword(subsection, keyword)
+      CALL keyword_release(keyword)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
 
       CALL section_create(subsection, __LOCATION__, &
                           name="ANDREUSSI", &

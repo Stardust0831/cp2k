@@ -14,14 +14,16 @@
 ! **************************************************************************************************
 MODULE mathlib
 
-   USE kinds,                           ONLY: default_string_length,&
-                                              dp
-   USE mathconstants,                   ONLY: euler,&
-                                              fac,&
-                                              oorootpi,&
-                                              z_one,&
-                                              z_zero
+   USE kinds, ONLY: default_string_length, &
+                    dp
+   USE mathconstants, ONLY: euler, &
+                            fac, &
+                            oorootpi, &
+                            pi, &
+                            z_one, &
+                            z_zero
 #include "../base/base_uses.f90"
+   #:include 'expint.fypp'
 
    IMPLICIT NONE
    PRIVATE
@@ -45,7 +47,8 @@ MODULE mathlib
              diag_antisym, &
              diag_complex, &
              gemm_square, &
-             geeig_right
+             geeig_right, &
+             gauss_legendre
 
    ! Public functions
 
@@ -187,8 +190,8 @@ CONTAINS
       REAL(KIND=dp)                                      :: length_of_a, length_of_b
       REAL(KIND=dp), DIMENSION(SIZE(a, 1))               :: a_norm, b_norm
 
-      length_of_a = SQRT(DOT_PRODUCT(a, a))
-      length_of_b = SQRT(DOT_PRODUCT(b, b))
+      length_of_a = NORM2(a)
+      length_of_b = NORM2(b)
 
       IF ((length_of_a > eps_geo) .AND. (length_of_b > eps_geo)) THEN
          a_norm(:) = a(:)/length_of_a
@@ -997,8 +1000,9 @@ CONTAINS
       ! set singular values that are too small to zero
       DO i = 1, n
          IF (sig(i) > rskip*MAXVAL(sig)) THEN
-            IF (PRESENT(determinant)) &
+            IF (PRESENT(determinant)) THEN
                determinant = determinant*sig(i)
+            END IF
             sig_plus(i, i) = 1._dp/sig(i)
          ELSE
             sig_plus(i, i) = 0.0_dp
@@ -1402,14 +1406,14 @@ CONTAINS
       REAL(dp)                                           :: fn_val
 
       REAL(dp), PARAMETER :: dx0 = 1.461632144968362341262659542325721325e0_dp, p1(7) = [ &
-         .895385022981970e-02_dp, .477762828042627e+01_dp, .142441585084029e+03_dp, &
-         .118645200713425e+04_dp, .363351846806499e+04_dp, .413810161269013e+04_dp, &
-         .130560269827897e+04_dp], p2(4) = [-.212940445131011e+01_dp, -.701677227766759e+01_dp, &
-         -.448616543918019e+01_dp, -.648157123766197e+00_dp], piov4 = .785398163397448e0_dp, q1(6) &
-         = [.448452573429826e+02_dp, .520752771467162e+03_dp, .221000799247830e+04_dp, &
-         .364127349079381e+04_dp, .190831076596300e+04_dp, .691091682714533e-05_dp]
+                             .895385022981970e-02_dp, .477762828042627e+01_dp, .142441585084029e+03_dp, &
+                             .118645200713425e+04_dp, .363351846806499e+04_dp, .413810161269013e+04_dp, &
+                             .130560269827897e+04_dp], p2(4) = [-.212940445131011e+01_dp, -.701677227766759e+01_dp, &
+                                         -.448616543918019e+01_dp, -.648157123766197e+00_dp], piov4 = .785398163397448e0_dp, q1(6) &
+                             = [.448452573429826e+02_dp, .520752771467162e+03_dp, .221000799247830e+04_dp, &
+                                .364127349079381e+04_dp, .190831076596300e+04_dp, .691091682714533e-05_dp]
       REAL(dp), PARAMETER :: q2(4) = [.322703493791143e+02_dp, .892920700481861e+02_dp, &
-         .546117738103215e+02_dp, .777788548522962e+01_dp]
+                                      .546117738103215e+02_dp, .777788548522962e+01_dp]
 
       INTEGER                                            :: i, m, n, nq
       REAL(dp)                                           :: aug, den, sgn, upper, w, x, xmax1, xmx0, &
@@ -1514,80 +1518,7 @@ CONTAINS
 
    END FUNCTION digamma
 
-! **************************************************************************************************
-!> \brief computes the exponential integral
-!>      En(x) = Int(exp(-x*t)/t^n,t=1..infinity)  x>0, n=0,1,..
-!>      Note: Ei(-x) = -E1(x)
-!> \param n ...
-!> \param x ...
-!> \return ...
-!> \par History
-!>      05.2007 Created
-!> \author Manuel Guidon (adapted from Numerical recipies)
-! **************************************************************************************************
-   ELEMENTAL IMPURE FUNCTION expint(n, x)
-      INTEGER, INTENT(IN)                                :: n
-      REAL(dp), INTENT(IN)                               :: x
-      REAL(dp)                                           :: expint
-
-      INTEGER, PARAMETER                                 :: maxit = 100
-      REAL(dp), PARAMETER :: eps = 6.e-14_dp, euler = 0.5772156649015328606065120_dp, &
-         fpmin = TINY(0.0_dp)
-
-      INTEGER                                            :: i, ii, nm1
-      REAL(dp)                                           :: a, b, c, d, del, fact, h, psi
-
-      nm1 = n - 1
-
-      IF (n < 0 .OR. x < 0.0_dp .OR. (x == 0.0_dp .AND. (n == 0 .OR. n == 1))) THEN
-         CPABORT("Invalid argument")
-      ELSE IF (n == 0) THEN !Special case.
-         expint = EXP(-x)/x
-      ELSE IF (x == 0.0_dp) THEN !Another special case.
-         expint = 1.0_dp/nm1
-      ELSE IF (x > 1.0_dp) THEN !Lentz's algorithm (5.2).
-         b = x + n
-         c = 1.0_dp/FPMIN
-         d = 1.0_dp/b
-         h = d
-         DO i = 1, MAXIT
-            a = -i*(nm1 + i)
-            b = b + 2.0_dp
-            d = 1.0_dp/(a*d + b)
-            c = b + a/c
-            del = c*d
-            h = h*del
-            IF (ABS(del - 1.0_dp) < EPS) THEN
-               expint = h*EXP(-x)
-               RETURN
-            END IF
-         END DO
-         CPABORT("continued fraction failed in expint")
-      ELSE !Evaluate series.
-         IF (nm1 /= 0) THEN !Set first term.
-            expint = 1.0_dp/nm1
-         ELSE
-            expint = -LOG(x) - euler
-         END IF
-         fact = 1.0_dp
-         DO i = 1, MAXIT
-            fact = -fact*x/i
-            IF (i /= nm1) THEN
-               del = -fact/(i - nm1)
-            ELSE
-               psi = -euler !Compute I(n).
-               DO ii = 1, nm1
-                  psi = psi + 1.0_dp/ii
-               END DO
-               del = fact*(-LOG(x) + psi)
-            END IF
-            expint = expint + del
-            IF (ABS(del) < ABS(expint)*EPS) RETURN
-         END DO
-         CPABORT("series failed in expint")
-      END IF
-
-   END FUNCTION expint
+   @:define_expint(impure=1)
 
 ! **************************************************************************************************
 !> \brief  Jacobi matrix diagonalization. The eigenvalues are returned in
@@ -1635,8 +1566,10 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: v
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'diag'
+      INTEGER, PARAMETER                                 :: maxit = 100
       REAL(KIND=dp), PARAMETER                           :: a_eps = 1.0E-10_dp, d_eps = 1.0E-3_dp
 
+      CHARACTER(LEN=default_string_length)               :: max_iter
       INTEGER                                            :: handle, i, ip, iq
       REAL(KIND=dp)                                      :: a_max, apq, c, d_min, dip, diq, g, h, s, &
                                                             t, tau, theta, tresh
@@ -1653,8 +1586,7 @@ CONTAINS
 
       CALL unit_matrix(v)
 
-      ! Go for 50 iterations
-      DO i = 1, 50
+      DO i = 1, maxit
          d = b
          d_min = MAX(d_eps, MINVAL(ABS(b)))
          IF (a_max < a_eps*d_min) THEN
@@ -1704,7 +1636,10 @@ CONTAINS
             a_max = MAX(a_max, MAXVAL(ABS(a(ip, ip + 1:n))))
          END DO
       END DO
-      WRITE (*, '(/,T2,A,/)') 'Too many iterations in jacobi'
+      WRITE (max_iter, *) maxit
+      CALL cp_warn(__LOCATION__, &
+                   "Jacobi matrix diagonalization does not converge after "// &
+                   TRIM(ADJUSTL(max_iter))//" iterations; stop here anyway")
 
       CALL timestop(handle)
 
@@ -1855,10 +1790,10 @@ CONTAINS
 !> \param df ...
 ! **************************************************************************************************
       ELEMENTAL SUBROUTINE eval_transc_func(r, eps, omega, fn, df)
-      REAL(dp), INTENT(in)                               :: r, eps, omega
-      REAL(dp), INTENT(out)                              :: fn, df
+         REAL(dp), INTENT(in)                               :: r, eps, omega
+         REAL(dp), INTENT(out)                              :: fn, df
 
-      REAL(dp)                                           :: qr
+         REAL(dp)                                           :: qr
 
          qr = omega*r
          fn = ERFC(qr) - r*eps
@@ -1975,12 +1910,14 @@ CONTAINS
       IF (n /= SIZE(C_out, 2)) CPABORT("Incompatible (cols) result array 3 (C).")
       IF (.NOT. (A_trans == 'N' .OR. A_trans == 'n' .OR. &
                  A_trans == 'T' .OR. A_trans == 't' .OR. &
-                 A_trans == 'C' .OR. A_trans == 'c')) &
+                 A_trans == 'C' .OR. A_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 1 (A).")
+      END IF
       IF (.NOT. (B_trans == 'N' .OR. B_trans == 'n' .OR. &
                  B_trans == 'T' .OR. B_trans == 't' .OR. &
-                 B_trans == 'C' .OR. B_trans == 'c')) &
+                 B_trans == 'C' .OR. B_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 2 (B).")
+      END IF
 
       CALL timeset(routineN, handle)
 
@@ -2018,12 +1955,14 @@ CONTAINS
       IF (n /= SIZE(C_out, 2)) CPABORT("Incompatible (cols) result array 3 (C).")
       IF (.NOT. (A_trans == 'N' .OR. A_trans == 'n' .OR. &
                  A_trans == 'T' .OR. A_trans == 't' .OR. &
-                 A_trans == 'C' .OR. A_trans == 'c')) &
+                 A_trans == 'C' .OR. A_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 1 (A).")
+      END IF
       IF (.NOT. (B_trans == 'N' .OR. B_trans == 'n' .OR. &
                  B_trans == 'T' .OR. B_trans == 't' .OR. &
-                 B_trans == 'C' .OR. B_trans == 'c')) &
+                 B_trans == 'C' .OR. B_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 2 (B).")
+      END IF
 
       CALL timeset(routineN, handle)
 
@@ -2068,16 +2007,19 @@ CONTAINS
       IF (n /= SIZE(D_out, 2)) CPABORT("Incompatible (cols) result array 4 (D).")
       IF (.NOT. (A_trans == 'N' .OR. A_trans == 'n' .OR. &
                  A_trans == 'T' .OR. A_trans == 't' .OR. &
-                 A_trans == 'C' .OR. A_trans == 'c')) &
+                 A_trans == 'C' .OR. A_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 1 (A).")
+      END IF
       IF (.NOT. (B_trans == 'N' .OR. B_trans == 'n' .OR. &
                  B_trans == 'T' .OR. B_trans == 't' .OR. &
-                 B_trans == 'C' .OR. B_trans == 'c')) &
+                 B_trans == 'C' .OR. B_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 2 (B).")
+      END IF
       IF (.NOT. (C_trans == 'N' .OR. C_trans == 'n' .OR. &
                  C_trans == 'T' .OR. C_trans == 't' .OR. &
-                 C_trans == 'C' .OR. C_trans == 'c')) &
+                 C_trans == 'C' .OR. C_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 3 (C).")
+      END IF
 
       CALL timeset(routineN, handle)
 
@@ -2127,16 +2069,19 @@ CONTAINS
       IF (n /= SIZE(D_out, 2)) CPABORT("Incompatible (cols) result array 4 (D).")
       IF (.NOT. (A_trans == 'N' .OR. A_trans == 'n' .OR. &
                  A_trans == 'T' .OR. A_trans == 't' .OR. &
-                 A_trans == 'C' .OR. A_trans == 'c')) &
+                 A_trans == 'C' .OR. A_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 1 (A).")
+      END IF
       IF (.NOT. (B_trans == 'N' .OR. B_trans == 'n' .OR. &
                  B_trans == 'T' .OR. B_trans == 't' .OR. &
-                 B_trans == 'C' .OR. B_trans == 'c')) &
+                 B_trans == 'C' .OR. B_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 2 (B).")
+      END IF
       IF (.NOT. (C_trans == 'N' .OR. C_trans == 'n' .OR. &
                  C_trans == 'T' .OR. C_trans == 't' .OR. &
-                 C_trans == 'C' .OR. C_trans == 'c')) &
+                 C_trans == 'C' .OR. C_trans == 'c')) THEN
          CPABORT("Unknown transpose character for array 3 (C).")
+      END IF
 
       CALL timeset(routineN, handle)
 
@@ -2166,7 +2111,7 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'geeig_right'
       COMPLEX(KIND=dp), PARAMETER :: cone = CMPLX(1.0_dp, 0.0_dp, KIND=dp), &
-         czero = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+                                     czero = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
 
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)        :: cevals
       COMPLEX(kind=dp), ALLOCATABLE, DIMENSION(:, :)     :: A, B, work
@@ -2215,7 +2160,7 @@ CONTAINS
       ! Calculate U*s**(-1/2)
       cevals(:) = CMPLX(1.0_dp/SQRT(evals(:)), 0.0_dp, KIND=dp)
       DO i = 1, MIN(SIZE(work, 2), SIZE(cevals))
-         CALL zscal(MIN(SIZE(work, 2), SIZE(cevals)), cevals(i), work(1, i), 1)
+         work(1:MIN(SIZE(work, 2), SIZE(cevals)), i) = cevals(i)*work(1:MIN(SIZE(work, 2), SIZE(cevals)), i)
       END DO
       ! Reduce to get U^(-C) * H * U^(-1)
       CALL gemm_square(work, 'C', A, 'N', B)
@@ -2241,5 +2186,45 @@ CONTAINS
 
       CALL timestop(handle)
    END SUBROUTINE geeig_right
+
+! **************************************************************************************************
+!> \brief Gauss-Legendre nodes and weights on [-1,1], with nodes in ascending order.
+!>        The Legendre roots are refined by Newton iterations to machine precision.
+!> \param n number of nodes
+!> \param nodes ...
+!> \param weights ...
+! **************************************************************************************************
+   SUBROUTINE gauss_legendre(n, nodes, weights)
+      INTEGER, INTENT(IN)                                :: n
+      REAL(KIND=dp), DIMENSION(n), INTENT(OUT)           :: nodes, weights
+
+      INTEGER, PARAMETER                                 :: max_iter = 100
+
+      INTEGER                                            :: i, iter, j
+      REAL(KIND=dp)                                      :: derivative, dz, p0, p1, p2, z
+
+      DO i = 1, (n + 1)/2
+         z = COS(pi*(REAL(i, dp) - 0.25_dp)/(REAL(n, dp) + 0.5_dp))
+         DO iter = 1, max_iter
+            p0 = 1.0_dp
+            p1 = 0.0_dp
+            DO j = 1, n
+               p2 = p1
+               p1 = p0
+               p0 = (REAL(2*j - 1, dp)*z*p1 - REAL(j - 1, dp)*p2)/REAL(j, dp)
+            END DO
+            derivative = REAL(n, dp)*(z*p0 - p1)/(z*z - 1.0_dp)
+            dz = p0/derivative
+            z = z - dz
+            IF (ABS(dz) <= EPSILON(1.0_dp)) EXIT
+         END DO
+         IF (iter > max_iter) CPABORT("Gauss-Legendre roots did not converge")
+         nodes(i) = -z
+         nodes(n + 1 - i) = z
+         weights(i) = 2.0_dp/((1.0_dp - z*z)*derivative**2)
+         weights(n + 1 - i) = weights(i)
+      END DO
+
+   END SUBROUTINE gauss_legendre
 
 END MODULE mathlib

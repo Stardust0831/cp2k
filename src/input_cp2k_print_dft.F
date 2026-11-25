@@ -18,13 +18,14 @@ MODULE input_cp2k_print_dft
    USE bibliography, ONLY: &
       Andermatt2016, Andreussi2012, Avezac2005, BaniHashemian2016, Becke1988b, Bengtsson1999, &
       Blochl1995, Brehm2018, Brelaz1979, Dewar1977, Dewar1985, Dudarev1997, Dudarev1998, &
-      Ehrhardt1985, Eriksen2020, Fattebert2002, Golze2017a, Golze2017b, Guidon2010, &
+      Ehrhardt1985, Eriksen2020, Fattebert2002, Golze2017a, Golze2017b, Grimme2015FOD, Guidon2010, &
       Heinzmann1976, Holmberg2017, Holmberg2018, Iannuzzi2005, Iannuzzi2006, Iannuzzi2007, &
       Knizia2013, Kolafa2004, Krack2000, Krack2002, Kuhne2007, Kunert2003, Lippert1997, &
       Lippert1999, Lu2004, Merlot2014, Perdew1981, Repasky2002, Rocha2006, Schenter2008, Schiffmann2015, &
       Shigeta2001, Stewart1982, Stewart1989, Stewart2007, Thiel1992, VanVoorhis2015, &
       VandeVondele2003, VandeVondele2005a, VandeVondele2005b, VandeVondele2006, Weber2008, &
-      Yin2017, Pracht2019, Caldeweyher2019, Caldeweyher2020
+      Yin2017, Pracht2019, Caldeweyher2019, Caldeweyher2020, Gresch2017, Soluyanov2011, &
+      Pizzi2020, Marzari1997, Souza2001, Mattiat2022
    USE cp_output_handling, ONLY: add_last_numeric, &
                                  cp_print_key_section_create, &
                                  debug_print_level, &
@@ -88,9 +89,9 @@ MODULE input_cp2k_print_dft
       outer_scf_optimizer_diis, outer_scf_optimizer_newton, outer_scf_optimizer_newton_ls, &
       outer_scf_optimizer_none, outer_scf_optimizer_sd, outer_scf_optimizer_secant, &
       outer_scf_s2_constraint, plus_u_lowdin, plus_u_mulliken, plus_u_mulliken_charges, &
-      qiskit_solver, radius_covalent, radius_default, radius_single, radius_user, radius_vdw, &
-      random_guess, real_time_propagation, ref_charge_atomic, ref_charge_mulliken, rel_dkh, &
-      rel_none, rel_pot_erfc, rel_pot_full, rel_sczora_mp, rel_trans_atom, rel_trans_full, &
+      plus_u_tensorial, qiskit_solver, radius_covalent, radius_default, radius_single, radius_user, &
+      radius_vdw, random_guess, real_time_propagation, ref_charge_atomic, ref_charge_mulliken, &
+      rel_dkh, rel_none, rel_pot_erfc, rel_pot_full, rel_sczora_mp, rel_trans_atom, rel_trans_full, &
       rel_trans_molecule, rel_zora, rel_zora_full, rel_zora_mp, restart_guess, &
       sccs_andreussi, sccs_derivative_cd3, sccs_derivative_cd5, sccs_derivative_cd7, &
       sccs_derivative_fft, sccs_fattebert_gygi, shape_function_density, shape_function_gaussian, &
@@ -98,11 +99,12 @@ MODULE input_cp2k_print_dft
       slater, smear_energy_window, smear_fermi_dirac, smear_list, sparse_guess, tddfpt_davidson, &
       tddfpt_excitations, tddfpt_lanczos, tddfpt_singlet, tddfpt_spin_cons, tddfpt_spin_flip, &
       tddfpt_triplet, use_mom_ref_coac, use_mom_ref_com, use_mom_ref_user, use_mom_ref_zero, &
+      moments_format_detailed, moments_format_trajectory, &
       use_restart_wfn, use_rt_restart, use_scf_wfn, wannier_projection, weight_type_mass, &
       weight_type_unit, wfi_aspc_nr, wfi_gext_proj_nr, wfi_gext_proj_qtr_nr, wfi_frozen_method_nr, &
       wfi_linear_p_method_nr, wfi_linear_ps_method_nr, wfi_linear_wf_method_nr, wfi_ps_method_nr, &
-      wfi_use_guess_method_nr, wfi_use_prev_p_method_nr, wfi_use_prev_rho_r_method_nr, &
-      wfi_use_prev_wf_method_nr, wfn_mix_orig_external, wfn_mix_orig_occ, wfn_mix_orig_virtual, &
+      wfi_use_guess_method_nr, wfi_use_prev_p_method_nr, wfi_use_prev_wf_method_nr, &
+      wfn_mix_orig_external, wfn_mix_orig_occ, wfn_mix_orig_virtual, &
       xas_1s_type, xas_2p_type, xas_2s_type, xas_3d_type, xas_3p_type, xas_3s_type, xas_4d_type, &
       xas_4f_type, xas_4p_type, xas_4s_type, xas_dip_len, xas_dip_vel, xas_dscf, xas_none, &
       xas_not_excited, xas_tdp_by_index, xas_tdp_by_kind, xas_tp_fh, xas_tp_flex, xas_tp_hh, &
@@ -118,7 +120,7 @@ MODULE input_cp2k_print_dft
                                   create_ext_vxc_section
    USE input_cp2k_field, ONLY: create_efield_section, &
                                create_per_efield_section
-   USE input_cp2k_kpoints, ONLY: create_kpoint_set_section, &
+   USE input_cp2k_kpoints, ONLY: create_kpoint_set_section, create_unfolding_section, &
                                  create_kpoints_section
    USE input_cp2k_loc, ONLY: create_localize_section, &
                              print_wanniers
@@ -485,6 +487,23 @@ CONTAINS
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="POSITION", &
+                          description="Print the analytic AO matrices <mu|x,y,z|nu> in Bohr, relative to "// &
+                          "the coordinate origin, in the same AO ordering as OVERLAP and KOHN_SHAM_MATRIX. "// &
+                          "Only isolated GPW/GAPW systems; not a periodic Berry-phase operator. "// &
+                          "Use NDIGITS 16 for numerical postprocessing.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="SOC", &
+                          description="Print the three real antisymmetric AO GTH SOC components Vx, Vy, Vz in hartree. "// &
+                          "The physical orbital operators are i*Vx, i*Vy, i*Vz. "// &
+                          "Requires a restricted, isolated GPW/GAPW calculation with GTH SOC potentials.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="FERMI_CONTACT", &
                           description="If the printkey is activated controls the printing of the Fermi contact matrix", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
@@ -540,8 +559,9 @@ CONTAINS
          print_key, __LOCATION__, "MO", &
          description="Controls the printing of the molecular orbital (MO) information. The requested MO information "// &
          "is printed for all occupied MOs by default. Use the MO_INDEX_RANGE keyword to restrict the number "// &
-         "of the MOs or to print the MO information for unoccupied MOs. With diagonalization, additional MOs "// &
-         "have to be made available for printout using the ADDED_MOS keyword in the SCF section. With OT, "// &
+         "of the MOs or to print the MO information for unoccupied MOs. With diagonalization, an explicit "// &
+         "positive range or -1 as its last index makes the requested MOs available automatically, up to the "// &
+         "AO basis size. ADDED_MOS can make extra MOs available independently of this print request. With OT, "// &
          "it is sufficient to specify the desired MO_INDEX_RANGE. The OT eigensolver can be controlled with "// &
          "the EPS_LUMO and MAX_ITER_LUMO keywords in the SCF section.", &
          print_level=high_print_level, filename="__STD_OUT__")
@@ -592,8 +612,9 @@ CONTAINS
                           name="MO_INDEX_RANGE", &
                           variants=s2a("MO_RANGE", "RANGE"), &
                           description="Print only the requested subset of MOs. The indices of the first and "// &
-                          "the last MO have to be specified to define the range. -1 as the last MO index "// &
-                          "prints all available orbitals with diagonalisation (ADDED_MOS) and all orbitals with OT.", &
+                          "the last MO have to be specified to define the range. A positive range makes the "// &
+                          "requested MOs available automatically. -1 as the last MO index makes and prints all "// &
+                          "available orbitals with diagonalization and all orbitals with OT.", &
                           repeats=.FALSE., &
                           n_var=2, &
                           type_of_var=integer_t, &
@@ -695,6 +716,54 @@ CONTAINS
                           enum_desc=s2a("Write GTO basis set definition (MOLDEN denormalization convention)", &
                                         "Write explicit overlap matrices S(k) for all k-points"), &
                           enum_i_vals=[mokp_ao_gto_basis, mokp_ao_overlap_matrix])
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL section_add_subsection(section, print_key)
+      CALL section_release(print_key)
+
+      CALL cp_print_key_section_create(print_key, __LOCATION__, "CC4S", &
+                             description="Export a restricted RI-HF reference and CC4S input after converged single-point SCF. "// &
+                                  "Requires RI_FLAVOR MO, XC_FUNCTIONAL NONE, HF FRACTION 1 and identical HF and RI operators. "// &
+                                       "Use COULOMB for molecules or TRUNCATED for neutral, fully periodic Gamma-point cells. "// &
+                                       "Complete distributed intermediates; no k-point sampling. "// &
+                                       "FILENAME sets the common file prefix; exact names (=name) and stdout are unsupported.", &
+                                       print_level=debug_print_level + 1, filename="cc4s", common_iter_levels=2)
+      CALL keyword_create(keyword, __LOCATION__, name="METHOD", &
+                          description="Correlation method requested in the generated CC4S input file.", default_i_val=2, &
+                          enum_c_vals=s2a("MP2", "CCSD", "CCSD_T"), enum_i_vals=[1, 2, 3], &
+                          enum_desc=s2a("MP2", "MP2 and CCSD", "MP2, CCSD and perturbative triples"))
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="N_FROZEN_CORE", &
+                          description="Number of lowest occupied spatial orbitals omitted from the export.", default_i_val=0)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="MAX_ITER", &
+                          description="Maximum CC4S coupled-cluster iterations.", default_i_val=100)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="ENERGY_CONVERGENCE", &
+                          description="CC4S correlation-energy convergence in Hartree.", &
+                          default_r_val=1.0e-7_dp)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="AMPLITUDES_CONVERGENCE", &
+                          description="CC4S amplitude convergence threshold.", &
+                          default_r_val=1.0e-6_dp)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="OUTPUT_BUFFER_SIZE", &
+                          description="Maximum output buffer size per MPI rank in MiB (1 MiB = 1048576 bytes). "// &
+                          "Positive real value; rounded down to whole Real64 elements and capped by the vertex size. "// &
+                          "The element count must fit a default INTEGER. Does not directly set transformation batch sizes.", &
+                          default_r_val=8.0_dp)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="MAX_MEMORY", &
+                          description="Maximum estimated export workspace per MPI rank in MB, "// &
+                          "Selects orbital and auxiliary batch sizes; includes output and reduction buffers. "// &
+                          "Excludes existing SCF storage, allocator overhead and CC4S. This is not a process memory limit.", &
+                          default_r_val=1024.0_dp)
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
       CALL section_add_subsection(section, print_key)
@@ -884,11 +953,34 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="NGAUSS", &
-                          description="Number of Gaussian functions used in the expansion of atomic (core) density", &
+                          description="Number of Gaussian functions used in the expansion of atomic (core) density "// &
+                          "for XRD_INTERFACE. Does not select a valence-only density.", &
                           usage="NGAUSS 10", n_var=1, default_i_val=12, type_of_var=integer_t)
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
 
+      CALL section_add_subsection(section, print_key)
+      CALL section_release(print_key)
+
+      CALL cp_print_key_section_create(print_key, __LOCATION__, "FOD", &
+                                       description="Fractional occupation number weighted density (FOD) of Grimme and Hansen "// &
+                                       "[doi:10.1002/anie.201501887]. Prints the orbital sum N_FOD. "// &
+                                       "Requires GPW at Gamma and positive-temperature Fermi-Dirac smearing. "// &
+                                       "FOD is a qualitative static-correlation diagnostic, not a proof of "// &
+                                       "multireference character. Results depend on the functional and electronic "// &
+                                       "temperature; metallic occupations need a different interpretation.", &
+                                       print_level=debug_print_level + 1, filename="", citations=[Grimme2015FOD])
+      CALL keyword_create(keyword, __LOCATION__, name="CUBE", &
+                          description="Also collocate the FOD density, print its grid integral and write a cube "// &
+                          "in electrons/bohr**3. Without this option only the inexpensive orbital sum is computed.", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="STRIDE", &
+                          description="Cube sampling stride. Supply one value for all directions or three values.", &
+                          usage="STRIDE 2 2 2", n_var=-1, default_i_vals=[2, 2, 2], type_of_var=integer_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
       CALL section_add_subsection(section, print_key)
       CALL section_release(print_key)
 
@@ -1213,6 +1305,36 @@ CONTAINS
          default_i_val=1)
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
+      CALL keyword_create( &
+         keyword, __LOCATION__, &
+         name="UNIT", &
+         description="Unit of the printed electric multipole moments. Multipoles of order L are "// &
+         "printed in UNIT*length^(L-1), where length is angstrom for debye and e_angstrom, bohr for "// &
+         "au_dip (atomic unit of the dipole) and m for C_m (Coulomb meter). For k-point calculations the "// &
+         "dipole matrix elements are printed in UNIT and the Berry curvature in length^2. The FORMAT "// &
+         "TRAJECTORY output is always in Debye.", &
+         usage="UNIT {debye|e_angstrom|au_dip|C_m}", &
+         repeats=.FALSE., &
+         n_var=1, &
+         type_of_var=char_t, &
+         default_c_val="debye")
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create( &
+         keyword, __LOCATION__, &
+         name="FORMAT", &
+         description="Format of the moments output. DETAILED prints the traditional multi-line report. "// &
+         "TRAJECTORY prints one machine-readable electric-dipole record per iteration. For periodic "// &
+         "calculations each record also contains the cell matrix in Debye, which is required to unwrap "// &
+         "Berry-phase jumps in variable cells.", &
+         usage="FORMAT {DETAILED|TRAJECTORY}", &
+         enum_c_vals=s2a("DETAILED", "TRAJECTORY"), &
+         enum_desc=s2a("Traditional multi-line moments report", &
+                       "One electric-dipole record per iteration"), &
+         enum_i_vals=[moments_format_detailed, moments_format_trajectory], &
+         default_i_val=moments_format_detailed)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, &
                           name="MAGNETIC", &
                           description="Calculate also magnetic moments, only implemented without periodic boundaries", &
@@ -1231,7 +1353,8 @@ CONTAINS
                           repeats=.FALSE., &
                           n_var=1, &
                           default_l_val=.FALSE., &
-                          lone_keyword_l_val=.TRUE.)
+                          lone_keyword_l_val=.TRUE., &
+                          citations=[Mattiat2022])
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, &
@@ -1242,7 +1365,8 @@ CONTAINS
                           repeats=.FALSE., &
                           n_var=1, &
                           default_l_val=.FALSE., &
-                          lone_keyword_l_val=.TRUE.)
+                          lone_keyword_l_val=.TRUE., &
+                          citations=[Mattiat2022])
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
       CALL keyword_create(keyword, __LOCATION__, &
@@ -1289,6 +1413,41 @@ CONTAINS
                           repeats=.FALSE., &
                           n_var=1, default_i_val=10, &
                           type_of_var=integer_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="SOC", &
+                          description="Compute the k-point dipole matrix elements and Berry "// &
+                          "curvature with spin-orbit coupling (SOC) included, in the 2*n_ao "// &
+                          "spinor basis.", &
+                          usage="SOC .TRUE.", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          default_l_val=.FALSE., &
+                          lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="KPOINT_DIPOLE_FILE", &
+                          description="Write the k-point dipole matrix elements to this file. "// &
+                          "Without a value, the file kpoint_dipoles.dat "// &
+                          "is used. Only used for KPOINT calculations.", &
+                          usage="KPOINT_DIPOLE_FILE {filename}", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          type_of_var=char_t, &
+                          default_c_val="", &
+                          lone_keyword_c_val="kpoint_dipoles.dat")
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="BERRY_CURVATURE_FILE", &
+                          description="Write the k-point Berry curvature to this file. "// &
+                          "Without a value, the file berry_curvature.dat "// &
+                          "is used. Only used for KPOINT calculations.", &
+                          usage="BERRY_CURVATURE_FILE {filename}", &
+                          repeats=.FALSE., &
+                          n_var=1, &
+                          type_of_var=char_t, &
+                          default_c_val="", &
+                          lone_keyword_c_val="berry_curvature.dat")
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
       CALL create_kpoint_set_section(subsection)
@@ -2255,16 +2414,14 @@ CONTAINS
 
       CALL cp_print_key_section_create( &
          print_key, __LOCATION__, name="CHARGEMOL", &
-         description="Write .wfx input file for Chargemol", &
+         description="Write a Gaussian-orbital .wfx file for external Chargemol analysis. "// &
+         "For all-electron calculations, the file includes core and valence electrons. "// &
+         "OT output requires uniform occupied-orbital occupations within each spin channel. "// &
+         "It uses private canonical occupied orbitals and leaves the SCF state unchanged. "// &
+         "Only Gamma-point (un)restricted HF and Kohn-Sham wavefunctions are supported.", &
          print_level=debug_print_level + 1, &
          filename="CHARGEMOL", &
-         add_last=add_last_numeric)
-      CALL keyword_create(keyword, __LOCATION__, name="BACKUP_COPIES", &
-                          description="Specifies the maximum number of backup copies.", &
-                          usage="BACKUP_COPIES {int}", &
-                          default_i_val=1)
-      CALL section_add_keyword(print_key, keyword)
-      CALL keyword_release(keyword)
+         add_last=add_last_numeric, do_backup=.TRUE.)
       CALL keyword_create(keyword, __LOCATION__, name="PERIODIC", &
                           description="Write information about cell periodicity.", &
                           usage="PERIODIC {LOGICAL}", &
@@ -2474,6 +2631,9 @@ CONTAINS
       CALL create_kpoint_set_section(subsection)
       CALL section_add_subsection(section, subsection)
       CALL section_release(subsection)
+      CALL create_unfolding_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
 
    END SUBROUTINE create_bandstructure_section
 
@@ -2616,7 +2776,10 @@ CONTAINS
                           "If the TOTAL_DENSITY keyword is used the hard density will be computed more accurately "// &
                           "but may introduce non-physical features. The SOFT_DENSITY keyword will lead to only the "// &
                           "soft density being printed. In GPW these options have no effect and the cube file will "// &
-                          "only contain the valence electron density.", &
+                          "only contain the valence electron density. In all-electron GAPW, hard+soft contains "// &
+                          "all electrons. The soft part is not a valence-only density and need not integrate "// &
+                          "to the chemical valence electron count. Use CHARGEMOL for a Gaussian-orbital export "// &
+                          "that avoids representing core peaks on a regular grid.", &
                           usage="DENSITY_INCLUDE TOTAL_HARD_APPROX", &
                           enum_c_vals=s2a("TOTAL_HARD_APPROX", "TOTAL_DENSITY", "SOFT_DENSITY"), &
                           enum_desc=s2a("Print (hard+soft) density where the hard components shape is approximated", &
@@ -2883,6 +3046,17 @@ CONTAINS
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="SPIN_CHANNEL", &
+                          description="Collinear spin channel to export or localize. "// &
+                          "Spin-polarized calculations use separate SEED_NAME_up and SEED_NAME_down files. "// &
+                          "BOTH runs the channels independently with their respective MO band counts. "// &
+                          "The numeric values 1 and 2 remain aliases for ALPHA and BETA. "// &
+                          "With SOC, use the restricted channel ALPHA (1).", &
+                          usage="SPIN_CHANNEL BOTH", default_i_val=0, n_var=1, type_of_var=enum_t, &
+                          enum_c_vals=s2a("BOTH", "ALPHA", "BETA", "1", "2"), enum_i_vals=[0, 1, 2, 1, 2])
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="MP_GRID", &
                           description="The dimensions of the Monkhorst-Pack k-point grid. ", &
                           usage="MP_GRID 6 6 6", n_var=-1, default_i_vals=[10, 10, 10], type_of_var=integer_t)
@@ -2895,13 +3069,155 @@ CONTAINS
                           "the full k-point mesh from DFT%KPOINTS for Monkhorst-Pack, MacDonald, Gamma, or "// &
                           "explicit GENERAL k-points. If the SCF calculation uses K290 or SPGLIB symmetry "// &
                           "reduction, the corresponding unreduced mesh is used for Wannier90 because "// &
-                          "Wannier90 requires a complete mesh.", &
+                          "Wannier90 requires a complete mesh. NNKP reads explicit k-points and directed "// &
+                          "overlap connections from NNKP_FILE, without a regular-mesh requirement. "// &
+                          "WILSON generates and refines a surface of closed loops at the SCF potential. "// &
+                          "TRIM generates four or eight time-reversal-invariant points for native parity analysis.", &
                           usage="KPOINTS_SOURCE MP_GRID", type_of_var=enum_t, &
-                          enum_c_vals=s2a("MP_GRID", "SCF"), &
-                          enum_i_vals=[0, 1], &
+                          enum_c_vals=s2a("MP_GRID", "SCF", "NNKP", "WILSON", "TRIM"), &
+                          enum_i_vals=[0, 1, 2, 3, 4], &
                           enum_desc=s2a("Build the Wannier90 k-point mesh from WANNIER90%MP_GRID.", &
-                                        "Use the full k-point mesh from DFT%KPOINTS."), &
+                                        "Use the full k-point mesh from DFT%KPOINTS.", &
+                                        "Read explicit k-points and connections from NNKP_FILE.", &
+                                        "Generate a family of closed Wilson loops.", &
+                                        "Generate TRIM and enable native inversion-parity analysis."), &
                           default_i_val=0)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="NNKP_FILE", &
+                          description="Wannier90 nnkp file for KPOINTS_SOURCE NNKP. Required literal block names: "// &
+                          "real_lattice (Angstrom), recip_lattice (2*pi/Angstrom), kpoints (fractional), "// &
+                          "and nnkpts (nearest-neighbour point indices and reciprocal lattice shifts). Nonzero exclusions "// &
+                          "in the file are unsupported; use EXCLUDE_BANDS in CP2K instead.", &
+                          usage="NNKP_FILE loop.nnkp", default_c_val="wannier90.nnkp", &
+                          n_var=1, type_of_var=char_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="WILSON_LOOP", &
+                          description="Compute native SVD-unitarized Wilson loops for NNKP connections. "// &
+                          "Requires one directed neighbour per point and contiguous, closed loops. "// &
+                          "Automatically enabled by KPOINTS_SOURCE WILSON.", default_l_val=.FALSE., &
+                          citations=[Gresch2017])
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WILSON_MESH", &
+                          description="Points per closed loop and number of transverse loops. "// &
+                          "Only for KPOINTS_SOURCE WILSON; loops include both transverse endpoints.", &
+                          n_var=2, default_i_vals=[16, 9], type_of_var=integer_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WILSON_ORIGIN", &
+                          description="Origin of Wilson surface in fractional reciprocal coordinates.", &
+                          n_var=3, default_r_vals=[0.0_dp, 0.0_dp, 0.0_dp], type_of_var=real_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WILSON_DIRECTION", &
+                          description="Integer reciprocal vector along each closed Wilson loop.", &
+                          n_var=3, default_i_vals=[1, 0, 0], type_of_var=integer_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WILSON_TRANSVERSE", &
+                          description="Fractional reciprocal vector spanning the transverse surface. "// &
+                          "For Z2 choose a time-reversal half-plane, e.g. 0 0.5 0.", &
+                          n_var=3, default_r_vals=[0.0_dp, 0.5_dp, 0.0_dp], type_of_var=real_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="Z2", &
+                          description="Compute native largest-gap crossing parity on a WILSON half-surface. "// &
+                          "Requires SOC, a nonmagnetic time-reversal-invariant Hamiltonian, an isolated "// &
+                          "occupied subspace, and converged Wilson spectra. TIME_REVERSAL must be set.", &
+                          default_l_val=.FALSE., citations=[Soluyanov2011, Gresch2017])
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="CHERN", &
+                          description="Compute the native first Chern number from determinant Wilson winding. "// &
+                          "Requires KPOINTS_SOURCE WILSON and a closed full surface with integer transverse "// &
+                          "winding, e.g. WILSON_TRANSVERSE 0 1 0. Not compatible with Z2 half-surfaces. "// &
+                          "The selected bands must be isolated; SOC and time reversal are not required.", &
+                          default_l_val=.FALSE., citations=[Gresch2017])
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PARITY", &
+                          description="Compute native even/odd inversion irreps at explicit TRIM. Uses the Gaussian "// &
+                          "AO metric, orbital parities, atom permutations and Bloch lattice phases. Validates the "// &
+                          "selected representation and its energy commutator. No Z2Pack or Wannier fit is needed.", &
+                          default_l_val=.FALSE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="INVERSION_TQC", &
+                          description="Enable PARITY and classify the inversion-subgroup symmetry signature of "// &
+                          "the occupied spinor bands. Requires SOC and TIME_REVERSAL and all four/eight TRIM. "// &
+                          "Reports Fu-Kane indices, 3D Z4, and an exact signed/nonnegative atomic EBR-signature test. "// &
+                          "Not a full-space-group TQC classifier or a certificate of a bulk gap/trivial topology.", &
+                          default_l_val=.FALSE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="TQC_DIMENSION", &
+                          description="Dimension of the inversion analysis: 2 uses the four kz=0 TRIM; "// &
+                          "3 uses all eight TRIM of the supplied reciprocal cell. All cell directions must be periodic.", &
+                          default_i_val=3)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PARITY_ORIGIN", &
+                          description="Inversion center in fractional direct-cell coordinates. The operation is "// &
+                          "r -> 2*center-r. Atomic kinds, basis and the selected Hamiltonian subspace must be invariant.", &
+                          n_var=3, default_r_vals=[0.0_dp, 0.0_dp, 0.0_dp], type_of_var=real_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PARITY_TOLERANCE", &
+                          description="Tolerance for parity metric, subspace and character checks. Also used "// &
+                          "as the inversion geometry tolerance in Bohr. Tighten with numerical convergence.", &
+                          default_r_val=1.e-6_dp)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="PARITY_ENERGY_TOL", &
+                          description="Maximum projected symmetry/eigenvalue commutator in Hartree.", &
+                          default_r_val=1.e-6_dp)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="REQUIRE_GLOBAL_GAP", &
+                          description="Require a positive sampled indirect gap above the lowest selected bands. "// &
+                          "Unlike the direct subspace gap this tests a common energy interval over all sampled "// &
+                          "points. A finite sampling does not prove a bulk gap. No per-point Fermi shifts are applied.", &
+                          default_l_val=.FALSE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="STATE_EXPORT", &
+                          description="Export selected complex AO states, all eigenvalues and full contracted "// &
+                          "Gaussian basis to SEED_NAME.topology for cross-geometry/phason overlaps. "// &
+                          "Requires NNKP, WILSON or TRIM, uses atomic units, and can generate large files. "// &
+                          "Spinor coefficients include second-variational SOC when enabled. "// &
+                          "No Wannier fit or Fermi-energy alignment is performed.", default_l_val=.FALSE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="TIME_REVERSAL", &
+                          description="User confirmation that the Hamiltonian is time-reversal invariant. "// &
+                          "Boundary Kramers degeneracy is additionally checked; it is not a proof of TR symmetry.", &
+                          default_l_val=.FALSE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="SOC", &
+                          description="Second-variational pseudopotential SOC for explicit-loop exports. "// &
+                          "Requires a restricted SCF and SOC-capable pseudopotentials. ADDED_MOS controls "// &
+                          "the scalar basis; EXCLUDE_BANDS then refers to spinor bands. Converge ADDED_MOS.", &
+                          default_l_val=.FALSE.)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WILSON_MAX_REFINEMENT", &
+                          description="Maximum joint doublings of loop and transverse resolution; at least "// &
+                          "one doubling is required for generated WILSON surfaces.", default_i_val=3)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WILSON_TOL", &
+                          description="Tolerance of Wilson centres between successive meshes (reduced units).", &
+                          default_r_val=1.e-3_dp)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="WILSON_GAP_TOL", &
+                          description="Minimum sampled separation from excluded bands in Hartree.", &
+                          default_r_val=1.e-7_dp)
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
 
@@ -2927,10 +3243,10 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="USE_BLOCH_PHASES", &
-                          description="Apply the CP2K Bloch-phase gauge to complete exported band subspaces "// &
-                          "and write an explicit identity .amn projection file for Wannier90. It is only "// &
-                          "valid when WANNIER_FUNCTIONS matches the number of exported bands; disentangled "// &
-                          "Wannier90 calculations still need explicit projections.", &
+                          description="Apply the CP2K Bloch-phase gauge to reused SCF band subspaces. "// &
+                          "INITIAL_PROJECTIONS determines projections in the same gauge. With NONE, "// &
+                          "write identity projections and require equal band and Wannier counts. "// &
+                          "AO_SCDM and AO_HYBRID also support disentanglement.", &
                           usage="USE_BLOCH_PHASES T", default_l_val=.FALSE.)
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
@@ -2943,16 +3259,67 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="EXCLUDE_BANDS", &
-                          description="List of Bands excluded in the Wannier calculation.", &
+                          description="One-based MO indices removed before the Wannier calculation. "// &
+                          "Retained bands are exported in ascending order and renumbered from one; "// &
+                          "the original indices are written to SEED_NAME_band_indices.dat. "// &
+                          "Band exclusions must retain or remove complete degenerate subspaces "// &
+                          "inside the outer energy window.", &
                           usage="EXCLUDE_BANDS b1 b2 ...", n_var=-1, repeats=.TRUE., &
                           type_of_var=integer_t)
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="WANNIER_FUNCTIONS", &
-                          description="Number of Wannier functions to be calculated. ", &
+                          description="Number of Wannier functions to be calculated. "// &
+                          "Specify once for all spin channels, or twice for separate alpha and beta counts.", &
                           usage="WANNIER_FUNCTIONS 6", n_var=1, default_i_val=0, &
                           repeats=.TRUE., type_of_var=integer_t)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="INITIAL_PROJECTIONS", &
+                          description="Initial projections written to SEED_NAME.amn for external Wannier90. "// &
+                          "NONE preserves the historical export without projections, except that "// &
+                          "USE_BLOCH_PHASES writes IDENTITY for complete band spaces. AO_SCDM selects "// &
+                          "fixed AO trials by pivoted QR across the entire mesh. This is AO-based, not "// &
+                          "real-space SCDM. AO_HYBRID forms tetrahedral trials from all on-atom radial "// &
+                          "s/p pairs before selection, retaining other AOs. Both use the overlap metric "// &
+                          "and the exported Bloch gauge and allow rectangular projections. "// &
+                          "IDENTITY requires equal band and Wannier counts. AO trials require "// &
+                          "KPOINTS_SOURCE MP_GRID or SCF. Localization is performed by external Wannier90.", &
+                          type_of_var=enum_t, enum_c_vals=s2a("NONE", "IDENTITY", "AO_SCDM", "AO_HYBRID"), &
+                          enum_i_vals=[-1, 0, 1, 2], default_i_val=-1, citations=[Pizzi2020])
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="EXPORT_PROJECTION_CANDIDATES", &
+                          description="Write complete projection banks for external trial selection, "// &
+                          "without changing INITIAL_PROJECTIONS. AO writes SEED_NAME_ao_candidates.amn. "// &
+                          "AO_HYBRID writes SEED_NAME_hybrid_candidates.amn using the same s/p hybrids "// &
+                          "as INITIAL_PROJECTIONS AO_HYBRID. BOTH writes both files. "// &
+                          "The banks use the exported bands and Bloch gauge before energy-window masking. "// &
+                          "Requires KPOINTS_SOURCE MP_GRID or SCF.", &
+                          type_of_var=enum_t, enum_c_vals=s2a("NONE", "AO", "AO_HYBRID", "BOTH"), &
+                          enum_i_vals=[0, 1, 2, 3], default_i_val=0)
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="DIS_WIN_MIN", &
+                 description="Lower edge of the disentanglement outer energy window; defaults to the lowest exported eigenvalue.", &
+                          type_of_var=real_t, unit_str="eV")
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="DIS_WIN_MAX", &
+                description="Upper edge of the disentanglement outer energy window; defaults to the highest exported eigenvalue.", &
+                          type_of_var=real_t, unit_str="eV")
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="DIS_FROZ_MIN", &
+                          description="Lower edge of the frozen energy window. Requires DIS_FROZ_MAX; "// &
+                          "if omitted, the lower spectrum edge is used.", type_of_var=real_t, unit_str="eV")
+      CALL section_add_keyword(print_key, keyword)
+      CALL keyword_release(keyword)
+      CALL keyword_create(keyword, __LOCATION__, name="DIS_FROZ_MAX", &
+                          description="Upper edge of the frozen energy window. States inside this window "// &
+                          "must be retained in the optimized subspace.", type_of_var=real_t, unit_str="eV")
       CALL section_add_keyword(print_key, keyword)
       CALL keyword_release(keyword)
 

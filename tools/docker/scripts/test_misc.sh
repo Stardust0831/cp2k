@@ -31,6 +31,8 @@ unzip -q -d ./tools/minimax_tools/1_xData 1_xData.zip
 run_test ./tools/precommit/format_fortran_test.py
 run_test ./tools/minimax_tools/minimax_to_fortran_source.py --check
 run_test ./tools/docker/generate_dockerfiles.py --check
+run_test python3 -m unittest discover -s ./tools/blue_moon -p 'test_*.py'
+run_test python3 ./tools/regtesting/test_compare_wannier90_mmn.py
 
 # Test pao-ml training.
 # Passing example.pao twice to have enough samples to split off 20% for validation.
@@ -44,12 +46,15 @@ run_test ./tools/pao-ml/pao-validate.py --threshold=1e-5 --model="tests/QS/regte
 run_test ./tools/vibronic_spec/main.py ./tools/vibronic_spec/example/example_config.toml
 
 run_test mypy --strict ./tools/pao-ml/
+run_test mypy --strict ./tools/blue_moon/
+run_test mypy --strict ./tools/mace/create_cp2k_model.py
 run_test mypy --strict ./tools/minimax_tools/minimax_to_fortran_source.py
 run_test mypy --strict ./tools/dashboard/generate_dashboard.py
 run_test mypy --strict ./tools/regtesting/optimize_test_dirs.py
 run_test mypy --strict ./tools/regtesting/compare_wannier90_mmn.py
 run_test mypy --strict ./tools/regtesting/validate_wannier90_export.py
 run_test mypy --strict ./tools/precommit/precommit.py
+run_test mypy --strict ./tools/precommit/precommit_server.py
 run_test mypy --strict ./tools/precommit/check_file_properties.py
 run_test mypy --strict ./tools/precommit/format_makefile.py
 run_test mypy --strict ./tools/precommit/format_input_file.py

@@ -92,7 +92,7 @@ CONTAINS
                                                             iex, lb, natom, nbatch, ndo_mo, &
                                                             ndo_so, nex_atom, nsgfp, ri_atom, &
                                                             source, ub
-      INTEGER, DIMENSION(:), POINTER                     :: blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_size
       LOGICAL                                            :: do_coulomb, do_sc, do_sf, do_sg, do_tp, &
                                                             do_xc, found
       REAL(dp), DIMENSION(:, :), POINTER                 :: PQ
@@ -164,7 +164,8 @@ CONTAINS
 
             ! Broadcast the integrals to all procs (deleted after all donor states for this atoms are treated)
             lb = 1; IF (do_sf .AND. .NOT. do_sc) lb = 4
-            ub = 2; IF (do_sc) ub = 3; IF (do_sf) ub = 4
+            ub = 2; IF (do_sc) ub = 3
+            IF (do_sf) ub = 4
             DO i = lb, ub
                IF (.NOT. ASSOCIATED(xas_tdp_env%ri_fxc(ri_atom, i)%array)) THEN
                   ALLOCATE (xas_tdp_env%ri_fxc(ri_atom, i)%array(nsgfp, nsgfp))
@@ -216,7 +217,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(INOUT)                    :: coul_ker
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: contr1_int
       TYPE(dbcsr_distribution_type), POINTER             :: dist
-      INTEGER, DIMENSION(:), POINTER                     :: blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_size
       TYPE(xas_tdp_env_type), POINTER                    :: xas_tdp_env
       TYPE(xas_tdp_control_type), POINTER                :: xas_tdp_control
       TYPE(qs_environment_type), POINTER                 :: qs_env
@@ -282,7 +283,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(INOUT)                    :: xc_ker
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: contr1_int_PQ
       TYPE(dbcsr_distribution_type), POINTER             :: dist
-      INTEGER, DIMENSION(:), POINTER                     :: blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_size
       TYPE(donor_state_type), POINTER                    :: donor_state
       TYPE(xas_tdp_env_type), POINTER                    :: xas_tdp_env
       TYPE(xas_tdp_control_type), POINTER                :: xas_tdp_control
@@ -407,7 +408,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(INOUT)                    :: xc_ker
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: contr1_int_PQ
       TYPE(dbcsr_distribution_type), POINTER             :: dist
-      INTEGER, DIMENSION(:), POINTER                     :: blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_size
       TYPE(donor_state_type), POINTER                    :: donor_state
       TYPE(xas_tdp_env_type), POINTER                    :: xas_tdp_env
       TYPE(xas_tdp_control_type), POINTER                :: xas_tdp_control
@@ -495,7 +496,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(INOUT)                    :: sg_xc_ker, tp_xc_ker
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: contr1_int_PQ
       TYPE(dbcsr_distribution_type), POINTER             :: dist
-      INTEGER, DIMENSION(:), POINTER                     :: blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_size
       TYPE(donor_state_type), POINTER                    :: donor_state
       TYPE(xas_tdp_env_type), POINTER                    :: xas_tdp_env
       TYPE(xas_tdp_control_type), POINTER                :: xas_tdp_control
@@ -602,7 +603,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'kernel_exchange'
 
       INTEGER                                            :: handle
-      INTEGER, DIMENSION(:), POINTER                     :: blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_size
       LOGICAL                                            :: do_off_sc
       TYPE(dbcsr_distribution_type), POINTER             :: dist
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: contr1_int
@@ -662,7 +663,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(INOUT)                    :: ondiag_ex_ker
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: contr1_int
       TYPE(dbcsr_distribution_type), POINTER             :: dist
-      INTEGER, DIMENSION(:), POINTER                     :: blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_size
       TYPE(donor_state_type), POINTER                    :: donor_state
       TYPE(xas_tdp_env_type), POINTER                    :: xas_tdp_env
       TYPE(xas_tdp_control_type), POINTER                :: xas_tdp_control
@@ -671,7 +672,7 @@ CONTAINS
       INTEGER                                            :: group, iblk, iso, jblk, jso, nblk, &
                                                             ndo_mo, ndo_so, nsgfa, nsgfp, ri_atom, &
                                                             source
-      INTEGER, DIMENSION(:), POINTER                     :: col_dist, col_dist_work, row_dist, &
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: col_dist, col_dist_work, row_dist, &
                                                             row_dist_work
       INTEGER, DIMENSION(:, :), POINTER                  :: pgrid
       LOGICAL                                            :: do_roks, do_uks, found
@@ -823,7 +824,7 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(INOUT)                    :: offdiag_ex_ker
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: contr1_int
       TYPE(dbcsr_distribution_type), POINTER             :: dist
-      INTEGER, DIMENSION(:), POINTER                     :: blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: blk_size
       TYPE(donor_state_type), POINTER                    :: donor_state
       TYPE(xas_tdp_env_type), POINTER                    :: xas_tdp_env
       TYPE(xas_tdp_control_type), POINTER                :: xas_tdp_control
@@ -981,7 +982,7 @@ CONTAINS
 
       INTEGER                                            :: handle, i, imo, ispin, katom, kkind, &
                                                             natom, ndo_mo, ndo_so, nkind, nspins
-      INTEGER, DIMENSION(:), POINTER                     :: ri_blk_size, std_blk_size
+      INTEGER, CONTIGUOUS, DIMENSION(:), POINTER         :: ri_blk_size, std_blk_size
       LOGICAL                                            :: do_uks
       REAL(dp), DIMENSION(:, :), POINTER                 :: coeffs
       TYPE(dbcsr_distribution_type)                      :: opt_dbcsr_dist
@@ -1368,9 +1369,9 @@ CONTAINS
             ! If on-diagonal quadrants only, can skip jso < iso
             IF (.NOT. quadrants(2) .AND. jso < iso) CYCLE
 
-            i = iso; j = jso;
+            i = iso; j = jso
             IF (my_mt) THEN
-               i = jso; j = iso;
+               i = jso; j = iso
             END IF
 
             ! Take the product lhs*rhs^T

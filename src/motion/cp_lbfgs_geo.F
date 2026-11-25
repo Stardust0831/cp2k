@@ -11,7 +11,6 @@
 !>      01.2020 Space Group Symmetry introduced by Pierre-André Cazade [pcazade]
 ! **************************************************************************************************
 MODULE cp_lbfgs_geo
-   USE cell_types,                      ONLY: cell_type
    USE cp_external_control,             ONLY: external_control
    USE cp_lbfgs_optimizer_gopt,         ONLY: cp_lbfgs_opt_gopt_type,&
                                               cp_opt_gopt_create,&
@@ -23,7 +22,6 @@ MODULE cp_lbfgs_geo
    USE cp_output_handling,              ONLY: cp_iterate,&
                                               cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
-   USE cp_subsys_types,                 ONLY: cp_subsys_type
    USE force_env_types,                 ONLY: force_env_get,&
                                               force_env_type
    USE global_types,                    ONLY: global_environment_type
@@ -35,14 +33,9 @@ MODULE cp_lbfgs_geo
    USE gopt_param_types,                ONLY: gopt_param_type
    USE input_constants,                 ONLY: default_ts_method_id
    USE input_section_types,             ONLY: section_vals_type,&
-                                              section_vals_val_get,&
                                               section_vals_val_set
    USE kinds,                           ONLY: dp
    USE message_passing,                 ONLY: mp_para_env_type
-   USE space_groups,                    ONLY: identify_space_group,&
-                                              print_spgr,&
-                                              spgr_apply_rotations_coord
-   USE space_groups_types,              ONLY: spgr_type
 #include "../base/base_uses.f90"
 
    IMPLICIT NONE
@@ -80,42 +73,30 @@ CONTAINS
 
       INTEGER                                            :: handle, iter_nr, its, output_unit
       LOGICAL                                            :: converged, should_stop
-      TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_lbfgs_opt_gopt_type), POINTER              :: optimizer
       TYPE(cp_logger_type), POINTER                      :: logger
-      TYPE(cp_subsys_type), POINTER                      :: subsys
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(section_vals_type), POINTER                   :: root_section
-      TYPE(spgr_type), POINTER                           :: spgr
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (optimizer, para_env, spgr)
+      NULLIFY (optimizer, para_env)
       logger => cp_get_default_logger()
-      spgr => gopt_env%spgr
       root_section => force_env%root_section
       CPASSERT(ASSOCIATED(force_env))
       CPASSERT(ASSOCIATED(gopt_param))
 
-      ! collecting subsys
-      CALL force_env_get(force_env, para_env=para_env, cell=cell, subsys=subsys)
+      CALL force_env_get(force_env, para_env=para_env)
 
       ! Geometry optimization starts now
       output_unit = cp_print_key_unit_nr(logger, geo_section, "PRINT%PROGRAM_RUN_INFO", &
                                          extension=".geoLog")
       CALL print_geo_opt_header(gopt_env, output_unit, "L-BFGS")
 
-      ! finds space group
-      CALL section_vals_val_get(geo_section, "KEEP_SPACE_GROUP", l_val=spgr%keep_space_group)
-      IF (spgr%keep_space_group) THEN
-         CALL identify_space_group(subsys, geo_section, gopt_env, output_unit)
-         CALL spgr_apply_rotations_coord(spgr, x0)
-         CALL print_spgr(spgr)
-      END IF
-
       ! Stop if not implemented
-      IF (gopt_env%type_id == default_ts_method_id) &
-         CPABORT("BFGS method not yet working with DIMER")
+      IF (gopt_env%type_id == default_ts_method_id) THEN
+         CPABORT("L-BFGS method not yet working with DIMER")
+      END IF
 
       ALLOCATE (optimizer)
       CALL cp_opt_gopt_create(optimizer, para_env=para_env, obj_funct=gopt_env, &
@@ -136,7 +117,7 @@ CONTAINS
          ! Real optimization step..
          IF (.NOT. cp_opt_gopt_next(optimizer, geo_section=geo_section, &
                                     force_env=force_env, gopt_param=gopt_param, &
-                                    converged=converged, spgr=spgr)) EXIT
+                                    converged=converged)) EXIT
 
          ! Check for an external exit command
          CALL external_control(should_stop, "GEO", globenv=globenv)
@@ -147,15 +128,13 @@ CONTAINS
          IF (its == gopt_param%max_iter) EXIT
       END DO
 
-      IF ((its == gopt_param%max_iter) .AND. (.NOT. converged)) THEN
+      IF (optimizer%status == 5) THEN
+         IF (output_unit > 0) THEN
+            WRITE (output_unit, FMT="(/,T2,A)") "*** L-BFGS ABNORMAL EXIT: OPTIMIZATION NOT CONVERGED ***"
+            WRITE (output_unit, FMT="(T2,A)") "L-BFGS task: "//TRIM(optimizer%task)
+         END IF
+      ELSE IF ((its == gopt_param%max_iter) .AND. (.NOT. converged)) THEN
          CALL print_geo_opt_nc(gopt_env, output_unit)
-      END IF
-
-      ! show space_group
-      CALL section_vals_val_get(geo_section, "SHOW_SPACE_GROUP", l_val=spgr%show_space_group)
-      IF (spgr%show_space_group) THEN
-         CALL identify_space_group(subsys, geo_section, gopt_env, output_unit)
-         CALL print_spgr(spgr)
       END IF
 
       ! Write final output information, if converged

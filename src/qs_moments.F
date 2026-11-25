@@ -13,11 +13,9 @@
 ! **************************************************************************************************
 MODULE qs_moments
    USE ai_angmom, ONLY: angmom
-   USE ai_moments, ONLY: contract_cossin, &
-                         cossin, &
+   USE ai_moments, ONLY: contract_expikr, &
                          diff_momop, &
-                         diff_momop2, &
-                         diff_momop_velocity, &
+                         expikr, &
                          moment
    USE atomic_kind_types, ONLY: atomic_kind_type, &
                                 get_atomic_kind
@@ -28,32 +26,39 @@ MODULE qs_moments
    USE block_p_types, ONLY: block_p_type
    USE cell_types, ONLY: cell_type, &
                          pbc, &
+                         pbc_stable, &
                          get_cell
    USE commutator_rpnl, ONLY: build_com_mom_nl
    USE cp_blacs_env, ONLY: cp_blacs_env_type
    USE cp_cfm_basic_linalg, ONLY: cp_cfm_det
-   USE cp_cfm_types, ONLY: cp_cfm_create, &
+   USE cp_cfm_types, ONLY: cp_cfm_copy_general, &
+                           cp_cfm_create, &
+                           cp_cfm_get_element, &
                            cp_cfm_get_info, &
                            cp_cfm_release, &
+                           cp_cfm_to_fm, &
+                           cp_fm_to_cfm, &
                            cp_cfm_type
    USE cp_control_types, ONLY: dft_control_type
    USE cp_dbcsr_api, ONLY: &
       dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_distribution_type, &
-      dbcsr_get_block_p, dbcsr_get_info, dbcsr_init_p, dbcsr_multiply, dbcsr_p_type, &
+      dbcsr_get_block_p, dbcsr_get_info, dbcsr_get_matrix_type, dbcsr_init_p, dbcsr_multiply, dbcsr_p_type, &
       dbcsr_set, dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, dbcsr_type_symmetric
    USE cp_dbcsr_contrib, ONLY: dbcsr_dot, &
                                dbcsr_trace
    USE cp_dbcsr_cp2k_link, ONLY: cp_dbcsr_alloc_block_from_nbl
-   USE cp_dbcsr_operations, ONLY: cp_dbcsr_sm_fm_multiply, &
+   USE cp_dbcsr_operations, ONLY: copy_dbcsr_to_fm, &
+                                  cp_dbcsr_sm_fm_multiply, &
                                   dbcsr_allocate_matrix_set, &
                                   dbcsr_deallocate_matrix_set
+   USE cp_files, ONLY: close_file, &
+                       open_file
    USE cp_fm_struct, ONLY: cp_fm_struct_create, &
                            cp_fm_struct_double, &
                            cp_fm_struct_release, &
                            cp_fm_struct_type
    USE cp_fm_types, ONLY: cp_fm_copy_general, &
                           cp_fm_create, &
-                          cp_fm_get_element, &
                           cp_fm_get_info, &
                           cp_fm_release, &
                           cp_fm_set_all, &
@@ -61,15 +66,25 @@ MODULE qs_moments
    USE cp_result_methods, ONLY: cp_results_erase, &
                                 put_results
    USE cp_result_types, ONLY: cp_result_type
+   USE cp_units, ONLY: cp_ukind_dipole, &
+                       cp_unit_create, &
+                       cp_unit_from_cp2k, &
+                       cp_unit_from_cp2k1, &
+                       cp_unit_release, &
+                       cp_unit_type, &
+                       cp_units_au, &
+                       cp_units_c_m, &
+                       cp_units_debye, &
+                       cp_units_e_angstrom
    USE distribution_1d_types, ONLY: distribution_1d_type
+   USE input_constants, ONLY: use_mom_ref_coac
    USE kinds, ONLY: default_string_length, &
                     dp, &
                     max_line_length
    USE kpoint_k_r_trafo_simple, ONLY: replicate_rs_matrices, &
                                       rs_to_kp
    USE kpoint_methods, ONLY: kpoint_init_cell_index, &
-                             kpoint_initialize, &
-                             rskp_transform
+                             kpoint_initialize
    USE kpoint_types, ONLY: get_kpoint_info, &
                            kpoint_env_p_type, &
                            kpoint_env_type, &
@@ -80,23 +95,26 @@ MODULE qs_moments
    USE mathconstants, ONLY: pi, &
                             twopi, &
                             gaussi, &
+                            z_one, &
                             z_zero
    USE message_passing, ONLY: mp_para_env_type
+   USE parallel_gemm_api, ONLY: parallel_gemm
    USE moments_utils, ONLY: get_reference_point
    USE orbital_pointers, ONLY: current_maxl, &
                                indco, &
                                ncoset
-   USE parallel_gemm_api, ONLY: parallel_gemm
    USE particle_methods, ONLY: get_particle_set
    USE particle_types, ONLY: particle_type
-   USE physcon, ONLY: bohr, &
-                      debye, &
-                      angstrom
+   USE physcon, ONLY: angstrom
    USE qs_environment_types, ONLY: get_qs_env, &
                                    qs_environment_type
    USE qs_kind_types, ONLY: get_qs_kind, &
                             get_qs_kind_set, &
                             qs_kind_type
+   USE kpoint_transform, ONLY: rskp_prepared_transform_type, &
+                               rskp_transform_evaluate, &
+                               rskp_transform_prepare, &
+                               rskp_transform_release
    USE qs_ks_types, ONLY: get_ks_env, &
                           qs_ks_env_type
    USE qs_mo_types, ONLY: get_mo_set, &
@@ -107,12 +125,14 @@ MODULE qs_moments
                                      neighbor_list_iterator_p_type, &
                                      neighbor_list_iterator_release, &
                                      neighbor_list_set_p_type
-   USE qs_operators_ao, ONLY: build_lin_mom_matrix
+   USE qs_operators_ao, ONLY: build_exp_ikr_matrix, &
+                              build_lin_mom_matrix
    USE qs_overlap, ONLY: build_overlap_matrix
    USE qs_rho_types, ONLY: qs_rho_get, &
                            qs_rho_type
    USE rt_propagation_types, ONLY: get_rtp, &
                                    rt_prop_type
+   USE soc_pseudopotential_methods, ONLY: V_SOC_xyz_from_pseudopotential
    USE cp_parser_methods, ONLY: read_float_object
    USE input_section_types, ONLY: section_vals_get, &
                                   section_vals_get_subs_vals, &
@@ -131,454 +151,17 @@ MODULE qs_moments
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'qs_moments'
 
    ! Public subroutines
-   PUBLIC :: build_berry_moment_matrix, build_local_moment_matrix
+   PUBLIC :: build_berry_moment_matrix, build_local_moment_matrix, get_multipoles_ao
    PUBLIC :: build_berry_kpoint_matrix, build_local_magmom_matrix
    PUBLIC :: qs_moment_berry_phase, qs_moment_locop
    PUBLIC :: qs_moment_kpoints, build_local_moment_matrix_rs_img
-   PUBLIC :: qs_moment_kpoints_deep
+   PUBLIC :: qs_moment_kpoints_deep, qs_moment_kpoints_deep_soc
    PUBLIC :: qs_moment_kpoints_scf_mos
-   PUBLIC :: dipole_deriv_ao
    PUBLIC :: build_local_moments_der_matrix
-   PUBLIC :: build_dsdv_moments
-   PUBLIC :: dipole_velocity_deriv
    PUBLIC :: calculate_commutator_nl_terms, op_orbbas, op_orbbas_rtp, &
              print_moments, print_moments_nl, set_label
 
 CONTAINS
-
-! *****************************************************************************
-!> \brief This returns the derivative of the moment integrals [a|\mu|b], with respect
-!>        to the basis function on the right
-!>        difdip(beta, alpha) = < mu | r_beta | ∂_alpha nu >  * (mu - nu)
-!> \param qs_env ...
-!> \param difdip ...
-!> \param order The order of the derivative (1 for dipole moment)
-!> \param lambda The atom on which we take the derivative
-!> \param rc ...
-!> \author Edward Ditler
-! **************************************************************************************************
-   SUBROUTINE dipole_velocity_deriv(qs_env, difdip, order, lambda, rc)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(dbcsr_p_type), DIMENSION(:, :), INTENT(INOUT) :: difdip
-      INTEGER, INTENT(IN)                                :: order, lambda
-      REAL(KIND=dp), DIMENSION(3)                        :: rc
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'dipole_velocity_deriv'
-
-      INTEGER :: handle, i, iatom, icol, idir, ikind, inode, irow, iset, j, jatom, jkind, jset, &
-                 last_jatom, lda, ldab, ldb, M_dim, maxsgf, natom, ncoa, ncob, nkind, nseta, nsetb, sgfa, &
-                 sgfb
-      LOGICAL                                            :: found
-      REAL(dp)                                           :: dab
-      REAL(dp), DIMENSION(3)                             :: ra, rab, rac, rb, rbc
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: work
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: mab
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: difmab, difmab2
-      TYPE(block_p_type), ALLOCATABLE, DIMENSION(:, :)   :: mint, mint2
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_list
-      TYPE(gto_basis_set_type), POINTER                  :: basis_set_a, basis_set_b
-      TYPE(neighbor_list_iterator_p_type), &
-         DIMENSION(:), POINTER                           :: nl_iterator
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_all
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-      TYPE(qs_kind_type), POINTER                        :: qs_kind
-
-      CALL timeset(routineN, handle)
-
-      NULLIFY (cell, particle_set, qs_kind_set, sab_all)
-      CALL get_qs_env(qs_env, cell=cell, particle_set=particle_set, &
-                      qs_kind_set=qs_kind_set, sab_all=sab_all)
-      CALL get_qs_kind_set(qs_kind_set=qs_kind_set, &
-                           maxco=ldab, maxsgf=maxsgf)
-
-      nkind = SIZE(qs_kind_set)
-      natom = SIZE(particle_set)
-
-      M_dim = ncoset(order) - 1
-
-      ALLOCATE (basis_set_list(nkind))
-
-      ALLOCATE (mab(ldab, ldab, M_dim))
-      ALLOCATE (difmab2(ldab, ldab, M_dim, 3))
-      ALLOCATE (work(ldab, maxsgf))
-      ALLOCATE (mint(3, 3))
-      ALLOCATE (mint2(3, 3))
-
-      mab(1:ldab, 1:ldab, 1:M_dim) = 0.0_dp
-      difmab2(1:ldab, 1:ldab, 1:M_dim, 1:3) = 0.0_dp
-      work(1:ldab, 1:maxsgf) = 0.0_dp
-
-      DO i = 1, 3
-      DO j = 1, 3
-         NULLIFY (mint(i, j)%block)
-         NULLIFY (mint2(i, j)%block)
-      END DO
-      END DO
-
-      ! Set the basis_set_list(nkind) to point to the corresponding basis sets
-      DO ikind = 1, nkind
-         qs_kind => qs_kind_set(ikind)
-         CALL get_qs_kind(qs_kind=qs_kind, basis_set=basis_set_a)
-         IF (ASSOCIATED(basis_set_a)) THEN
-            basis_set_list(ikind)%gto_basis_set => basis_set_a
-         ELSE
-            NULLIFY (basis_set_list(ikind)%gto_basis_set)
-         END IF
-      END DO
-
-      CALL neighbor_list_iterator_create(nl_iterator, sab_all)
-      DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
-         CALL get_iterator_info(nl_iterator, ikind=ikind, jkind=jkind, inode=inode, &
-                                iatom=iatom, jatom=jatom, r=rab)
-
-         basis_set_a => basis_set_list(ikind)%gto_basis_set
-         basis_set_b => basis_set_list(jkind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis_set_a)) CYCLE
-         IF (.NOT. ASSOCIATED(basis_set_b)) CYCLE
-
-         ASSOCIATE ( &
-            ! basis ikind
-            first_sgfa => basis_set_a%first_sgf, &
-            la_max => basis_set_a%lmax, &
-            la_min => basis_set_a%lmin, &
-            npgfa => basis_set_a%npgf, &
-            nsgfa => basis_set_a%nsgf_set, &
-            rpgfa => basis_set_a%pgf_radius, &
-            set_radius_a => basis_set_a%set_radius, &
-            sphi_a => basis_set_a%sphi, &
-            zeta => basis_set_a%zet, &
-            ! basis jkind, &
-            first_sgfb => basis_set_b%first_sgf, &
-            lb_max => basis_set_b%lmax, &
-            lb_min => basis_set_b%lmin, &
-            npgfb => basis_set_b%npgf, &
-            nsgfb => basis_set_b%nsgf_set, &
-            rpgfb => basis_set_b%pgf_radius, &
-            set_radius_b => basis_set_b%set_radius, &
-            sphi_b => basis_set_b%sphi, &
-            zetb => basis_set_b%zet)
-
-            nseta = basis_set_a%nset
-            nsetb = basis_set_b%nset
-
-            IF (inode == 1) last_jatom = 0
-
-            ! this guarantees minimum image convention
-            ! anything else would not make sense
-            IF (jatom == last_jatom) THEN
-               CYCLE
-            END IF
-
-            last_jatom = jatom
-
-            irow = iatom
-            icol = jatom
-
-            DO i = 1, 3
-            DO j = 1, 3
-               NULLIFY (mint(i, j)%block)
-               CALL dbcsr_get_block_p(matrix=difdip(i, j)%matrix, &
-                                      row=irow, col=icol, BLOCK=mint(i, j)%block, &
-                                      found=found)
-               CPASSERT(found)
-               mint(i, j)%block = 0._dp
-            END DO
-            END DO
-
-            ! With and without MIC, rab(:) is the vector giving us the coordinates of rb.
-            ra = pbc(particle_set(iatom)%r(:), cell)
-            rb(:) = ra(:) + rab(:)
-            rac = pbc(rc, ra, cell)
-            rbc = rac + rab
-            dab = norm2(rab)
-
-            DO iset = 1, nseta
-               ncoa = npgfa(iset)*ncoset(la_max(iset))
-               sgfa = first_sgfa(1, iset)
-               DO jset = 1, nsetb
-                  IF (set_radius_a(iset) + set_radius_b(jset) < dab) CYCLE
-                  ncob = npgfb(jset)*ncoset(lb_max(jset))
-                  sgfb = first_sgfb(1, jset)
-                  ldab = MAX(ncoa, ncob)
-                  lda = ncoset(la_max(iset))*npgfa(iset)
-                  ldb = ncoset(lb_max(jset))*npgfb(jset)
-                  ALLOCATE (difmab(lda, ldb, M_dim, 3))
-
-                  ! Calculate integral difmab(beta, alpha) = (a|r_beta|db_alpha)
-                  ! difmab(beta, alpha) = < a | r_beta | ∂_alpha b >
-                  ! difmab(j, idir) = < a | r_j | ∂_idir b >
-                  CALL diff_momop_velocity(la_max(iset), npgfa(iset), zeta(:, iset), &
-                                           rpgfa(:, iset), la_min(iset), lb_max(jset), npgfb(jset), &
-                                           zetb(:, jset), rpgfb(:, jset), lb_min(jset), order, rac, rbc, &
-                                           difmab, lambda=lambda, iatom=iatom, jatom=jatom)
-
-                  !                  *** Contraction step ***
-
-                  DO idir = 1, 3 ! derivative of AO function
-                  DO j = 1, 3     ! position operator r_j
-                     CALL dgemm("N", "N", ncoa, nsgfb(jset), ncob, &
-                                1.0_dp, difmab(1, 1, j, idir), SIZE(difmab, 1), &
-                                sphi_b(1, sgfb), SIZE(sphi_b, 1), &
-                                0.0_dp, work(1, 1), SIZE(work, 1))
-
-                     CALL dgemm("T", "N", nsgfa(iset), nsgfb(jset), ncoa, &
-                                1.0_dp, sphi_a(1, sgfa), SIZE(sphi_a, 1), &
-                                work(1, 1), SIZE(work, 1), &
-                                1.0_dp, mint(j, idir)%block(sgfa, sgfb), &
-                                SIZE(mint(j, idir)%block, 1))
-                  END DO !j
-                  END DO !idir
-                  DEALLOCATE (difmab)
-               END DO !jset
-            END DO !iset
-         END ASSOCIATE
-      END DO!iterator
-
-      CALL neighbor_list_iterator_release(nl_iterator)
-
-      DO i = 1, 3
-      DO j = 1, 3
-         NULLIFY (mint(i, j)%block)
-      END DO
-      END DO
-
-      DEALLOCATE (mab, difmab2, basis_set_list, work, mint, mint2)
-
-      CALL timestop(handle)
-   END SUBROUTINE dipole_velocity_deriv
-
-! **************************************************************************************************
-!> \brief Builds the moments for the derivative of the overlap with respect to nuclear velocities
-!> \param qs_env ...
-!> \param moments ...
-!> \param nmoments ...
-!> \param ref_point ...
-!> \param ref_points ...
-!> \param basis_type ...
-!> \author Edward Ditler
-! **************************************************************************************************
-   SUBROUTINE build_dsdv_moments(qs_env, moments, nmoments, ref_point, ref_points, basis_type)
-
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(dbcsr_p_type), DIMENSION(:)                   :: moments
-      INTEGER, INTENT(IN)                                :: nmoments
-      REAL(KIND=dp), DIMENSION(:), INTENT(IN), OPTIONAL  :: ref_point
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN), &
-         OPTIONAL                                        :: ref_points
-      CHARACTER(len=*), OPTIONAL                         :: basis_type
-
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'build_dsdv_moments'
-
-      INTEGER :: handle, i, iatom, icol, ikind, inode, irow, iset, jatom, jkind, jset, last_jatom, &
-                 maxco, maxsgf, natom, ncoa, ncob, nkind, nm, nseta, nsetb, sgfa, sgfb
-      INTEGER, DIMENSION(3)                              :: image_cell
-      LOGICAL                                            :: found
-      REAL(KIND=dp)                                      :: dab
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: work
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: mab
-      REAL(KIND=dp), DIMENSION(3)                        :: ra, rab, rac, rb, rbc, rc
-      TYPE(block_p_type), ALLOCATABLE, DIMENSION(:)      :: mint
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_list
-      TYPE(gto_basis_set_type), POINTER                  :: basis_set_a, basis_set_b
-      TYPE(neighbor_list_iterator_p_type), &
-         DIMENSION(:), POINTER                           :: nl_iterator
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_orb
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-      TYPE(qs_kind_type), POINTER                        :: qs_kind
-
-      IF (nmoments < 1) RETURN
-
-      CALL timeset(routineN, handle)
-
-      NULLIFY (qs_kind_set, cell, particle_set, sab_orb)
-
-      nm = (6 + 11*nmoments + 6*nmoments**2 + nmoments**3)/6 - 1
-      CPASSERT(SIZE(moments) >= nm)
-
-      NULLIFY (qs_kind_set, particle_set, sab_orb, cell)
-      CALL get_qs_env(qs_env=qs_env, &
-                      qs_kind_set=qs_kind_set, &
-                      particle_set=particle_set, cell=cell, &
-                      sab_orb=sab_orb)
-
-      nkind = SIZE(qs_kind_set)
-      natom = SIZE(particle_set)
-
-      ! Allocate work storage
-      CALL get_qs_kind_set(qs_kind_set=qs_kind_set, &
-                           maxco=maxco, maxsgf=maxsgf, &
-                           basis_type=basis_type)
-
-      ALLOCATE (mab(maxco, maxco, nm))
-      mab(:, :, :) = 0.0_dp
-
-      ALLOCATE (work(maxco, maxsgf))
-      work(:, :) = 0.0_dp
-
-      ALLOCATE (mint(nm))
-      DO i = 1, nm
-         NULLIFY (mint(i)%block)
-      END DO
-
-      ALLOCATE (basis_set_list(nkind))
-      DO ikind = 1, nkind
-         qs_kind => qs_kind_set(ikind)
-         CALL get_qs_kind(qs_kind=qs_kind, basis_set=basis_set_a, basis_type=basis_type)
-         IF (ASSOCIATED(basis_set_a)) THEN
-            basis_set_list(ikind)%gto_basis_set => basis_set_a
-         ELSE
-            NULLIFY (basis_set_list(ikind)%gto_basis_set)
-         END IF
-      END DO
-      CALL neighbor_list_iterator_create(nl_iterator, sab_orb)
-      DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
-         CALL get_iterator_info(nl_iterator, ikind=ikind, jkind=jkind, inode=inode, &
-                                iatom=iatom, jatom=jatom, r=rab, cell=image_cell)
-         basis_set_a => basis_set_list(ikind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis_set_a)) CYCLE
-         basis_set_b => basis_set_list(jkind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis_set_b)) CYCLE
-         ! basis ikind
-         ASSOCIATE ( &
-            first_sgfa => basis_set_a%first_sgf, &
-            la_max => basis_set_a%lmax, &
-            la_min => basis_set_a%lmin, &
-            npgfa => basis_set_a%npgf, &
-            nsgfa => basis_set_a%nsgf_set, &
-            rpgfa => basis_set_a%pgf_radius, &
-            set_radius_a => basis_set_a%set_radius, &
-            sphi_a => basis_set_a%sphi, &
-            zeta => basis_set_a%zet, &
-            ! basis jkind, &
-            first_sgfb => basis_set_b%first_sgf, &
-            lb_max => basis_set_b%lmax, &
-            lb_min => basis_set_b%lmin, &
-            npgfb => basis_set_b%npgf, &
-            nsgfb => basis_set_b%nsgf_set, &
-            rpgfb => basis_set_b%pgf_radius, &
-            set_radius_b => basis_set_b%set_radius, &
-            sphi_b => basis_set_b%sphi, &
-            zetb => basis_set_b%zet)
-
-            nseta = basis_set_a%nset
-            nsetb = basis_set_b%nset
-
-            IF (inode == 1) last_jatom = 0
-
-            ! this guarantees minimum image convention
-            ! anything else would not make sense
-            IF (jatom == last_jatom) THEN
-               CYCLE
-            END IF
-
-            last_jatom = jatom
-
-            IF (iatom <= jatom) THEN
-               irow = iatom
-               icol = jatom
-            ELSE
-               irow = jatom
-               icol = iatom
-            END IF
-
-            DO i = 1, nm
-               NULLIFY (mint(i)%block)
-               CALL dbcsr_get_block_p(matrix=moments(i)%matrix, &
-                                      row=irow, col=icol, BLOCK=mint(i)%block, found=found)
-               mint(i)%block = 0._dp
-            END DO
-
-            ! fold atomic position back into unit cell
-            IF (PRESENT(ref_points)) THEN
-               rc(:) = 0.5_dp*(ref_points(:, iatom) + ref_points(:, jatom))
-            ELSE IF (PRESENT(ref_point)) THEN
-               rc(:) = ref_point(:)
-            ELSE
-               rc(:) = 0._dp
-            END IF
-            ! using PBC here might screw a molecule that fits the box (but e.g. hasn't been shifted by center_molecule)
-            ! by folding around the center, such screwing can be avoided for a proper choice of center.
-            ! we dont use PBC at this point
-
-            ! With and without MIC, rab(:) is the vector giving us the coordinates of rb.
-            ra(:) = particle_set(iatom)%r(:)
-            rb(:) = ra(:) + rab(:)
-            rac = pbc(rc, ra, cell)
-            rbc = rac + rab
-
-            dab = NORM2(rab)
-
-            DO iset = 1, nseta
-
-               ncoa = npgfa(iset)*ncoset(la_max(iset))
-               sgfa = first_sgfa(1, iset)
-
-               DO jset = 1, nsetb
-
-                  IF (set_radius_a(iset) + set_radius_b(jset) < dab) CYCLE
-
-                  ncob = npgfb(jset)*ncoset(lb_max(jset))
-                  sgfb = first_sgfb(1, jset)
-
-                  ! Calculate the primitive integrals
-                  CALL moment(la_max(iset), npgfa(iset), zeta(:, iset), &
-                              rpgfa(:, iset), la_min(iset), &
-                              lb_max(jset), npgfb(jset), zetb(:, jset), &
-                              rpgfb(:, jset), nmoments, rac, rbc, mab)
-
-                  ! Contraction step
-                  DO i = 1, nm
-
-                     CALL dgemm("N", "N", ncoa, nsgfb(jset), ncob, &
-                                1.0_dp, mab(1, 1, i), SIZE(mab, 1), &
-                                sphi_b(1, sgfb), SIZE(sphi_b, 1), &
-                                0.0_dp, work(1, 1), SIZE(work, 1))
-
-                     IF (iatom <= jatom) THEN
-
-                        CALL dgemm("T", "N", nsgfa(iset), nsgfb(jset), ncoa, &
-                                   1.0_dp, sphi_a(1, sgfa), SIZE(sphi_a, 1), &
-                                   work(1, 1), SIZE(work, 1), &
-                                   1.0_dp, mint(i)%block(sgfa, sgfb), &
-                                   SIZE(mint(i)%block, 1))
-
-                     ELSE
-
-                        CALL dgemm("T", "N", nsgfb(jset), nsgfa(iset), ncoa, &
-                                   1.0_dp, work(1, 1), SIZE(work, 1), &
-                                   sphi_a(1, sgfa), SIZE(sphi_a, 1), &
-                                   1.0_dp, mint(i)%block(sgfb, sgfa), &
-                                   SIZE(mint(i)%block, 1))
-
-                     END IF
-
-                  END DO
-
-               END DO
-            END DO
-         END ASSOCIATE
-
-      END DO ! iterator
-
-      CALL neighbor_list_iterator_release(nl_iterator)
-
-      ! Release work storage
-      DEALLOCATE (mab, basis_set_list)
-      DEALLOCATE (work)
-      DO i = 1, nm
-         NULLIFY (mint(i)%block)
-      END DO
-      DEALLOCATE (mint)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE build_dsdv_moments
 
 ! **************************************************************************************************
 !> \brief ...
@@ -588,8 +171,13 @@ CONTAINS
 !> \param ref_point ...
 !> \param ref_points ...
 !> \param basis_type ...
+!> \param all_images accumulate all neighbor images belonging to one atom pair
+!> \param minimum_image apply the half-cell image filter
+!> \param neighbor_image preserve the neighbor-list image geometry
+!> \param first_component first Cartesian moment component to write
 ! **************************************************************************************************
-   SUBROUTINE build_local_moment_matrix(qs_env, moments, nmoments, ref_point, ref_points, basis_type)
+   SUBROUTINE build_local_moment_matrix(qs_env, moments, nmoments, ref_point, ref_points, basis_type, &
+                                        all_images, minimum_image, neighbor_image, first_component)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: moments
@@ -598,13 +186,17 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(IN), &
          OPTIONAL                                        :: ref_points
       CHARACTER(len=*), OPTIONAL                         :: basis_type
+      LOGICAL, OPTIONAL                                   :: all_images, minimum_image, neighbor_image
+      INTEGER, OPTIONAL                                   :: first_component
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_local_moment_matrix'
 
-      INTEGER :: handle, i, iatom, icol, ikind, inode, irow, iset, jatom, jkind, jset, last_jatom, &
-                 maxco, maxsgf, natom, ncoa, ncob, nkind, nm, nseta, nsetb, sgfa, sgfb
-      LOGICAL                                            :: found
+      INTEGER :: component_start, handle, i, iatom, icol, ikind, inode, irow, iset, jatom, jkind, jset, &
+                 last_jatom, maxco, maxsgf, ncoa, ncob, nkind, nm, nseta, nsetb, sgfa, sgfb
+      LOGICAL                                            :: found, my_all_images, my_minimum_image, &
+                                                            my_neighbor_image, new_atom_pair
       REAL(KIND=dp)                                      :: dab
+      REAL(KIND=dp), DIMENSION(3)                        :: half_cell
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: work
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: mab
       REAL(KIND=dp), DIMENSION(3)                        :: ra, rab, rac, rb, rbc, rc
@@ -624,10 +216,18 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (qs_kind_set, cell, particle_set, sab_orb)
+      my_all_images = .FALSE.
+      IF (PRESENT(all_images)) my_all_images = all_images
+      my_minimum_image = .FALSE.
+      IF (PRESENT(minimum_image)) my_minimum_image = minimum_image
+      my_neighbor_image = .FALSE.
+      IF (PRESENT(neighbor_image)) my_neighbor_image = neighbor_image
 
       nm = (6 + 11*nmoments + 6*nmoments**2 + nmoments**3)/6 - 1
       CPASSERT(SIZE(moments) >= nm)
+      component_start = 1
+      IF (PRESENT(first_component)) component_start = first_component
+      CPASSERT(component_start >= 1 .AND. component_start <= nm)
 
       NULLIFY (qs_kind_set, particle_set, sab_orb, cell)
       CALL get_qs_env(qs_env=qs_env, &
@@ -635,9 +235,11 @@ CONTAINS
                       particle_set=particle_set, cell=cell, &
                       sab_orb=sab_orb)
 
-      nkind = SIZE(qs_kind_set)
-      natom = SIZE(particle_set)
+      IF (my_minimum_image) THEN
+         half_cell = 0.5_dp*NORM2(cell%hmat, DIM=1)
+      END IF
 
+      nkind = SIZE(qs_kind_set)
       ! Allocate work storage
       CALL get_qs_kind_set(qs_kind_set=qs_kind_set, &
                            maxco=maxco, maxsgf=maxsgf, &
@@ -650,7 +252,7 @@ CONTAINS
       work(:, :) = 0.0_dp
 
       ALLOCATE (mint(nm))
-      DO i = 1, nm
+      DO i = component_start, nm
          NULLIFY (mint(i)%block)
       END DO
 
@@ -699,30 +301,36 @@ CONTAINS
 
             IF (inode == 1) last_jatom = 0
 
-            ! this guarantees minimum image convention
-            ! anything else would not make sense
-            IF (jatom == last_jatom) THEN
+            IF (my_minimum_image) THEN
+               IF (ANY(ABS(rab(:)) > half_cell(:))) CYCLE
+            END IF
+
+            new_atom_pair = jatom /= last_jatom
+            IF (.NOT. my_all_images .AND. .NOT. new_atom_pair) THEN
                CYCLE
             END IF
 
-            last_jatom = jatom
+            IF (new_atom_pair) THEN
+               last_jatom = jatom
 
-            IF (iatom <= jatom) THEN
-               irow = iatom
-               icol = jatom
-            ELSE
-               irow = jatom
-               icol = iatom
+               IF (iatom <= jatom) THEN
+                  irow = iatom
+                  icol = jatom
+               ELSE
+                  irow = jatom
+                  icol = iatom
+               END IF
+
+               DO i = component_start, nm
+                  NULLIFY (mint(i)%block)
+                  CALL dbcsr_get_block_p(matrix=moments(i)%matrix, &
+                                         row=irow, col=icol, BLOCK=mint(i)%block, found=found)
+                  CPASSERT(found .AND. ASSOCIATED(mint(i)%block))
+                  mint(i)%block = 0._dp
+               END DO
             END IF
 
-            DO i = 1, nm
-               NULLIFY (mint(i)%block)
-               CALL dbcsr_get_block_p(matrix=moments(i)%matrix, &
-                                      row=irow, col=icol, BLOCK=mint(i)%block, found=found)
-               mint(i)%block = 0._dp
-            END DO
-
-            ! fold atomic position back into unit cell
+            ! Reference point and image geometry.
             IF (PRESENT(ref_points)) THEN
                rc(:) = 0.5_dp*(ref_points(:, iatom) + ref_points(:, jatom))
             ELSE IF (PRESENT(ref_point)) THEN
@@ -730,15 +338,34 @@ CONTAINS
             ELSE
                rc(:) = 0._dp
             END IF
-            ! using PBC here might screw a molecule that fits the box (but e.g. hasn't been shifted by center_molecule)
-            ! by folding around the center, such screwing can be avoided for a proper choice of center.
-            ra(:) = pbc(particle_set(iatom)%r(:) - rc, cell) + rc
-            rb(:) = pbc(particle_set(jatom)%r(:) - rc, cell) + rc
-            ! we dont use PBC at this point
-            rab(:) = ra(:) - rb(:)
-            rac(:) = ra(:) - rc(:)
-            rbc(:) = rb(:) - rc(:)
-            dab = NORM2(rab)
+
+            IF (my_all_images) THEN
+               ! Keep the image represented by the current neighbor-list node.
+               ra(:) = pbc(particle_set(iatom)%r(:), cell)
+               rb(:) = ra(:) + rab(:)
+               rac(:) = pbc(rc, ra, cell)
+               IF (my_neighbor_image) THEN
+                  rbc(:) = rac(:) + rab(:)
+               ELSE
+                  rbc(:) = pbc(rc, rb, cell)
+               END IF
+               dab = NORM2(rab)
+            ELSE IF (my_neighbor_image) THEN
+               ! Keep the neighbor-list image while selecting one atom-pair representative.
+               ra(:) = particle_set(iatom)%r(:)
+               rb(:) = ra(:) + rab(:)
+               rac(:) = pbc(rc, ra, cell)
+               rbc(:) = rac(:) + rab(:)
+               dab = NORM2(rab)
+            ELSE
+               ! Fold atomic positions around the reference point.
+               ra(:) = pbc(particle_set(iatom)%r(:) - rc, cell) + rc
+               rb(:) = pbc(particle_set(jatom)%r(:) - rc, cell) + rc
+               rab(:) = ra(:) - rb(:)
+               rac(:) = ra(:) - rc(:)
+               rbc(:) = rb(:) - rc(:)
+               dab = NORM2(rab)
+            END IF
 
             DO iset = 1, nseta
 
@@ -759,7 +386,7 @@ CONTAINS
                               rpgfb(:, jset), nmoments, rac, rbc, mab)
 
                   ! Contraction step
-                  DO i = 1, nm
+                  DO i = component_start, nm
 
                      CALL dgemm("N", "N", ncoa, nsgfb(jset), ncob, &
                                 1.0_dp, mab(1, 1, i), SIZE(mab, 1), &
@@ -796,7 +423,7 @@ CONTAINS
       ! Release work storage
       DEALLOCATE (mab, basis_set_list)
       DEALLOCATE (work)
-      DO i = 1, nm
+      DO i = component_start, nm
          NULLIFY (mint(i)%block)
       END DO
       DEALLOCATE (mint)
@@ -804,6 +431,54 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE build_local_moment_matrix
+
+! **************************************************************************************************
+!> \brief The AO multipoles M^k_µν = <φ_µ|(r - r_0)^k|φ_ν> of every order up to n_moments, on the
+!>        block pattern of the overlap, about r_0, the centre of atomic charges;
+!>        k = x, y, z for order 1, then xx, xy, xz, yy, yz, zz for order 2
+!> \param qs_env source of the basis, the geometry and the overlap's block pattern
+!> \param n_moments highest order, 1 for dipoles, 2 adds quadrupoles
+!> \param matrix_multipole M^k_µν, one entry per component k, allocated here; the caller releases it
+!> \param rpoint r_0
+! **************************************************************************************************
+   SUBROUTINE get_multipoles_ao(qs_env, n_moments, matrix_multipole, rpoint)
+
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      INTEGER, INTENT(IN)                                :: n_moments
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_multipole
+      REAL(KIND=dp), DIMENSION(3), INTENT(OUT)           :: rpoint
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'get_multipoles_ao'
+
+      INTEGER                                            :: handle, idir, n_multipole
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
+      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_orb
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (matrix_s, sab_orb, ref_point)
+      CALL get_qs_env(qs_env, matrix_s=matrix_s, sab_orb=sab_orb)
+
+      ! components of every order up to n_moments: 3 dipoles, then 6 quadrupoles
+      n_multipole = (6 + 11*n_moments + 6*n_moments**2 + n_moments**3)/6 - 1
+      NULLIFY (matrix_multipole)
+      CALL dbcsr_allocate_matrix_set(matrix_multipole, n_multipole)
+      DO idir = 1, n_multipole
+         CALL dbcsr_init_p(matrix_multipole(idir)%matrix)
+         CALL dbcsr_create(matrix_multipole(idir)%matrix, name="ao_multipole", &
+                           template=matrix_s(1)%matrix, matrix_type=dbcsr_type_symmetric)
+         CALL cp_dbcsr_alloc_block_from_nbl(matrix_multipole(idir)%matrix, sab_orb)
+         CALL dbcsr_set(matrix_multipole(idir)%matrix, 0._dp)
+      END DO
+
+      CALL get_reference_point(rpoint, qs_env=qs_env, reference=use_mom_ref_coac, ref_point=ref_point)
+      CALL build_local_moment_matrix(qs_env, matrix_multipole, n_moments, ref_point=rpoint)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE get_multipoles_ao
 
 ! **************************************************************************************************
 !> \brief Calculate right-hand sided derivatives of multipole moments, e. g. < a | xy d/dz | b >
@@ -817,11 +492,16 @@ CONTAINS
 !>        build_local_moment_matrix, needs moments as arguments to store results)
 !> \param ref_point ...
 !> \param moments contains the multipole moments, optionally for free, up to order nmoments
-!> \note
-!>        Adapted from rRc_xyz_der_ao in qs_operators_ao
+!> \param basis_type basis set used for the integral evaluation
+!> \param minimum_image apply the half-cell image filter
+!> \param ordered use ordered neighbor blocks and, for ordinary derivatives, the full neighbor list
+!> \param lambda optional atom selector for the right-hand derivative
+!> \param deltaR optional weights for left and right nuclear-coordinate derivatives
+!> \param neighbor_image use the neighbor-list image for coordinate construction
 ! **************************************************************************************************
    SUBROUTINE build_local_moments_der_matrix(qs_env, moments_der, nmoments_der, nmoments, &
-                                             ref_point, moments)
+                                             ref_point, moments, basis_type, minimum_image, ordered, lambda, &
+                                             deltaR, neighbor_image)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(dbcsr_p_type), DIMENSION(:, :), &
          INTENT(INOUT), POINTER                          :: moments_der
@@ -829,14 +509,21 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(IN), OPTIONAL  :: ref_point
       TYPE(dbcsr_p_type), DIMENSION(:), INTENT(INOUT), &
          OPTIONAL, POINTER                               :: moments
+      CHARACTER(len=*), OPTIONAL                         :: basis_type
+      LOGICAL, OPTIONAL                                   :: minimum_image, ordered
+      INTEGER, OPTIONAL                                   :: lambda
+      REAL(KIND=dp), DIMENSION(:, :), OPTIONAL, POINTER  :: deltaR
+      LOGICAL, OPTIONAL                                   :: neighbor_image
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_local_moments_der_matrix'
 
       INTEGER :: dimders, handle, i, iatom, icol, ider, ii, ikind, inode, ipgf, irow, iset, j, &
-                 jatom, jkind, jpgf, jset, last_jatom, M_dim, maxco, maxsgf, na, nb, ncoa, ncob, nda, ndb, &
+                 jatom, jkind, jpgf, jset, last_jatom, lda_min, M_dim, maxco, maxsgf, na, nb, ncoa, ncob, nda, ndb, &
                  nders, nkind, nm, nmom_build, nseta, nsetb, sgfa, sgfb
-      LOGICAL                                            :: found
-      REAL(KIND=dp)                                      :: dab
+      LOGICAL                                            :: accumulate_images, found, my_minimum_image, my_neighbor_image, &
+                                                            my_ordered, new_atom_pair
+      REAL(KIND=dp)                                      :: dab, derivative_sign
+      REAL(KIND=dp), DIMENSION(3)                        :: half_cell
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: work
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: mab
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: difmab
@@ -850,7 +537,7 @@ CONTAINS
       TYPE(neighbor_list_iterator_p_type), &
          DIMENSION(:), POINTER                           :: nl_iterator
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_orb
+         POINTER                                         :: sab_all, sab_orb
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(qs_kind_type), POINTER                        :: qs_kind
@@ -863,21 +550,55 @@ CONTAINS
       nders = 1                                    ! only first order derivatives
       dimders = ncoset(nders) - 1
 
-      NULLIFY (qs_kind_set, particle_set, sab_orb, cell)
+      my_minimum_image = .FALSE.
+      IF (PRESENT(minimum_image)) my_minimum_image = minimum_image
+      my_ordered = .FALSE.
+      IF (PRESENT(ordered)) my_ordered = ordered
+      my_neighbor_image = my_ordered
+      IF (PRESENT(neighbor_image)) my_neighbor_image = neighbor_image
+      CPASSERT(.NOT. (PRESENT(deltaR) .AND. PRESENT(lambda)))
+      IF (PRESENT(lambda) .OR. PRESENT(deltaR)) THEN
+         CPASSERT(my_ordered)
+      END IF
+      accumulate_images = my_ordered .AND. my_neighbor_image
+      IF (PRESENT(deltaR) .OR. PRESENT(lambda)) accumulate_images = .FALSE.
+      derivative_sign = 1._dp
+      ! diff_momop returns the right nuclear-center derivative. The former
+      ! rRc_xyz_der_ao interface exposed the corresponding electronic derivative
+      ! on the ordinary ordered path.
+      IF (my_ordered .AND. .NOT. PRESENT(deltaR) .AND. .NOT. PRESENT(lambda)) THEN
+         derivative_sign = -1._dp
+      END IF
+
+      NULLIFY (qs_kind_set, particle_set, sab_all, sab_orb, cell)
       CALL get_qs_env(qs_env=qs_env, &
                       qs_kind_set=qs_kind_set, &
                       particle_set=particle_set, &
                       cell=cell, &
-                      sab_orb=sab_orb)
+                      sab_orb=sab_orb, &
+                      sab_all=sab_all)
+
+      IF (my_ordered) THEN
+         CPASSERT(nmoments_der > 0)
+         CPASSERT(dbcsr_get_matrix_type(moments_der(1, 1)%matrix) == dbcsr_type_no_symmetry)
+         IF (nmoments > 0) THEN
+            CPASSERT(PRESENT(moments))
+            CPASSERT(dbcsr_get_matrix_type(moments(1)%matrix) == dbcsr_type_no_symmetry)
+         END IF
+      END IF
+
+      IF (my_minimum_image) THEN
+         half_cell = 0.5_dp*NORM2(cell%hmat, DIM=1)
+      END IF
 
       nkind = SIZE(qs_kind_set)
 
       ! Work storage
       CALL get_qs_kind_set(qs_kind_set=qs_kind_set, &
-                           maxco=maxco, maxsgf=maxsgf)
+                           maxco=maxco, maxsgf=maxsgf, &
+                           basis_type=basis_type)
 
       IF (nmoments > 0) THEN
-         CPASSERT(PRESENT(moments))
          nm = (6 + 11*nmoments + 6*nmoments**2 + nmoments**3)/6 - 1
          CPASSERT(SIZE(moments) == nm)
          ! storage for integrals
@@ -914,7 +635,7 @@ CONTAINS
       ALLOCATE (basis_set_list(nkind))
       DO ikind = 1, nkind
          qs_kind => qs_kind_set(ikind)
-         CALL get_qs_kind(qs_kind=qs_kind, basis_set=basis_set_a)
+         CALL get_qs_kind(qs_kind=qs_kind, basis_set=basis_set_a, basis_type=basis_type)
          IF (ASSOCIATED(basis_set_a)) THEN
             basis_set_list(ikind)%gto_basis_set => basis_set_a
          ELSE
@@ -924,7 +645,11 @@ CONTAINS
 
       ! Calculate derivatives looping over neighbour list
       NULLIFY (nl_iterator)
-      CALL neighbor_list_iterator_create(nl_iterator, sab_orb)
+      IF (my_ordered) THEN
+         CALL neighbor_list_iterator_create(nl_iterator, sab_all)
+      ELSE
+         CALL neighbor_list_iterator_create(nl_iterator, sab_orb)
+      END IF
       DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
          CALL get_iterator_info(nl_iterator, ikind=ikind, jkind=jkind, inode=inode, &
                                 iatom=iatom, jatom=jatom, r=rab)
@@ -954,8 +679,62 @@ CONTAINS
             sphi_b => basis_set_b%sphi, &
             zetb => basis_set_b%zet)
 
+            IF (SIZE(sphi_a, 1) == 0) CYCLE
+            IF (SIZE(sphi_b, 1) == 0) CYCLE
+
             nseta = basis_set_a%nset
             nsetb = basis_set_b%nset
+
+            IF (inode == 1) last_jatom = 0
+
+            IF (my_minimum_image) THEN
+               IF (ANY(ABS(rab(:)) > half_cell(:))) CYCLE
+            END IF
+
+            new_atom_pair = jatom /= last_jatom
+            ! The ordinary ordered neighbor-image path accumulates all images for one atom pair.
+            ! Specialized derivative paths select one representative image, as in the former builders.
+            IF (.NOT. accumulate_images .AND. .NOT. new_atom_pair) CYCLE
+
+            IF (new_atom_pair) THEN
+               last_jatom = jatom
+
+               ! get blocks
+               IF (my_ordered) THEN
+                  irow = iatom
+                  icol = jatom
+               ELSE IF (iatom <= jatom) THEN
+                  irow = iatom
+                  icol = jatom
+               ELSE
+                  irow = jatom
+                  icol = iatom
+               END IF
+
+               IF (nmoments > 0) THEN
+                  DO i = 1, nm
+                     NULLIFY (mom_block(i)%block)
+                     ! get block from pre calculated overlap matrix
+                     CALL dbcsr_get_block_p(matrix=moments(i)%matrix, &
+                                            row=irow, col=icol, BLOCK=mom_block(i)%block, found=found)
+                     CPASSERT(found .AND. ASSOCIATED(mom_block(i)%block))
+                     mom_block(i)%block = 0._dp
+                  END DO
+               END IF
+               IF (nmoments_der > 0) THEN
+                  DO i = 1, M_dim
+                     DO ider = 1, dimders
+                        NULLIFY (mom_block_der(i, ider)%block)
+                        CALL dbcsr_get_block_p(matrix=moments_der(i, ider)%matrix, &
+                                               row=irow, col=icol, &
+                                               block=mom_block_der(i, ider)%block, &
+                                               found=found)
+                        CPASSERT(found .AND. ASSOCIATED(mom_block_der(i, ider)%block))
+                        mom_block_der(i, ider)%block = 0._dp
+                     END DO
+                  END DO
+               END IF
+            END IF
 
             ! reference point
             IF (PRESENT(ref_point)) THEN
@@ -965,54 +744,26 @@ CONTAINS
             END IF
             ! using PBC here might screw a molecule that fits the box (but e.g. hasn't been shifted by center_molecule)
             ! by folding around the center, such screwing can be avoided for a proper choice of center.
-            ra(:) = pbc(particle_set(iatom)%r(:) - rc, cell) + rc
-            rb(:) = pbc(particle_set(jatom)%r(:) - rc, cell) + rc
-            ! we dont use PBC at this point
-            rab(:) = ra(:) - rb(:)
-            rac(:) = ra(:) - rc(:)
-            rbc(:) = rb(:) - rc(:)
-            dab = NORM2(rab)
-
-            ! get blocks
-            IF (inode == 1) last_jatom = 0
-
-            IF (jatom == last_jatom) THEN
-               CYCLE
-            END IF
-
-            last_jatom = jatom
-
-            IF (iatom <= jatom) THEN
-               irow = iatom
-               icol = jatom
+            IF (my_neighbor_image) THEN
+               ra(:) = pbc(particle_set(iatom)%r(:), cell)
+               rb(:) = ra(:) + rab(:)
+               rac(:) = pbc(rc, ra, cell)
+               rbc(:) = rac(:) + rab(:)
+            ELSE IF (my_ordered) THEN
+               ra(:) = particle_set(iatom)%r(:)
+               rb(:) = particle_set(jatom)%r(:)
+               rab(:) = pbc(rb, ra, cell)
+               rac(:) = pbc(ra - rc, cell)
+               rbc(:) = pbc(rb - rc, cell)
             ELSE
-               irow = jatom
-               icol = iatom
+               ra(:) = pbc(particle_set(iatom)%r(:) - rc, cell) + rc
+               rb(:) = pbc(particle_set(jatom)%r(:) - rc, cell) + rc
+               ! we dont use PBC at this point
+               rab(:) = ra(:) - rb(:)
+               rac(:) = ra(:) - rc(:)
+               rbc(:) = rb(:) - rc(:)
             END IF
-
-            IF (nmoments > 0) THEN
-               DO i = 1, nm
-                  NULLIFY (mom_block(i)%block)
-                  ! get block from pre calculated overlap matrix
-                  CALL dbcsr_get_block_p(matrix=moments(i)%matrix, &
-                                         row=irow, col=icol, BLOCK=mom_block(i)%block, found=found)
-                  CPASSERT(found .AND. ASSOCIATED(mom_block(i)%block))
-                  mom_block(i)%block = 0._dp
-               END DO
-            END IF
-            IF (nmoments_der > 0) THEN
-               DO i = 1, M_dim
-                  DO ider = 1, dimders
-                     NULLIFY (mom_block_der(i, ider)%block)
-                     CALL dbcsr_get_block_p(matrix=moments_der(i, ider)%matrix, &
-                                            row=irow, col=icol, &
-                                            block=mom_block_der(i, ider)%block, &
-                                            found=found)
-                     CPASSERT(found .AND. ASSOCIATED(mom_block_der(i, ider)%block))
-                     mom_block_der(i, ider)%block = 0._dp
-                  END DO
-               END DO
-            END IF
+            dab = NORM2(rab)
 
             DO iset = 1, nseta
 
@@ -1031,8 +782,9 @@ CONTAINS
                                     npgfb(jset)*ncoset(lb_max(jset) + 1), ncoset(nmom_build) - 1))
 
                   ! Calculate the primitive integrals (need l+1 for derivatives)
+                  lda_min = MAX(0, la_min(iset) - 1)
                   CALL moment(la_max(iset) + 1, npgfa(iset), zeta(:, iset), &
-                              rpgfa(:, iset), la_min(iset), &
+                              rpgfa(:, iset), lda_min, &
                               lb_max(jset) + 1, npgfb(jset), zetb(:, jset), &
                               rpgfb(:, jset), nmom_build, rac, rbc, mab_tmp)
 
@@ -1041,7 +793,8 @@ CONTAINS
                                      rpgfa(:, iset), la_min(iset), &
                                      lb_max(jset), npgfb(jset), zetb(:, jset), &
                                      rpgfb(:, jset), lb_min(jset), &
-                                     nmoments_der, rac, rbc, difmab, mab_ext=mab_tmp)
+                                     nmoments_der, rac, rbc, difmab, mab_ext=mab_tmp, &
+                                     lambda=lambda, deltaR=deltaR, iatom=iatom, jatom=jatom)
                   END IF
 
                   IF (nmoments > 0) THEN
@@ -1074,7 +827,7 @@ CONTAINS
                                    sphi_b(1, sgfb), SIZE(sphi_b, 1), &
                                    0.0_dp, work(1, 1), SIZE(work, 1))
 
-                        IF (iatom <= jatom) THEN
+                        IF (my_ordered .OR. iatom <= jatom) THEN
                            CALL dgemm("T", "N", nsgfa(iset), nsgfb(jset), ncoa, &
                                       1.0_dp, sphi_a(1, sgfa), SIZE(sphi_a, 1), &
                                       work(1, 1), SIZE(work, 1), &
@@ -1094,15 +847,15 @@ CONTAINS
                      DO i = 1, M_dim
                         DO ider = 1, dimders
                            CALL dgemm("N", "N", ncoa, nsgfb(jset), ncob, &
-                                      1.0_dp, difmab(1, 1, i, ider), SIZE(difmab, 1), &
+                                      derivative_sign, difmab(1, 1, i, ider), SIZE(difmab, 1), &
                                       sphi_b(1, sgfb), SIZE(sphi_b, 1), &
                                       0._dp, work(1, 1), SIZE(work, 1))
 
-                           IF (iatom <= jatom) THEN
+                           IF (my_ordered .OR. iatom <= jatom) THEN
                               CALL dgemm("T", "N", nsgfa(iset), nsgfb(jset), ncoa, &
                                          1.0_dp, sphi_a(1, sgfa), SIZE(sphi_a, 1), &
                                          work(1, 1), SIZE(work, 1), &
-                                         1._dp, mom_block_der(i, ider)%block(sgfa, sgfb), &
+                                         1.0_dp, mom_block_der(i, ider)%block(sgfa, sgfb), &
                                          SIZE(mom_block_der(i, ider)%block, 1))
                            ELSE
                               CALL dgemm("T", "N", nsgfb(jset), nsgfa(iset), ncoa, &
@@ -1167,7 +920,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_local_magmom_matrix'
 
       INTEGER :: handle, i, iatom, icol, ikind, inode, irow, iset, jatom, jkind, jset, maxco, &
-                 maxsgf, natom, ncoa, ncob, nkind, nm, nseta, nsetb, sgfa, sgfb
+                 maxsgf, ncoa, ncob, nkind, nm, nseta, nsetb, sgfa, sgfb
       LOGICAL                                            :: found
       REAL(KIND=dp)                                      :: dab
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: work
@@ -1175,7 +928,6 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(3)                        :: ra, rab, rac, rb, rbc, rc
       TYPE(block_p_type), ALLOCATABLE, DIMENSION(:)      :: mint
       TYPE(cell_type), POINTER                           :: cell
-      TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_s
       TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_list
       TYPE(gto_basis_set_type), POINTER                  :: basis_set_a, basis_set_b
       TYPE(neighbor_list_iterator_p_type), &
@@ -1190,11 +942,6 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (qs_kind_set, cell, particle_set, sab_orb)
-      NULLIFY (matrix_s)
-
-      CALL get_qs_env(qs_env=qs_env, matrix_s=matrix_s)
-
       ! magnetic dipoles/angular moments only
       nm = 3
 
@@ -1205,7 +952,6 @@ CONTAINS
                       sab_orb=sab_orb)
 
       nkind = SIZE(qs_kind_set)
-      natom = SIZE(particle_set)
 
       ! Allocate work storage
       CALL get_qs_kind_set(qs_kind_set=qs_kind_set, &
@@ -1277,8 +1023,8 @@ CONTAINS
                NULLIFY (mint(i)%block)
                CALL dbcsr_get_block_p(matrix=magmom(i)%matrix, &
                                       row=irow, col=icol, BLOCK=mint(i)%block, found=found)
+               CPASSERT(found .AND. ASSOCIATED(mint(i)%block))
                mint(i)%block = 0._dp
-               CPASSERT(ASSOCIATED(mint(i)%block))
             END DO
 
             ! fold atomic position back into unit cell
@@ -1378,149 +1124,18 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_berry_moment_matrix'
 
-      INTEGER :: handle, iatom, icol, ikind, inode, irow, iset, jatom, jkind, jset, ldab, ldsa, &
-                 ldsb, ldwork, natom, ncoa, ncob, nkind, nseta, nsetb, sgfa, sgfb
-      LOGICAL                                            :: found
-      REAL(dp), DIMENSION(:, :), POINTER                 :: cblock, cosab, sblock, sinab, work
-      REAL(KIND=dp)                                      :: dab
-      REAL(KIND=dp), DIMENSION(3)                        :: ra, rab, rb
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_list
-      TYPE(gto_basis_set_type), POINTER                  :: basis_set_a, basis_set_b
-      TYPE(neighbor_list_iterator_p_type), &
-         DIMENSION(:), POINTER                           :: nl_iterator
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_orb
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-      TYPE(qs_kind_type), POINTER                        :: qs_kind
+      INTEGER                                            :: handle
+      TYPE(dbcsr_p_type), DIMENSION(2, 1)                :: op_sm_set
+      REAL(KIND=dp), DIMENSION(3, 1)                     :: kvec_batch
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (qs_kind_set, particle_set, sab_orb, cell)
-      CALL get_qs_env(qs_env=qs_env, &
-                      qs_kind_set=qs_kind_set, &
-                      particle_set=particle_set, cell=cell, &
-                      sab_orb=sab_orb)
+      op_sm_set(1, 1)%matrix => cosmat
+      op_sm_set(2, 1)%matrix => sinmat
+      kvec_batch(:, 1) = kvec(:)
 
-      IF (PRESENT(sab_orb_external)) sab_orb => sab_orb_external
-
-      CALL dbcsr_set(sinmat, 0.0_dp)
-      CALL dbcsr_set(cosmat, 0.0_dp)
-
-      CALL get_qs_kind_set(qs_kind_set=qs_kind_set, maxco=ldwork, basis_type=basis_type)
-      ldab = ldwork
-      ALLOCATE (cosab(ldab, ldab))
-      ALLOCATE (sinab(ldab, ldab))
-      ALLOCATE (work(ldwork, ldwork))
-
-      nkind = SIZE(qs_kind_set)
-      natom = SIZE(particle_set)
-
-      ALLOCATE (basis_set_list(nkind))
-      DO ikind = 1, nkind
-         qs_kind => qs_kind_set(ikind)
-         CALL get_qs_kind(qs_kind=qs_kind, basis_set=basis_set_a, basis_type=basis_type)
-         IF (ASSOCIATED(basis_set_a)) THEN
-            basis_set_list(ikind)%gto_basis_set => basis_set_a
-         ELSE
-            NULLIFY (basis_set_list(ikind)%gto_basis_set)
-         END IF
-      END DO
-      CALL neighbor_list_iterator_create(nl_iterator, sab_orb)
-      DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
-         CALL get_iterator_info(nl_iterator, ikind=ikind, jkind=jkind, inode=inode, &
-                                iatom=iatom, jatom=jatom, r=rab)
-         basis_set_a => basis_set_list(ikind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis_set_a)) CYCLE
-         basis_set_b => basis_set_list(jkind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis_set_b)) CYCLE
-         ASSOCIATE ( &
-            ! basis ikind
-            first_sgfa => basis_set_a%first_sgf, &
-            la_max => basis_set_a%lmax, &
-            la_min => basis_set_a%lmin, &
-            npgfa => basis_set_a%npgf, &
-            nsgfa => basis_set_a%nsgf_set, &
-            rpgfa => basis_set_a%pgf_radius, &
-            set_radius_a => basis_set_a%set_radius, &
-            sphi_a => basis_set_a%sphi, &
-            zeta => basis_set_a%zet, &
-            ! basis jkind, &
-            first_sgfb => basis_set_b%first_sgf, &
-            lb_max => basis_set_b%lmax, &
-            lb_min => basis_set_b%lmin, &
-            npgfb => basis_set_b%npgf, &
-            nsgfb => basis_set_b%nsgf_set, &
-            rpgfb => basis_set_b%pgf_radius, &
-            set_radius_b => basis_set_b%set_radius, &
-            sphi_b => basis_set_b%sphi, &
-            zetb => basis_set_b%zet)
-
-            nseta = basis_set_a%nset
-            nsetb = basis_set_b%nset
-
-            ldsa = SIZE(sphi_a, 1)
-            ldsb = SIZE(sphi_b, 1)
-
-            IF (iatom <= jatom) THEN
-               irow = iatom
-               icol = jatom
-            ELSE
-               irow = jatom
-               icol = iatom
-            END IF
-
-            NULLIFY (cblock)
-            CALL dbcsr_get_block_p(matrix=cosmat, &
-                                   row=irow, col=icol, BLOCK=cblock, found=found)
-            NULLIFY (sblock)
-            CALL dbcsr_get_block_p(matrix=sinmat, &
-                                   row=irow, col=icol, BLOCK=sblock, found=found)
-            IF (ASSOCIATED(cblock) .AND. .NOT. ASSOCIATED(sblock) .OR. &
-                .NOT. ASSOCIATED(cblock) .AND. ASSOCIATED(sblock)) THEN
-               CPABORT("cblock and sblock should both be present for contract_cossin")
-            END IF
-
-            IF (ASSOCIATED(cblock) .AND. ASSOCIATED(sblock)) THEN
-
-               ra(:) = pbc(particle_set(iatom)%r(:), cell)
-               rb(:) = ra + rab
-               dab = SQRT(rab(1)*rab(1) + rab(2)*rab(2) + rab(3)*rab(3))
-
-               DO iset = 1, nseta
-
-                  ncoa = npgfa(iset)*ncoset(la_max(iset))
-                  sgfa = first_sgfa(1, iset)
-
-                  DO jset = 1, nsetb
-
-                     IF (set_radius_a(iset) + set_radius_b(jset) < dab) CYCLE
-
-                     ncob = npgfb(jset)*ncoset(lb_max(jset))
-                     sgfb = first_sgfb(1, jset)
-
-                     ! Calculate the primitive integrals
-                     CALL cossin(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
-                                 lb_max(jset), npgfb(jset), zetb(:, jset), rpgfb(:, jset), lb_min(jset), &
-                                 ra, rb, kvec, cosab, sinab)
-                     CALL contract_cossin(cblock, sblock, &
-                                          iatom, ncoa, nsgfa(iset), sgfa, sphi_a, ldsa, &
-                                          jatom, ncob, nsgfb(jset), sgfb, sphi_b, ldsb, &
-                                          cosab, sinab, ldab, work, ldwork)
-
-                  END DO
-               END DO
-
-            END IF
-         END ASSOCIATE
-      END DO
-      CALL neighbor_list_iterator_release(nl_iterator)
-
-      DEALLOCATE (cosab)
-      DEALLOCATE (sinab)
-      DEALLOCATE (work)
-      DEALLOCATE (basis_set_list)
+      CALL build_exp_ikr_matrix(qs_env, op_sm_set, kvec_batch, &
+                                sab_orb_external=sab_orb_external, basis_type=basis_type)
 
       CALL timestop(handle)
 
@@ -1533,23 +1148,29 @@ CONTAINS
 !> \param sinmat ...
 !> \param kvec ...
 !> \param basis_type ...
+!> \param ordered use all ordered atom pairs for a non-Hermitian cross-k overlap
+!> \param ordered_kpoints image-cell mapping for the ordered neighbour list
 ! **************************************************************************************************
-   SUBROUTINE build_berry_kpoint_matrix(qs_env, cosmat, sinmat, kvec, basis_type)
+   SUBROUTINE build_berry_kpoint_matrix(qs_env, cosmat, sinmat, kvec, basis_type, ordered, ordered_kpoints)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: cosmat, sinmat
       REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: kvec
       CHARACTER(len=*), OPTIONAL                         :: basis_type
+      LOGICAL, INTENT(IN), OPTIONAL                      :: ordered
+      TYPE(kpoint_type), POINTER, OPTIONAL               :: ordered_kpoints
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'build_berry_kpoint_matrix'
 
-      INTEGER :: handle, i, iatom, ic, icol, ikind, inode, irow, iset, jatom, jkind, jset, ldab, &
+      CHARACTER                                          :: matrix_symmetry
+      COMPLEX(dp), ALLOCATABLE                           :: expab(:, :)
+      INTEGER :: handle, i, iatom, ic, icol, ikind, inode, irow, iset, jatom, jkind, jset, &
                  ldsa, ldsb, ldwork, natom, ncoa, ncob, nimg, nkind, nseta, nsetb, sgfa, sgfb
       INTEGER, DIMENSION(3)                              :: icell
-      INTEGER, DIMENSION(:), POINTER                     :: row_blk_sizes
+      INTEGER, DIMENSION(:), CONTIGUOUS, POINTER                     :: row_blk_sizes
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
-      LOGICAL                                            :: found, use_cell_mapping
-      REAL(dp), DIMENSION(:, :), POINTER                 :: cblock, cosab, sblock, sinab, work
+      LOGICAL                                            :: found, full_pairs, stable_images, use_cell_mapping
+      REAL(dp), DIMENSION(:, :), POINTER                 :: cblock, sblock, work
       REAL(KIND=dp)                                      :: dab
       REAL(KIND=dp), DIMENSION(3)                        :: ra, rab, rb
       TYPE(cell_type), POINTER                           :: cell
@@ -1569,12 +1190,18 @@ CONTAINS
 
       CALL timeset(routineN, handle)
 
+      full_pairs = .FALSE.
+      IF (PRESENT(ordered)) full_pairs = ordered
+      matrix_symmetry = dbcsr_type_symmetric
+      IF (full_pairs) matrix_symmetry = dbcsr_type_no_symmetry
+
       CALL get_qs_env(qs_env, &
                       ks_env=ks_env, &
                       dft_control=dft_control)
+      CALL get_ks_env(ks_env=ks_env, kpoints=kpoints)
+      stable_images = kpoints%nkp > 0 .AND. kpoints%symmetry
       nimg = dft_control%nimages
       IF (nimg > 1) THEN
-         CALL get_ks_env(ks_env=ks_env, kpoints=kpoints)
          CALL get_kpoint_info(kpoint=kpoints, cell_to_index=cell_to_index)
          use_cell_mapping = .TRUE.
       ELSE
@@ -1585,6 +1212,15 @@ CONTAINS
                       qs_kind_set=qs_kind_set, &
                       particle_set=particle_set, cell=cell, &
                       sab_orb=sab_orb)
+
+      IF (full_pairs) THEN
+         CALL get_qs_env(qs_env, sab_all=sab_orb)
+         IF (.NOT. ASSOCIATED(sab_orb)) CPABORT("Ordered Berry integrals require k-point neighbour lists.")
+         CPASSERT(PRESENT(ordered_kpoints))
+         CALL get_kpoint_info(ordered_kpoints, cell_to_index=cell_to_index)
+         nimg = SIZE(ordered_kpoints%index_to_cell, 2)
+         use_cell_mapping = .TRUE.
+      END IF
 
       nkind = SIZE(qs_kind_set)
       natom = SIZE(particle_set)
@@ -1611,7 +1247,7 @@ CONTAINS
          ALLOCATE (sinmat(1, i)%matrix)
          CALL dbcsr_create(matrix=sinmat(1, i)%matrix, &
                            name="SINMAT", &
-                           dist=dbcsr_dist, matrix_type=dbcsr_type_symmetric, &
+                           dist=dbcsr_dist, matrix_type=matrix_symmetry, &
                            row_blk_size=row_blk_sizes, col_blk_size=row_blk_sizes)
          CALL cp_dbcsr_alloc_block_from_nbl(sinmat(1, i)%matrix, sab_orb)
          CALL dbcsr_set(sinmat(1, i)%matrix, 0.0_dp)
@@ -1619,16 +1255,14 @@ CONTAINS
          ALLOCATE (cosmat(1, i)%matrix)
          CALL dbcsr_create(matrix=cosmat(1, i)%matrix, &
                            name="COSMAT", &
-                           dist=dbcsr_dist, matrix_type=dbcsr_type_symmetric, &
+                           dist=dbcsr_dist, matrix_type=matrix_symmetry, &
                            row_blk_size=row_blk_sizes, col_blk_size=row_blk_sizes)
          CALL cp_dbcsr_alloc_block_from_nbl(cosmat(1, i)%matrix, sab_orb)
          CALL dbcsr_set(cosmat(1, i)%matrix, 0.0_dp)
       END DO
 
       CALL get_qs_kind_set(qs_kind_set=qs_kind_set, maxco=ldwork)
-      ldab = ldwork
-      ALLOCATE (cosab(ldab, ldab))
-      ALLOCATE (sinab(ldab, ldab))
+      ALLOCATE (expab(ldwork, ldwork))
       ALLOCATE (work(ldwork, ldwork))
 
       CALL neighbor_list_iterator_create(nl_iterator, sab_orb)
@@ -1667,7 +1301,7 @@ CONTAINS
             ldsa = SIZE(sphi_a, 1)
             ldsb = SIZE(sphi_b, 1)
 
-            IF (iatom <= jatom) THEN
+            IF (iatom <= jatom .OR. full_pairs) THEN
                irow = iatom
                icol = jatom
             ELSE
@@ -1691,7 +1325,12 @@ CONTAINS
                                    row=irow, col=icol, BLOCK=cblock, found=found)
             CPASSERT(found)
 
-            ra(:) = pbc(particle_set(iatom)%r(:), cell)
+            ! Absolute phases must use the same atom images as the orbital neighbour list.
+            IF (stable_images) THEN
+               ra(:) = pbc_stable(particle_set(iatom)%r(:), cell)
+            ELSE
+               ra(:) = pbc(particle_set(iatom)%r(:), cell)
+            END IF
             rb(:) = ra + rab
             dab = SQRT(rab(1)*rab(1) + rab(2)*rab(2) + rab(3)*rab(3))
 
@@ -1708,13 +1347,13 @@ CONTAINS
                   sgfb = first_sgfb(1, jset)
 
                   ! Calculate the primitive integrals
-                  CALL cossin(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
+                  CALL expikr(la_max(iset), npgfa(iset), zeta(:, iset), rpgfa(:, iset), la_min(iset), &
                               lb_max(jset), npgfb(jset), zetb(:, jset), rpgfb(:, jset), lb_min(jset), &
-                              ra, rb, kvec, cosab, sinab)
-                  CALL contract_cossin(cblock, sblock, &
+                              ra, rb, kvec, expab)
+                  CALL contract_expikr(cblock, sblock, &
                                        iatom, ncoa, nsgfa(iset), sgfa, sphi_a, ldsa, &
                                        jatom, ncob, nsgfb(jset), sgfb, sphi_b, ldsb, &
-                                       cosab, sinab, ldab, work, ldwork)
+                                       expab, work, ldwork, ordered=full_pairs)
 
                END DO
             END DO
@@ -1722,8 +1361,7 @@ CONTAINS
       END DO
       CALL neighbor_list_iterator_release(nl_iterator)
 
-      DEALLOCATE (cosab)
-      DEALLOCATE (sinab)
+      DEALLOCATE (expab)
       DEALLOCATE (work)
       DEALLOCATE (basis_set_list)
       DEALLOCATE (row_blk_sizes)
@@ -1740,16 +1378,19 @@ CONTAINS
 !> \param reference ...
 !> \param ref_point ...
 !> \param unit_number ...
+!> \param unit_str unit of the printed moments (dipole unit of cp_units), default debye
 ! **************************************************************************************************
-   SUBROUTINE qs_moment_berry_phase(qs_env, magnetic, nmoments, reference, ref_point, unit_number)
+   SUBROUTINE qs_moment_berry_phase(qs_env, magnetic, nmoments, reference, ref_point, unit_number, unit_str)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       LOGICAL, INTENT(IN)                                :: magnetic
       INTEGER, INTENT(IN)                                :: nmoments, reference
       REAL(dp), DIMENSION(:), POINTER                    :: ref_point
       INTEGER, INTENT(IN)                                :: unit_number
+      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: unit_str
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_moment_berry_phase'
+      REAL(dp), PARAMETER                                :: eps_occ = 1.0E-6_dp
 
       CHARACTER(LEN=8), ALLOCATABLE, DIMENSION(:)        :: rlab
       CHARACTER(LEN=default_string_length)               :: description
@@ -1757,13 +1398,17 @@ CONTAINS
                                                             zij(3, 3), zijk(3, 3, 3), &
                                                             zijkl(3, 3, 3, 3), zphase(3), zz
       INTEGER                                            :: handle, i, ia, idim, ikind, ispin, ix, &
-                                                            iy, iz, j, k, l, nao, nm, nmo, nmom, &
-                                                            nmotot, tmp_dim
-      LOGICAL                                            :: floating, ghost, uniform
-      REAL(dp)                                           :: charge, ci(3), cij(3, 3), dd, occ, trace
+                                                            iy, iz, j, k, l, nao, nm, nmo, nmo_max, &
+                                                            nmom, tmp_dim
+      LOGICAL                                            :: floating, fractional, ghost
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: all_occupied
+      LOGICAL, ALLOCATABLE, DIMENSION(:, :)              :: mo_occupied
+      REAL(dp)                                           :: charge, ci(3), cij(3, 3), dd, nel_det, &
+                                                            occ, trace
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: mmom
       REAL(dp), ALLOCATABLE, DIMENSION(:, :)             :: rmom
       REAL(dp), DIMENSION(3)                             :: kvec, qq, rcc, ria
+      REAL(dp), DIMENSION(:), POINTER                    :: occupation_numbers
       TYPE(atomic_kind_type), POINTER                    :: atomic_kind
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_cfm_type), ALLOCATABLE, DIMENSION(:)       :: eigrmat
@@ -1831,17 +1476,15 @@ CONTAINS
       ALLOCATE (cosmat, sinmat)
       CALL dbcsr_copy(cosmat, matrix_s(1)%matrix, 'COS MOM')
       CALL dbcsr_copy(sinmat, matrix_s(1)%matrix, 'SIN MOM')
-      CALL dbcsr_set(cosmat, 0.0_dp)
-      CALL dbcsr_set(sinmat, 0.0_dp)
 
       ALLOCATE (op_fm_set(2, dft_control%nspins))
       ALLOCATE (opvec(dft_control%nspins))
       ALLOCATE (eigrmat(dft_control%nspins))
-      nmotot = 0
+      nmo_max = 0
       DO ispin = 1, dft_control%nspins
          NULLIFY (tmp_fm_struct, mo_coeff)
          CALL get_mo_set(mo_set=mos(ispin), mo_coeff=mo_coeff, nao=nao, nmo=nmo)
-         nmotot = nmotot + nmo
+         nmo_max = MAX(nmo_max, nmo)
          CALL cp_fm_create(opvec(ispin), mo_coeff%matrix_struct)
          CALL cp_fm_struct_create(tmp_fm_struct, nrow_global=nmo, &
                                   ncol_global=nmo, para_env=para_env, context=mo_coeff%matrix_struct%context)
@@ -1853,12 +1496,25 @@ CONTAINS
       END DO
 
       ! occupation
+      ALLOCATE (mo_occupied(nmo_max, dft_control%nspins), all_occupied(dft_control%nspins))
+      mo_occupied = .FALSE.
+      fractional = .FALSE.
+      nel_det = 0.0_dp
       DO ispin = 1, dft_control%nspins
-         CALL get_mo_set(mo_set=mos(ispin), maxocc=occ, uniform_occupation=uniform)
-         IF (.NOT. uniform) THEN
-            CPWARN("Berry phase moments for non uniform MOs' occupation numbers not implemented")
-         END IF
+         NULLIFY (occupation_numbers)
+         CALL get_mo_set(mo_set=mos(ispin), maxocc=occ, nmo=nmo, occupation_numbers=occupation_numbers)
+         DO i = 1, nmo
+            IF (occupation_numbers(i) > eps_occ) THEN
+               mo_occupied(i, ispin) = .TRUE.
+               nel_det = nel_det + occ
+               IF (ABS(occupation_numbers(i) - occ) > eps_occ) fractional = .TRUE.
+            END IF
+         END DO
+         all_occupied(ispin) = ALL(mo_occupied(1:nmo, ispin))
       END DO
+      IF (fractional) THEN
+         CPWARN("Berry phase moments for fractional MOs' occupation numbers not implemented")
+      END IF
 
       ! reference point
       CALL get_reference_point(rcc, qs_env=qs_env, reference=reference, ref_point=ref_point)
@@ -1967,7 +1623,7 @@ CONTAINS
 
       ! electronic contribution
 
-      ria = twopi*REAL(nmotot, dp)*occ*MATMUL(cell%h_inv, rcc)
+      ria = twopi*nel_det*MATMUL(cell%h_inv, rcc)
       xphase = CMPLX(COS(ria), SIN(ria), dp)
 
       ! charge
@@ -2004,6 +1660,9 @@ CONTAINS
                         CMPLX(op_fm_set(1, ispin)%local_data(:, idim), &
                               -op_fm_set(2, ispin)%local_data(:, idim), dp)
                   END DO
+                  IF (.NOT. all_occupied(ispin)) THEN
+                     CALL berry_phase_remove_unocc(eigrmat(ispin), mo_occupied(:, ispin))
+                  END IF
                   ! CALL cp_cfm_lu_decompose(eigrmat(ispin), zdeta)
                   CALL cp_cfm_det(eigrmat(ispin), zdeta)
                   zdet = zdet*zdeta
@@ -2036,6 +1695,9 @@ CONTAINS
                            CMPLX(op_fm_set(1, ispin)%local_data(:, idim), &
                                  -op_fm_set(2, ispin)%local_data(:, idim), dp)
                      END DO
+                     IF (.NOT. all_occupied(ispin)) THEN
+                        CALL berry_phase_remove_unocc(eigrmat(ispin), mo_occupied(:, ispin))
+                     END IF
                      ! CALL cp_cfm_lu_decompose(eigrmat(ispin), zdeta)
                      CALL cp_cfm_det(eigrmat(ispin), zdeta)
                      zdet = zdet*zdeta
@@ -2107,9 +1769,10 @@ CONTAINS
       CALL put_results(results=results, description=description, &
                        values=rmom(2:4, 3))
       IF (magnetic) THEN
-         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.TRUE., mmom=mmom)
+         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.TRUE., mmom=mmom, &
+                            unit_str=unit_str)
       ELSE
-         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.TRUE.)
+         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.TRUE., unit_str=unit_str)
       END IF
 
       DEALLOCATE (rmom)
@@ -2127,10 +1790,42 @@ CONTAINS
          CALL cp_cfm_release(eigrmat(ispin))
       END DO
       DEALLOCATE (eigrmat)
+      DEALLOCATE (mo_occupied, all_occupied)
 
       CALL timestop(handle)
 
    END SUBROUTINE qs_moment_berry_phase
+
+! **************************************************************************************************
+!> \brief Removes unoccupied MOs from the Berry phase matrix Z_ij = <psi_i|exp(i k.r)|psi_j> by
+!>        replacing their rows and columns with those of the unit matrix. The determinant of the
+!>        result equals the determinant of Z.
+!> \param zmat        nmo x nmo Berry phase matrix of one spin channel, modified on output
+!> \param mo_occupied .TRUE. for the MOs that are part of the Slater determinant
+! **************************************************************************************************
+   SUBROUTINE berry_phase_remove_unocc(zmat, mo_occupied)
+
+      TYPE(cp_cfm_type), INTENT(IN)                      :: zmat
+      LOGICAL, DIMENSION(:), INTENT(IN)                  :: mo_occupied
+
+      INTEGER                                            :: icol, irow, ncol_local, nrow_local
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+
+      NULLIFY (col_indices, row_indices)
+      CALL cp_cfm_get_info(zmat, nrow_local=nrow_local, ncol_local=ncol_local, &
+                           row_indices=row_indices, col_indices=col_indices)
+      DO icol = 1, ncol_local
+         DO irow = 1, nrow_local
+            IF (mo_occupied(row_indices(irow)) .AND. mo_occupied(col_indices(icol))) CYCLE
+            IF (row_indices(irow) == col_indices(icol)) THEN
+               zmat%local_data(irow, icol) = z_one
+            ELSE
+               zmat%local_data(irow, icol) = z_zero
+            END IF
+         END DO
+      END DO
+
+   END SUBROUTINE berry_phase_remove_unocc
 
 ! **************************************************************************************************
 !> \brief ...
@@ -2261,8 +1956,10 @@ CONTAINS
 !> \param unit_number ...
 !> \param vel_reprs ...
 !> \param com_nl ...
+!> \param unit_str unit of the printed moments (dipole unit of cp_units), default debye
 ! **************************************************************************************************
-   SUBROUTINE qs_moment_locop(qs_env, magnetic, nmoments, reference, ref_point, unit_number, vel_reprs, com_nl)
+   SUBROUTINE qs_moment_locop(qs_env, magnetic, nmoments, reference, ref_point, unit_number, vel_reprs, com_nl, &
+                              unit_str)
 
       TYPE(qs_environment_type), POINTER                 :: qs_env
       LOGICAL, INTENT(IN)                                :: magnetic
@@ -2270,6 +1967,7 @@ CONTAINS
       REAL(dp), DIMENSION(:), INTENT(IN), POINTER        :: ref_point
       INTEGER, INTENT(IN)                                :: unit_number
       LOGICAL, INTENT(IN), OPTIONAL                      :: vel_reprs, com_nl
+      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: unit_str
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'qs_moment_locop'
 
@@ -2278,7 +1976,7 @@ CONTAINS
       INTEGER                                            :: akind, handle, i, ia, iatom, idir, &
                                                             ikind, ispin, ix, iy, iz, l, nm, nmom, &
                                                             order
-      LOGICAL                                            :: my_com_nl, my_velreprs
+      LOGICAL                                            :: my_com_nl, my_velreprs, use_periodic_images
       REAL(dp)                                           :: charge, dd, strace, trace
       REAL(dp), ALLOCATABLE, DIMENSION(:)                :: mmom, nlcom_rrv, nlcom_rrv_vrr, &
                                                             nlcom_rv, nlcom_rvr, nlcom_rxrv, &
@@ -2380,7 +2078,10 @@ CONTAINS
          END DO
          CALL build_local_moments_der_matrix(qs_env, moments_der, 1, 2, ref_point=rcc, moments=moments)
       ELSE
-         CALL build_local_moment_matrix(qs_env, moments, nmom, ref_point=rcc)
+         ! In non-periodic directions the moment must include the same images as the overlap.
+         use_periodic_images = ANY(cell%perd /= 0) .AND. ANY(cell%perd == 0)
+         CALL build_local_moment_matrix(qs_env, moments, nmom, ref_point=rcc, &
+                                        all_images=use_periodic_images, neighbor_image=use_periodic_images)
       END IF
 
       CALL qs_rho_get(rho, rho_ao=rho_ao)
@@ -2599,14 +2300,22 @@ CONTAINS
       CALL put_results(results=results, description=description, &
                        values=rmom(2:4, 3))
 
+      IF (unit_number > 0 .AND. ANY(cell%perd /= 0) .AND. ANY(cell%perd == 0)) THEN
+         WRITE (unit_number, "(T3,A)") &
+            "Only dipole components perpendicular to the periodic lattice vectors are well-defined."
+      END IF
+
       IF (magnetic .AND. my_velreprs) THEN
-         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.FALSE., mmom=mmom, rmom_vel=rmom_vel)
+         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.FALSE., mmom=mmom, rmom_vel=rmom_vel, &
+                            unit_str=unit_str)
       ELSE IF (magnetic .AND. .NOT. my_velreprs) THEN
-         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.FALSE., mmom=mmom)
+         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.FALSE., mmom=mmom, &
+                            unit_str=unit_str)
       ELSE IF (my_velreprs .AND. .NOT. magnetic) THEN
-         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.FALSE., rmom_vel=rmom_vel)
+         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.FALSE., rmom_vel=rmom_vel, &
+                            unit_str=unit_str)
       ELSE
-         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.FALSE.)
+         CALL print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic=.FALSE., unit_str=unit_str)
       END IF
 
       IF (my_com_nl) THEN
@@ -2693,8 +2402,9 @@ CONTAINS
 !> \param periodic ...
 !> \param mmom ...
 !> \param rmom_vel ...
+!> \param unit_str unit of the printed electric moments (a dipole unit of cp_units), default debye
 ! **************************************************************************************************
-   SUBROUTINE print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic, mmom, rmom_vel)
+   SUBROUTINE print_moments(unit_number, nmom, rmom, rlab, rcc, cell, periodic, mmom, rmom_vel, unit_str)
       INTEGER, INTENT(IN)                                :: unit_number, nmom
       REAL(dp), DIMENSION(:, :), INTENT(IN)              :: rmom
       CHARACTER(LEN=8), DIMENSION(:)                     :: rlab
@@ -2702,11 +2412,26 @@ CONTAINS
       TYPE(cell_type), POINTER                           :: cell
       LOGICAL                                            :: periodic
       REAL(dp), DIMENSION(:), INTENT(IN), OPTIONAL       :: mmom, rmom_vel
+      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: unit_str
 
+      CHARACTER(LEN=16)                                  :: dip_label, fnum, ftot, len_label
       INTEGER                                            :: i, i0, i1, j, l
-      REAL(dp)                                           :: dd
+      LOGICAL                                            :: use_sci
+      REAL(dp)                                           :: dd, dip_fac, len_fac
 
       IF (unit_number > 0) THEN
+         IF (PRESENT(unit_str)) THEN
+            CALL get_moment_print_units(unit_str, dip_fac, len_fac, dip_label, len_label, use_sci)
+         ELSE
+            CALL get_moment_print_units("debye", dip_fac, len_fac, dip_label, len_label, use_sci)
+         END IF
+         ! fixed-point fields would print SI values (~1e-30) as zero
+         fnum = "F14.8"
+         ftot = "F13.7"
+         IF (use_sci) THEN
+            fnum = "ES14.6"
+            ftot = "ES13.5"
+         END IF
          DO l = 0, nmom
             SELECT CASE (l)
             CASE (0)
@@ -2717,49 +2442,53 @@ CONTAINS
             CASE (1)
                IF (periodic) THEN
                   WRITE (unit_number, "(T3,A)") "Dipole vectors are based on the periodic (Berry phase) operator."
-                  WRITE (unit_number, "(T3,A)") "They are defined modulo integer multiples of the cell matrix [Debye]."
-                  WRITE (unit_number, "(T3,A,3(F14.8,1X),A)") "[X] [", cell%hmat(1, :)*debye, "] [i]"
-                  WRITE (unit_number, "(T3,A,3(F14.8,1X),A)") "[Y]=[", cell%hmat(2, :)*debye, "]*[j]"
-                  WRITE (unit_number, "(T3,A,3(F14.8,1X),A)") "[Z] [", cell%hmat(3, :)*debye, "] [k]"
+                  WRITE (unit_number, "(T3,A)") "They are defined modulo integer multiples of the cell matrix ["// &
+                     TRIM(dip_label)//"]."
+                  WRITE (unit_number, "(T3,A,3("//TRIM(fnum)//",1X),A)") "[X] [", cell%hmat(1, :)*dip_fac, "] [i]"
+                  WRITE (unit_number, "(T3,A,3("//TRIM(fnum)//",1X),A)") "[Y]=[", cell%hmat(2, :)*dip_fac, "]*[j]"
+                  WRITE (unit_number, "(T3,A,3("//TRIM(fnum)//",1X),A)") "[Z] [", cell%hmat(3, :)*dip_fac, "] [k]"
                ELSE
                   WRITE (unit_number, "(T3,A)") "Dipoles are based on the traditional operator."
                END IF
-               dd = SQRT(SUM(rmom(2:4, 3)**2))*debye
-               WRITE (unit_number, "(T3,A)") "Dipole moment [Debye]"
-               WRITE (unit_number, "(T5,3(A,A,E15.7,1X),T60,A,T68,F13.7)") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye, i=2, 4), "Total=", dd
+               dd = SQRT(SUM(rmom(2:4, 3)**2))*dip_fac
+               WRITE (unit_number, "(T3,A)") "Dipole moment ["//TRIM(dip_label)//"]"
+               WRITE (unit_number, "(T5,3(A,A,E15.7,1X),T60,A,T68,"//TRIM(ftot)//")") &
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dip_fac, i=2, 4), "Total=", dd
             CASE (2)
-               WRITE (unit_number, "(T3,A)") "Quadrupole moment [Debye*Angstrom]"
+               dd = dip_fac*len_fac
+               WRITE (unit_number, "(T3,A)") "Quadrupole moment ["//TRIM(dip_label)//"*"//TRIM(len_label)//"]"
                WRITE (unit_number, "(T17,3(A,A,E16.8,9X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr, i=5, 7)
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=5, 7)
                WRITE (unit_number, "(T17,3(A,A,E16.8,9X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr, i=8, 10)
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=8, 10)
             CASE (3)
-               WRITE (unit_number, "(T3,A)") "Octapole moment [Debye*Angstrom**2]"
-               WRITE (unit_number, "(T7,4(A,A,F14.8,3X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr/bohr, i=11, 14)
-               WRITE (unit_number, "(T7,4(A,A,F14.8,3X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr/bohr, i=15, 18)
-               WRITE (unit_number, "(T7,4(A,A,F14.8,3X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr/bohr, i=19, 20)
+               dd = dip_fac*len_fac**2
+               WRITE (unit_number, "(T3,A)") "Octapole moment ["//TRIM(dip_label)//"*"//TRIM(len_label)//"**2]"
+               WRITE (unit_number, "(T7,4(A,A,"//TRIM(fnum)//",3X))") &
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=11, 14)
+               WRITE (unit_number, "(T7,4(A,A,"//TRIM(fnum)//",3X))") &
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=15, 18)
+               WRITE (unit_number, "(T7,4(A,A,"//TRIM(fnum)//",3X))") &
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=19, 20)
             CASE (4)
-               WRITE (unit_number, "(T3,A)") "Hexadecapole moment [Debye*Angstrom**3]"
-               WRITE (unit_number, "(T6,4(A,A,F14.8,2X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr/bohr/bohr, i=21, 24)
-               WRITE (unit_number, "(T6,4(A,A,F14.8,2X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr/bohr/bohr, i=25, 28)
-               WRITE (unit_number, "(T6,4(A,A,F14.8,2X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr/bohr/bohr, i=29, 32)
-               WRITE (unit_number, "(T6,4(A,A,F14.8,2X))") &
-                  (TRIM(rlab(i)), "=", rmom(i, 3)*debye/bohr/bohr/bohr, i=32, 35)
+               dd = dip_fac*len_fac**3
+               WRITE (unit_number, "(T3,A)") "Hexadecapole moment ["//TRIM(dip_label)//"*"//TRIM(len_label)//"**3]"
+               WRITE (unit_number, "(T6,4(A,A,"//TRIM(fnum)//",2X))") &
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=21, 24)
+               WRITE (unit_number, "(T6,4(A,A,"//TRIM(fnum)//",2X))") &
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=25, 28)
+               WRITE (unit_number, "(T6,4(A,A,"//TRIM(fnum)//",2X))") &
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=29, 32)
+               WRITE (unit_number, "(T6,4(A,A,"//TRIM(fnum)//",2X))") &
+                  (TRIM(rlab(i)), "=", rmom(i, 3)*dd, i=32, 35)
             CASE DEFAULT
-               WRITE (unit_number, "(T3,A,A,I2)") "Higher moment [Debye*Angstrom**(L-1)]", &
-                  "  L=", l
+               WRITE (unit_number, "(T3,A,A,I2)") "Higher moment ["//TRIM(dip_label)//"*"//TRIM(len_label)// &
+                  "**(L-1)]", "  L=", l
                i0 = (6 + 11*(l - 1) + 6*(l - 1)**2 + (l - 1)**3)/6
                i1 = (6 + 11*l + 6*l**2 + l**3)/6 - 1
-               dd = debye/(bohr)**(l - 1)
+               dd = dip_fac*len_fac**(l - 1)
                DO i = i0, i1, 3
-                  WRITE (unit_number, "(T18,3(A,A,F14.8,4X))") &
+                  WRITE (unit_number, "(T18,3(A,A,"//TRIM(fnum)//",4X))") &
                      (TRIM(rlab(j + 1)), "=", rmom(j + 1, 3)*dd, j=i, MIN(i1, i + 2))
                END DO
             END SELECT
@@ -2793,6 +2522,60 @@ CONTAINS
       END IF
 
    END SUBROUTINE print_moments
+
+! **************************************************************************************************
+!> \brief Conversion factors and labels for printing electric moments in a chosen dipole unit.
+!>        Multipoles of order L are printed in (dipole unit)*(length unit)^(L-1), where the length
+!>        unit is paired with the dipole unit (debye, e_angstrom -> angstrom; au_dip -> bohr;
+!>        C_m -> m).
+!> \param unit_str dipole unit understood by cp_units (debye, e_angstrom, au_dip, C_m)
+!> \param dip_fac factor converting a dipole from a.u. (e*bohr) to unit_str
+!> \param len_fac factor converting a length from bohr to the paired length unit
+!> \param dip_label label of the dipole unit for the output headers
+!> \param len_label label of the paired length unit for the output headers
+!> \param use_sci .TRUE. if the values are too small for fixed-point output (SI units)
+! **************************************************************************************************
+   SUBROUTINE get_moment_print_units(unit_str, dip_fac, len_fac, dip_label, len_label, use_sci)
+      CHARACTER(LEN=*), INTENT(IN)                       :: unit_str
+      REAL(dp), INTENT(OUT)                              :: dip_fac, len_fac
+      CHARACTER(LEN=*), INTENT(OUT)                      :: dip_label, len_label
+      LOGICAL, INTENT(OUT)                               :: use_sci
+
+      CHARACTER(LEN=16)                                  :: len_unit
+      TYPE(cp_unit_type)                                 :: unit
+
+      CALL cp_unit_create(unit, unit_str)
+      IF (unit%n_kinds /= 1 .OR. unit%kind_id(1) /= cp_ukind_dipole .OR. unit%power(1) /= 1) THEN
+         CALL cp_abort(__LOCATION__, "MOMENTS%UNIT must be a dipole moment unit "// &
+                       "(debye, e_angstrom, au_dip or C_m), got: "//TRIM(unit_str))
+      END IF
+      use_sci = .FALSE.
+      SELECT CASE (unit%unit_id(1))
+      CASE (cp_units_debye)
+         dip_label = "Debye"
+         len_label = "Angstrom"
+         len_unit = "angstrom"
+      CASE (cp_units_e_angstrom)
+         dip_label = "e*Angstrom"
+         len_label = "Angstrom"
+         len_unit = "angstrom"
+      CASE (cp_units_au)
+         dip_label = "a.u."
+         len_label = "Bohr"
+         len_unit = "bohr"
+      CASE (cp_units_c_m)
+         dip_label = "C*m"
+         len_label = "m"
+         len_unit = "m"
+         use_sci = .TRUE.
+      CASE DEFAULT
+         CALL cp_abort(__LOCATION__, "MOMENTS%UNIT: dipole unit not fully specified: "//TRIM(unit_str))
+      END SELECT
+      dip_fac = cp_unit_from_cp2k1(1.0_dp, unit)
+      len_fac = cp_unit_from_cp2k(1.0_dp, TRIM(len_unit))
+      CALL cp_unit_release(unit)
+
+   END SUBROUTINE get_moment_print_units
 
 ! **************************************************************************************************
 !> \brief ...
@@ -3111,222 +2894,6 @@ CONTAINS
       CALL timestop(handle)
    END SUBROUTINE calculate_commutator_nl_terms
 
-! *****************************************************************************
-!> \brief ...
-!> \param qs_env ...
-!> \param difdip ...
-!> \param deltaR ...
-!> \param order ...
-!> \param rcc ...
-!> \note calculate matrix elements <a|r_beta |db/dR_alpha > + <da/dR_alpha | r_beta | b >
-!> be aware: < a | r_beta| db/dR_alpha > = - < da/dR_alpha | r_beta | b > only valid
-!>           if alpha .neq.beta
-!> if alpha=beta: < a | r_beta| db/dR_alpha > = - < da/dR_alpha | r_beta | b > - < a | b >
-!> modified from qs_efield_mo_derivatives
-!> SL July 2015
-! **************************************************************************************************
-   SUBROUTINE dipole_deriv_ao(qs_env, difdip, deltaR, order, rcc)
-      TYPE(qs_environment_type), POINTER                 :: qs_env
-      TYPE(dbcsr_p_type), DIMENSION(:, :), &
-         INTENT(INOUT), POINTER                          :: difdip
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN), &
-         POINTER                                         :: deltaR
-      INTEGER, INTENT(IN)                                :: order
-      REAL(KIND=dp), DIMENSION(3), OPTIONAL              :: rcc
-
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'dipole_deriv_ao'
-
-      INTEGER :: handle, i, iatom, icol, idir, ikind, inode, irow, iset, j, jatom, jkind, jset, &
-                 last_jatom, lda, ldab, ldb, M_dim, maxsgf, natom, ncoa, ncob, nkind, nseta, nsetb, sgfa, &
-                 sgfb
-      INTEGER, DIMENSION(:), POINTER                     :: la_max, la_min, lb_max, lb_min, npgfa, &
-                                                            npgfb, nsgfa, nsgfb
-      INTEGER, DIMENSION(:, :), POINTER                  :: first_sgfa, first_sgfb
-      LOGICAL                                            :: found
-      REAL(dp)                                           :: dab
-      REAL(dp), DIMENSION(3)                             :: ra, rab, rac, rb, rbc, rc
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: work
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :)  :: difmab
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: set_radius_a, set_radius_b
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: rpgfa, rpgfb, sphi_a, sphi_b, zeta, zetb
-      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: mab
-      REAL(KIND=dp), DIMENSION(:, :, :, :), POINTER      :: difmab2
-      TYPE(block_p_type), ALLOCATABLE, DIMENSION(:, :)   :: mint, mint2
-      TYPE(cell_type), POINTER                           :: cell
-      TYPE(gto_basis_set_p_type), DIMENSION(:), POINTER  :: basis_set_list
-      TYPE(gto_basis_set_type), POINTER                  :: basis_set_a, basis_set_b
-      TYPE(neighbor_list_iterator_p_type), &
-         DIMENSION(:), POINTER                           :: nl_iterator
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_all, sab_orb
-      TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-      TYPE(qs_kind_type), POINTER                        :: qs_kind
-
-      CALL timeset(routineN, handle)
-
-      NULLIFY (cell, particle_set, qs_kind_set, sab_orb, sab_all)
-      CALL get_qs_env(qs_env, cell=cell, particle_set=particle_set, &
-                      qs_kind_set=qs_kind_set, sab_orb=sab_orb, sab_all=sab_all)
-      CALL get_qs_kind_set(qs_kind_set=qs_kind_set, &
-                           maxco=ldab, maxsgf=maxsgf)
-
-      nkind = SIZE(qs_kind_set)
-      natom = SIZE(particle_set)
-
-      M_dim = ncoset(order) - 1
-
-      IF (PRESENT(rcc)) THEN
-         rc = rcc
-      ELSE
-         rc = 0._dp
-      END IF
-
-      ALLOCATE (basis_set_list(nkind))
-
-      ALLOCATE (mab(ldab, ldab, M_dim))
-      ALLOCATE (difmab2(ldab, ldab, M_dim, 3))
-      ALLOCATE (work(ldab, maxsgf))
-      ALLOCATE (mint(3, 3))
-      ALLOCATE (mint2(3, 3))
-
-      mab(1:ldab, 1:ldab, 1:M_dim) = 0.0_dp
-      difmab2(1:ldab, 1:ldab, 1:M_dim, 1:3) = 0.0_dp
-      work(1:ldab, 1:maxsgf) = 0.0_dp
-
-      DO i = 1, 3
-      DO j = 1, 3
-         NULLIFY (mint(i, j)%block)
-         NULLIFY (mint2(i, j)%block)
-      END DO
-      END DO
-
-      ! Set the basis_set_list(nkind) to point to the corresponding basis sets
-      DO ikind = 1, nkind
-         qs_kind => qs_kind_set(ikind)
-         CALL get_qs_kind(qs_kind=qs_kind, basis_set=basis_set_a)
-         IF (ASSOCIATED(basis_set_a)) THEN
-            basis_set_list(ikind)%gto_basis_set => basis_set_a
-         ELSE
-            NULLIFY (basis_set_list(ikind)%gto_basis_set)
-         END IF
-      END DO
-
-      CALL neighbor_list_iterator_create(nl_iterator, sab_all)
-      DO WHILE (neighbor_list_iterate(nl_iterator) == 0)
-         CALL get_iterator_info(nl_iterator, ikind=ikind, jkind=jkind, inode=inode, &
-                                iatom=iatom, jatom=jatom, r=rab)
-
-         basis_set_a => basis_set_list(ikind)%gto_basis_set
-         basis_set_b => basis_set_list(jkind)%gto_basis_set
-         IF (.NOT. ASSOCIATED(basis_set_a)) CYCLE
-         IF (.NOT. ASSOCIATED(basis_set_b)) CYCLE
-
-         ! basis ikind
-         first_sgfa => basis_set_a%first_sgf
-         la_max => basis_set_a%lmax
-         la_min => basis_set_a%lmin
-         npgfa => basis_set_a%npgf
-         nseta = basis_set_a%nset
-         nsgfa => basis_set_a%nsgf_set
-         rpgfa => basis_set_a%pgf_radius
-         set_radius_a => basis_set_a%set_radius
-         sphi_a => basis_set_a%sphi
-         zeta => basis_set_a%zet
-         ! basis jkind
-         first_sgfb => basis_set_b%first_sgf
-         lb_max => basis_set_b%lmax
-         lb_min => basis_set_b%lmin
-         npgfb => basis_set_b%npgf
-         nsetb = basis_set_b%nset
-         nsgfb => basis_set_b%nsgf_set
-         rpgfb => basis_set_b%pgf_radius
-         set_radius_b => basis_set_b%set_radius
-         sphi_b => basis_set_b%sphi
-         zetb => basis_set_b%zet
-
-         IF (inode == 1) last_jatom = 0
-
-         ! this guarentees minimum image convention
-         ! anything else would not make sense
-         IF (jatom == last_jatom) THEN
-            CYCLE
-         END IF
-
-         last_jatom = jatom
-
-         irow = iatom
-         icol = jatom
-
-         DO i = 1, 3
-         DO j = 1, 3
-            NULLIFY (mint(i, j)%block)
-            CALL dbcsr_get_block_p(matrix=difdip(i, j)%matrix, &
-                                   row=irow, col=icol, BLOCK=mint(i, j)%block, &
-                                   found=found)
-            CPASSERT(found)
-         END DO
-         END DO
-
-         ra(:) = particle_set(iatom)%r(:)
-         rb(:) = particle_set(jatom)%r(:)
-         rab(:) = pbc(rb, ra, cell)
-         rac(:) = pbc(ra - rc, cell)
-         rbc(:) = pbc(rb - rc, cell)
-         dab = SQRT(rab(1)*rab(1) + rab(2)*rab(2) + rab(3)*rab(3))
-
-         DO iset = 1, nseta
-            ncoa = npgfa(iset)*ncoset(la_max(iset))
-            sgfa = first_sgfa(1, iset)
-            DO jset = 1, nsetb
-               IF (set_radius_a(iset) + set_radius_b(jset) < dab) CYCLE
-               ncob = npgfb(jset)*ncoset(lb_max(jset))
-               sgfb = first_sgfb(1, jset)
-               ldab = MAX(ncoa, ncob)
-               lda = ncoset(la_max(iset))*npgfa(iset)
-               ldb = ncoset(lb_max(jset))*npgfb(jset)
-               ALLOCATE (difmab(lda, ldb, M_dim, 3))
-
-               ! Calculate integral (da|r|b)
-               CALL diff_momop2(la_max(iset), npgfa(iset), zeta(:, iset), &
-                                rpgfa(:, iset), la_min(iset), lb_max(jset), npgfb(jset), &
-                                zetb(:, jset), rpgfb(:, jset), lb_min(jset), order, rac, rbc, &
-                                difmab, deltaR=deltaR, iatom=iatom, jatom=jatom)
-
-!                  *** Contraction step ***
-
-               DO idir = 1, 3 ! derivative of AO function
-               DO j = 1, 3     ! position operator r_j
-                  CALL dgemm("N", "N", ncoa, nsgfb(jset), ncob, &
-                             1.0_dp, difmab(1, 1, j, idir), SIZE(difmab, 1), &
-                             sphi_b(1, sgfb), SIZE(sphi_b, 1), &
-                             0.0_dp, work(1, 1), SIZE(work, 1))
-
-                  CALL dgemm("T", "N", nsgfa(iset), nsgfb(jset), ncoa, &
-                             1.0_dp, sphi_a(1, sgfa), SIZE(sphi_a, 1), &
-                             work(1, 1), SIZE(work, 1), &
-                             1.0_dp, mint(j, idir)%block(sgfa, sgfb), &
-                             SIZE(mint(j, idir)%block, 1))
-               END DO !j
-               END DO !idir
-               DEALLOCATE (difmab)
-            END DO !jset
-         END DO !iset
-      END DO!iterator
-
-      CALL neighbor_list_iterator_release(nl_iterator)
-
-      DO i = 1, 3
-      DO j = 1, 3
-         NULLIFY (mint(i, j)%block)
-      END DO
-      END DO
-
-      DEALLOCATE (mab, difmab2, basis_set_list, work, mint, mint2)
-
-      CALL timestop(handle)
-   END SUBROUTINE dipole_deriv_ao
-
 ! **************************************************************************************************
 !> \brief Get list of kpoints from input to compute dipole moment elements
 !> \param qs_env ...
@@ -3361,8 +2928,9 @@ CONTAINS
       kpnts => section_vals_get_subs_vals(qs_env%input, "DFT%PRINT%MOMENTS%KPOINTS")
       CALL section_vals_get(kpset, explicit=explicit_kpset)
       CALL section_vals_get(kpnts, explicit=explicit_kpnts)
-      IF (explicit_kpset .AND. explicit_kpnts) &
+      IF (explicit_kpset .AND. explicit_kpnts) then
          CPABORT("Both KPOINT_SET and KPOINTS present in MOMENTS section")
+      end if
 
       IF (explicit_kpset) THEN
          CALL get_qs_env(qs_env, cell=cell)
@@ -3616,7 +3184,7 @@ CONTAINS
 
                      CALL dgemm("T", "N", nsgfa(iset), nsgfb(jset), ncoa, &
                                 1.0_dp, sphi_a(1, sgfa), ldsa, &
-                                work(1, 1), ldwork, 1.0_dp, dblock(1, 1), SIZE(dblock, 1))
+                                work(1, 1), ldwork, 1.0_dp, dblock(sgfa, sgfb), SIZE(dblock, 1))
                   END DO
                END DO
             END DO
@@ -3630,34 +3198,99 @@ CONTAINS
    END SUBROUTINE build_local_moment_matrix_rs_img
 
 ! **************************************************************************************************
-!> \brief Calculates the dipole moments and berry curvature for periodic systems for kpoints
+!> \brief Image-cell index covering the images of two kpoint environments and their mirrors -R.
+!>        Needed when the SCF neighbor list reaches further than sab_all (e.g. with HFX), so
+!>        that real-space matrices of both kinds can be replicated into one set of arrays.
+!> \param kp_a first kpoint environment (cell index initialised)
+!> \param kp_b second kpoint environment (cell index initialised)
+!> \param index_to_cell union image list, dim (3, n_images); allocated here, caller deallocates
+!> \param cell_to_index mapping of cell coordinates to the union image index (0 = not present);
+!>        allocated here, caller deallocates
+!> \author Shridhar Shanbhag
+! **************************************************************************************************
+   SUBROUTINE get_cell_index_union(kp_a, kp_b, index_to_cell, cell_to_index)
+      TYPE(kpoint_type), POINTER                         :: kp_a, kp_b
+      INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+
+      INTEGER                                            :: i, ic, isgn, n
+      INTEGER, DIMENSION(3)                              :: cell, itm
+      INTEGER, DIMENSION(:, :), ALLOCATABLE              :: list
+      INTEGER, DIMENSION(:, :), POINTER                  :: itc_a, itc_b
+
+      NULLIFY (itc_a, itc_b)
+      CALL get_kpoint_info(kp_a, index_to_cell=itc_a)
+      CALL get_kpoint_info(kp_b, index_to_cell=itc_b)
+      CPASSERT(ASSOCIATED(itc_a))
+      CPASSERT(ASSOCIATED(itc_b))
+
+      DO i = 1, 3
+         itm(i) = MAX(MAXVAL(ABS(itc_a(i, :))), MAXVAL(ABS(itc_b(i, :))))
+      END DO
+      ALLOCATE (cell_to_index(-itm(1):itm(1), -itm(2):itm(2), -itm(3):itm(3)))
+      cell_to_index(:, :, :) = 0
+      ALLOCATE (list(3, 2*(SIZE(itc_a, 2) + SIZE(itc_b, 2))))
+
+      ! the images of kp_a keep their order, so index i of kp_a is index i of the union
+      n = 0
+      DO isgn = 1, -1, -2
+         DO ic = 1, SIZE(itc_a, 2)
+            cell(:) = isgn*itc_a(:, ic)
+            IF (cell_to_index(cell(1), cell(2), cell(3)) /= 0) CYCLE
+            n = n + 1
+            cell_to_index(cell(1), cell(2), cell(3)) = n
+            list(:, n) = cell(:)
+         END DO
+      END DO
+      DO isgn = 1, -1, -2
+         DO ic = 1, SIZE(itc_b, 2)
+            cell(:) = isgn*itc_b(:, ic)
+            IF (cell_to_index(cell(1), cell(2), cell(3)) /= 0) CYCLE
+            n = n + 1
+            cell_to_index(cell(1), cell(2), cell(3)) = n
+            list(:, n) = cell(:)
+         END DO
+      END DO
+
+      ALLOCATE (index_to_cell(3, n))
+      index_to_cell(:, :) = list(:, 1:n)
+      DEALLOCATE (list)
+
+   END SUBROUTINE get_cell_index_union
+
+! **************************************************************************************************
+!> \brief Calculate interband k-point dipole moments d_nm(k) = i<u_n|∇_k|u_m>, Berry curvature,
+!>        momentum and band energies for a periodic system for k-points
 !> \param qs_env ...
 !> \param xkp list of kpoints
 !> \param dipole ...
 !> \param rcc coordinates about which to calculate the dipole
-!> \param berry_c berry curvature calculated using Ω^γ_n = Σ_m 2*Im[d^α_nm (d^β_mn)*]
-!> \param do_parallel option to distribute the result in dipole across
-!>        different MPI ranks
+!> \param berry_c berry curvature calculated using Ω^γ_n = -Σ_{m≠n} 2*Im[d^α_nm d^β_mn]
+!> \param momentum ...
+!> \param energy ...
+!> \param do_parallel option to distribute the result in dipole across different MPI ranks
 !> \author Shridhar Shanbhag
 ! **************************************************************************************************
-   SUBROUTINE qs_moment_kpoints_deep(qs_env, xkp, dipole, rcc, berry_c, do_parallel)
+   SUBROUTINE qs_moment_kpoints_deep(qs_env, xkp, dipole, rcc, berry_c, momentum, energy, do_parallel)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       LOGICAL, OPTIONAL                                  :: do_parallel
-      LOGICAL                                            :: my_do_parallel, calc_bc
+      LOGICAL                                            :: my_do_parallel, calc_dipole, calc_bc, &
+                                                            calc_momentum, calc_energy
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'qs_moment_kpoints_deep'
       COMPLEX(KIND=dp)                                   :: phase, tmp_max
       COMPLEX(KIND=dp), DIMENSION(:, :), ALLOCATABLE     :: C_k, H_k, S_k, D_k, CDC, C_dH_C, &
                                                             C_dS_C, dH_dk_i, dS_dk_i
-      COMPLEX(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE  :: dip
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE  :: dip, mom
       COMPLEX(KIND=dp), DIMENSION(:, :, :, :, :), &
-         ALLOCATABLE                                     :: dipole
+         ALLOCATABLE, OPTIONAL                           :: dipole, momentum
       INTEGER                                            :: handle, i_dir, ikp, nkp, &
-                                                            n_img_scf, n_img_all, nao, &
+                                                            n_img_scf, n_img_all, n_img_mom, nao, &
                                                             num_pe, num_copy, mepos, n, m, mu, &
                                                             ispin, nspin
       INTEGER, DIMENSION(3)                              :: periodic
-      INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell_all
+      INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell_all, index_to_cell_mom
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index_all
+      REAL(KIND=dp), PARAMETER                           :: eps_degenerate = 1.0E-10_dp
       REAL(KIND=dp), DIMENSION(3), OPTIONAL              :: rcc
       REAL(KIND=dp), DIMENSION(3)                        :: my_rcc
       REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
@@ -3665,6 +3298,8 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: bc, xkp
       REAL(KIND=dp), DIMENSION(:, :, :, :), &
          ALLOCATABLE, OPTIONAL                           :: berry_c
+      REAL(KIND=dp), DIMENSION(:, :, :), &
+         ALLOCATABLE, OPTIONAL                           :: energy
       REAL(KIND=dp), DIMENSION(:, :, :, :), &
          ALLOCATABLE                                     :: D_rs, H_rs, S_rs
       TYPE(cell_type), POINTER                           :: cell
@@ -3678,7 +3313,10 @@ CONTAINS
          POINTER                                         :: sab_all
 
       CALL timeset(routineN, handle)
+      calc_dipole = PRESENT(dipole)
       calc_bc = PRESENT(berry_c)
+      calc_momentum = PRESENT(momentum)
+      calc_energy = PRESENT(energy)
       my_do_parallel = .FALSE.
       my_rcc = 0.0_dp
       IF (PRESENT(do_parallel)) my_do_parallel = do_parallel
@@ -3699,18 +3337,21 @@ CONTAINS
       nspin = SIZE(matrix_ks_kp, 1)
       nkp = SIZE(xkp, 2)
 
-      ! create kpoint environment kpoints_all which contains all neighbor cells R
-      ! without considering any lattice symmetry
-      NULLIFY (kpoints_all)
+      ! create kpoint environment kpoints_all which contains all neighbor cells R of sab_all
+      ! (the images of the dipole operator) without considering any lattice symmetry
+      NULLIFY (kpoints_all, index_to_cell_mom)
       CALL kpoint_create(kpoints_all)
       CALL kpoint_init_cell_index(kpoints_all, sab_all, para_env, n_img_scf)
+      CALL get_kpoint_info(kpoints_all, index_to_cell=index_to_cell_mom)
+      n_img_mom = SIZE(index_to_cell_mom, 2)
 
-      CALL get_kpoint_info(kpoints_all, cell_to_index=cell_to_index_all, &
-                           index_to_cell=index_to_cell_all)
+      ! The SCF neighbor list (e.g. extended for HFX) can contain images not in sab_all, so the
+      ! arrays S_rs, H_rs, D_rs are indexed by the union of both image sets (incl. mirrors -R)
+      CALL get_cell_index_union(kpoints_all, kpoints_scf, index_to_cell_all, cell_to_index_all)
       n_img_all = SIZE(index_to_cell_all, 2)
 
       NULLIFY (moments_rs_img)
-      CALL dbcsr_allocate_matrix_set(moments_rs_img, 3, n_img_all)
+      CALL dbcsr_allocate_matrix_set(moments_rs_img, 3, n_img_mom)
       ! D_μ,ν = <φ_μ|r|φ_ν>
       CALL build_local_moment_matrix_rs_img(qs_env, moments_rs_img, rcc=my_rcc)
 
@@ -3731,18 +3372,22 @@ CONTAINS
          num_copy = CEILING(REAL(nkp)/num_pe)
       END IF
 
-      ALLOCATE (dipole(nspin, num_copy, 3, nao, nao), source=z_zero)
+      IF (calc_dipole) ALLOCATE (dipole(nspin, num_copy, 3, nao, nao), source=z_zero)
       IF (calc_bc) ALLOCATE (berry_c(nspin, num_copy, 3, nao), source=0.0_dp)
+      IF (calc_momentum) ALLOCATE (momentum(nspin, num_copy, 3, nao, nao), source=z_zero)
+      IF (calc_energy) ALLOCATE (energy(nspin, num_copy, nao), source=0.0_dp)
 
 !$OMP PARALLEL DEFAULT(NONE) PRIVATE(ikp, S_k, H_k, eigenvals, C_k, ispin, n, m, &
-!$OMP i_dir, dS_dk_i, dH_dk_i, D_k, dip, bc, C_dS_C, C_dH_C, CDC, tmp_max, phase) &
-!$OMP SHARED(num_pe, mepos, dipole, berry_c, nao, nspin, periodic, &
-!$OMP nkp, xkp, S_rs, H_rs, D_rs, index_to_cell_all, hmat, calc_bc)
+!$OMP i_dir, dS_dk_i, dH_dk_i, D_k, dip, bc, mom, C_dS_C, C_dH_C, CDC, tmp_max, phase) &
+!$OMP SHARED(num_pe, mepos, dipole, berry_c, momentum, energy, nao, nspin, periodic, nkp, &
+!$OMP xkp, S_rs, H_rs, D_rs, index_to_cell_all, hmat, calc_dipole, calc_bc, calc_momentum, calc_energy)
       ALLOCATE (dS_dk_i(nao, nao), C_dS_C(nao, nao), dH_dk_i(nao, nao), C_dH_C(nao, nao), source=z_zero)
-      ALLOCATE (CDC(nao, nao), dip(3, nao, nao), S_k(nao, nao), H_k(nao, nao), source=z_zero)
+      ALLOCATE (CDC(nao, nao), S_k(nao, nao), H_k(nao, nao), source=z_zero)
       ALLOCATE (C_k(nao, nao), D_k(nao, nao), source=z_zero)
       ALLOCATE (eigenvals(nao), source=0.0_dp)
+      IF (calc_dipole .OR. calc_bc) ALLOCATE (dip(3, nao, nao), source=z_zero)
       IF (calc_bc) ALLOCATE (bc(3, nao), source=0.0_dp)
+      IF (calc_momentum) ALLOCATE (mom(3, nao, nao), source=z_zero)
 !$OMP DO COLLAPSE(2)
       DO ispin = 1, nspin
          DO ikp = 1, nkp
@@ -3770,6 +3415,11 @@ CONTAINS
                C_k(:, n) = C_k(:, n)/phase
             END DO
 
+            ! reset per k-point/spin: degenerate pairs are skipped below and must not keep
+            ! values from a previous iteration
+            IF (calc_dipole .OR. calc_bc) dip = z_zero
+            IF (calc_momentum) mom = z_zero
+
             DO i_dir = 1, 3 ! d^x, d^y, d^z
 
                IF (periodic(i_dir) == 0) CYCLE
@@ -3785,21 +3435,38 @@ CONTAINS
                CALL gemm_square(C_k, 'C', dH_dk_i, 'N', C_k, 'N', C_dH_C)
                CALL gemm_square(C_k, 'C', D_k, 'N', C_k, 'N', CDC)
 
-               ! Compute the dipole
-               ! d_nm (k) = - i/(ε(n)-ε(m)) [ (C^H)(dH(k)/dk)C ]_nm
-               !            + i ε(n)/(ε(n)-ε(m)) [ (C^H)(dS(k)/dk)C ]_nm + [ (C^H)D(k)C ]_nm
+               ! Compute the dipole (n ≠ m)
+               !    d_nm (k) = - i/(ε_n - ε_m) [ C^† dH(k)/dk C ]_nm
+               !               + i ε_n/(ε_n - ε_m) [ C^† dS(k)/dk C ]_nm + [ C^†D(k)C ]_nm
+               ! and the momentum
+               !    p_nm = <ψ_n|-iħ∇_r|ψ_m> = <u_n|(ħk - iħ∇_r)|u_m>
+               !         = i d_nm (ε_n - ε_m) + ∇_k ε_n δ_nm
+               !         = [ C^† dH(k)/dk C ]_nm - ε_n [ C^† dS(k)/dk C ]_nm
+               !           + i (ε_n - ε_m) [ (C^H)D(k)C ]_nm
                DO n = 1, nao
                   DO m = 1, nao
-                     IF (n == m) CYCLE ! diagonal elements would need to be computed from
-                     ! a numerical k-derivative which is not implemented
-                     dip(i_dir, n, m) = -gaussi*C_dH_C(n, m)/(eigenvals(n) - eigenvals(m)) &
-                                        + gaussi*eigenvals(n)*C_dS_C(n, m)/(eigenvals(n) - eigenvals(m)) &
-                                        + CDC(n, m)
+                     IF (n == m) THEN
+                        ! diagonal elements of the dipole would need to be computed from
+                        ! a numerical k-derivative which is not implemented
+                        IF (calc_momentum) THEN
+                           mom(i_dir, n, n) = DBLE(C_dH_C(n, n)) - DBLE(eigenvals(n)*C_dS_C(n, n))
+                        END IF
+                     ELSE
+                        IF ((calc_dipole .OR. calc_bc) .AND. (ABS(eigenvals(n) - eigenvals(m)) >= eps_degenerate)) THEN
+                           dip(i_dir, n, m) = -gaussi*C_dH_C(n, m)/(eigenvals(n) - eigenvals(m)) &
+                                              + gaussi*eigenvals(n)*C_dS_C(n, m)/(eigenvals(n) - eigenvals(m)) &
+                                              + CDC(n, m)
+                        END IF
+                        IF (calc_momentum) THEN
+                           mom(i_dir, n, m) = C_dH_C(n, m) - eigenvals(n)*C_dS_C(n, m) &
+                                              + gaussi*CDC(n, m)*(eigenvals(n) - eigenvals(m))
+                        END IF
+                     END IF
                   END DO
                END DO
             END DO
             ! Compute the Berry curvature from the dipoles
-            ! Ω^γ_n = Σ_m 2*Im[d^α_nm d^β_mn], where, α, β, γ belong to {x, y, z}
+            ! Ω^γ_n = -Σ_{m≠n} 2*Im[d^α_nm d^β_mn], where (α, β, γ) are cyclic in {x, y, z}
             IF (calc_bc) THEN
                bc = 0.0_dp
                DO i_dir = 1, 3
@@ -3807,25 +3474,370 @@ CONTAINS
                      DO m = 1, nao
                         IF (n == m) CYCLE
                         bc(i_dir, n) = bc(i_dir, n) &
-                                       + 2*AIMAG(dip(1 + MOD(i_dir, 3), n, m)*dip(1 + MOD(i_dir + 1, 3), m, n))
+                                       - 2*AIMAG(dip(1 + MOD(i_dir, 3), n, m)*dip(1 + MOD(i_dir + 1, 3), m, n))
                      END DO
                   END DO
                END DO
             END IF
-            ! Store the dipoles and berry curvature for each MPI rank
-            dipole(ispin, CEILING(REAL(ikp)/num_pe), :, :, :) = dip(:, :, :)
+            ! Store the dipoles, momentum, berry curvature and energies for each MPI rank
+            IF (calc_dipole) dipole(ispin, CEILING(REAL(ikp)/num_pe), :, :, :) = dip(:, :, :)
+            IF (calc_momentum) momentum(ispin, CEILING(REAL(ikp)/num_pe), :, :, :) = mom(:, :, :)
             IF (calc_bc) berry_c(ispin, CEILING(REAL(ikp)/num_pe), :, :) = bc(:, :)
+            IF (calc_energy) energy(ispin, CEILING(REAL(ikp)/num_pe), :) = eigenvals(:)
          END DO
       END DO
 !$OMP END DO
-      DEALLOCATE (dS_dk_i, C_dS_C, dH_dk_i, C_dH_C, CDC, dip, S_k, H_k, C_k, D_k, eigenvals)
+      DEALLOCATE (dS_dk_i, C_dS_C, dH_dk_i, C_dH_C, CDC, S_k, H_k, C_k, D_k, eigenvals)
+      IF (calc_dipole .OR. calc_bc) DEALLOCATE (dip)
       IF (calc_bc) DEALLOCATE (bc)
+      IF (calc_momentum) DEALLOCATE (mom)
 !$OMP END PARALLEL
       DEALLOCATE (S_rs, H_rs, D_rs)
+      DEALLOCATE (index_to_cell_all, cell_to_index_all)
       CALL dbcsr_deallocate_matrix_set(moments_rs_img)
       CALL kpoint_release(kpoints_all)
       CALL timestop(handle)
    END SUBROUTINE qs_moment_kpoints_deep
+
+! **************************************************************************************************
+!> \brief Add the spin-orbit coupling operator V^SOC(k) = sigma . V(k) (or its k-derivative) to a
+!>        2*nao spinor matrix. The real-space components VSOC_rs store V^SOC without the imaginary
+!>        unit (real, antisymmetric), so the physical Hermitian component is W_c = i*V_c(k). The
+!>        Pauli placement mirrors H_KS_spinor_kp in post_scf_bandstructure_utils.F:
+!>        uu += W_z ; dd += -W_z ; ud += W_x + i*W_y ; du += W_x - i*W_y.
+!> \param mat_spinor 2*nao spinor matrix to be updated in place
+!> \param VSOC_rs real-space SOC images, dim (3=xyz, nao, nao, n_img)
+!> \param index_to_cell image-cell coordinates
+!> \param xkp k-point
+!> \param nao number of atomic orbitals (block size)
+!> \param deriv_direction optional cartesian direction for the k-derivative of V^SOC
+!> \param hmat cell matrix, required for the derivative
+!> \author Shridhar Shanbhag
+! **************************************************************************************************
+   SUBROUTINE add_VSOC_to_spinor(mat_spinor, VSOC_rs, index_to_cell, xkp, nao, &
+                                 deriv_direction, hmat)
+      COMPLEX(KIND=dp), DIMENSION(:, :), INTENT(INOUT)   :: mat_spinor
+      REAL(KIND=dp), DIMENSION(:, :, :, :), INTENT(IN)   :: VSOC_rs
+      INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: xkp
+      INTEGER, INTENT(IN)                                :: nao
+      INTEGER, INTENT(IN), OPTIONAL                      :: deriv_direction
+      REAL(KIND=dp), DIMENSION(3, 3), INTENT(IN), &
+         OPTIONAL                                        :: hmat
+
+      COMPLEX(KIND=dp), DIMENSION(:, :), ALLOCATABLE     :: Vx, Vy, Vz
+      INTEGER                                            :: s
+
+      s = nao + 1
+      ALLOCATE (Vx(nao, nao), Vy(nao, nao), Vz(nao, nao), source=z_zero)
+
+      IF (PRESENT(deriv_direction)) THEN
+         CALL rs_to_kp(VSOC_rs(1, :, :, :), Vx, index_to_cell, xkp, deriv_direction, hmat)
+         CALL rs_to_kp(VSOC_rs(2, :, :, :), Vy, index_to_cell, xkp, deriv_direction, hmat)
+         CALL rs_to_kp(VSOC_rs(3, :, :, :), Vz, index_to_cell, xkp, deriv_direction, hmat)
+      ELSE
+         CALL rs_to_kp(VSOC_rs(1, :, :, :), Vx, index_to_cell, xkp)
+         CALL rs_to_kp(VSOC_rs(2, :, :, :), Vy, index_to_cell, xkp)
+         CALL rs_to_kp(VSOC_rs(3, :, :, :), Vz, index_to_cell, xkp)
+      END IF
+
+      ! physical component operators W_c = i * V_c (VSOC_rs stores V without the imaginary unit)
+      Vx(:, :) = gaussi*Vx(:, :)
+      Vy(:, :) = gaussi*Vy(:, :)
+      Vz(:, :) = gaussi*Vz(:, :)
+
+      mat_spinor(1:nao, 1:nao) = mat_spinor(1:nao, 1:nao) + Vz(:, :)
+      mat_spinor(s:2*nao, s:2*nao) = mat_spinor(s:2*nao, s:2*nao) - Vz(:, :)
+      mat_spinor(1:nao, s:2*nao) = mat_spinor(1:nao, s:2*nao) + Vx(:, :) + gaussi*Vy(:, :)
+      mat_spinor(s:2*nao, 1:nao) = mat_spinor(s:2*nao, 1:nao) + Vx(:, :) - gaussi*Vy(:, :)
+
+      DEALLOCATE (Vx, Vy, Vz)
+
+   END SUBROUTINE add_VSOC_to_spinor
+
+! **************************************************************************************************
+!> \brief Calculate interband k-point dipole moments d_nm(k) = i<u_n|∇_k|u_m>, Berry curvature,
+!>        momentum and band energies for a periodic system for k-points with spin-orbit coupling
+!>        (SOC) in the 2*nao spinor basis, via the length-gauge sum rule.
+!>        SOC enters both the Hamiltonian and the velocity operator (the k-derivative of V^SOC is
+!>        included). Mirrors qs_moment_kpoints_deep but promoted to spinor space; the two spin
+!>        channels are merged into 2*nao spinor bands (returned with spin dimension 1).
+!> \param qs_env ...
+!> \param xkp k-points at which the dipoles are evaluated
+!> \param dipole optional output dipoles, dim (1, k copy, 3, 2*nao, 2*nao)
+!> \param rcc reference point for the local dipole operator (interband dipoles are origin-independent)
+!> \param berry_c optional SOC Berry curvature, dim (1, k copy, 3, 2*nao)
+!> \param momentum optional SOC momentum matrix elements p_nm, dim (1, k copy, 3, 2*nao, 2*nao)
+!> \param energy optional spinor band energies, dim (1, k copy, 2*nao)
+!> \param do_parallel distribute k-points over MPI ranks
+!> \author Shridhar Shanbhag
+! **************************************************************************************************
+   SUBROUTINE qs_moment_kpoints_deep_soc(qs_env, xkp, dipole, rcc, berry_c, momentum, energy, do_parallel)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: xkp
+      COMPLEX(KIND=dp), DIMENSION(:, :, :, :, :), &
+         ALLOCATABLE, OPTIONAL                           :: dipole
+      REAL(KIND=dp), DIMENSION(3), OPTIONAL              :: rcc
+      REAL(KIND=dp), DIMENSION(:, :, :, :), &
+         ALLOCATABLE, OPTIONAL                           :: berry_c
+      COMPLEX(KIND=dp), DIMENSION(:, :, :, :, :), &
+         ALLOCATABLE, OPTIONAL                           :: momentum
+      REAL(KIND=dp), DIMENSION(:, :, :), &
+         ALLOCATABLE, OPTIONAL                           :: energy
+      LOGICAL, OPTIONAL                                  :: do_parallel
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'qs_moment_kpoints_deep_soc'
+      REAL(KIND=dp), PARAMETER                           :: eps_degenerate = 1.0E-10_dp
+
+      COMPLEX(KIND=dp)                                   :: phase, tmp_max
+      COMPLEX(KIND=dp), DIMENSION(:, :), ALLOCATABLE     :: D_k, dHd_k, dHu_k, dS_k, Hd_k, Hu_k, &
+                                                            S_k, D2, dH2, dS2, H2, S2, W, WD2W, &
+                                                            WdH2W, WdS2W
+      COMPLEX(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE  :: dip, mom
+      INTEGER                                            :: handle, i_dir, ikp, mepos, mu, m, n, &
+                                                            n_img_all, n_img_mom, nao, nao2, nimg, nkp, &
+                                                            nspin, num_copy, num_pe, s
+      INTEGER, DIMENSION(3)                              :: periodic
+      INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell_all, index_to_cell_mom
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index_all
+      LOGICAL                                            :: calc_bc, calc_dipole, calc_energy, &
+                                                            calc_momentum, my_do_parallel
+      REAL(KIND=dp), DIMENSION(3)                        :: my_rcc
+      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: eigenvals
+      REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE        :: bc
+      REAL(KIND=dp), DIMENSION(:, :, :, :), ALLOCATABLE  :: D_rs, H_rs, S_rs, VSOC_rs
+      TYPE(cell_type), POINTER                           :: cell
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: mat_V_SOC_xyz, matrix_ks_kp, &
+                                                            matrix_s_kp, moments_rs_img
+      TYPE(dft_control_type), POINTER                    :: dft_control
+      TYPE(kpoint_type), POINTER                         :: kpoints_all, kpoints_scf
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: sab_all
+
+      CALL timeset(routineN, handle)
+      calc_dipole = PRESENT(dipole)
+      calc_bc = PRESENT(berry_c)
+      calc_momentum = PRESENT(momentum)
+      calc_energy = PRESENT(energy)
+      my_do_parallel = .FALSE.
+      my_rcc = 0.0_dp
+      IF (PRESENT(do_parallel)) my_do_parallel = do_parallel
+      IF (PRESENT(rcc)) my_rcc = rcc
+
+      NULLIFY (cell, cell_to_index_all, dft_control, index_to_cell_all, index_to_cell_mom, kpoints_all, &
+               kpoints_scf, mat_V_SOC_xyz, matrix_ks_kp, matrix_s_kp, moments_rs_img, mos, &
+               para_env, sab_all)
+
+      CALL get_qs_env(qs_env, &
+                      matrix_ks_kp=matrix_ks_kp, &
+                      matrix_s_kp=matrix_s_kp, &
+                      sab_all=sab_all, &
+                      cell=cell, &
+                      kpoints=kpoints_scf, &
+                      para_env=para_env, &
+                      dft_control=dft_control, &
+                      mos=mos)
+
+      CALL get_mo_set(mo_set=mos(1), nao=nao)
+      CALL get_cell(cell=cell, h=hmat, periodic=periodic)
+      nspin = SIZE(matrix_ks_kp, 1)
+      nkp = SIZE(xkp, 2)
+      nao2 = 2*nao
+      s = nao + 1
+
+      ! create kpoint environment kpoints_all which contains all neighbor cells R of sab_all
+      ! (the images of the dipole operator)
+      CALL kpoint_create(kpoints_all)
+      CALL kpoint_init_cell_index(kpoints_all, sab_all, para_env, nimg)
+      CALL get_kpoint_info(kpoints_all, index_to_cell=index_to_cell_mom)
+      n_img_mom = SIZE(index_to_cell_mom, 2)
+
+      ! The SCF neighbor list (e.g. extended for HFX) can contain images not in sab_all, so the
+      ! arrays S_rs, H_rs, D_rs, VSOC_rs are indexed by the union of both image sets (incl. -R)
+      CALL get_cell_index_union(kpoints_all, kpoints_scf, index_to_cell_all, cell_to_index_all)
+      n_img_all = SIZE(index_to_cell_all, 2)
+
+      NULLIFY (moments_rs_img)
+      CALL dbcsr_allocate_matrix_set(moments_rs_img, 3, n_img_mom)
+      ! D_mu,nu = <phi_mu|r|phi_nu>
+      CALL build_local_moment_matrix_rs_img(qs_env, moments_rs_img, rcc=my_rcc)
+
+      ! Real-space SOC operator V^SOC_c^R (c=x,y,z), stored real and antisymmetric on sab_orb.
+      ! Aborts inside if the atoms carry no pseudopotential SOC parameters.
+      CALL V_SOC_xyz_from_pseudopotential(qs_env, mat_V_SOC_xyz)
+
+      ALLOCATE (S_rs(1, nao, nao, n_img_all), H_rs(nspin, nao, nao, n_img_all), source=0.0_dp)
+      ALLOCATE (D_rs(3, nao, nao, n_img_all), VSOC_rs(3, nao, nao, n_img_all), source=0.0_dp)
+
+      ! Convert real-space dbcsr matrices into arrays (S/H on the SCF kpoints, D on kpoints_all)
+      CALL replicate_rs_matrices(matrix_s_kp, kpoints_scf, S_rs, cell_to_index_all)
+      CALL replicate_rs_matrices(matrix_ks_kp, kpoints_scf, H_rs, cell_to_index_all)
+      CALL replicate_rs_matrices(moments_rs_img, kpoints_all, D_rs, cell_to_index_all)
+      CALL replicate_rs_matrices(mat_V_SOC_xyz, kpoints_scf, VSOC_rs, cell_to_index_all)
+
+      mepos = 0
+      num_pe = 1
+      num_copy = nkp
+      IF (my_do_parallel) THEN
+         mepos = para_env%mepos
+         num_pe = para_env%num_pe
+         num_copy = CEILING(REAL(nkp)/num_pe)
+      END IF
+
+      IF (calc_dipole) ALLOCATE (dipole(1, num_copy, 3, nao2, nao2), source=z_zero)
+      IF (calc_bc) ALLOCATE (berry_c(1, num_copy, 3, nao2), source=0.0_dp)
+      IF (calc_momentum) ALLOCATE (momentum(1, num_copy, 3, nao2, nao2), source=z_zero)
+      IF (calc_energy) ALLOCATE (energy(1, num_copy, nao2), source=0.0_dp)
+
+!$OMP PARALLEL DEFAULT(NONE) PRIVATE(ikp, i_dir, n, m, mu, tmp_max, phase, eigenvals, &
+!$OMP S_k, Hu_k, Hd_k, D_k, dS_k, dHu_k, dHd_k, S2, H2, D2, dS2, dH2, W, &
+!$OMP WdH2W, WdS2W, WD2W, dip, bc, mom) &
+!$OMP SHARED(num_pe, mepos, dipole, berry_c, momentum, energy, nao, nao2, s, nspin, periodic, &
+!$OMP nkp, xkp, S_rs, H_rs, D_rs, VSOC_rs, index_to_cell_all, hmat, calc_dipole, calc_bc, &
+!$OMP calc_momentum, calc_energy)
+      ALLOCATE (S_k(nao, nao), Hu_k(nao, nao), Hd_k(nao, nao), D_k(nao, nao), source=z_zero)
+      ALLOCATE (dS_k(nao, nao), dHu_k(nao, nao), dHd_k(nao, nao), source=z_zero)
+      ALLOCATE (S2(nao2, nao2), H2(nao2, nao2), D2(nao2, nao2), dS2(nao2, nao2), &
+                dH2(nao2, nao2), W(nao2, nao2), source=z_zero)
+      ALLOCATE (WdH2W(nao2, nao2), WdS2W(nao2, nao2), WD2W(nao2, nao2), source=z_zero)
+      ALLOCATE (eigenvals(nao2), source=0.0_dp)
+      IF (calc_dipole .OR. calc_bc) ALLOCATE (dip(3, nao2, nao2), source=z_zero)
+      IF (calc_bc) ALLOCATE (bc(3, nao2), source=0.0_dp)
+      IF (calc_momentum) ALLOCATE (mom(3, nao2, nao2), source=z_zero)
+!$OMP DO
+      DO ikp = 1, nkp
+         IF (MOD(ikp - 1, num_pe) /= mepos) CYCLE
+
+         ! S(k), H_up(k), H_dn(k)
+         CALL rs_to_kp(S_rs(1, :, :, :), S_k, index_to_cell_all, xkp(:, ikp))
+         CALL rs_to_kp(H_rs(1, :, :, :), Hu_k, index_to_cell_all, xkp(:, ikp))
+         CALL rs_to_kp(H_rs(nspin, :, :, :), Hd_k, index_to_cell_all, xkp(:, ikp))
+
+         ! spinor overlap S2 = blockdiag(S, S)
+         S2 = z_zero
+         S2(1:nao, 1:nao) = S_k(:, :)
+         S2(s:nao2, s:nao2) = S_k(:, :)
+
+         ! spinor Hamiltonian H2 = blockdiag(H_up, H_dn) + V^SOC(k)
+         H2 = z_zero
+         H2(1:nao, 1:nao) = Hu_k(:, :)
+         H2(s:nao2, s:nao2) = Hd_k(:, :)
+         CALL add_VSOC_to_spinor(H2, VSOC_rs, index_to_cell_all, xkp(:, ikp), nao)
+
+         ! Diagonalize H2 W = S2 W E  ->  spinor bands and AO-spinor eigenvectors
+         CALL geeig_right(H2, S2, eigenvals, W)
+
+         ! To have a smooth complex phase of C(k) as function of k, for every n, we force
+         ! the largest C_μ,n(k) to be real.
+         ! This is important to have a continuous dipole moment d_nm(k) as a function of k
+         DO n = 1, nao2
+            tmp_max = W(1, n)
+            DO mu = 1, nao2
+               IF (ABS(W(mu, n)) < ABS(tmp_max)) CYCLE
+               tmp_max = W(mu, n)
+            END DO
+            phase = tmp_max/ABS(tmp_max)
+            W(:, n) = W(:, n)/phase
+         END DO
+
+         IF (calc_dipole .OR. calc_bc) dip = z_zero
+         IF (calc_momentum) mom = z_zero
+         DO i_dir = 1, 3 ! d^x, d^y, d^z
+
+            IF (periodic(i_dir) == 0) CYCLE
+
+            ! spinor overlap derivative dS2 = blockdiag(grad S, grad S)
+            CALL rs_to_kp(S_rs(1, :, :, :), dS_k, index_to_cell_all, xkp(:, ikp), i_dir, hmat)
+            dS2 = z_zero
+            dS2(1:nao, 1:nao) = dS_k(:, :)
+            dS2(s:nao2, s:nao2) = dS_k(:, :)
+
+            ! spinor Hamiltonian derivative dH2 = blockdiag(grad H_up, grad H_dn) + grad V^SOC
+            CALL rs_to_kp(H_rs(1, :, :, :), dHu_k, index_to_cell_all, xkp(:, ikp), i_dir, hmat)
+            CALL rs_to_kp(H_rs(nspin, :, :, :), dHd_k, index_to_cell_all, xkp(:, ikp), i_dir, hmat)
+            dH2 = z_zero
+            dH2(1:nao, 1:nao) = dHu_k(:, :)
+            dH2(s:nao2, s:nao2) = dHd_k(:, :)
+            CALL add_VSOC_to_spinor(dH2, VSOC_rs, index_to_cell_all, xkp(:, ikp), nao, i_dir, hmat)
+
+            ! spinor dipole operator D2 = blockdiag(D(k), D(k))
+            CALL rs_to_kp(D_rs(i_dir, :, :, :), D_k, index_to_cell_all, xkp(:, ikp))
+            D2 = z_zero
+            D2(1:nao, 1:nao) = D_k(:, :)
+            D2(s:nao2, s:nao2) = D_k(:, :)
+
+            ! Basis transform to the spinor eigenbasis: W^H (grad S) W, W^H (grad H) W, W^H D W
+            CALL gemm_square(W, 'C', dH2, 'N', W, 'N', WdH2W)
+            CALL gemm_square(W, 'C', dS2, 'N', W, 'N', WdS2W)
+            CALL gemm_square(W, 'C', D2, 'N', W, 'N', WD2W)
+
+            ! d_nm(k) = -i/(E_n-E_m)[W^H grad H W]_nm + i E_n/(E_n-E_m)[W^H grad S W]_nm + [W^H D W]_nm
+            ! Degenerate spinor pairs (|E_n-E_m| < eps_degenerate, e.g. Kramers) are skipped for the
+            ! dipole (and hence the Berry curvature): the length-gauge sum rule needs degenerate
+            ! perturbation theory there. The momentum below is well defined and is still computed.
+            ! Momentum (grad H includes grad V^SOC, i.e. the SOC part of the velocity):
+            !    p_nm = i d_nm (E_n - E_m) + grad_k E_n delta_nm
+            !         = [W^H grad H W]_nm - E_n [W^H grad S W]_nm + i (E_n - E_m) [W^H D W]_nm
+            DO n = 1, nao2
+               DO m = 1, nao2
+                  IF (n == m) THEN
+                     ! diagonal elements of the dipole would need to be computed from
+                     ! a numerical k-derivative which is not implemented
+                     IF (calc_momentum) THEN
+                        mom(i_dir, n, n) = DBLE(WdH2W(n, n)) - DBLE(eigenvals(n)*WdS2W(n, n))
+                     END IF
+                  ELSE
+                     IF ((calc_dipole .OR. calc_bc) .AND. (ABS(eigenvals(n) - eigenvals(m)) >= eps_degenerate)) THEN
+                        dip(i_dir, n, m) = -gaussi*WdH2W(n, m)/(eigenvals(n) - eigenvals(m)) &
+                                           + gaussi*eigenvals(n)*WdS2W(n, m)/(eigenvals(n) - eigenvals(m)) &
+                                           + WD2W(n, m)
+                     END IF
+                     IF (calc_momentum) THEN
+                        mom(i_dir, n, m) = WdH2W(n, m) - eigenvals(n)*WdS2W(n, m) &
+                                           + gaussi*WD2W(n, m)*(eigenvals(n) - eigenvals(m))
+                     END IF
+                  END IF
+               END DO
+            END DO
+         END DO
+
+         ! Berry curvature Omega^gamma_n = -Sum_{m/=n} 2*Im[d^alpha_nm d^beta_mn], (alpha,beta,gamma) cyclic
+         IF (calc_bc) THEN
+            bc = 0.0_dp
+            DO i_dir = 1, 3
+               DO n = 1, nao2
+                  DO m = 1, nao2
+                     IF (n == m) CYCLE
+                     bc(i_dir, n) = bc(i_dir, n) &
+                                    - 2*AIMAG(dip(1 + MOD(i_dir, 3), n, m)*dip(1 + MOD(i_dir + 1, 3), m, n))
+                  END DO
+               END DO
+            END DO
+         END IF
+
+         ! Store the dipoles, momentum, berry curvature and energies for each MPI rank
+         IF (calc_dipole) dipole(1, CEILING(REAL(ikp)/num_pe), :, :, :) = dip(:, :, :)
+         IF (calc_momentum) momentum(1, CEILING(REAL(ikp)/num_pe), :, :, :) = mom(:, :, :)
+         IF (calc_bc) berry_c(1, CEILING(REAL(ikp)/num_pe), :, :) = bc(:, :)
+         IF (calc_energy) energy(1, CEILING(REAL(ikp)/num_pe), :) = eigenvals(:)
+      END DO
+!$OMP END DO
+      DEALLOCATE (S_k, Hu_k, Hd_k, D_k, dS_k, dHu_k, dHd_k, S2, H2, D2, dS2, dH2, W, &
+                  WdH2W, WdS2W, WD2W, eigenvals)
+      IF (calc_dipole .OR. calc_bc) DEALLOCATE (dip)
+      IF (calc_bc) DEALLOCATE (bc)
+      IF (calc_momentum) DEALLOCATE (mom)
+!$OMP END PARALLEL
+      DEALLOCATE (S_rs, H_rs, D_rs, VSOC_rs)
+      DEALLOCATE (index_to_cell_all, cell_to_index_all)
+      CALL dbcsr_deallocate_matrix_set(moments_rs_img)
+      CALL dbcsr_deallocate_matrix_set(mat_V_SOC_xyz)
+      CALL kpoint_release(kpoints_all)
+      CALL timestop(handle)
+   END SUBROUTINE qs_moment_kpoints_deep_soc
 
 ! **************************************************************************************************
 !> \brief Calculates interband k-point dipoles in the existing SCF MO basis.
@@ -3843,41 +3855,43 @@ CONTAINS
          OPTIONAL                                        :: nmo_spin_out
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'qs_moment_kpoints_scf_mos'
-
       INTEGER                                            :: handle, i_dir, ikp, ikp_local, ispin, &
                                                             m, n, nao, nkp, nmo, nspin
       INTEGER, DIMENSION(:), ALLOCATABLE                 :: nmo_spin
       INTEGER, DIMENSION(2)                              :: kp_range
-      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: my_kpgrp
       REAL(KIND=dp), PARAMETER                           :: eps_degenerate = 1.0E-10_dp
-      REAL(KIND=dp)                                      :: cimag, creal, energy_diff
+      COMPLEX(KIND=dp)                                   :: moment_element
+      REAL(KIND=dp)                                      :: energy_diff
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE           :: eigenvalues_kp
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvals
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env_all
-      TYPE(cp_fm_struct_type), POINTER                   :: moment_struct
       TYPE(cp_fm_struct_type), POINTER                   :: fm_struct
-      TYPE(cp_fm_type)                                   :: fm_dummy, fm_tmp, mo_coeff_im_global, &
-                                                            mo_coeff_re_global, moment_im, &
-                                                            moment_re
-      TYPE(cp_fm_type), POINTER                          :: mo_coeff_im, mo_coeff_re
+      TYPE(cp_cfm_type)                                  :: cfm_empty, cfm_mo_coeff_global, &
+                                                            cfm_moment, cfm_operator, cfm_work
+      TYPE(cp_fm_type)                                   :: fm_dummy, fm_mo_coeff_global
+      TYPE(cp_fm_type)                                   :: fm_operator_imag, fm_operator_real
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: overlap_deriv
-      TYPE(dbcsr_type), POINTER                          :: cmatrix, rmatrix
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: overlap_deriv_xyz
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(kpoint_env_p_type), DIMENSION(:), POINTER     :: kp_env
       TYPE(kpoint_env_type), POINTER                     :: kp
       TYPE(kpoint_type), POINTER                         :: kpoints_scf
-      TYPE(mo_set_type), DIMENSION(:, :), POINTER        :: mos_kp
-      TYPE(mp_para_env_type), POINTER                    :: para_env, para_env_kp
+      TYPE(rskp_prepared_transform_type)                 :: transform
+      TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos_kp
+      TYPE(cp_cfm_type), POINTER                         :: cmo_coeff_source
+      TYPE(cp_fm_type), POINTER                          :: fm_mo_coeff_source
+      TYPE(mp_para_env_type), POINTER                    :: para_env, para_env_inter_kp, para_env_kp
       TYPE(neighbor_list_set_p_type), DIMENSION(:), &
          POINTER                                         :: sab_kp, sab_orb
       TYPE(qs_ks_env_type), POINTER                      :: ks_env
 
       CALL timeset(routineN, handle)
 
-      NULLIFY (blacs_env_all, cell_to_index, cmatrix, dft_control, eigenvals, fm_struct, kp, &
-               kp_env, kpoints_scf, ks_env, mo_coeff_im, mo_coeff_re, moment_struct, mos_kp, &
-               overlap_deriv, para_env, para_env_kp, rmatrix, sab_kp, sab_orb)
+      NULLIFY (blacs_env_all, cmo_coeff_source, dft_control, eigenvals, &
+               fm_mo_coeff_source, &
+               fm_struct, kp, kp_env, kpoints_scf, ks_env, mos_kp, &
+               overlap_deriv, overlap_deriv_xyz, para_env, para_env_inter_kp, para_env_kp, sab_kp, sab_orb)
       IF (PRESENT(rcc)) THEN
          MARK_USED(rcc)
       END IF
@@ -3891,14 +3905,14 @@ CONTAINS
       CPASSERT(ASSOCIATED(sab_orb))
 
       CALL get_kpoint_info(kpoints_scf, nkp=nkp, kp_range=kp_range, kp_env=kp_env, &
-                           para_env_kp=para_env_kp, blacs_env_all=blacs_env_all, &
-                           cell_to_index=cell_to_index, sab_nl=sab_kp)
+                           para_env_kp=para_env_kp, para_env_inter_kp=para_env_inter_kp, &
+                           blacs_env_all=blacs_env_all, sab_nl=sab_kp)
       IF (kp_range(2) >= kp_range(1)) THEN
          CPASSERT(ASSOCIATED(kp_env))
       END IF
       CPASSERT(ASSOCIATED(para_env_kp))
+      CPASSERT(ASSOCIATED(para_env_inter_kp))
       CPASSERT(ASSOCIATED(blacs_env_all))
-      CPASSERT(ASSOCIATED(cell_to_index))
       CPASSERT(ASSOCIATED(sab_kp))
 
       CALL build_overlap_matrix(ks_env, matrixkp_s=overlap_deriv, nderivative=1, &
@@ -3913,7 +3927,7 @@ CONTAINS
          mos_kp => kp%mos
          CPASSERT(ASSOCIATED(mos_kp))
          DO ispin = 1, nspin
-            CALL get_mo_set(mos_kp(1, ispin), nmo=nmo_spin(ispin))
+            CALL get_mo_set(mos_kp(ispin), nmo=nmo_spin(ispin))
          END DO
       END IF
       CALL para_env%max(nmo_spin)
@@ -3923,13 +3937,15 @@ CONTAINS
          nmo_spin_out(:) = nmo_spin(:)
       END IF
 
-      ALLOCATE (rmatrix, cmatrix)
-      CALL dbcsr_create(rmatrix, template=overlap_deriv(1, 1)%matrix, &
-                        matrix_type=dbcsr_type_antisymmetric)
-      CALL dbcsr_create(cmatrix, template=overlap_deriv(1, 1)%matrix, &
-                        matrix_type=dbcsr_type_symmetric)
-      CALL cp_dbcsr_alloc_block_from_nbl(rmatrix, sab_kp)
-      CALL cp_dbcsr_alloc_block_from_nbl(cmatrix, sab_kp)
+      CPASSERT(SIZE(overlap_deriv, 1) >= 4)
+      overlap_deriv_xyz => overlap_deriv(2:4, :)
+      CALL cp_fm_struct_create(fm_struct, nrow_global=nao, ncol_global=nao, &
+                               para_env=para_env, context=blacs_env_all)
+      CALL rskp_transform_prepare(transform, overlap_deriv_xyz, [1, 2, 3], sab_kp, &
+                                  kpoints_scf%cell_to_index, fm_struct, para_env, para_env_kp, &
+                                  para_env_inter_kp, kpoints_scf%rskp_transform, kpoints_scf%xkp, &
+                                  kpoints_scf%nkp_grid, kpoints_scf%kp_dist, mirror_sign=-1)
+      CALL cp_fm_struct_release(fm_struct)
 
       DO ikp = 1, nkp
          my_kpgrp = (ikp >= kp_range(1) .AND. ikp <= kp_range(2))
@@ -3946,81 +3962,81 @@ CONTAINS
 
             CALL cp_fm_struct_create(fm_struct, nrow_global=nao, ncol_global=nmo, &
                                      para_env=para_env, context=blacs_env_all)
-            CALL cp_fm_create(mo_coeff_re_global, fm_struct)
-            CALL cp_fm_create(mo_coeff_im_global, fm_struct)
-            CALL cp_fm_create(fm_tmp, fm_struct)
+            CALL cp_cfm_create(cfm_mo_coeff_global, fm_struct)
+            CALL cp_cfm_create(cfm_work, fm_struct)
             CALL cp_fm_struct_release(fm_struct)
-            CALL cp_fm_struct_create(moment_struct, nrow_global=nmo, ncol_global=nmo, &
+            CALL cp_fm_struct_create(fm_struct, nrow_global=nmo, ncol_global=nmo, &
                                      para_env=para_env, context=blacs_env_all)
-            CALL cp_fm_create(moment_re, moment_struct)
-            CALL cp_fm_create(moment_im, moment_struct)
-            CALL cp_fm_struct_release(moment_struct)
+            CALL cp_cfm_create(cfm_moment, fm_struct)
+            CALL cp_fm_struct_release(fm_struct)
+            CALL cp_fm_struct_create(fm_struct, nrow_global=nao, ncol_global=nao, &
+                                     para_env=para_env, context=blacs_env_all)
+            CALL cp_cfm_create(cfm_operator, fm_struct)
+            CALL cp_fm_create(fm_operator_real, fm_struct)
+            CALL cp_fm_create(fm_operator_imag, fm_struct)
+            CALL cp_fm_struct_release(fm_struct)
 
             IF (my_kpgrp) THEN
-               CALL get_mo_set(mos_kp(1, ispin), eigenvalues=eigenvals, mo_coeff=mo_coeff_re)
-               CALL get_mo_set(mos_kp(2, ispin), mo_coeff=mo_coeff_im)
+               CALL get_mo_set(mos_kp(ispin), eigenvalues=eigenvals)
                CPASSERT(ASSOCIATED(eigenvals))
-               CPASSERT(ASSOCIATED(mo_coeff_re))
-               CPASSERT(ASSOCIATED(mo_coeff_im))
+               IF (kpoints_scf%use_real_wfn) THEN
+                  NULLIFY (cmo_coeff_source)
+                  fm_mo_coeff_source => mos_kp(ispin)%mo_coeff
+               ELSE
+                  NULLIFY (fm_mo_coeff_source)
+                  cmo_coeff_source => mos_kp(ispin)%cmo_coeff
+               END IF
                IF (para_env_kp%is_source()) eigenvalues_kp(1:nmo) = eigenvals(1:nmo)
-               CALL cp_fm_copy_general(mo_coeff_re, mo_coeff_re_global, para_env)
-               CALL cp_fm_copy_general(mo_coeff_im, mo_coeff_im_global, para_env)
             ELSE
-               CALL cp_fm_copy_general(fm_dummy, mo_coeff_re_global, para_env)
-               CALL cp_fm_copy_general(fm_dummy, mo_coeff_im_global, para_env)
+               NULLIFY (cmo_coeff_source)
+               NULLIFY (fm_mo_coeff_source)
+            END IF
+            IF (kpoints_scf%use_real_wfn) THEN
+               CALL cp_fm_create(fm_mo_coeff_global, cfm_mo_coeff_global%matrix_struct)
+               IF (ASSOCIATED(fm_mo_coeff_source)) THEN
+                  CALL cp_fm_copy_general(fm_mo_coeff_source, fm_mo_coeff_global, para_env)
+               ELSE
+                  CALL cp_fm_copy_general(fm_dummy, fm_mo_coeff_global, para_env)
+               END IF
+               CALL cp_fm_to_cfm(msourcer=fm_mo_coeff_global, mtarget=cfm_mo_coeff_global)
+               CALL cp_fm_release(fm_mo_coeff_global)
+            ELSE
+               IF (ASSOCIATED(cmo_coeff_source)) THEN
+                  CALL cp_cfm_copy_general(cmo_coeff_source, cfm_mo_coeff_global, para_env)
+               ELSE
+                  CALL cp_cfm_copy_general(cfm_empty, cfm_mo_coeff_global, para_env)
+               END IF
             END IF
             CALL para_env%sum(eigenvalues_kp)
 
             DO i_dir = 1, 3
-               CALL dbcsr_set(rmatrix, 0.0_dp)
-               CALL dbcsr_set(cmatrix, 0.0_dp)
-               CALL rskp_transform(rmatrix=rmatrix, cmatrix=cmatrix, rsmat=overlap_deriv, &
-                                   ispin=i_dir + 1, xkp=kpoints_scf%xkp(:, ikp), &
-                                   cell_to_index=cell_to_index, sab_nl=sab_kp)
-
-               ! Project the complex AO derivative operator as C^H A C. The
-               ! off-diagonal length-gauge dipoles follow from the energy-gap relation.
-               CALL cp_dbcsr_sm_fm_multiply(rmatrix, mo_coeff_re_global, fm_tmp, nmo)
-               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
-                                  1.0_dp, mo_coeff_re_global, fm_tmp, 0.0_dp, moment_re)
-               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
-                                  -1.0_dp, mo_coeff_im_global, fm_tmp, 0.0_dp, moment_im)
-
-               CALL cp_dbcsr_sm_fm_multiply(rmatrix, mo_coeff_im_global, fm_tmp, nmo)
-               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
-                                  1.0_dp, mo_coeff_re_global, fm_tmp, 1.0_dp, moment_im)
-               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
-                                  1.0_dp, mo_coeff_im_global, fm_tmp, 1.0_dp, moment_re)
-
-               CALL cp_dbcsr_sm_fm_multiply(cmatrix, mo_coeff_re_global, fm_tmp, nmo)
-               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
-                                  1.0_dp, mo_coeff_re_global, fm_tmp, 1.0_dp, moment_im)
-               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
-                                  1.0_dp, mo_coeff_im_global, fm_tmp, 1.0_dp, moment_re)
-
-               CALL cp_dbcsr_sm_fm_multiply(cmatrix, mo_coeff_im_global, fm_tmp, nmo)
-               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
-                                  -1.0_dp, mo_coeff_re_global, fm_tmp, 1.0_dp, moment_re)
-               CALL parallel_gemm("T", "N", nmo, nmo, nao, &
-                                  1.0_dp, mo_coeff_im_global, fm_tmp, 1.0_dp, moment_im)
+               ! The derivative transforms are anti-Hermitian at each k point.
+               CALL rskp_transform_evaluate(transform, i_dir, ikp, kpoints_scf%xkp, &
+                                            fm_operator_real, fm_operator_imag)
+               CALL cp_fm_to_cfm(fm_operator_real, fm_operator_imag, cfm_operator)
+               CALL parallel_gemm("N", "N", nao, nmo, nao, z_one, cfm_operator, &
+                                  cfm_mo_coeff_global, z_zero, cfm_work)
+               CALL parallel_gemm("C", "N", nmo, nmo, nao, z_one, cfm_mo_coeff_global, &
+                                  cfm_work, z_zero, cfm_moment)
 
                DO n = 1, nmo
                   DO m = 1, nmo
                      IF (n == m) CYCLE
                      energy_diff = eigenvalues_kp(m) - eigenvalues_kp(n)
                      IF (ABS(energy_diff) <= eps_degenerate) CYCLE
-                     CALL cp_fm_get_element(moment_re, m, n, creal)
-                     CALL cp_fm_get_element(moment_im, m, n, cimag)
-                     IF (para_env%is_source()) &
-                        dipole(ispin, ikp, i_dir, n, m) = CMPLX(creal, cimag, KIND=dp)/energy_diff
+                     CALL cp_cfm_get_element(cfm_moment, m, n, moment_element)
+                     IF (para_env%is_source()) THEN
+                        dipole(ispin, ikp, i_dir, n, m) = moment_element/energy_diff
+                     END IF
                   END DO
                END DO
             END DO
-            CALL cp_fm_release(mo_coeff_im_global)
-            CALL cp_fm_release(mo_coeff_re_global)
-            CALL cp_fm_release(moment_im)
-            CALL cp_fm_release(moment_re)
-            CALL cp_fm_release(fm_tmp)
+            CALL cp_cfm_release(cfm_mo_coeff_global)
+            CALL cp_cfm_release(cfm_work)
+            CALL cp_cfm_release(cfm_moment)
+            CALL cp_cfm_release(cfm_operator)
+            CALL cp_fm_release(fm_operator_real)
+            CALL cp_fm_release(fm_operator_imag)
             DEALLOCATE (eigenvalues_kp)
          END DO
       END DO
@@ -4033,8 +4049,7 @@ CONTAINS
          END DO
       END DO
 
-      CALL dbcsr_deallocate_matrix(cmatrix)
-      CALL dbcsr_deallocate_matrix(rmatrix)
+      CALL rskp_transform_release(transform)
       CALL dbcsr_deallocate_matrix_set(overlap_deriv)
       DEALLOCATE (nmo_spin)
       CALL timestop(handle)
@@ -4042,28 +4057,46 @@ CONTAINS
    END SUBROUTINE qs_moment_kpoints_scf_mos
 
 ! **************************************************************************************************
-!> \brief Calculate and print dipole moment elements d_nm(k) for k-point calculations
+!> \brief Calculate and print dipole moment elements d_nm(k) = i<u_n|∇_k|u_m> for k-point
+!>        calculations
 !> \param qs_env ...
 !> \param nmoments ...
 !> \param reference ...
 !> \param ref_point ...
 !> \param max_nmo ...
 !> \param unit_number ...
+!> \param do_soc include spin-orbit coupling (spinor sum-rule; requires an explicit KPOINT set)
+!> \param unit_str unit of the printed dipoles (dipole unit of cp_units), default debye; the Berry
+!>        curvature is printed in the paired length unit squared
+!> \param dip_file if present and non-empty, the dipole matrix elements are written to this file
+!>        instead of being printed to unit_number
+!> \param bc_file if present and non-empty, the Berry curvature is written to this file instead of
+!>        being printed to unit_number
 !> \author Shridhar Shanbhag
 ! **************************************************************************************************
-   SUBROUTINE qs_moment_kpoints(qs_env, nmoments, reference, ref_point, max_nmo, unit_number)
+   SUBROUTINE qs_moment_kpoints(qs_env, nmoments, reference, ref_point, max_nmo, unit_number, do_soc, &
+                                unit_str, dip_file, bc_file)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       INTEGER, INTENT(IN)                                :: nmoments, reference, max_nmo
       REAL(dp), DIMENSION(:), INTENT(IN), POINTER        :: ref_point
       INTEGER, INTENT(IN)                                :: unit_number
+      LOGICAL, INTENT(IN)                                :: do_soc
+      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: unit_str, dip_file, bc_file
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'qs_moment_kpoints'
+      CHARACTER(LEN=16)                                  :: dip_label, len_label
+      INTEGER                                            :: bc_unit, dip_unit, iu
+      INTEGER, DIMENSION(3)                              :: out_units
+      LOGICAL                                            :: use_sci
+      LOGICAL                                            :: to_bc_file, to_dip_file
+      LOGICAL, DIMENSION(3)                              :: print_bc, print_dip
+      REAL(KIND=dp)                                      :: dip_fac, len_fac
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks_kp
       COMPLEX(KIND=dp), DIMENSION(:, :, :), ALLOCATABLE  :: dipole_to_print
       COMPLEX(KIND=dp), DIMENSION(:, :, :, :, :), &
          ALLOCATABLE                                     :: dipole
       INTEGER                                            :: handle, i_dir, ikp, nmo_dim, nkp, nao, &
                                                             num_pe, mepos, n, m, &
-                                                            ispin, nspin, nmin, nmax, homo
+                                                            ispin, nspin, nspin_dip, nmin, nmax, homo
       INTEGER, DIMENSION(:), ALLOCATABLE                 :: nmo_spin_scf
       LOGICAL                                            :: explicit_kpnts, explicit_kpset, use_scf_mos
       REAL(KIND=dp), DIMENSION(3)                        :: rcc
@@ -4098,11 +4131,75 @@ CONTAINS
       CALL section_vals_get(kpnts, explicit=explicit_kpnts)
       use_scf_mos = .NOT. explicit_kpset .AND. .NOT. explicit_kpnts
 
+      IF (do_soc .AND. use_scf_mos) THEN
+         CALL cp_abort(__LOCATION__, "MOMENTS with SOC requires an explicit KPOINT_SET or "// &
+                       "KPOINTS section (the interband sum-rule / deep path).")
+      END IF
+
+      ! output units: d_nm in the dipole unit, Berry curvature in the paired length unit squared
+      IF (PRESENT(unit_str)) THEN
+         CALL get_moment_print_units(unit_str, dip_fac, len_fac, dip_label, len_label, use_sci)
+      ELSE
+         CALL get_moment_print_units("debye", dip_fac, len_fac, dip_label, len_label, use_sci)
+      END IF
+      MARK_USED(use_sci)
+
       IF (unit_number > 0) WRITE (unit_number, FMT="(/,T2,A)") &
          '!-----------------------------------------------------------------------------!'
-      IF (unit_number > 0) WRITE (unit_number, "(T22,A)") "Periodic Dipole Matrix Elements"
+      IF (unit_number > 0) WRITE (unit_number, "(T22,A)") "Periodic Dipole Matrix Elements ["// &
+         TRIM(dip_label)//"]"
+      IF (unit_number > 0 .AND. do_soc) WRITE (unit_number, "(T20,A)") &
+         "with Spin-Orbit Coupling (spinor bands)"
 
-      IF (use_scf_mos) THEN
+      ! optional separate files, written by the I/O rank only; data written to a file is not
+      ! repeated in the main MOMENTS output
+      to_dip_file = .FALSE.
+      to_bc_file = .FALSE.
+      IF (PRESENT(dip_file)) to_dip_file = (LEN_TRIM(dip_file) > 0)
+      IF (PRESENT(bc_file)) to_bc_file = (LEN_TRIM(bc_file) > 0)
+      IF (unit_number > 0 .AND. to_dip_file) WRITE (unit_number, "(/,T3,A)") &
+         "Dipole matrix elements written to file: "//TRIM(dip_file)
+      IF (unit_number > 0 .AND. to_bc_file) WRITE (unit_number, "(/,T3,A)") &
+         "Berry curvature written to file: "//TRIM(bc_file)
+      dip_unit = -1
+      bc_unit = -1
+      IF (para_env%is_source()) THEN
+         IF (to_dip_file) THEN
+            CALL open_file(file_name=TRIM(dip_file), file_status="REPLACE", file_action="WRITE", &
+                           unit_number=dip_unit)
+            WRITE (dip_unit, FMT="(/,T2,A)") &
+               '!-----------------------------------------------------------------------------!'
+            WRITE (dip_unit, "(T22,A)") "Periodic Dipole Matrix Elements ["//TRIM(dip_label)//"]"
+            IF (do_soc) WRITE (dip_unit, "(T20,A)") "with Spin-Orbit Coupling (spinor bands)"
+         END IF
+         IF (to_bc_file) THEN
+            CALL open_file(file_name=TRIM(bc_file), file_status="REPLACE", file_action="WRITE", &
+                           unit_number=bc_unit)
+            WRITE (bc_unit, FMT="(/,T2,A)") &
+               '!-----------------------------------------------------------------------------!'
+            WRITE (bc_unit, "(T22,A)") "Berry Curvature ["//TRIM(len_label)//"^2]"
+            IF (do_soc) WRITE (bc_unit, "(T20,A)") "with Spin-Orbit Coupling (spinor bands)"
+         END IF
+      END IF
+      ! output targets: main output, dipole file, Berry curvature file; each table goes
+      ! to its file if one is given, otherwise to the main output
+      out_units = [unit_number, dip_unit, bc_unit]
+      print_dip = [.NOT. to_dip_file, to_dip_file, .FALSE.]
+      print_bc = [.NOT. to_bc_file, .FALSE., to_bc_file]
+      IF (to_dip_file .AND. to_bc_file) out_units(1) = -1
+
+      nspin_dip = nspin
+      IF (do_soc) THEN
+         ! spinor sum-rule: SOC merges the two spin channels into 2*nao spinor bands
+         CALL qs_moment_kpoints_deep_soc(qs_env, &
+                                         xkp, &
+                                         dipole, &
+                                         rcc, &
+                                         berry_c, &
+                                         do_parallel=.TRUE.)
+         nmo_dim = 2*nao
+         nspin_dip = 1
+      ELSE IF (use_scf_mos) THEN
          CALL qs_moment_kpoints_scf_mos(qs_env, dipole, rcc, nmo_spin_scf)
          nmo_dim = SIZE(dipole, 4)
          ALLOCATE (berry_c(nspin, nkp, 3, nmo_dim), source=0.0_dp)
@@ -4137,13 +4234,20 @@ CONTAINS
       num_pe = para_env%num_pe
 
       DO ikp = 1, nkp
-         DO ispin = 1, nspin
-            CALL get_mo_set(mo_set=mos(ispin), homo=homo)
+         DO ispin = 1, nspin_dip
+            IF (do_soc) THEN
+               ! spinor HOMO = number of occupied spin-up + spin-down states (mirrors SOC_ev)
+               CALL get_mo_set(mo_set=mos(1), homo=homo)
+               CALL get_mo_set(mo_set=mos(nspin), homo=n)
+               homo = homo + n
+            ELSE
+               CALL get_mo_set(mo_set=mos(ispin), homo=homo)
+            END IF
             nmin = max(1, homo - (max_nmo - 1)/2)
-            nmax = min(nao, homo + max_nmo/2)
+            nmax = min(nmo_dim, homo + max_nmo/2)
             IF (max_nmo == 0) THEN
                nmin = 1
-               nmax = nao
+               nmax = nmo_dim
             END IF
             IF (use_scf_mos) THEN
                nmax = min(nmax, nmo_spin_scf(ispin))
@@ -4161,29 +4265,37 @@ CONTAINS
                CALL para_env%sum(dipole_to_print)
                CALL para_env%sum(bc_to_print)
             END IF
-            IF (unit_number > 0) THEN
-               IF (special_pnts(ikp) /= "") WRITE (unit_number, "(/,2X,A,A)") &
+            DO iu = 1, SIZE(out_units)
+               IF (out_units(iu) <= 0) CYCLE
+               IF (special_pnts(ikp) /= "") WRITE (out_units(iu), "(/,2X,A,A)") &
                   "Special point: ", ADJUSTL(TRIM(special_pnts(ikp)))
-               WRITE (unit_number, "(/,1X,A,I3,1X,3(A,1F12.6))") &
+               WRITE (out_units(iu), "(/,1X,A,I3,1X,3(A,1F12.6))") &
                   "Kpoint:", ikp, ", kx:", xkp(1, ikp), ", ky:", xkp(2, ikp), ", kz:", xkp(3, ikp)
-               IF (nspin > 1) WRITE (unit_number, "(/,2X,A,I2)") "Open Shell System. Spin:", ispin
-               WRITE (unit_number, "(2X,A)") "  kp   n   m  Re(dx_nm)  Im(dx_nm) &
-               & Re(dy_nm)  Im(dy_nm)  Re(dz_nm)  Im(dz_nm)"
-               DO n = nmin, nmax
-                  DO m = nmin, nmax
-                     IF (n == m) CYCLE
-                     WRITE (unit_number, "(2X,I4,2I4,6(G11.3))") ikp, n, m, dipole_to_print(1:3, n, m)
+               IF (nspin > 1 .AND. .NOT. do_soc) WRITE (out_units(iu), "(/,2X,A,I2)") &
+                  "Open Shell System. Spin:", ispin
+               IF (print_dip(iu)) THEN
+                  WRITE (out_units(iu), "(2X,A)") "  kp   n   m  Re(dx_nm)  Im(dx_nm) &
+                  & Re(dy_nm)  Im(dy_nm)  Re(dz_nm)  Im(dz_nm)"
+                  DO n = nmin, nmax
+                     DO m = nmin, nmax
+                        IF (n == m) CYCLE
+                        WRITE (out_units(iu), "(2X,I4,2I4,6(G11.3))") ikp, n, m, dipole_to_print(1:3, n, m)*dip_fac
+                     END DO
                   END DO
-               END DO
-               WRITE (unit_number, "(/,1X,A)") "Berry Curvature"
-               WRITE (unit_number, "(2X,A)") "   kp    n      YZ          ZX          XY"
-               DO n = nmin, nmax
-                  WRITE (unit_number, "(2X,2I5,3(1X,G11.3))") &
-                     ikp, n, bc_to_print(1, n), bc_to_print(2, n), bc_to_print(3, n)
-               END DO
-            END IF
+               END IF
+               IF (print_bc(iu)) THEN
+                  WRITE (out_units(iu), "(/,1X,A)") "Berry Curvature ["//TRIM(len_label)//"^2]"
+                  WRITE (out_units(iu), "(2X,A)") "   kp    n      YZ          ZX          XY"
+                  DO n = nmin, nmax
+                     WRITE (out_units(iu), "(2X,2I5,3(1X,G11.3))") &
+                        ikp, n, bc_to_print(1:3, n)*len_fac**2
+                  END DO
+               END IF
+            END DO
          END DO
       END DO
+      IF (dip_unit > 0) CALL close_file(unit_number=dip_unit)
+      IF (bc_unit > 0) CALL close_file(unit_number=bc_unit)
       DEALLOCATE (dipole_to_print, bc_to_print, berry_c, dipole)
       IF (ALLOCATED(nmo_spin_scf)) DEALLOCATE (nmo_spin_scf)
       DEALLOCATE (special_pnts, xkp)

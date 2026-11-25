@@ -530,6 +530,8 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: delta
       INTEGER, INTENT(IN)                                :: nder, iw
 
+      REAL(KIND=dp), PARAMETER                           :: error_threshold = 1.0E-12_dp
+
       INTEGER                                            :: i, ider, j, k, l, lhomo, m, n, nhomo, &
                                                             s1, s2
       REAL(KIND=dp)                                      :: dene, emax, expzet, fhomo, o, prefac, &
@@ -617,7 +619,7 @@ CONTAINS
          DO i = 1, n
             amat(i, i) = amat(i, i) - 1._dp
          END DO
-         IF (MAXVAL(ABS(amat)) > 1.e-12) THEN
+         IF (MAXVAL(ABS(amat)) > error_threshold) THEN
             WRITE (iw, '(/,A,G20.10)') " Orthogonality error  ", MAXVAL(ABS(amat))
          END IF
          DEALLOCATE (amat)
@@ -1103,11 +1105,11 @@ CONTAINS
 
       IF (PRESENT(counter)) THEN
          WRITE (str, "(I12)") counter
-      ELSEIF (PRESENT(rval)) THEN
+      ELSE IF (PRESENT(rval)) THEN
          WRITE (str, "(G18.8)") rval
-      ELSEIF (PRESENT(ival)) THEN
+      ELSE IF (PRESENT(ival)) THEN
          WRITE (str, "(I12)") ival
-      ELSEIF (PRESENT(cval)) THEN
+      ELSE IF (PRESENT(cval)) THEN
          WRITE (str, "(A)") TRIM(ADJUSTL(cval))
       ELSE
          WRITE (str, "(A)") ""

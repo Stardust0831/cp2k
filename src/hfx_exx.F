@@ -81,7 +81,8 @@ MODULE hfx_exx
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'hfx_exx'
 
-   PUBLIC :: calculate_exx, add_exx_to_rhs, calc_exx_admm_xc_contributions, exx_pre_hfx, exx_post_hfx
+   PUBLIC :: calculate_exx, add_exx_to_rhs, calc_exx_admm_xc_contributions, exx_pre_hfx, exx_post_hfx, &
+             remove_exc_energy
 
 CONTAINS
 
@@ -278,8 +279,8 @@ CONTAINS
          IF (do_admm) THEN
 
             CALL calc_exx_admm_xc_contributions(qs_env, matrix_ks, matrix_ks_aux_fit, x_data, &
-                                                energy%exc, energy%exc_aux_fit, calc_forces, &
-                                                use_virial)
+                                                energy%exc, energy%exc_aux_fit, &
+                                                calc_forces, use_virial)
 
             ! ADMM overlap forces
             IF (calc_forces) CALL admm_projection_derivative(qs_env, matrix_ks_aux_fit, rho_ao)
@@ -567,7 +568,7 @@ CONTAINS
             xc_section_aux => qs_env%mp2_env%ri_rpa%xc_section_aux
             xc_section_primary => qs_env%mp2_env%ri_rpa%xc_section_primary
          END IF
-      ELSEIF (qs_env%energy_correction) THEN
+      ELSE IF (qs_env%energy_correction) THEN
          IF (ASSOCIATED(qs_env%ec_env%xc_section_aux) .AND. &
              ASSOCIATED(qs_env%ec_env%xc_section_primary)) THEN
             xc_section_aux => qs_env%ec_env%xc_section_aux
@@ -624,8 +625,8 @@ CONTAINS
 !> \param calc_forces ...
 !> \param use_virial ...
 ! **************************************************************************************************
-   SUBROUTINE calc_exx_admm_xc_contributions(qs_env, matrix_prim, matrix_aux, x_data, exc, exc_aux_fit, &
-                                             calc_forces, use_virial)
+   SUBROUTINE calc_exx_admm_xc_contributions(qs_env, matrix_prim, matrix_aux, x_data, exc, &
+                                             exc_aux_fit, calc_forces, use_virial)
       TYPE(qs_environment_type), POINTER                 :: qs_env
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: matrix_prim, matrix_aux
       TYPE(hfx_type), DIMENSION(:, :), POINTER           :: x_data
@@ -633,6 +634,7 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: calc_forces, use_virial
 
       INTEGER                                            :: ispin, nspins
+      REAL(dp)                                           :: edisp
       REAL(dp), DIMENSION(3, 3)                          :: pv_loc
       TYPE(admm_type), POINTER                           :: admm_env
       TYPE(dbcsr_p_type), DIMENSION(:), POINTER          :: rho_ao, rho_ao_aux_fit
@@ -647,7 +649,8 @@ CONTAINS
       NULLIFY (xc_section_aux, xc_section_primary, rho, rho_aux_fit, v_dummy, v_rspace, v_rspace_aux_fit, &
                auxbas_pw_pool, pw_env, rho_ao, rho_ao_aux_fit, dft_control, admm_env)
 
-      CALL get_qs_env(qs_env, dft_control=dft_control, pw_env=pw_env, rho=rho, admm_env=admm_env, virial=virial)
+      CALL get_qs_env(qs_env, dft_control=dft_control, pw_env=pw_env, rho=rho, &
+                      admm_env=admm_env, virial=virial)
       CALL get_admm_env(admm_env, rho_aux_fit=rho_aux_fit)
 
       nspins = dft_control%nspins
@@ -692,7 +695,9 @@ CONTAINS
 
       IF (use_virial) virial%pv_xc = 0.0_dp
       CALL qs_vxc_create(qs_env%ks_env, rho_struct=rho, xc_section=xc_section_primary, &
-                         vxc_rho=v_rspace, vxc_tau=v_dummy, exc=exc)
+                         vxc_rho=v_rspace, vxc_tau=v_dummy, exc=exc, edisp=edisp, &
+                         dispersion_env=qs_env%dispersion_env)
+      IF (edisp /= 0.0_dp) exc = exc + edisp
       IF (use_virial) THEN
          virial%pv_exc = virial%pv_exc - virial%pv_xc
          virial%pv_virial = virial%pv_virial - virial%pv_xc

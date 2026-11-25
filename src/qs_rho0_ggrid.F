@@ -45,8 +45,6 @@ MODULE qs_rho0_ggrid
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_force_types,                  ONLY: qs_force_type
-   USE qs_harmonics_atom,               ONLY: get_none0_cg_list,&
-                                              harmonics_atom_type
    USE qs_integrate_potential,          ONLY: integrate_pgf_product
    USE qs_kind_types,                   ONLY: get_qs_kind,&
                                               qs_kind_type
@@ -125,7 +123,7 @@ CONTAINS
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_pool_p_type), DIMENSION(:), POINTER        :: pw_pools
       TYPE(pw_pool_type), POINTER                        :: pw_pool
-      TYPE(pw_r3d_rs_type)                               :: coeff_rspace, rho0_r_tmp
+      TYPE(pw_r3d_rs_type)                               :: coeff_rspace
       TYPE(pw_r3d_rs_type), POINTER                      :: rho0_s_rs
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(realspace_grid_desc_p_type), DIMENSION(:), &
@@ -204,7 +202,7 @@ CONTAINS
             ra(:) = pbc(particle_set(iatom)%r, cell)
             IF (rs_grid%desc%parallel .AND. .NOT. rs_grid%desc%distributed) THEN
                ! replicated realspace grid, split the atoms up between procs
-               IF (MODULO(nat, rs_grid%desc%group_size) == rs_grid%desc%my_pos) THEN
+               IF (MODULO(iatom, rs_grid%desc%group_size) == rs_grid%desc%my_pos) THEN
                   npme = npme + 1
                   cores(npme) = iat
                END IF
@@ -254,15 +252,17 @@ CONTAINS
          CALL pw_pool%give_back_pw(coeff_rspace)
          CALL pw_pool%give_back_pw(coeff_gspace)
       ELSE
-
-         CALL pw_pool%create_pw(rho0_r_tmp)
-
-         CALL transfer_rs2pw(rs_grid, rho0_r_tmp)
-
-         tot_rs_int = pw_integrate_function(rho0_r_tmp, isign=-1)
-
-         CALL pw_transfer(rho0_r_tmp, rho0_s_rs)
-         CALL pw_pool%give_back_pw(rho0_r_tmp)
+         IF (ASSOCIATED(rs_grid%desc%pw, rho0_s_rs%pw_grid)) THEN
+            CALL transfer_rs2pw(rs_grid, rho0_s_rs)
+            tot_rs_int = pw_integrate_function(rho0_s_rs, isign=-1)
+         ELSE
+            ! Custom pools may use a distinct grid descriptor at the same level.
+            CALL pw_pool%create_pw(coeff_rspace)
+            CALL transfer_rs2pw(rs_grid, coeff_rspace)
+            tot_rs_int = pw_integrate_function(coeff_rspace, isign=-1)
+            CALL pw_transfer(coeff_rspace, rho0_s_rs)
+            CALL pw_pool%give_back_pw(coeff_rspace)
+         END IF
 
          CALL pw_zero(rho0_s_gs)
          CALL pw_transfer(rho0_s_rs, rho0_s_gs)
@@ -354,18 +354,15 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'integrate_vhg0_rspace'
 
-      INTEGER :: auxbas_grid, bo(2), handle, i, iat, iatom, ic, icg, ico, ig1, ig2, igrid, ii, &
-         ikind, ipgf1, ipgf2, is, iset1, iset2, iso, iso1, iso2, ispin, j, l0_ikind, llmax, &
-         llmax_nuc, lmax0, lshell, lx, ly, lz, m1, m2, max_iso_not0_local, max_s_harm, &
-         max_s_harm_nuc, maxl, maxl_nuc, maxso, maxso_nuc, mepos, n1, n2, nat, nch_ik, nch_max, &
-         ncurr, nset, nset_nuc, nsotot, nsotot_nuc, nspins, num_pe
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: cg_n_list
-      INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: cg_list
-      INTEGER, DIMENSION(:), POINTER                     :: atom_list, lmax, lmax_nuc, lmin, &
-                                                            lmin_nuc, npgf, npgf_nuc
-      LOGICAL                                            :: grid_distributed, paw_atom, use_virial
+      INTEGER :: auxbas_grid, bo(2), handle, i, iat, iatom, ic, ico, igrid, ii, ikind, is, iso, &
+         ispin, j, l0_ikind, lmax0, lshell, lx, ly, lz, maxso, maxso_nuc, mepos, n_iso, n_iso_nuc, &
+         nat, nch_max, nset, nset_nuc, nso_ik, nsotot, nsotot_nuc, nspins, num_pe
+      INTEGER, DIMENSION(:), POINTER                     :: atom_list
+      LOGICAL                                            :: direct_transfer, grid_distributed, &
+                                                            paw_atom, use_virial
       REAL(KIND=dp)                                      :: eps_rho_rspace, force_tmp(3), fscale, &
                                                             ra(3), rpgf0, zet0
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: hab_sph_all
       REAL(KIND=dp), DIMENSION(3, 3)                     :: my_virial_a, my_virial_b
       REAL(KIND=dp), DIMENSION(:), POINTER               :: hab_sph, norm_l, Qlm
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: hab, hdab_sph, intloc, intloc_nuc, pab
@@ -376,13 +373,12 @@ CONTAINS
       TYPE(cneo_potential_type), POINTER                 :: cneo_potential
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(gto_basis_set_type), POINTER                  :: basis_1c_set, nuc_basis_set
-      TYPE(harmonics_atom_type), POINTER                 :: harmonics
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(pw_c1d_gs_type)                               :: coeff_gaux, coeff_gspace
       TYPE(pw_env_type), POINTER                         :: pw_env
       TYPE(pw_pool_p_type), DIMENSION(:), POINTER        :: pw_pools
       TYPE(pw_pool_type), POINTER                        :: pw_aux, pw_pool
-      TYPE(pw_r3d_rs_type)                               :: coeff_raux, coeff_rspace
+      TYPE(pw_r3d_rs_type)                               :: coeff_rspace
       TYPE(qs_force_type), DIMENSION(:), POINTER         :: force
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       TYPE(realspace_grid_desc_p_type), DIMENSION(:), &
@@ -440,9 +436,10 @@ CONTAINS
       !   END IF
       !END IF
 
-      IF (PRESENT(local_rho_set)) &
+      IF (PRESENT(local_rho_set)) THEN
          CALL get_local_rho(local_rho_set, rho0_mpole=rho0_mpole, rho_atom_set=rho_atom_set, &
                             rhoz_cneo_set=rhoz_cneo_set)
+      END IF
       ! Q from rho0_mpole of local_rho_set
       ! for TDDFT forces we need mixed potential / integral space
       ! potential stored on local_rho_set_2nd
@@ -471,37 +468,43 @@ CONTAINS
          pw_pool => pw_pools(igrid)%pool
       END IF
 
-      CALL pw_pool%create_pw(coeff_gspace)
-      CALL pw_pool%create_pw(coeff_rspace)
-
-      IF (igrid /= auxbas_grid) THEN
-         pw_aux => pw_pools(auxbas_grid)%pool
-         CALL pw_aux%create_pw(coeff_gaux)
-         CALL pw_transfer(v_rspace, coeff_gaux)
-         CALL pw_copy(coeff_gaux, coeff_gspace)
-         CALL pw_transfer(coeff_gspace, coeff_rspace)
-         CALL pw_aux%give_back_pw(coeff_gaux)
-         CALL pw_aux%create_pw(coeff_raux)
-         fscale = coeff_rspace%pw_grid%dvol/coeff_raux%pw_grid%dvol
-         CALL pw_scale(coeff_rspace, fscale)
-         CALL pw_aux%give_back_pw(coeff_raux)
-      ELSE
-
-         IF (coeff_gspace%pw_grid%spherical) THEN
-            CALL pw_transfer(v_rspace, coeff_gspace)
+      direct_transfer = igrid == auxbas_grid .AND. .NOT. pw_pool%pw_grid%spherical .AND. &
+                        ASSOCIATED(rs_desc%pw, v_rspace%pw_grid)
+      IF (.NOT. direct_transfer) THEN
+         CALL pw_pool%create_pw(coeff_rspace)
+         IF (igrid /= auxbas_grid .OR. pw_pool%pw_grid%spherical) THEN
+            CALL pw_pool%create_pw(coeff_gspace)
+            IF (igrid /= auxbas_grid) THEN
+               pw_aux => pw_pools(auxbas_grid)%pool
+               CALL pw_aux%create_pw(coeff_gaux)
+               CALL pw_transfer(v_rspace, coeff_gaux)
+               CALL pw_copy(coeff_gaux, coeff_gspace)
+               CALL pw_aux%give_back_pw(coeff_gaux)
+            ELSE
+               ! Preserve the reciprocal-space projection on spherical grids.
+               CALL pw_transfer(v_rspace, coeff_gspace)
+            END IF
             CALL pw_transfer(coeff_gspace, coeff_rspace)
+            CALL pw_pool%give_back_pw(coeff_gspace)
+            IF (igrid /= auxbas_grid) THEN
+               fscale = coeff_rspace%pw_grid%dvol/pw_aux%pw_grid%dvol
+               CALL pw_scale(coeff_rspace, fscale)
+            END IF
          ELSE
             CALL pw_copy(v_rspace, coeff_rspace)
          END IF
       END IF
-      CALL pw_pool%give_back_pw(coeff_gspace)
 
       ! Setup the rs grid at level igrid
       CALL rs_grid_create(rs_v, rs_desc)
       CALL rs_grid_zero(rs_v)
-      CALL transfer_pw2rs(rs_v, coeff_rspace)
-
-      CALL pw_pool%give_back_pw(coeff_rspace)
+      IF (direct_transfer) THEN
+         ! The potential is already on the target grid; no PW copy is needed.
+         CALL transfer_pw2rs(rs_v, v_rspace)
+      ELSE
+         CALL transfer_pw2rs(rs_v, coeff_rspace)
+         CALL pw_pool%give_back_pw(coeff_rspace)
+      END IF
 
       ! Now the potential is on the right grid => integration
 
@@ -519,8 +522,6 @@ CONTAINS
       CALL reallocate(a_hdab_sph, 1, 3, 1, 3, 1, nch_max)
       CALL reallocate(pab, 1, nch_max, 1, 1)
 
-      ncurr = -1
-
       grid_distributed = rs_v%desc%distributed
 
       fscale = 1.0_dp
@@ -529,40 +530,35 @@ CONTAINS
       END IF
 
       DO ikind = 1, SIZE(atomic_kind_set, 1)
-         NULLIFY (basis_1c_set, atom_list, harmonics, cneo_potential)
+         NULLIFY (basis_1c_set, atom_list, cneo_potential)
          CALL get_atomic_kind(atomic_kind_set(ikind), atom_list=atom_list, natom=nat)
          CALL get_qs_kind(qs_kind_set(ikind), &
                           basis_set=basis_1c_set, basis_type="GAPW_1C", &
                           paw_atom=paw_atom, &
-                          harmonics=harmonics, &
                           cneo_potential=cneo_potential)
 
          IF (.NOT. paw_atom) CYCLE
 
-         NULLIFY (Qlm_gg, lmax, npgf)
+         NULLIFY (Qlm_gg)
          CALL get_rho0_mpole(rho0_mpole=rho0_mpole, ikind=ikind, &
                              l0_ikind=l0_ikind, Qlm_gg=Qlm_gg, &  ! Qs different
                              rpgf0_s=rpgf0)
 
          CALL get_gto_basis_set(gto_basis_set=basis_1c_set, &
-                                lmax=lmax, lmin=lmin, &
-                                maxso=maxso, maxl=maxl, &
-                                nset=nset, npgf=npgf)
+                                maxso=maxso, nset=nset)
 
          nsotot = maxso*nset
          ALLOCATE (intloc(nsotot, nsotot))
 
          ! Initialize the local KS integrals
 
-         nch_ik = ncoset(l0_ikind)
          pab = 1.0_dp
-         max_s_harm = harmonics%max_s_harm
-         llmax = harmonics%llmax
+         nso_ik = nsoset(l0_ikind)
+         ALLOCATE (hab_sph_all(nso_ik, nat))
+         hab_sph_all = 0.0_dp
 
          NULLIFY (intloc_nuc)
-         maxl_nuc = -1
-         max_s_harm_nuc = 0
-         llmax_nuc = -1
+         nsotot_nuc = 0
          IF (ASSOCIATED(cneo_potential)) THEN
             NULLIFY (nuc_basis_set)
             CALL get_qs_kind(qs_kind_set(ikind), &
@@ -570,18 +566,10 @@ CONTAINS
                              basis_type="NUC")
 
             CALL get_gto_basis_set(gto_basis_set=nuc_basis_set, &
-                                   lmax=lmax_nuc, lmin=lmin_nuc, &
-                                   maxso=maxso_nuc, maxl=maxl_nuc, &
-                                   nset=nset_nuc, npgf=npgf_nuc)
+                                   maxso=maxso_nuc, nset=nset_nuc)
             nsotot_nuc = maxso_nuc*nset_nuc
             ALLOCATE (intloc_nuc(nsotot_nuc, nsotot_nuc))
-            max_s_harm_nuc = cneo_potential%harmonics%max_s_harm
-            llmax_nuc = cneo_potential%harmonics%llmax
          END IF
-
-         ALLOCATE (cg_list(2, nsoset(MAX(maxl, maxl_nuc))**2, &
-                           MAX(max_s_harm, max_s_harm_nuc)), &
-                   cg_n_list(MAX(max_s_harm, max_s_harm_nuc)))
 
          num_pe = para_env%num_pe
          mepos = para_env%mepos
@@ -598,7 +586,6 @@ CONTAINS
 
                hab = 0.0_dp
                hdab = 0.0_dp
-               intloc = 0._dp
                IF (use_virial) THEN
                   my_virial_a = 0.0_dp
                   my_virial_b = 0.0_dp
@@ -651,96 +638,7 @@ CONTAINS
                   END DO ! is
                END DO ! lshell
 
-               m1 = 0
-               DO iset1 = 1, nset
-
-                  m2 = 0
-                  DO iset2 = 1, nset
-                     CALL get_none0_cg_list(harmonics%my_CG, lmin(iset1), lmax(iset1), lmin(iset2), lmax(iset2), &
-                                            max_s_harm, llmax, cg_list, cg_n_list, max_iso_not0_local)
-                     n1 = nsoset(lmax(iset1))
-                     DO ipgf1 = 1, npgf(iset1)
-                        n2 = nsoset(lmax(iset2))
-                        DO ipgf2 = 1, npgf(iset2)
-
-                           DO iso = 1, MIN(nsoset(l0_ikind), max_iso_not0_local)
-                              DO icg = 1, cg_n_list(iso)
-                                 iso1 = cg_list(1, icg, iso)
-                                 iso2 = cg_list(2, icg, iso)
-
-                                 ig1 = iso1 + n1*(ipgf1 - 1) + m1
-                                 ig2 = iso2 + n2*(ipgf2 - 1) + m2
-
-                                 intloc(ig1, ig2) = intloc(ig1, ig2) + Qlm_gg(ig1, ig2, iso)*hab_sph(iso) ! potential times Q
-
-                              END DO ! icg
-                           END DO ! iso
-
-                        END DO ! ipgf2
-                     END DO ! ipgf1
-                     m2 = m2 + maxso
-                  END DO ! iset2
-                  m1 = m1 + maxso
-               END DO ! iset1
-
-               IF (ASSOCIATED(cneo_potential)) THEN
-                  intloc_nuc = 0.0_dp
-                  m1 = 0
-                  DO iset1 = 1, nset_nuc
-                     n1 = nsoset(lmax_nuc(iset1))
-                     m2 = 0
-                     DO iset2 = 1, nset_nuc
-                        n2 = nsoset(lmax_nuc(iset2))
-                        CALL get_none0_cg_list(cneo_potential%harmonics%my_CG, lmin_nuc(iset1), &
-                                               lmax_nuc(iset1), lmin_nuc(iset2), lmax_nuc(iset2), &
-                                               max_s_harm_nuc, llmax_nuc, cg_list, cg_n_list, &
-                                               max_iso_not0_local)
-                        DO ipgf1 = 1, npgf_nuc(iset1)
-                           DO ipgf2 = 1, npgf_nuc(iset2)
-
-                              DO iso = 1, MIN(nsoset(l0_ikind), max_iso_not0_local)
-                                 DO icg = 1, cg_n_list(iso)
-                                    iso1 = cg_list(1, icg, iso)
-                                    iso2 = cg_list(2, icg, iso)
-
-                                    ig1 = iso1 + n1*(ipgf1 - 1) + m1
-                                    ig2 = iso2 + n2*(ipgf2 - 1) + m2
-
-                                    intloc_nuc(ig1, ig2) = intloc_nuc(ig1, ig2) - cneo_potential%zeff* &
-                                                           cneo_potential%Qlm_gg(ig1, ig2, iso)*hab_sph(iso)
-
-                                 END DO ! icg
-                              END DO ! iso
-
-                           END DO ! ipgf2
-                        END DO ! ipgf1
-                        m2 = m2 + maxso_nuc
-                     END DO ! iset2
-                     m1 = m1 + maxso_nuc
-                  END DO ! iset1
-               END IF
-
-               IF (grid_distributed) THEN
-                  ! Sum result over all processors
-                  CALL para_env%sum(intloc)
-                  IF (ASSOCIATED(cneo_potential)) THEN
-                     CALL para_env%sum(intloc_nuc)
-                  END IF
-               END IF
-
-               IF (j == mepos) THEN
-                  rho_atom => rho_atom_set(iatom)
-                  CALL get_rho_atom(rho_atom=rho_atom, ga_Vlocal_gb_h=int_local_h, ga_Vlocal_gb_s=int_local_s)
-                  DO ispin = 1, nspins
-                     int_local_h(ispin)%r_coef = int_local_h(ispin)%r_coef + intloc
-                     int_local_s(ispin)%r_coef = int_local_s(ispin)%r_coef + intloc
-                  END DO
-                  IF (ASSOCIATED(cneo_potential)) THEN
-                     rhoz_cneo => rhoz_cneo_set(iatom)
-                     rhoz_cneo%ga_Vlocal_gb_h = rhoz_cneo%ga_Vlocal_gb_h + intloc_nuc
-                     rhoz_cneo%ga_Vlocal_gb_s = rhoz_cneo%ga_Vlocal_gb_s + intloc_nuc
-                  END IF
-               END IF
+               hab_sph_all(1:nso_ik, iat) = hab_sph(1:nso_ik)
 
                IF (PRESENT(atener)) THEN
                   DO iso = 1, nsoset(l0_ikind)
@@ -773,9 +671,50 @@ CONTAINS
             END DO
          END DO
 
-         DEALLOCATE (intloc)
+         IF (grid_distributed .AND. nat > 0) THEN
+            ! Sum multipole potential coefficients over all processors once per kind
+            CALL para_env%sum(hab_sph_all)
+         END IF
+
+         ! Qlm_gg is zero outside Gaunt selection rules (calculate_mpole_gau), so dense DGEMV is exact.
+         bo = get_limit(nat, num_pe, mepos)
+         n_iso = MIN(nso_ik, SIZE(Qlm_gg, 3))
+         CPASSERT(nsotot > 0)
+         CPASSERT(n_iso > 0)
+         CPASSERT(IS_CONTIGUOUS(Qlm_gg))
+         CPASSERT(SIZE(Qlm_gg, 1) == nsotot)
+         CPASSERT(SIZE(Qlm_gg, 2) == nsotot)
+         DO iat = bo(1), bo(2)
+            iatom = atom_list(iat)
+            CALL dgemv('N', nsotot*nsotot, n_iso, 1.0_dp, &
+                       Qlm_gg(1, 1, 1), nsotot*nsotot, &
+                       hab_sph_all(1, iat), 1, 0.0_dp, intloc(1, 1), 1)
+
+            rho_atom => rho_atom_set(iatom)
+            CALL get_rho_atom(rho_atom=rho_atom, ga_Vlocal_gb_h=int_local_h, ga_Vlocal_gb_s=int_local_s)
+            DO ispin = 1, nspins
+               int_local_h(ispin)%r_coef = int_local_h(ispin)%r_coef + intloc
+               int_local_s(ispin)%r_coef = int_local_s(ispin)%r_coef + intloc
+            END DO
+
+            IF (ASSOCIATED(cneo_potential)) THEN
+               n_iso_nuc = MIN(nso_ik, SIZE(cneo_potential%Qlm_gg, 3))
+               CPASSERT(nsotot_nuc > 0)
+               CPASSERT(n_iso_nuc > 0)
+               CPASSERT(IS_CONTIGUOUS(cneo_potential%Qlm_gg))
+               CPASSERT(SIZE(cneo_potential%Qlm_gg, 1) == nsotot_nuc)
+               CPASSERT(SIZE(cneo_potential%Qlm_gg, 2) == nsotot_nuc)
+               CALL dgemv('N', nsotot_nuc*nsotot_nuc, n_iso_nuc, -cneo_potential%zeff, &
+                          cneo_potential%Qlm_gg(1, 1, 1), nsotot_nuc*nsotot_nuc, &
+                          hab_sph_all(1, iat), 1, 0.0_dp, intloc_nuc(1, 1), 1)
+               rhoz_cneo => rhoz_cneo_set(iatom)
+               rhoz_cneo%ga_Vlocal_gb_h = rhoz_cneo%ga_Vlocal_gb_h + intloc_nuc
+               rhoz_cneo%ga_Vlocal_gb_s = rhoz_cneo%ga_Vlocal_gb_s + intloc_nuc
+            END IF
+         END DO
+
+         DEALLOCATE (hab_sph_all, intloc)
          IF (ASSOCIATED(intloc_nuc)) DEALLOCATE (intloc_nuc)
-         DEALLOCATE (cg_list, cg_n_list)
 
       END DO ! ikind
 

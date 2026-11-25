@@ -10,13 +10,9 @@
 !> \author Stepan Marek (08.24)
 ! **************************************************************************************************
 MODULE rt_propagation_ft
-   USE fft_lib,                         ONLY: fft_1dm,&
-                                              fft_alloc,&
-                                              fft_create_plan_1dm,&
-                                              fft_dealloc,&
-                                              fft_destroy_plan,&
-                                              fft_library
-   USE fft_plan,                        ONLY: fft_plan_type
+   USE fft_api,                         ONLY: fft_1d_local,&
+                                              fft_allocate,&
+                                              fft_deallocate
    USE kinds,                           ONLY: dp
    USE mathconstants,                   ONLY: twopi
 #include "../base/base_uses.f90"
@@ -108,11 +104,10 @@ CONTAINS
 
       COMPLEX(kind=dp)                                   :: subtract_value
       COMPLEX(kind=dp), CONTIGUOUS, DIMENSION(:), &
-         POINTER                                         :: ft_samples, samples, samples_input
-      INTEGER                                            :: handle, i, i0, j, nsamples, nseries, stat
+         POINTER                                         :: ft_samples, samples_input
+      INTEGER                                            :: handle, i, i0, j, nsamples, nseries
       LOGICAL                                            :: subtract_initial
-      REAL(kind=dp)                                      :: damping, t0, t_total
-      TYPE(fft_plan_type)                                :: fft_plan
+      REAL(kind=dp)                                      :: damping, delta_t, t0, t_total
 
 ! For value and result series: Index 1 - different series, Index 2 - single series entry
 
@@ -120,6 +115,9 @@ CONTAINS
       ! Start with t0
       t0 = 0.0_dp
       IF (PRESENT(t0_opt)) t0 = t0_opt
+      IF (SIZE(time_series) < 2) THEN
+         CPABORT("multi_fft requires at least two time samples.")
+      END IF
       ! Determine zero index
       i0 = 1
       DO i = 1, SIZE(time_series)
@@ -130,8 +128,18 @@ CONTAINS
       END DO
       ! Determine nsamples
       nsamples = SIZE(time_series) - i0 + 1
+      IF (nsamples < 2) THEN
+         CPABORT("multi_fft requires at least two samples in the selected time window.")
+      END IF
       ! Determine total time
       t_total = time_series(SIZE(time_series)) - time_series(i0)
+      delta_t = time_series(i0 + 1) - time_series(i0)
+      IF (t_total /= t_total .OR. ABS(t_total) >= HUGE(t_total) .OR. t_total <= 0.0_dp) THEN
+         CPABORT("multi_fft detected an abnormal total time window (NaN/Inf/non-positive).")
+      END IF
+      IF (delta_t /= delta_t .OR. ABS(delta_t) >= HUGE(delta_t) .OR. delta_t <= 0.0_dp) THEN
+         CPABORT("multi_fft detected an abnormal timestep (NaN/Inf/non-positive).")
+      END IF
       ! Now can determine default damping
       damping = 4.0_dp/(t_total)
       ! Damping option supplied in au units of time
@@ -142,6 +150,9 @@ CONTAINS
             ! Special case - zero damping
             damping = 0.0_dp
          END IF
+      END IF
+      IF (damping /= damping .OR. ABS(damping) >= HUGE(damping)) THEN
+         CPABORT("multi_fft detected an abnormal damping factor (NaN/Inf).")
       END IF
       ! subtract initial
       subtract_initial = .TRUE.
@@ -159,17 +170,19 @@ CONTAINS
       ! Calculate the omega series values, ordered from negative to positive
       IF (PRESENT(omega_series)) THEN
          CALL fft_freqs(nsamples, t_total, omega_series, fft_ordering_opt=.FALSE.)
+         IF (ANY(omega_series /= omega_series) .OR. &
+             ANY(ABS(omega_series) >= HUGE(omega_series))) THEN
+            CPABORT("multi_fft produced abnormal frequencies (NaN/Inf).")
+         END IF
       END IF
 
       ! Use FFTW3 library
       ! Allocate the in-out arrays (on every rank)
       CALL timeset(routineN, handle)
-      NULLIFY (samples)
       NULLIFY (samples_input)
       NULLIFY (ft_samples)
-      CALL fft_alloc(samples, [nsamples*nseries])
-      CALL fft_alloc(samples_input, [nsamples*nseries])
-      CALL fft_alloc(ft_samples, [nsamples*nseries])
+      CALL fft_allocate(samples_input, [nsamples*nseries])
+      CALL fft_allocate(ft_samples, [nsamples*nseries])
       ! Fill the samples with data
       DO i = 1, nseries
          DO j = 1, nsamples
@@ -184,34 +197,24 @@ CONTAINS
          END DO
       END DO
       ! Create the plan (this overwrites samples and ft_samples with planning data)
-      CALL fft_create_plan_1dm(fft_plan, fft_library("FFTW3"), -1, .FALSE., nsamples, nseries, samples, ft_samples, 3)
       ! Carry out the transform
       ! Scale by dt - to transform to an integral
-      CALL fft_1dm(fft_plan, samples_input, ft_samples, time_series(2) - time_series(1), stat)
-      IF (stat /= 0) THEN
-         ! Failed fftw3 - go to backup
-         ! Uses value_series and result_series - no need to reassign data
-         ! TODO : OMP parallel for different series?
-         DO i = 1, nseries
-            IF (subtract_initial) THEN
-               subtract_value = value_series(i, 1)
-            END IF
-            CALL ft_simple(time_series(i0:SIZE(time_series)), &
-                           value_series(i, i0:SIZE(value_series, 2)), result_series(i, 1:nsamples), &
-                           damping, subtract_value)
-         END DO
-      ELSE
-         ! Successful FT requires shift
-         DO i = 1, nseries
-            CALL fft_shift(ft_samples((i - 1)*nsamples + 1:i*nsamples))
-            result_series(i, :) = ft_samples((i - 1)*nsamples + 1:i*nsamples)
-         END DO
+      CALL fft_1d_local(.FALSE., nsamples, nseries, .FALSE., .FALSE., nsamples, nsamples, samples_input, ft_samples)
+      ft_samples(:) = ft_samples*delta_t
+      ! Successful FT requires shift
+      DO i = 1, nseries
+         CALL fft_shift(ft_samples((i - 1)*nsamples + 1:i*nsamples))
+         result_series(i, :) = ft_samples((i - 1)*nsamples + 1:i*nsamples)
+      END DO
+      IF (ANY(REAL(result_series, kind=dp) /= REAL(result_series, kind=dp)) .OR. &
+          ANY(AIMAG(result_series) /= AIMAG(result_series)) .OR. &
+          ANY(ABS(REAL(result_series, kind=dp)) >= HUGE(1.0_dp)) .OR. &
+          ANY(ABS(AIMAG(result_series)) >= HUGE(1.0_dp))) THEN
+         CPABORT("multi_fft produced abnormal Fourier amplitudes (NaN/Inf).")
       END IF
       ! Deallocate
-      CALL fft_dealloc(samples)
-      CALL fft_dealloc(ft_samples)
-      CALL fft_dealloc(samples_input)
-      CALL fft_destroy_plan(fft_plan)
+      CALL fft_deallocate(ft_samples)
+      CALL fft_deallocate(samples_input)
       CALL timestop(handle)
    END SUBROUTINE multi_fft
 ! **************************************************************************************************
